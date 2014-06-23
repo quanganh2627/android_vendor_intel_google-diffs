@@ -1,0 +1,230 @@
+From 261941f2170c98d4d6407dd4fa4fa56833787f02 Mon Sep 17 00:00:00 2001
+From: Serguei Katkov <serguei.i.katkov@intel.com>
+Date: Mon, 17 Jun 2013 14:26:18 +0700
+Subject: Dalvik: Fix dvmCompilerInsertBasicBlockBetween and its usage
+
+BZ: 114473
+
+There is misprint in dvmCompilerInsertBasicBlockBetween during
+updating predecessors for child.
+The patch fixes this part as well as usage of
+dvmCompilerInsertBasicBlockBetween where we should be careful
+using this function while iterating over predecessors.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I1775dc28a58c9811330fe5717bc2cfbb2805f5dd
+Orig-MCG-Change-Id: I1780a3b3dc38c3a9048e08f633be49a8e33410d4
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/IntermediateRep.cpp |    2 +-
+ vm/compiler/Loop.cpp            |  150 ++++++++++++++++++---------------------
+ 2 files changed, 70 insertions(+), 82 deletions(-)
+
+diff --git a/vm/compiler/IntermediateRep.cpp b/vm/compiler/IntermediateRep.cpp
+index d5b1749..f6eed01 100644
+--- a/vm/compiler/IntermediateRep.cpp
++++ b/vm/compiler/IntermediateRep.cpp
+@@ -409,7 +409,7 @@ bool dvmCompilerInsertBasicBlockBetween (BasicBlock *newBlock, BasicBlock *paren
+     }
+ 
+     //Link to child
+-    dvmCompilerUpdatePredecessors (newBlock, newBlock->fallThrough, newBlock);
++    dvmCompilerUpdatePredecessors (newBlock, newBlock->fallThrough, child);
+     newBlock->fallThrough = child;
+     newBlock->taken = 0;
+ 
+diff --git a/vm/compiler/Loop.cpp b/vm/compiler/Loop.cpp
+index 695fc8e..da39068 100644
+--- a/vm/compiler/Loop.cpp
++++ b/vm/compiler/Loop.cpp
+@@ -1723,112 +1723,100 @@ static void insertBlockBeforeBackwardHelper (CompilationUnit *cUnit,
+         return;
+     }
+ 
+-    //Initialize iterator
+-    BitVectorIterator bvIterator;
+-    dvmBitVectorIteratorInit (predecessors, &bvIterator);
+-
+     //Ok, there is currently no way a backward branch can have more than one predecessor
+     //Something went terribly wrong if it did, so get out
++    //Note that if we remove this check we need to revisit to code below, cosidering loop
++    //over predecessors.
+     if (dvmCountSetBits (predecessors) != 1)
+     {
+         cUnit->quitLoopMode = true;
+         return;
+     }
+ 
+-    while (true)
+-    {
+-        //Get the block index
+-        int blockIdx = dvmBitVectorIteratorNext (&bvIterator);
++    // We have only one predecessor so take it
++    int blockIdx = dvmHighestBitSet (predecessors);
+ 
+-        //Break if we are done
+-        if (blockIdx == -1)
+-        {
+-            break;
+-        }
++    //Get the predecessor block
++    BasicBlock *predecessor =
++            reinterpret_cast<BasicBlock *> (dvmGrowableListGetElement (
++                    &cUnit->blockList, blockIdx));
+ 
+-        //Get the predecessor block
+-        BasicBlock *predecessor =
+-                reinterpret_cast<BasicBlock *> (dvmGrowableListGetElement (
+-                        &cUnit->blockList, blockIdx));
++    //Paranoid
++    assert (predecessor != 0);
+ 
+-        //Paranoid
+-        if (predecessor == 0)
+-        {
+-            continue;
+-        }
++    //Create a preBackward block
++    BasicBlock *preBackward = dvmCompilerNewBBinCunit (cUnit,
++            kPreBackwardBlock);
+ 
+-        //Create a preBackward block
+-        BasicBlock *preBackward = dvmCompilerNewBBinCunit (cUnit,
+-                kPreBackwardBlock);
++    //Paranoid
++    assert(preBackward != 0);
++
++    //Now we copy the relevant parts
++    preBackward->startOffset = backward->startOffset;
++    preBackward->firstMIRInsn = backward->firstMIRInsn;
++    preBackward->lastMIRInsn = backward->lastMIRInsn;
++    preBackward->containingMethod = backward->containingMethod;
++
++    //We also need to make a copy of the write back requests
++    preBackward->requestWriteBack = dvmCompilerAllocBitVector (1, true);
++    dvmCopyBitVector (preBackward->requestWriteBack,
++            backward->requestWriteBack);
++
++    //We want the new block to be the taken branch.
++    //So if backward used to be the fallthrough, make it the taken.
++    if(predecessor->fallThrough == backward)
++    {
++        MIR *ifMir = predecessor->lastMIRInsn;
+ 
+-        //Paranoid
+-        assert(preBackward != 0);
+-
+-        //Now we copy the relevant parts
+-        preBackward->startOffset = backward->startOffset;
+-        preBackward->firstMIRInsn = backward->firstMIRInsn;
+-        preBackward->lastMIRInsn = backward->lastMIRInsn;
+-        preBackward->containingMethod = backward->containingMethod;
+-
+-        //We also need to make a copy of the write back requests
+-        preBackward->requestWriteBack = dvmCompilerAllocBitVector (1, true);
+-        dvmCopyBitVector (preBackward->requestWriteBack,
+-                backward->requestWriteBack);
+-
+-        //We want the new block to be the taken branch.
+-        //So if backward used to be the fallthrough, make it the taken.
+-        if(predecessor->fallThrough == backward)
++        //It is unexpected if we have a null MIR, so bail out
++        if (ifMir == 0)
+         {
+-            MIR *ifMir = predecessor->lastMIRInsn;
+-
+-            //It is unexpected if we have a null MIR, but just continue
+-            if (ifMir == 0)
+-            {
+-                continue;
+-            }
++            cUnit->quitLoopMode = true;
++            return;
++        }
+ 
+-            //Paranoid, we should have an if at the end
+-            assert(ifMir != 0 && ifMir->dalvikInsn.opcode >= OP_IF_EQ
+-                    && ifMir->dalvikInsn.opcode <= OP_IF_LEZ);
++        //Paranoid, we should have an if at the end
++        assert(ifMir != 0 && ifMir->dalvikInsn.opcode >= OP_IF_EQ
++                && ifMir->dalvikInsn.opcode <= OP_IF_LEZ);
+ 
+-            Opcode negated;
++        Opcode negated;
+ 
+-            bool canNegate = negateOpcode (ifMir->dalvikInsn.opcode, negated);
++        bool canNegate = negateOpcode (ifMir->dalvikInsn.opcode, negated);
+ 
+-            //If we can negate the bytecode condition, then we can swap
+-            //the children
+-            if (canNegate == true)
+-            {
+-                //Update opcode
+-                ifMir->dalvikInsn.opcode = negated;
++        //If we can negate the bytecode condition, then we can swap
++        //the children
++        if (canNegate == true)
++        {
++            //Update opcode
++            ifMir->dalvikInsn.opcode = negated;
+ 
+-                //Set the fallthrough to be the old taken
+-                predecessor->fallThrough = predecessor->taken;
++            //Set the fallthrough to be the old taken
++            predecessor->fallThrough = predecessor->taken;
+ 
+-                //Make the backward be the new taken
+-                predecessor->taken = backward;
+-            }
++            //Make the backward be the new taken
++            predecessor->taken = backward;
+         }
++    }
+ 
+-        //Insert the preBackward block between predecessor and backward CC
+-        bool res = dvmCompilerInsertBasicBlockBetween (preBackward, predecessor,
+-                backward);
++    //Insert the preBackward block between predecessor and backward CC
++    bool res = dvmCompilerInsertBasicBlockBetween (preBackward, predecessor,
++            backward);
+ 
+-        //If we failed inserting, that's not good but let's keep going
+-        if (res == false)
+-        {
+-            continue;
+-        }
++    //If we failed inserting, that's not good and we bail out
++    if (res == false)
++    {
++        cUnit->quitLoopMode = true;
++        return;
++    }
+ 
+-        //Clear fields from backward
+-        backward->firstMIRInsn = 0;
+-        backward->lastMIRInsn = 0;
++    //Clear fields from backward
++    backward->firstMIRInsn = 0;
++    backward->lastMIRInsn = 0;
+ 
+-        //Update parent of the MIRs
+-        for (MIR *mir = preBackward->firstMIRInsn; mir != 0; mir = mir->next)
+-        {
+-            mir->bb = preBackward;
+-        }
++    //Update parent of the MIRs
++    for (MIR *mir = preBackward->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        mir->bb = preBackward;
+     }
+ }
+ 
+-- 
+1.7.4.1
+

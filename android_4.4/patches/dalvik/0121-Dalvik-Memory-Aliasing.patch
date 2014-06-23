@@ -1,0 +1,920 @@
+From 5099a9dfe9d8208f5faf76af6b7e2de7057a81be Mon Sep 17 00:00:00 2001
+From: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Date: Thu, 4 Apr 2013 13:38:26 -0700
+Subject: Dalvik: Memory Aliasing
+
+BZ: 97825
+
+Added a new memory aliasing pass.
+
+CompilerIR.h:
+ - Added a new InstructionColor chaining between MIRs to be able to handle
+     memory aliasing coloring and follow a chain
+
+LoopInformation:
+ - New gate to detect very simple loops: not nested and one basicblock
+
+LoopOpt, LoopRegisterUsage:
+ - New memory aliasing pass
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I033b1a0afa93917f0fd9821e4d47c2215c4a4054
+Orig-MCG-Change-Id: I09da95bf7cd9797bd2ad526f5bc14f29da9d67a3
+Signed-off-by: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/Dvm.mk                         |    1 +
+ vm/compiler/Compiler.h            |    6 +
+ vm/compiler/CompilerIR.h          |   11 +
+ vm/compiler/IntermediateRep.cpp   |   38 +++
+ vm/compiler/LoopInformation.cpp   |  123 +++++++++
+ vm/compiler/LoopInformation.h     |    9 +
+ vm/compiler/LoopOpt.cpp           |   12 +-
+ vm/compiler/LoopRegisterUsage.cpp |  538 +++++++++++++++++++++++++++++++++++++
+ vm/compiler/LoopRegisterUsage.h   |   32 +++
+ 9 files changed, 767 insertions(+), 3 deletions(-)
+ create mode 100644 vm/compiler/LoopRegisterUsage.cpp
+ create mode 100644 vm/compiler/LoopRegisterUsage.h
+
+diff --git a/vm/Dvm.mk b/vm/Dvm.mk
+index fc99d9b..bde8d50 100644
+--- a/vm/Dvm.mk
++++ b/vm/Dvm.mk
+@@ -358,6 +358,7 @@ ifeq ($(dvm_arch),x86)
+               compiler/codegen/$(dvm_arch_variant)/StackExtensionX86.cpp \
+               compiler/LoopOpt.cpp \
+               compiler/Checks.cpp \
++              compiler/LoopRegisterUsage.cpp \
+               compiler/Pass.cpp \
+               compiler/BBOptimization.cpp \
+               compiler/LoopInformation.cpp \
+diff --git a/vm/compiler/Compiler.h b/vm/compiler/Compiler.h
+index 2627ba4..68514ee 100644
+--- a/vm/compiler/Compiler.h
++++ b/vm/compiler/Compiler.h
+@@ -292,4 +292,10 @@ void dvmCompilerCalculatePredecessors (CompilationUnit *cUnit);
+ /* Build domination information */
+ void dvmCompilerBuildDomination (CompilationUnit *cUnit);
+ 
++/* Find the highest MIR in the color */
++MIR *dvmCompilerFindHighestMIRInColor (MIR *elem);
++
++/* Find the lowest MIR in the color */
++MIR *dvmCompilerFindLowestMIRInColor (MIR *elem);
++
+ #endif  // DALVIK_VM_COMPILER_H_
+diff --git a/vm/compiler/CompilerIR.h b/vm/compiler/CompilerIR.h
+index d23b97d..7edce81 100644
+--- a/vm/compiler/CompilerIR.h
++++ b/vm/compiler/CompilerIR.h
+@@ -163,12 +163,23 @@ typedef struct CallsiteInfo {
+     LIR *misPredBranchOver;
+ } CallsiteInfo;
+ 
++/**
++ * @class sInstructionColor
++ * @brief The instruction color to disambiguate memory aliasing
++ */
++typedef struct sInstructionColor {
++    unsigned int aliasingColor; /**< @brief Aliasing color */
++    MIR *prev;                  /**< @brief Previous instruction in the color */
++    MIR *next;                  /**< @brief Next instruction in the color */
++}SInstructionColor;
++
+ typedef struct MIR {
+     DecodedInstruction dalvikInsn;
+     unsigned int width;
+     unsigned int offset;
+     unsigned int topologicalOrder;      //Topological order of the MIR in the entire CFG
+     BasicBlock *bb;                     //BasicBlock containing the MIR
++    SInstructionColor color;             //Instruction color
+     struct MIR *prev;
+     struct MIR *next;
+     struct SSARepresentation *ssaRep;
+diff --git a/vm/compiler/IntermediateRep.cpp b/vm/compiler/IntermediateRep.cpp
+index b5b32dd..8c7442a 100644
+--- a/vm/compiler/IntermediateRep.cpp
++++ b/vm/compiler/IntermediateRep.cpp
+@@ -302,3 +302,41 @@ BasicBlock *dvmCompilerCopyBasicBlock (CompilationUnit *cUnit, const BasicBlock
+ 
+     return res;
+ }
++
++/**
++ * @brief Find the highest MIR in the color
++ * @param elem an instruction
++ * @return the first instruction in the color following the color link list
++ */
++MIR *dvmCompilerFindHighestMIRInColor (MIR *elem)
++{
++    //Paranoid
++    assert (elem != 0);
++
++    while (elem->color.prev != 0)
++    {
++        //Go to the previous one
++        elem = elem->color.prev;
++    }
++
++    return elem;
++}
++
++/**
++ * @brief Find the lowest MIR in the color
++ * @param elem an instruction
++ * @return the last instruction in the color following the color link list
++ */
++MIR *dvmCompilerFindLowestMIRInColor (MIR *elem)
++{
++    //Paranoid
++    assert (elem != 0);
++
++    while (elem->color.next != 0)
++    {
++        //Go to the next one
++        elem = elem->color.next;
++    }
++
++    return elem;
++}
+diff --git a/vm/compiler/LoopInformation.cpp b/vm/compiler/LoopInformation.cpp
+index 4f0d056..0e214c9 100644
+--- a/vm/compiler/LoopInformation.cpp
++++ b/vm/compiler/LoopInformation.cpp
+@@ -633,3 +633,126 @@ void LoopInformation::clearInterIterationVariables (void)
+ {
+     dvmClearAllBits (interIterationVariables);
+ }
++
++/**
++ * @brief Determines whether the loop contains certain opcodes that would block memory aliasing
++ * @param cUnit the CompilationUnit
++ * @param bv the BitVector representing the BasicBlocks of the loop
++ * @return whether or not the loop contains any non supported opcodes in its BasicBlocks
++ */
++static bool containsUnsupportedOpcodes (const CompilationUnit *cUnit, BitVector *bv)
++{
++    //Get highest bit, it's also the only one set (checked by the gate)
++    int highest = dvmHighestBitSet (bv);
++
++    //Get the BasicBlock
++    BasicBlock *bb = (BasicBlock *) dvmGrowableListGetElement(& (cUnit->blockList), highest);
++
++    //Paranoid
++    assert (bb != 0);
++
++    //Currently we refuse:
++    //  - returns, calls, move results, throw, switch
++    //  - execute inline, new array, monitor
++    for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        //Get Dalvik instruction
++        DecodedInstruction &insn = mir->dalvikInsn;
++
++        switch (insn.opcode)
++        {
++            //These are more paranoid than anything because they should not appear without an invoke
++            //And we ignore invokes already
++            case OP_MOVE_RESULT:
++            case OP_MOVE_RESULT_WIDE:
++            case OP_MOVE_RESULT_OBJECT:
++            case OP_MOVE_EXCEPTION:
++
++            //Refuse returns
++            case OP_RETURN_VOID:
++            case OP_RETURN:
++            case OP_RETURN_WIDE:
++            case OP_RETURN_OBJECT:
++            case OP_RETURN_VOID_BARRIER:
++
++            //Refuse new instance and new array
++            case OP_NEW_INSTANCE:
++            case OP_NEW_ARRAY:
++
++            //Refuse throw
++            case OP_THROW:
++
++            //Refuse switches
++            case OP_PACKED_SWITCH:
++            case OP_SPARSE_SWITCH:
++
++            //Refuse invokes
++            case OP_INVOKE_VIRTUAL:
++            case OP_INVOKE_VIRTUAL_RANGE:
++            case OP_INVOKE_INTERFACE:
++            case OP_INVOKE_INTERFACE_RANGE:
++            case OP_INVOKE_OBJECT_INIT_RANGE:
++            case OP_INVOKE_VIRTUAL_QUICK:
++            case OP_INVOKE_VIRTUAL_QUICK_RANGE:
++            case OP_INVOKE_SUPER_RANGE:
++            case OP_INVOKE_DIRECT_RANGE:
++            case OP_INVOKE_STATIC_RANGE:
++            case OP_INVOKE_SUPER_QUICK_RANGE:
++            case OP_INVOKE_SUPER:
++            case OP_INVOKE_DIRECT:
++            case OP_INVOKE_STATIC:
++            case OP_INVOKE_SUPER_QUICK:
++
++            //Refuse breakpoints, throw, execute inline
++            case OP_BREAKPOINT:
++            case OP_THROW_VERIFICATION_ERROR:
++            case OP_EXECUTE_INLINE:
++            case OP_EXECUTE_INLINE_RANGE:
++                //It does contain an unsupported opcode
++                return true;
++
++            default:
++                break;
++        }
++    }
++
++    //All good
++    return false;
++}
++
++//The following gate accepts only very simple loops: one basicblock, no nesting
++bool dvmCompilerVerySimpleLoopGate (const CompilationUnit *cUnit, const Pass *curPass)
++{
++    //Only do something if we have the loop information
++    LoopInformation *info = cUnit->loopInformation;
++
++    if (info == 0)
++    {
++        return false;
++    }
++
++    //Reject any nested loops
++    if (info->getNestedNbr () != 0)
++    {
++        return false;
++    }
++
++    //Right now, we will refuse anything that has more than one block
++    BitVector *bv = const_cast<BitVector *> (info->getBasicBlocks ());
++
++    if (dvmCountSetBits (bv) > 1)
++    {
++        return false;
++    }
++
++    //Finally we don't support every type of opcodes here, there are some that would make aliasing impossible
++    if (containsUnsupportedOpcodes (cUnit, bv) == true)
++    {
++        return false;
++    }
++
++    //Unused parameter
++    (void) curPass;
++
++    return true;
++}
+diff --git a/vm/compiler/LoopInformation.h b/vm/compiler/LoopInformation.h
+index 1bab8d8..f8f05dc 100644
+--- a/vm/compiler/LoopInformation.h
++++ b/vm/compiler/LoopInformation.h
+@@ -23,6 +23,7 @@
+ struct BasicBlock;
+ struct BitVector;
+ class CompilationUnit;
++class Pass;
+ 
+ /**
+   * @class LoopInformation
+@@ -279,4 +280,12 @@ class LoopInformation
+          void clearInterIterationVariables (void);
+ };
+ 
++/**
++ * @brief Gate to determine if the CompilationUnit only contains a very simple loop: not nested, one BasicBlock
++ * @param cUnit the CompilationUnit
++ * @param curPass the Pass structure
++ * @return whether to execute the pass or not: currently only very simple loops are supported
++ */
++bool dvmCompilerVerySimpleLoopGate (const CompilationUnit *cUnit, const Pass *curPass);
++
+ #endif
+diff --git a/vm/compiler/LoopOpt.cpp b/vm/compiler/LoopOpt.cpp
+index 52340fe..540fb7a 100644
+--- a/vm/compiler/LoopOpt.cpp
++++ b/vm/compiler/LoopOpt.cpp
+@@ -20,6 +20,7 @@
+ #include "Dataflow.h"
+ #include "Loop.h"
+ #include "LoopOpt.h"
++#include "LoopRegisterUsage.h"
+ #include "Pass.h"
+ #include "RegisterizationME.h"
+ 
+@@ -54,14 +55,19 @@ START_PASSES
+                 dvmCompilerFormOldLoop, 0, 0, 0, kOptimizationBasicBlockChange),
+     NEW_PASS ("Check Removal", kAllNodes, 0, 0,
+                 dvmCompilerStartCheckRemoval, dvmCompilerEndCheckRemoval, dvmCompilerCheckRemoval, 0, 0),
++    //Memory Aliasing only works on one basic block so let's try to merge first
++    //For the moment, no pass will create new blocks, etc. so this is fine up here
++    //Otherwise, we might want to duplicate the merge or make the gate for memory aliasing smarter
++    NEW_PASS ("Merge Blocks", kAllNodes, 0, 0,
++                0, 0, dvmCompilerMergeBasicBlocks, 0, kOptimizationBasicBlockChange),
++    NEW_PASS ("Memory Aliasing", kAllNodes, 0, dvmCompilerVerySimpleLoopGate,
++              0, 0, dvmCompilerMemoryAliasing, 0, 0),
+     //This should be after the last optimization that changes instruction sequence or BB logic
+-    //Note: merge block and reorder are safe and should be after
++    //Note: reorder is safe and should be after
+     //We do registerization for all traces to provide spill information to the BE
+     NEW_PASS ("Write Back Registers", kAllNodes, 0, 0, 0, 0, dvmCompilerWriteBackAll, 0, 0),
+     NEW_PASS ("Registerization ME", kAllNodes, 0, dvmCompilerRegisterizeGate,
+                 0, dvmCompilerRegisterize, 0, 0, 0),
+-    NEW_PASS ("Merge Blocks", kAllNodes, 0, 0,
+-                0, 0, dvmCompilerMergeBasicBlocks, 0, kOptimizationBasicBlockChange),
+     NEW_PASS ("Insert Prebackward Block", kAllNodes, 0, 0,
+                     0, dvmCompilerInsertPreBackward, 0, 0, kOptimizationBasicBlockChange),
+     NEW_PASS ("Reorder Blocks", kBreadthFirstTraversal, 0, dvmCompilerTraceIsLoop,
+diff --git a/vm/compiler/LoopRegisterUsage.cpp b/vm/compiler/LoopRegisterUsage.cpp
+new file mode 100644
+index 0000000..4f2b867
+--- /dev/null
++++ b/vm/compiler/LoopRegisterUsage.cpp
+@@ -0,0 +1,538 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "CompilerIR.h"
++#include "Dalvik.h"
++#include "Dataflow.h"
++#include "LoopInformation.h"
++#include "LoopRegisterUsage.h"
++#include "Pass.h"
++#include <set>
++
++/**
++ * @brief Get the start index we actually care about for coloring depending on the opcode
++ * @param opcode the considered opcode
++ * @return the start index to be considered when comparing two instructions
++ */
++static int getStartUseIndex (int opcode)
++{
++    //Default result
++    int res = 0;
++
++    //We are basically setting the iputs to their igets counterparts
++    switch (opcode)
++    {
++        case OP_IPUT:
++        case OP_IPUT_OBJECT:
++        case OP_IPUT_BOOLEAN:
++        case OP_IPUT_BYTE:
++        case OP_IPUT_CHAR:
++        case OP_IPUT_SHORT:
++        case OP_IPUT_QUICK:
++        case OP_IPUT_OBJECT_QUICK:
++            //Skip the VR containing what to store
++            res = 1;
++            break;
++        case OP_IPUT_WIDE:
++        case OP_IPUT_WIDE_QUICK:
++            //Skip the two VRs containing what to store
++            res = 2;
++            break;
++        default:
++            //Do nothing in the general case
++            break;
++    }
++
++    return res;
++}
++
++/**
++ * @brief Compare constants between two MIRs
++ * @param first the first DecodedInstruction
++ * @param second the second DecodedInstruction
++ * @return whether the two instructions are identical regarding constants
++ */
++static bool compareConstants (const DecodedInstruction &first, const DecodedInstruction &second)
++{
++    //Get the associated flags
++    int fflags = dvmCompilerDataFlowAttributes[first.opcode];
++    int sflags = dvmCompilerDataFlowAttributes[second.opcode];
++
++    //We have a special case for getter and setters and all the others
++    //First test is that the fact that first and second are either a setter/getter is the same
++    int firstMask = ( (fflags & (DF_IS_GETTER | DF_IS_SETTER)) != 0);
++    int secondMask = ( (sflags & (DF_IS_GETTER | DF_IS_SETTER)) != 0);
++
++    //If not, we are done
++    if (firstMask != secondMask)
++    {
++        return false;
++    }
++
++    //Let us separate the case of different opcode and are getter or setters
++    if ( (firstMask != 0) && (first.opcode != second.opcode))
++    {
++        //We now know that one is a getter and the other is a setter
++        //To simplify this code greatly, let's force the GETTER to be first
++        if ( (fflags & DF_IS_GETTER) == 0)
++        {
++            return compareConstants (second, first);
++        }
++        else
++        {
++            //Ok we now know that first is a getter, and second is a setter
++            //The way opcodes are paired prove:
++            //  vA/vB/vC will be used by both or neither, so just check first
++            //If vC is used, we are done (no constants)
++            //If not:
++            //  If vB is not used, vB is our constant
++            //  If not, vC is our constant
++
++            //The above code basically handles the difference between Agets/Aputs, Igets/Iputs, and Sgets/Sputs
++
++            //Check vC
++            int mask = (fflags & (DF_UC | DF_UC_WIDE));
++
++            if (mask == 0)
++            {
++                //vC is not used, what about vB?
++                mask = (fflags & (DF_UB | DF_UB_WIDE));
++
++                if (mask == 0)
++                {
++                    //vB is not used, so it is our constant
++                    return (first.vB == second.vB);
++                }
++                else
++                {
++                    //vC is not used, so it is our constant
++                    return (first.vC == second.vC);
++                }
++            }
++        }
++    }
++    else
++    {
++        //In the general case, we force the instruction opcodes to be similar
++        if (first.opcode != second.opcode)
++        {
++            return false;
++        }
++
++        //Now we look at vA/vB/vC if not used
++        int mask = (fflags & (DF_DA | DF_UA | DF_DA_WIDE | DF_UA_WIDE));
++
++        if (mask == 0)
++        {
++            if (first.vA != second.vA)
++            {
++                return false;
++            }
++        }
++
++        //Now vB
++        mask = (fflags & (DF_UB | DF_UB_WIDE));
++
++        if (mask == 0)
++        {
++            if (first.vB != second.vB)
++            {
++                return false;
++            }
++        }
++
++        //Now vC
++        mask = (fflags & (DF_UC | DF_UC_WIDE));
++
++        if (mask == 0)
++        {
++            if (first.vC != second.vC)
++            {
++                return false;
++            }
++        }
++    }
++
++    //Got here, all is good
++    return true;
++}
++
++/**
++ * @brief Hash the opcode
++ * @param opcode the opcode to hash
++ * @return the new opcode if we are combining them together
++ */
++static int hashOpcode (int opcode)
++{
++    //We are basically setting the iputs to their igets counterparts
++    switch (opcode)
++    {
++        case OP_IPUT:
++            return OP_IGET;
++        case OP_IPUT_WIDE:
++            return OP_IGET_WIDE;
++        case OP_IPUT_OBJECT:
++            return OP_IGET_OBJECT;
++        case OP_IPUT_BOOLEAN:
++            return OP_IGET_BOOLEAN;
++        case OP_IPUT_BYTE:
++            return OP_IGET_BYTE;
++        case OP_IPUT_CHAR:
++            return OP_IGET_CHAR;
++        case OP_IPUT_SHORT:
++            return OP_IGET_SHORT;
++        case OP_IPUT_QUICK:
++            return OP_IGET_QUICK;
++        case OP_IPUT_WIDE_QUICK:
++            return OP_IGET_WIDE_QUICK;
++        case OP_IPUT_OBJECT_QUICK:
++            return OP_IGET_OBJECT_QUICK;
++        default:
++            //Do nothing in the general case
++            break;
++    }
++
++    return opcode;
++}
++
++/**
++ * @brief Is the opcode making disambiguation impossible with just looking at operands?
++ * @param opcode the Opcode in question
++ */
++bool canOperandsDisambiguate (int opcode)
++{
++    switch (opcode)
++    {
++        //Cannot disambiguate object gets
++        case OP_IGET_OBJECT:
++        case OP_IGET_OBJECT_QUICK:
++        case OP_IPUT_OBJECT:
++        case OP_IPUT_OBJECT_QUICK:
++        case OP_IGET_OBJECT_VOLATILE:
++        case OP_IPUT_OBJECT_VOLATILE:
++            return false;
++    }
++    return true;
++}
++
++/**
++ * @brief Are the instructions similar regarding operands/opcode?
++ * @param first the first MIR
++ * @param second the second MIR
++ * @param consideredMIRs a map containing MIRs that have a finalized color
++ * @return whether first == second from a semantic point of view
++ */
++static bool similarInstructions (MIR *first, MIR *second, const std::map<MIR *, bool> &consideredMIRs)
++{
++    //Simple first
++    if (first == second)
++    {
++        return true;
++    }
++
++    //If both instructions have been considered, we only have to look at their color
++    if ( (consideredMIRs.find (first) != consideredMIRs.end ()) &&
++         (consideredMIRs.find (second) != consideredMIRs.end ()))
++    {
++        return first->color.aliasingColor == second->color.aliasingColor;
++    }
++
++    //Then check opcode and vA, vB, and vC
++    const DecodedInstruction &dfirst = first->dalvikInsn;
++    const DecodedInstruction &dsecond = second->dalvikInsn;
++
++    //Get opcodes
++    int fopcode = dfirst.opcode;
++    int sopcode = dsecond.opcode;
++
++    //Hash the opcodes
++    fopcode = hashOpcode (fopcode);
++    sopcode = hashOpcode (sopcode);
++
++    //If different opcodes, we are done here
++    if (fopcode != sopcode)
++    {
++        return false;
++    }
++
++    //Extended instructions are always considered different (simplification of the algorithm)
++    int opcode = dfirst.opcode;
++
++    if (opcode >= static_cast<int> (kMirOpFirst))
++    {
++        return false;
++    }
++
++    /*
++      Sometimes the operands aren't sufficient to prove disambiguation
++      For example, two iget-object are almost impossible to disambiguate
++       iget-object v1, v2, 0x8
++       iget-object v3, v5, 0x16
++
++       How can your prove that v2.0x8 is != v5.0x16?
++
++       Even with v2 != v5, that proves nothing
++
++       The only way would be able to either prove v1 != v3 via an if in the trace
++       Or if we had object types from v1 and v3 to show that they are incompatible
++       For the moment, this patch does not do that, so we check the opcode and see if we
++       can disambiguate
++    */
++
++    if (canOperandsDisambiguate (dfirst.opcode) == false || canOperandsDisambiguate (dsecond.opcode) == false)
++    {
++        //Can't disambiguate, return that they are similar
++        return true;
++    }
++
++    //Now that operands are sufficient, what about the constants, we want to distinguish for example:
++    // iget-wide v0, v1, #12
++    // iput-wide v5, v1, #20
++    if (compareConstants (dfirst, dsecond) == false)
++    {
++        return false;
++    }
++
++    //Now what we really care about is the MIRs defining the uses
++    //Do they have the same color or not?
++
++    //First get the SSA representation
++    SSARepresentation *ssaRepFirst = first->ssaRep;
++    SSARepresentation *ssaRepSecond = second->ssaRep;
++
++    //Paranoid
++    assert (ssaRepFirst != 0 && ssaRepSecond != 0);
++
++    //Check the number of uses, this comes from the hash function, it can actually hash different opcodes
++    int numUsesFirst = ssaRepFirst->numUses;
++    int numUsesSecond = ssaRepSecond->numUses;
++
++    //However, we might only care about a certain index of them
++    int startUseIndexFirst = getStartUseIndex (dfirst.opcode);
++    int startUseIndexSecond = getStartUseIndex (dsecond.opcode);
++
++    //But they must have the same number of uses when we remove the index
++    if (numUsesFirst - startUseIndexFirst != numUsesSecond - startUseIndexSecond)
++    {
++        return false;
++    }
++
++    //Now iterate through the defWhere
++    MIR **defWhereFirst = ssaRepFirst->defWhere;
++    MIR **defWhereSecond = ssaRepSecond->defWhere;
++
++    //Paranoid
++    assert (defWhereFirst != 0 && defWhereSecond != 0);
++
++    //Let's iterate through it
++    for (int i = 0; i + startUseIndexFirst < numUsesFirst; i++)
++    {
++        MIR *defFirst = defWhereFirst[i + startUseIndexFirst];
++        MIR *defSecond = defWhereSecond[i + startUseIndexSecond];
++
++        //It is possible the use is not defined in the trace
++        if (defFirst == 0 || defSecond == 0)
++        {
++            //Then we don't know, be conservative
++            return true;
++        }
++        else
++        {
++            //In this case, we have two new instructions, if they are the same, it's easy: skip it
++            if (defFirst != defSecond)
++            {
++                //Too bad, we have more work to do, are they now similar?
++                if (similarInstructions (defFirst, defSecond, consideredMIRs) == false)
++                {
++                    //If not, we are done
++                    return false;
++                }
++            }
++        }
++    }
++
++    //We arrived here so we know the instructions are similar
++    return true;
++}
++
++/**
++ * @brief Handle colors for the BB, distinguish colors for SSA registers
++ * @param bb the BasicBlock
++ * @param workList the workList of instructions
++ * @param currentColor the current color being used
++ */
++static void handleColors (BasicBlock *bb, std::map<int, std::vector<MIR *> > &workList, unsigned int &currentColor)
++{
++    //This map will help track which MIRs have finalized colored
++    std::map<MIR *, bool> consideredMIRs;
++
++    //Go through the list of instructions again
++    for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        //Get the opcode
++        int opcode = mir->dalvikInsn.opcode;
++
++        //Hash it
++        opcode = hashOpcode (opcode);
++
++        //Get the right vector list
++        std::vector<MIR *> &list = workList[opcode];
++
++        //Now traverse same group
++        for (std::vector<MIR *>::iterator it = list.begin (); it != list.end (); it++)
++        {
++            //Get local version
++            MIR *other = *it;
++
++            //Skip topologically inferior instructions: reduces useless recalculations
++            if (other->topologicalOrder > mir->topologicalOrder)
++            {
++                //Ok, now we know we currently have the same color but should we is the real question
++                // To be of the same color, we now must look at our uses and see if their defines are the same or the same color
++                // We also remember which MIRs we've handled to not look at them multiple times as we work our way upwards
++                // Because we do this in order of traversal, we only need to recolor the current considered one
++                bool res = similarInstructions (mir, other, consideredMIRs) ;
++                if (res == false)
++                {
++                    //Only recolor if we have the same color
++                    if (other->color.aliasingColor == mir->color.aliasingColor)
++                    {
++                        //Ahh, we need a new color for them
++                        other->color.aliasingColor = currentColor;
++
++                        //Increment the color
++                        currentColor++;
++                    }
++                }
++                else
++                {
++                    //Similar instruction, so actually, use the lowest of the colors
++                    //This comes from the fact that if you had A,B,B in the list
++                    //A will provoke a new color for each B, but they should be similar; so this rectifies that
++                    unsigned int color = other->color.aliasingColor;
++
++                    //Set whoever to the minimum
++                    if (color >= mir->color.aliasingColor)
++                    {
++                        other->color.aliasingColor = mir->color.aliasingColor;
++                    }
++                    else
++                    {
++                        mir->color.aliasingColor = color;
++                    }
++
++                    //In this case, the color is finalized for other as well
++                    consideredMIRs[other] = true;
++                }
++            }
++        }
++
++        //This color is now finalized
++        consideredMIRs[mir] = true;
++    }
++}
++
++/**
++ * @brief Link the colored instructions together
++ * @param bb the BasicBlock
++ */
++static void linkColors (const BasicBlock *bb)
++{
++    //Map to remember last instruction per color
++    std::map<unsigned int, MIR *> colorMap;
++
++    for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        //Get color
++        unsigned int currentColor = mir->color.aliasingColor;
++
++        //Find last mir
++        MIR *last = colorMap[currentColor];
++
++        //First link mir to last
++        mir->color.prev = last;
++
++        //If we have a last, link it too
++        if (last != 0)
++        {
++            last->color.next = mir;
++        }
++
++        //Update last
++        colorMap[currentColor] = mir;
++    }
++}
++
++//The actual entry function to the memory aliasing pass
++
++/**
++ * The basic algorithm is:
++ *   - For each bytecode, use a hash to put Xput instructions with Xget, put them in separate buckets
++ *   - Then, for each color:
++ *      If we can disambiguate (we can't disambiguate easily get/put object bytecodes, see above comment when we try
++ *          Then create a new color
++ *
++ *  We can disambiguate if it's not a get/put object and the constant is different
++ */
++bool dvmCompilerMemoryAliasing (CompilationUnit *cUnit, BasicBlock *bb)
++{
++    //We have a map: (opcode -> list of instructions)
++    std::map<int, std::vector<MIR *> > workList;
++
++    //Color scheme
++    unsigned int currentColor = 0;
++
++    for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        DecodedInstruction &insn = mir->dalvikInsn;
++
++        //Add in the instruction to the map
++        int opcode = insn.opcode;
++        //Hash the opcode
++        opcode = hashOpcode (opcode);
++
++        //But first, we want to color the instruction
++        //Get the associated vector
++        std::vector<MIR *> &list = workList[opcode];
++
++        //If the list does not have a color yet, let's create a new one
++        if (list.size () == 0)
++        {
++            mir->color.aliasingColor = currentColor;
++            currentColor++;
++        }
++        else
++        {
++            //Copy the color from the first instruction of the list
++            mir->color.aliasingColor = list[0]->color.aliasingColor;
++        }
++
++        //Now add to the vector
++        list.push_back (mir);
++    }
++
++    //Once we have a list of base colors, we need to distinguish between uses
++    //For example, we now consider:
++    //  - Two adds to be same even if they use totally different registers
++    //  - Two loads from different memory areas
++    handleColors (bb, workList, currentColor);
++
++    //Before finishing the pass, one last traversal to actually link the color links together
++    linkColors (bb);
++
++    //Did not change the BasicBlock
++    return false;
++}
+diff --git a/vm/compiler/LoopRegisterUsage.h b/vm/compiler/LoopRegisterUsage.h
+new file mode 100644
+index 0000000..eb1015b
+--- /dev/null
++++ b/vm/compiler/LoopRegisterUsage.h
+@@ -0,0 +1,32 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef H_LOOPREGISTERUSAGE
++#define H_LOOPREGISTERUSAGE
++
++//Forward declarations
++struct CompilationUnit;
++class Pass;
++
++/**
++ * @brief Memory Aliasing pass: calculates which memory instruction aliases together
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock
++ * @return whether the pass changed something in the BasicBlock
++ */
++bool dvmCompilerMemoryAliasing (CompilationUnit *cUnit, BasicBlock *bb);
++
++#endif
+-- 
+1.7.4.1
+

@@ -1,0 +1,551 @@
+From 7614cc068184a47cf11678be61818127cac64f10 Mon Sep 17 00:00:00 2001
+From: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Date: Wed, 7 Nov 2012 12:45:51 -0800
+Subject: Dalvik: Loop Optimization Framework
+
+BZ: 63753
+
+Framework for Loop Optimizations
+
+Initial optimization framework in order to provide the loop compilation with a pass optimization framework.
+The patch moves most of the code out of a single optimization function, which does multiple passes on the loop, into an explicit pass system.
+The consequence is a cleaner optimization framework, which augments maintainability and is useful for debugging purposes.
+There should be no difference in semantics as the original passes are simply moved to a new pass system.
+There should be no difference in impact due to the low overhead of the pass framework compared to the original code.
+However, the patch is required to allow further optimization patches to be merged.
+PS: If the macro ARCH_IA32 is not defined, the patch only adds two files to the tool chain's compilation flow but does not change the loop compilation behavior.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I7582d1835abc6790f9ad23187956035d52626b11
+Orig-MCG-Change-Id: I572f706bfed4ae6519a7bf4ee8dd73357851e89e
+Signed-off-by: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/Dvm.mk               |    3 +-
+ vm/compiler/Loop.cpp    |   54 +++++++++
+ vm/compiler/Loop.h      |   45 ++++++++
+ vm/compiler/LoopOpt.cpp |  282 +++++++++++++++++++++++++++++++++++++++++++++++
+ vm/compiler/LoopOpt.h   |   63 +++++++++++
+ 5 files changed, 446 insertions(+), 1 deletions(-)
+ create mode 100644 vm/compiler/LoopOpt.cpp
+ create mode 100644 vm/compiler/LoopOpt.h
+
+diff --git a/vm/Dvm.mk b/vm/Dvm.mk
+index 03e6ae6..9644f47 100644
+--- a/vm/Dvm.mk
++++ b/vm/Dvm.mk
+@@ -342,7 +342,8 @@ ifeq ($(dvm_arch),x86)
+                 compiler/codegen/x86-atom/NcgCodegenO1.cpp \
+                 compiler/codegen/x86-atom/Schedule.cpp \
+                 compiler/codegen/x86-atom/DataFlow.cpp \
+-                compiler/codegen/x86-atom/GlueOpt.cpp
++                compiler/codegen/x86-atom/GlueOpt.cpp \
++                compiler/LoopOpt.cpp
+         LOCAL_C_INCLUDES += \
+                 hardware/intel/apache-harmony
+         LOCAL_STATIC_LIBRARIES += \
+diff --git a/vm/compiler/Loop.cpp b/vm/compiler/Loop.cpp
+index aaeca68..b4093e3 100644
+--- a/vm/compiler/Loop.cpp
++++ b/vm/compiler/Loop.cpp
+@@ -19,6 +19,10 @@
+ #include "Dataflow.h"
+ #include "Loop.h"
+ 
++#ifdef ARCH_IA32
++#include "LoopOpt.h"
++#endif
++
+ #define DEBUG_LOOP(X)
+ 
+ #if 0
+@@ -677,6 +681,55 @@ bool dvmCompilerFilterLoopBlocks(CompilationUnit *cUnit)
+     return true;
+ }
+ 
++#ifdef ARCH_IA32
++/*
++ * Main entry point to do loop optimization.
++ * Return false if sanity checks for loop formation/optimization failed.
++ */
++bool dvmCompilerLoopOpt(CompilationUnit *cUnit)
++{
++    //Create the loop analysis
++    LoopAnalysis *loopAnalysis =
++        (LoopAnalysis *)dvmCompilerNew(sizeof(LoopAnalysis), true);
++    cUnit->loopAnalysis = loopAnalysis;
++
++    //Call the loop optimizer driver
++    dvmCompilerLoopOptimizationDriver (cUnit);
++
++    return true;
++}
++
++//Handlers for the static functions here
++bool dvmCompilerSimpleCountedLoop (CompilationUnit *cUnit)
++{
++    return isSimpleCountedLoop (cUnit);
++}
++
++bool dvmCompilerIVArrayAccess (CompilationUnit *cUnit)
++{
++    return doLoopBodyCodeMotion (cUnit);
++}
++
++void dvmCompilerHoistIVArrayAccess (CompilationUnit *cUnit)
++{
++    genHoistedChecks (cUnit);
++}
++
++void dvmCompilerDumpIVList (CompilationUnit *cUnit)
++{
++    DEBUG_LOOP (dumpIVList (cUnit));
++}
++
++void dvmCompilerDumpConstants (CompilationUnit *cUnit)
++{
++    DEBUG_LOOP (dumpConstants (cUnit));
++}
++
++void dvmCompilerDumpHoistedChecks (CompilationUnit *cUnit)
++{
++    DEBUG_LOOP (dumpHoistedChecks(cUnit));
++}
++#else
+ /*
+  * Main entry point to do loop optimization.
+  * Return false if sanity checks for loop formation/optimization failed.
+@@ -726,6 +779,7 @@ bool dvmCompilerLoopOpt(CompilationUnit *cUnit)
+     genHoistedChecks(cUnit);
+     return true;
+ }
++#endif
+ 
+ /*
+  * Select the target block of the backward branch.
+diff --git a/vm/compiler/Loop.h b/vm/compiler/Loop.h
+index 0608633..c31de14 100644
+--- a/vm/compiler/Loop.h
++++ b/vm/compiler/Loop.h
+@@ -33,6 +33,11 @@ typedef struct LoopAnalysis {
+     LIR *branchToBody;                  // branch over to the body from entry
+     LIR *branchToPCR;                   // branch over to the PCR cell
+     bool bodyIsClean;                   // loop body cannot throw any exceptions
++
++#ifdef ARCH_IA32
++    void *passData;                     // Pass data
++    bool isSimpleCountedLoop;           // Is the loop simple counted
++#endif
+ } LoopAnalysis;
+ 
+ bool dvmCompilerFilterLoopBlocks(CompilationUnit *cUnit);
+@@ -46,4 +51,44 @@ bool dvmCompilerFilterLoopBlocks(CompilationUnit *cUnit);
+                                     return false;                       \
+                                 }
+ 
++#ifdef ARCH_IA32
++//Externalizing certain Loop.cpp functionalities
++/**
++ * @brief Whether or not the loop is a simple counted loop
++ * @param cUnit the CompilationUnit
++ * @return whether or not the loop is a simple counted loop
++ */
++bool dvmCompilerSimpleCountedLoop (CompilationUnit *cUnit);
++
++/**
++ * @brief Handle the detection of Induction Variable Array Accesses
++ * @param cUnit the CompilationUnit
++ * @return whether or not the optimization has been performed
++ */
++bool dvmCompilerIVArrayAccess (CompilationUnit *cUnit);
++
++/**
++ * @brief Hoist the access checks that are detected by the dvmCompielrIVArrayAccess function
++ * @param cUnit the CompilationUnit
++ */
++void dvmCompilerHoistIVArrayAccess (CompilationUnit *cUnit);
++
++/**
++ * @brief Dump the Induction Variable list, only if DEBUG_LOOP is defined in Loop.cpp
++ * @param cUnit the CompilationUnit
++ */
++void dvmCompilerDumpIVList (CompilationUnit *cUnit);
++
++/**
++ * @brief Dump the detected constants, only if DEBUG_LOOP is defined in Loop.cpp
++ * @param cUnit the CompilationUnit
++ */
++void dvmCompilerDumpConstants (CompilationUnit *cUnit);
++
++/**
++ * @brief Dump the hoisted checks, only if DEBUG_LOOP is defined in Loop.cpp
++ * @param cUnit the CompilationUnit
++ */
++void dvmCompilerDumpHoistedChecks (CompilationUnit *cUnit);
++#endif
+ #endif  // DALVIK_VM_LOOP_H_
+diff --git a/vm/compiler/LoopOpt.cpp b/vm/compiler/LoopOpt.cpp
+new file mode 100644
+index 0000000..85659ae
+--- /dev/null
++++ b/vm/compiler/LoopOpt.cpp
+@@ -0,0 +1,282 @@
++/*
++* Copyright (C) 2012 Intel Corporation
++*
++* Licensed under the Apache License, Version 2.0 (the "License");
++* you may not use this file except in compliance with the License.
++* You may obtain a copy of the License at
++*
++*      http://www.apache.org/licenses/LICENSE-2.0
++*
++* Unless required by applicable law or agreed to in writing, software
++* distributed under the License is distributed on an "AS IS" BASIS,
++* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++* See the License for the specific language governing permissions and
++* limitations under the License.
++*/
++
++#include "Dalvik.h"
++#include "Dataflow.h"
++#include "Loop.h"
++#include "LoopOpt.h"
++
++/**
++ * @brief Static functions defined below
++ */
++static void startConstant (CompilationUnit *cUnit, SPass *curPass);
++static void endConstant (CompilationUnit *cUnit, SPass *curPass);
++static void startInductionVariable (CompilationUnit *cUnit, SPass *curPass);
++static void endInductionVariable (CompilationUnit *cUnit, SPass *curPass);
++static void startInductionAccessDetection (CompilationUnit *cUnit, SPass *curPass);
++static void endInductionAccessDetection (CompilationUnit *cUnit, SPass *curPass);
++static void simpleCountedLoopHandler (CompilationUnit *cUnit, SPass *curPass);
++static void endHoisting (CompilationUnit *cUnit, SPass *curPass);
++static bool simpleCountedGate (const CompilationUnit *cUnit, const SPass *curPass);
++
++/**
++ * @brief Three macros to help pass definitions
++ */
++
++#define START_PASSES \
++    static SPass gPasses[] = {
++
++#define NEW_PASS(NAME,TYPE,DATA,GATE,START,END,WORK,FLAG) \
++        { \
++            NAME, TYPE, DATA, GATE, START, END, WORK, FLAG \
++        }
++
++#define END_PASSES \
++    };
++
++START_PASSES
++    NEW_PASS ("Constant values detection", kAllNodes, NULL, NULL,
++            startConstant, endConstant, dvmCompilerDoConstantPropagation,0),
++    NEW_PASS ("Induction variable detection", kAllNodes, NULL, NULL,
++                 startInductionVariable, endInductionVariable, dvmCompilerFindInductionVariables,0),
++    NEW_PASS ("Simple Counted Loop Detection", kAllNodes, NULL, NULL,
++                 NULL, simpleCountedLoopHandler, NULL, 0),
++    NEW_PASS ("Induction variable detection", kAllNodes, NULL, simpleCountedGate,
++                 startInductionVariable, endInductionVariable, dvmCompilerFindInductionVariables, 0),
++    NEW_PASS ("Induction array based checks", kAllNodes, NULL, simpleCountedGate,
++                 startInductionAccessDetection, endInductionAccessDetection, NULL, 0),
++    NEW_PASS ("Generate the hoisted code from induction array", kAllNodes, NULL, simpleCountedGate,
++                 NULL, endHoisting, NULL, 0),
++    /* Last element must have and be the only one to have a NULL name, it's our ending check */
++    NEW_PASS (NULL,         /** Pass name */
++         kAllNodes,     /** Type of traversal */
++         NULL,          /** Data */
++         NULL,          /** Gate function */
++         NULL,          /** Start function */
++         NULL,          /** End function */
++         NULL,          /** Work function */
++         0              /** Flags */
++         ),
++END_PASSES
++
++/**
++  * @brief Handle pass flag, for the moment the function is empty
++  * @param cUnit the CompilationUnit
++  * @param curPass the SPass
++  */
++static void handlePassFlag (CompilationUnit *cUnit, SPass *pass)
++{
++    /** Todo when needed */
++    (void) cUnit;
++    (void) pass;
++}
++
++ /**
++  * @brief The loop pass driver
++  * @param cUnit the CompilationUnit
++  */
++void dvmCompilerLoopOptimizationDriver (CompilationUnit *cUnit)
++{
++    //Go through the different elements
++    SPass *curPass = gPasses;
++
++    while (curPass->passName != NULL)
++    {
++        //We have a pass: do we apply it? By default yes
++        bool applyPass = true;
++
++        //But if a gate is defined, we call that
++        if (curPass->gate != NULL)
++        {
++            applyPass = curPass->gate (cUnit, curPass);
++        }
++
++        if (applyPass == true)
++        {
++            //Applying the pass: first start, doWork, and end calls
++            //Each function might not be defined
++            if (curPass->start != NULL)
++            {
++                curPass->start (cUnit, curPass);
++            }
++
++            if (curPass->doWork != NULL)
++            {
++                //Set the data in cUnit
++                LoopAnalysis *loopAnalysis = cUnit->loopAnalysis;
++                loopAnalysis->passData = curPass->data;
++                dvmCompilerDataFlowAnalysisDispatcher (cUnit, curPass->doWork, curPass->traversalType, false /* isIterative */);
++                loopAnalysis->passData = NULL;
++            }
++
++            if (curPass->end != NULL)
++            {
++                curPass->end (cUnit, curPass);
++            }
++
++            //Do we need any clean up?
++            handlePassFlag (cUnit, curPass);
++        }
++
++        //Go to next pass
++        curPass++;
++    }
++}
++
++
++//Functions used to emulate the original code structure
++/**
++  * @brief Initializes the constant detection data structures
++  * @param cUnit the CompilationUnit
++  * @param curPass the SPass
++  */
++static void startConstant (CompilationUnit *cUnit, SPass *curPass)
++{
++    /* Constant propagation */
++    cUnit->isConstantV = dvmCompilerAllocBitVector(cUnit->numSSARegs, false);
++    cUnit->constantValues = (int *)dvmCompilerNew(sizeof(int) * cUnit->numSSARegs, true);
++
++    //Remove warning
++    (void) curPass;
++}
++
++/**
++  * @brief Dumps the loop constants
++  * @param cUnit the CompilationUnit
++  * @param curPass the SPass
++  */
++static void endConstant (CompilationUnit *cUnit, SPass *curPass)
++{
++    dvmCompilerDumpConstants (cUnit);
++
++    //Remove warnings
++    (void) cUnit;
++    (void) curPass;
++}
++
++/**
++  * @brief Initializes the data for the induction detection pass
++  * @param cUnit the CompilationUnit
++  * @param curPass the SPass
++  */
++static void startInductionVariable (CompilationUnit *cUnit, SPass *curPass)
++{
++    LoopAnalysis *loopAnalysis = cUnit->loopAnalysis;
++
++    /* Find induction variables - basic and dependent */
++    loopAnalysis->ivList = (GrowableList *)dvmCompilerNew(sizeof(GrowableList), true);
++    dvmInitGrowableList(loopAnalysis->ivList, 4);
++    loopAnalysis->isIndVarV = dvmCompilerAllocBitVector(cUnit->numSSARegs, false);
++
++    //Remove warning
++    (void) curPass;
++}
++
++/**
++  * @brief Dumps the Induction variable list
++  * @param cUnit the CompilationUnit
++  * @param curPass the SPass
++  */
++static void endInductionVariable (CompilationUnit *cUnit, SPass *curPass)
++{
++    dvmCompilerDumpIVList (cUnit);
++
++    //Remove warnings
++    (void) cUnit;
++    (void) curPass;
++}
++
++/**
++  * @brief Initializes data for the induction access pass
++  * @param cUnit the CompilationUnit
++  * @param curPass the SPass
++  */
++static void startInductionAccessDetection (CompilationUnit *cUnit, SPass *curPass)
++{
++    LoopAnalysis *loopAnalysis = cUnit->loopAnalysis;
++    loopAnalysis->arrayAccessInfo = (GrowableList *)dvmCompilerNew(sizeof(GrowableList), true);
++    dvmInitGrowableList(loopAnalysis->arrayAccessInfo, 4);
++
++    //Remove warning
++    (void) curPass;
++}
++
++/**
++  * @brief Perform the body code motion function: handles induction access detection
++  * @param cUnit the CompilationUnit
++  * @param curPass the SPass
++  */
++static void endInductionAccessDetection (CompilationUnit *cUnit, SPass *curPass)
++{
++    LoopAnalysis *loopAnalysis = cUnit->loopAnalysis;
++    loopAnalysis->bodyIsClean = dvmCompilerIVArrayAccess (cUnit);
++
++    dvmCompilerDumpHoistedChecks (cUnit);
++
++    //Remove warning
++    (void) curPass;
++}
++
++/**
++  * @brief Determines whether the loop is a simple counted loop, ie:
++        - Only one induction variable, knowing the lower/upper bounds
++    Function also fills in the loopAnalysis->isSimpleCountedLoop variable
++  * @param cUnit the CompilationUnit
++  */
++static void simpleCountedLoopHandler (CompilationUnit *cUnit, SPass *curPass)
++{
++    bool res = dvmCompilerSimpleCountedLoop(cUnit);
++
++    //Set it in the loop analysis information
++    LoopAnalysis *loopAnalysis = cUnit->loopAnalysis;
++    loopAnalysis->isSimpleCountedLoop = res;
++
++    //Remove warning
++    (void) curPass;
++}
++
++/**
++  * @brief Generates the hoisting of the checks
++  * @param cUnit the CompilationUnit
++  * @param curPass the SPass
++  */
++static void endHoisting (CompilationUnit *cUnit, SPass *curPass)
++{
++    /*
++     * Convert the array access information into extended MIR code in the loop header.
++     */
++    dvmCompilerHoistIVArrayAccess (cUnit);
++
++    //Remove warning
++    (void) curPass;
++}
++
++/**
++  * @brief The simple counted gate, checks the simple counted loop boolean in the LoopAnalysis data structure.
++    It is filled up by the Simple Counted Loop Detection pass
++  * @param cUnit the CompilationUnit
++  * @param curPass the SPass
++  * @return whether or not the isSimpleCountedLoop variable is set
++  */
++static bool simpleCountedGate (const CompilationUnit *cUnit, const SPass *curPass)
++{
++    LoopAnalysis *loopAnalysis = cUnit->loopAnalysis;
++
++    //Remove warning
++    (void) curPass;
++
++    return loopAnalysis->isSimpleCountedLoop;
++}
+diff --git a/vm/compiler/LoopOpt.h b/vm/compiler/LoopOpt.h
+new file mode 100644
+index 0000000..1938fb5
+--- /dev/null
++++ b/vm/compiler/LoopOpt.h
+@@ -0,0 +1,63 @@
++/*
++* Copyright (C) 2012 Intel Corporation
++*
++* Licensed under the Apache License, Version 2.0 (the "License");
++* you may not use this file except in compliance with the License.
++* You may obtain a copy of the License at
++*
++*      http://www.apache.org/licenses/LICENSE-2.0
++*
++* Unless required by applicable law or agreed to in writing, software
++* distributed under the License is distributed on an "AS IS" BASIS,
++* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++* See the License for the specific language governing permissions and
++* limitations under the License.
++*/
++
++#ifndef DALVIK_VM_LOOPOPT_H_
++#define DALVIK_VM_LOOPOPT_H_
++
++#include "Dalvik.h"
++#include "CompilerInternals.h"
++
++/**
++  * @class SPass
++  * @brief SPass is the Pass structure for the optimizations
++  * The following structure has the different optimization passes that we are going to do
++  */
++typedef struct sPass
++{
++    /** @brief Pass name */
++    const char *passName;
++
++    /** @brief Type of traversal */
++    DataFlowAnalysisMode traversalType;
++
++    /** @brief Specific data for the pass */
++    void *data;
++
++    /** @brief Gate for the pass, taking the CompilationUnit and the pass information */
++    bool (*gate) (const CompilationUnit *cUnit, const struct sPass *curPass);
++
++    /** @brief Start of the pass function */
++    void (*start) (CompilationUnit *cUnit, struct sPass *curPass);
++
++    /** @brief End of the pass function */
++    void (*end) (CompilationUnit *cUnit, struct sPass *curPass);
++
++    /** @brief Per basic block work
++     *  @return returns whether the BasicBlock has been changed
++     */
++    bool (*doWork) (CompilationUnit *, BasicBlock *bb);
++
++    /** @brief Flags for clean-up */
++    unsigned int flags;
++}SPass;
++
++/**
++  * @brief The loop optimization driver: calls each pass from the gPasses array
++  * @param cUnit the Compilation Unit
++  */
++void dvmCompilerLoopOptimizationDriver (CompilationUnit *cUnit);
++
++#endif
+-- 
+1.7.4.1
+

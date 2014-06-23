@@ -1,0 +1,1116 @@
+From 79f3bf81b32598fd055bfba341b06611174ea708 Mon Sep 17 00:00:00 2001
+From: Serguei Katkov <serguei.i.katkov@intel.com>
+Date: Mon, 9 Sep 2013 14:51:50 +0700
+Subject: Dalvik: Sink Cast optimization misses some check for rejection
+
+BZ: 135424
+
+Sink cast optimization should not miss the following checks to reject
+optimization:
+ - loop can throw and we cannot guarantee that it will not throw
+   after peeling
+ - chosen VR should not be used in any computation except itself
+   and other sunk VRs
+ - in the computation itself only safe operation should be used
+
+Additionally the patch generalize optimization to be able to use
+it in any complex loops. The following changes are done:
+ - isBasicBlockInLoop method of LoopInformation is eliminated as
+   duplicate of contains method
+ - guaranteedToThrowFirstIteration moved to LoopInformation to use
+   in different optimizations
+ - getPhiInstruction return the first Phi node of the loop
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I72c15131201dc230484dc6c280a4fe21f4e5a125
+Orig-MCG-Change-Id: I14a04c5cd56891da040bffef5189cb35d54ada25
+Signed-off-by: Udayan Banerji <udayan.banerji@intel.com>
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+Reviewed-on: http://android.intel.com:8080/132726
+Reviewed-by: Beyler, Jean Christophe <jean.christophe.beyler@intel.com>
+Reviewed-by: lab_aqa <lab_aqa@intel.com>
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: Provodin, Vitaly A <vitaly.a.provodin@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: Hartley, Timothy D <timothy.d.hartley@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+---
+ vm/compiler/AccumulationSinking.cpp |    4 +-
+ vm/compiler/Compiler.h              |    8 +-
+ vm/compiler/InvariantRemoval.cpp    |  145 +-----------
+ vm/compiler/LoopInformation.cpp     |  177 ++++++++++++---
+ vm/compiler/LoopInformation.h       |   24 ++-
+ vm/compiler/SinkCastOpt.cpp         |  438 +++++++++++++++++++++++++++++++----
+ vm/compiler/Utility.cpp             |    4 +-
+ vm/compiler/Vectorization.cpp       |    8 +-
+ 8 files changed, 573 insertions(+), 235 deletions(-)
+
+diff --git a/vm/compiler/AccumulationSinking.cpp b/vm/compiler/AccumulationSinking.cpp
+index a5ab804..c8c3198 100644
+--- a/vm/compiler/AccumulationSinking.cpp
++++ b/vm/compiler/AccumulationSinking.cpp
+@@ -151,7 +151,7 @@ static void fillAccumulatorMapHelper (CompilationUnit *cUnit, LoopInformation *i
+             BasicBlock *bb = defined->bb;
+ 
+             //If in the loop, call recursively
+-            if (info->isBasicBlockInLoop (bb) == true)
++            if (info->contains (bb) == true)
+             {
+                 fillAccumulatorMapHelper (cUnit, info, defined, accumulatorCalculation, accumulatorMap);
+             }
+@@ -332,7 +332,7 @@ static MIR *findAloneDefInALoop(CompilationUnit *cUnit, LoopInformation *info, M
+     {
+         MIR* mir = chain->mir;
+ 
+-        if (info->isBasicBlockInLoop(mir->bb) == true)
++        if (info->contains (mir->bb) == true)
+         {
+             if (result != 0)
+             {
+diff --git a/vm/compiler/Compiler.h b/vm/compiler/Compiler.h
+index f9f7254..080e1a3 100644
+--- a/vm/compiler/Compiler.h
++++ b/vm/compiler/Compiler.h
+@@ -353,10 +353,10 @@ MIR *dvmCompilerFindLowestMIRInColor (MIR *elem);
+ bool dvmCompilerBuildDefUseChain (CompilationUnit *cUnit, BasicBlock *bb);
+ 
+ /**
+- * @brief Return true if the mir is a conditional bytecode
+- * @param mir The MIR to check
+- * @return whether the mir is conditional
++ * @brief Checks if the opcode is a conditional branch.
++ * @param opcode The opcode to check which may be an extended one
++ * @return Returns whether we are looking at a conditional branch
+  */
+-bool dvmCompilerIsMIRConditional (MIR *mir);
++bool dvmCompilerIsOpcodeConditionalBranch (int opcode);
+ 
+ #endif  // DALVIK_VM_COMPILER_H_
+diff --git a/vm/compiler/InvariantRemoval.cpp b/vm/compiler/InvariantRemoval.cpp
+index be78816..f6cf3ea 100644
+--- a/vm/compiler/InvariantRemoval.cpp
++++ b/vm/compiler/InvariantRemoval.cpp
+@@ -603,7 +603,7 @@ static void findIgetIputCandidatesHelper (CompilationUnit *cUnit, const LoopInfo
+                                         MIR *defined = ssaRep->defWhere[i];
+ 
+                                         //If it is in the loop, mark the boolean flag and bail
+-                                        if (defined != 0 && info->isBasicBlockInLoop (defined->bb) == true)
++                                        if (defined != 0 && info->contains (defined->bb) == true)
+                                         {
+                                             notInLoop = false;
+                                             break;
+@@ -884,112 +884,6 @@ void dvmCompilerInvariantRemoval (CompilationUnit *cUnit, Pass *curPass)
+     loopInfo->sinkInstructions (cUnit, moves);
+ }
+ 
+-/**
+- * @class SGuaranteeThrow
+- * @brief Information about the loop: guaranteed to throw in the first iteration or not at all, or can it throw at any iteration?
+- */
+-typedef struct sGuaranteeThrow
+-{
+-    bool guaranteeThrow;    /**< @brief Is the loop guaranteed to either not throw at all or throw at the first iteration? */
+-    bool canThrow;          /**< @brief Can the loop throw? */
+-}SGuaranteeThrow;
+-
+-/**
+- * @brief Are we guaranteed to throw during the execution of bb during the first iteration?
+- * @param cUnit the CompilationUnit
+- * @param loopInfo the LoopInformation
+- * @param bb the BasicBlock
+- * @return a filled SGuaranteeThrow structure
+- */
+-static SGuaranteeThrow guaranteedToThrowFirstIteration (const CompilationUnit *cUnit, const LoopInformation *loopInfo, const BasicBlock *bb)
+-{
+-    //Consider the loop cannot throw
+-    SGuaranteeThrow res = {false, false};
+-
+-    for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
+-    {
+-        //Get Dalvik instruction
+-        DecodedInstruction &insn = mir->dalvikInsn;
+-
+-        int dexFlags = dvmCompilerGetOpcodeFlags (insn.opcode);
+-
+-        //If instruction cannot throw, then we continue
+-        if ((dexFlags & kInstrCanThrow) == 0)
+-        {
+-            continue;
+-        }
+-
+-        //Set can throw here
+-        res.canThrow = true;
+-
+-        //If this MIR is invariant but can throw, then let's see if it is guaranteed to throw
+-        //in the first iteration (peeled iteration)
+-        if (mir->invariant == true)
+-        {
+-            continue;
+-        }
+-
+-        //If we have a divide with literal, then it is guaranteed to throw first iteration if
+-        //divisor is 0 and not changing. So continue.
+-        if (insn.opcode == OP_DIV_INT_LIT16
+-                || insn.opcode == OP_REM_INT_LIT16
+-                || insn.opcode == OP_DIV_INT_LIT8
+-                || insn.opcode == OP_REM_INT_LIT8)
+-        {
+-            continue;
+-        }
+-
+-        //Get Dataflow flags
+-        int dfFlags = dvmCompilerDataFlowAttributes[insn.opcode];
+-
+-        //If the bytecode contains null and range checks
+-        if ( (dfFlags & DF_HAS_NR_CHECKS) != 0)
+-        {
+-            //If we have marked it to not get a null check or bound check, we can ignore it
+-            int mask = (MIR_IGNORE_NULL_CHECK | MIR_IGNORE_RANGE_CHECK);
+-
+-            //We need both ignores to be turned on in order to continue
+-            if ( (mir->OptimizationFlags & mask) == mask)
+-            {
+-                continue;
+-            }
+-        }
+-
+-        //If the bytecode contains a null check
+-        if ( (dfFlags & DF_HAS_OBJECT_CHECKS) != 0)
+-        {
+-            //If we have marked it to not get a null check, we can ignore it
+-            if ( (mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK) != 0)
+-            {
+-                continue;
+-            }
+-        }
+-
+-        //Is it a getter or a setter
+-        bool instanceGetterSetter = ( (dfFlags & (DF_IS_SETTER | DF_IS_GETTER) ) != 0);
+-
+-        //If we have an instance getter/setter we can prove that if memory location is invariant,
+-        //we are guaranteed to throw in the peeled iteration
+-        if (instanceGetterSetter == true)
+-        {
+-            bool variant = dvmCompilerCheckVariant (mir, loopInfo->getVariants (), dvmCompilerGetStartUseIndex (insn.opcode));
+-
+-            if (variant == false)
+-            {
+-                continue;
+-            }
+-        }
+-
+-        //Just return res, it is set correctly: the loop cannot be guaranteed to not throw at the first iteration and it can throw
+-        return res;
+-    }
+-
+-
+-    //It is guaranteed to either throw at the first iteration or not at all
+-    res.guaranteeThrow = true;
+-    return res;
+-}
+-
+ static bool invariantRemovalGateHelper (const CompilationUnit *cUnit, LoopInformation *info)
+ {
+     //If not nested, just return false
+@@ -1011,42 +905,9 @@ static bool invariantRemovalGateHelper (const CompilationUnit *cUnit, LoopInform
+         return false;
+     }
+ 
+-    //Get the loop blocks
+-    BitVector *blocks = const_cast<BitVector *> (info->getBasicBlocks ());
+-
+-    //Get the iterator
+-    BitVectorIterator bvIterator;
+-    dvmBitVectorIteratorInit(blocks, &bvIterator);
+-
+-    while (true)
++    if (info->guaranteedToThrowFirstIteration (cUnit) == false)
+     {
+-        BasicBlock *bb = dvmCompilerGetNextBasicBlockViaBitVector (bvIterator, cUnit->blockList);
+-
+-        //If done, bail
+-        if (bb == 0)
+-        {
+-            break;
+-        }
+-
+-        //Find out if it can throw and will it at the first iteration
+-        SGuaranteeThrow res = guaranteedToThrowFirstIteration (cUnit, info, bb);
+-
+-        //If we cannot guarantee it, we are done
+-        if (res.guaranteeThrow == false)
+-        {
+-            return false;
+-        }
+-
+-        //We can guarantee it but does it throw anything?
+-        if (res.canThrow == true)
+-        {
+-            //If it does, we need to prove one more thing, does this BB always execute?
+-            if (info->executedPerIteration (cUnit, bb) == false)
+-            {
+-                //It doesn't have to be executed, so bail because the exception might be thrown later
+-                return false;
+-            }
+-        }
++        return false;
+     }
+ 
+     //Report success
+diff --git a/vm/compiler/LoopInformation.cpp b/vm/compiler/LoopInformation.cpp
+index c383866..8d16b78 100644
+--- a/vm/compiler/LoopInformation.cpp
++++ b/vm/compiler/LoopInformation.cpp
+@@ -729,11 +729,13 @@ BasicBlock *LoopInformation::getBackwardBranchBlock (const CompilationUnit *cUni
+ 
+ bool LoopInformation::contains (const BasicBlock *bb) const
+ {
+-    if (bb == 0 || basicBlocks == 0)
++    //If we don't have any basic blocks or if bb is nil, return false
++    if (basicBlocks == 0 || bb == 0)
+     {
+         return false;
+     }
+ 
++    //Otherwise check the bit
+     return dvmIsBitSet (basicBlocks, bb->id);
+ }
+ 
+@@ -978,7 +980,7 @@ bool LoopInformation::isAnBasicInductionVariable (const CompilationUnit *cUnit,
+     return false;
+ }
+ 
+-MIR *LoopInformation::getPhiInstruction (CompilationUnit *cUnit, unsigned int vr) const
++MIR *LoopInformation::getPhiInstruction (const CompilationUnit *cUnit, unsigned int vr) const
+ {
+     //Get the BasicBlock vector for this loop
+     BitVector *blocks = getBasicBlocks ();
+@@ -1010,7 +1012,21 @@ MIR *LoopInformation::getPhiInstruction (CompilationUnit *cUnit, unsigned int vr
+                 //Is it a match?
+                 if (dvmExtractSSARegister (cUnit, ssaReg) == vr)
+                 {
+-                    return mir;
++                    //In a complex CFG we can have several Phi nodes for the same VR
++                    //We'd like to find the first one, namely Phi node where the one of
++                    //uses comes from outside of the loop
++                    if (ssa->defWhere != 0)
++                    {
++                        for (int i = 0; i < ssa->numUses; i++)
++                        {
++                            MIR *defMir = ssa->defWhere[i];
++                            //If defMir is 0 then it is come from outside of trace
++                            if (defMir == 0 || contains (defMir->bb) == false)
++                            {
++                                return mir;
++                            }
++                        }
++                    }
+                 }
+             }
+         }
+@@ -1202,18 +1218,6 @@ bool LoopInformation::isInvariant (unsigned int ssa) const
+     return dvmIsBitSet (variants, ssa) == false;
+ }
+ 
+-bool LoopInformation::isBasicBlockInLoop (const BasicBlock *bb) const
+-{
+-    //If we don't have any basic blocks or if bb is nil, return false
+-    if (basicBlocks == 0 || bb == 0)
+-    {
+-        return false;
+-    }
+-
+-    //Otherwise check the bit
+-    return dvmIsBitSet (basicBlocks, bb->id);
+-}
+-
+ bool LoopInformation::canThrow (const CompilationUnit *cUnit) const
+ {
+     //Get the BasicBlock vector for this loop
+@@ -1223,25 +1227,9 @@ bool LoopInformation::canThrow (const CompilationUnit *cUnit) const
+     BitVectorIterator bvIterator;
+ 
+     dvmBitVectorIteratorInit (blocks, &bvIterator);
+-    while (true)
++    for (BasicBlock *bb = dvmCompilerGetNextBasicBlockViaBitVector (bvIterator, cUnit->blockList); bb != 0;
++                     bb = dvmCompilerGetNextBasicBlockViaBitVector (bvIterator, cUnit->blockList))
+     {
+-        //Get block index
+-        int blockIdx = dvmBitVectorIteratorNext (&bvIterator);
+-
+-        //If done, bail
+-        if (blockIdx == -1)
+-        {
+-            break;
+-        }
+-
+-        BasicBlock *bb = (BasicBlock*) (dvmGrowableListGetElement(&cUnit->blockList, blockIdx));
+-
+-        //Paranoid
+-        if (bb == 0)
+-        {
+-            break;
+-        }
+-
+         //Go through its instructions
+         for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
+         {
+@@ -1261,6 +1249,98 @@ bool LoopInformation::canThrow (const CompilationUnit *cUnit) const
+     return false;
+ }
+ 
++bool LoopInformation::guaranteedToThrowFirstIteration (const CompilationUnit *cUnit) const
++{
++    //Get the BasicBlock vector for this loop
++    BitVector *blocks = getBasicBlocks ();
++
++    //Iterate through them
++    BitVectorIterator bvIterator;
++
++    dvmBitVectorIteratorInit (blocks, &bvIterator);
++
++    for (BasicBlock *bb = dvmCompilerGetNextBasicBlockViaBitVector (bvIterator, cUnit->blockList); bb != 0;
++                     bb = dvmCompilerGetNextBasicBlockViaBitVector (bvIterator, cUnit->blockList))
++    {
++        for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++        {
++            //Get Dalvik instruction
++            DecodedInstruction &insn = mir->dalvikInsn;
++
++            int flags = dvmCompilerGetOpcodeFlags (insn.opcode);
++
++            //If instruction cannot throw, then we continue
++            if ((flags & kInstrCanThrow) == 0)
++            {
++                continue;
++            }
++
++            //If this MIR is invariant but can throw, then let's see if it is guaranteed to throw
++            //in the first iteration (peeled iteration)
++            if (mir->invariant == true)
++            {
++                continue;
++            }
++
++            //If we have a divide with literal, then it is guaranteed to throw first iteration if
++            //divisor is 0 and not changing. So continue.
++            if (insn.opcode == OP_DIV_INT_LIT16
++                    || insn.opcode == OP_REM_INT_LIT16
++                    || insn.opcode == OP_DIV_INT_LIT8
++                    || insn.opcode == OP_REM_INT_LIT8)
++            {
++                continue;
++            }
++
++            bool instanceGetterSetter = false;
++
++            //We made it this far so we are looking at variant instructions. Test to see if
++            //it is getter or a setter
++            switch (insn.opcode)
++            {
++                case OP_IGET:
++                case OP_IGET_WIDE:
++                case OP_IGET_OBJECT:
++                case OP_IGET_BOOLEAN:
++                case OP_IGET_BYTE:
++                case OP_IGET_CHAR:
++                case OP_IGET_SHORT:
++                case OP_IPUT:
++                case OP_IPUT_WIDE:
++                case OP_IPUT_OBJECT:
++                case OP_IPUT_BOOLEAN:
++                case OP_IPUT_BYTE:
++                case OP_IPUT_CHAR:
++                case OP_IPUT_SHORT:
++                case OP_IGET_QUICK:
++                case OP_IGET_WIDE_QUICK:
++                case OP_IGET_OBJECT_QUICK:
++                case OP_IPUT_QUICK:
++                case OP_IPUT_WIDE_QUICK:
++                case OP_IPUT_OBJECT_QUICK:
++                    instanceGetterSetter = true;
++                    break;
++                default:
++                    break;
++            }
++
++            //If we have an instance getter/setter we can prove that if memory location is invariant,
++            //we are guaranteed to throw in the peeled iteration
++            if (instanceGetterSetter == true)
++            {
++                bool variant = dvmCompilerCheckVariant (mir, getVariants (), dvmCompilerGetStartUseIndex(insn.opcode));
++
++                if (variant == false)
++                {
++                    continue;
++                }
++            }
++
++            return false;
++        }
++    }
++    return true;
++}
+ 
+ bool LoopInformation::hasInvoke (const CompilationUnit *cUnit) const
+ {
+@@ -1715,3 +1795,34 @@ void LoopInformation::addInstructionToExits (CompilationUnit *cUnit, MIR *mir)
+     //Call generic function
+     addInstructionsToExits (cUnit, insns);
+ }
++
++bool LoopInformation::isSSARegLeavesLoop (const CompilationUnit *cUnit, const int ssaReg) const
++{
++    int dalvikReg = dvmExtractSSARegister (cUnit, ssaReg);
++    int regVersion = dvmExtractSSASubscript (cUnit, ssaReg);
++
++    //Get the exits vector for this loop
++    BitVector *blocks = getExitLoops ();
++
++    // No exits => infinte loop
++    if (blocks == 0)
++    {
++        return false;
++    }
++
++    //Iterate through them
++    BitVectorIterator bvIterator;
++
++    dvmBitVectorIteratorInit (blocks, &bvIterator);
++
++    for (BasicBlock *bb = dvmCompilerGetNextBasicBlockViaBitVector (bvIterator, cUnit->blockList); bb != 0;
++                     bb = dvmCompilerGetNextBasicBlockViaBitVector (bvIterator, cUnit->blockList))
++    {
++        int exitRegVersion = DECODE_SUB (bb->dataFlowInfo->dalvikToSSAMapEntrance[dalvikReg]);
++        if (regVersion == exitRegVersion)
++        {
++            return true;
++        }
++    }
++    return false;
++}
+diff --git a/vm/compiler/LoopInformation.h b/vm/compiler/LoopInformation.h
+index 03d247a..c7380f3 100644
+--- a/vm/compiler/LoopInformation.h
++++ b/vm/compiler/LoopInformation.h
+@@ -364,7 +364,7 @@ class LoopInformation
+           * @param vr the virtual register we want the phi node from
+           * @return 0 if not found, the MIR otherwise
+           */
+-         MIR *getPhiInstruction (CompilationUnit *cUnit, unsigned int vr) const;
++         MIR *getPhiInstruction (const CompilationUnit *cUnit, unsigned int vr) const;
+ 
+          /**
+           * @brief Add a variable as an inter-iteration variable
+@@ -410,13 +410,6 @@ class LoopInformation
+          bool isInvariant (unsigned int ssa) const;
+ 
+          /**
+-          * @brief Is the BasicBlock in the loop?
+-          * @param bb the BasicBlock
+-          * @return whether the BasicBlock is in the loop, if bb is 0, returns false
+-          */
+-         bool isBasicBlockInLoop (const BasicBlock *bb) const;
+-
+-         /**
+           * @brief Can the loop throw an exception?
+           * @param cUnit the CompilationUnit
+           * @return whether the loop can throw an exception or not
+@@ -424,6 +417,13 @@ class LoopInformation
+          bool canThrow (const CompilationUnit *cUnit) const;
+ 
+          /**
++          * @brief Can the loop throw an exception after the loop peeling?
++          * @param cUnit the CompilationUnit
++          * @return whether the loop can throw an exception or not after the loop peeling
++          */
++         bool guaranteedToThrowFirstIteration (const CompilationUnit *cUnit) const;
++
++         /**
+           * @brief Does the loop have an invoke in it?
+           * @param cUnit the CompilationUnit
+           * @return whether the loop has an invoke bytecode
+@@ -623,6 +623,14 @@ class LoopInformation
+           * @param mir the MIR to add
+           */
+          void addInstructionToExits (CompilationUnit *cUnit, MIR *mir);
++
++         /**
++          * @brief check whether given ssaReg leaves a loop
++          * @param cUnit the CompilationUnit
++          * @param ssaReg SSA register to check
++          * @return true if ssaReg leaves a loop
++          */
++         bool isSSARegLeavesLoop (const CompilationUnit *cUnit, const int ssaReg) const;
+ };
+ 
+ /**
+diff --git a/vm/compiler/SinkCastOpt.cpp b/vm/compiler/SinkCastOpt.cpp
+index 78d28c5..761e507 100644
+--- a/vm/compiler/SinkCastOpt.cpp
++++ b/vm/compiler/SinkCastOpt.cpp
+@@ -14,6 +14,9 @@
+  * limitations under the License.
+  */
+ 
++#include <set>
++#include <map>
++
+ #include "Dalvik.h"
+ #include "Dataflow.h"
+ #include "Loop.h"
+@@ -21,6 +24,7 @@
+ #include "LoopOpt.h"
+ #include "BBOptimization.h"
+ #include "Pass.h"
++#include "Utility.h"
+ 
+ /**
+  * @brief Check if the cast operation on an IV is valid
+@@ -196,14 +200,231 @@ static bool isCastSinkable(MIR *mir)
+ }
+ 
+ /**
+- * @brief Handle sinking of a cast
++ * @brief Serves as a quick check on whether cast sinking can be further evaluated
++ * @param opcode The opcode to check which may be an extended one
++ * @return Returns true if opcode is an alu operation that will give same result even if intermediate casts are sunk.
++ */
++static bool isSafeInPresenceOfCasts (int opcode)
++{
++    bool safe = false;
++
++    switch (opcode)
++    {
++        //Operations add, mul, sub, rsub, and, or, xor, and shl are safe
++        case OP_ADD_INT:
++        case OP_ADD_INT_2ADDR:
++        case OP_ADD_INT_LIT8:
++        case OP_ADD_INT_LIT16:
++        case OP_MUL_INT:
++        case OP_MUL_INT_2ADDR:
++        case OP_MUL_INT_LIT8:
++        case OP_MUL_INT_LIT16:
++        case OP_SUB_INT:
++        case OP_SUB_INT_2ADDR:
++        case OP_RSUB_INT_LIT8:
++        case OP_RSUB_INT:
++        case OP_AND_INT:
++        case OP_AND_INT_2ADDR:
++        case OP_AND_INT_LIT8:
++        case OP_AND_INT_LIT16:
++        case OP_OR_INT:
++        case OP_OR_INT_2ADDR:
++        case OP_OR_INT_LIT8:
++        case OP_OR_INT_LIT16:
++        case OP_XOR_INT:
++        case OP_XOR_INT_2ADDR:
++        case OP_XOR_INT_LIT8:
++        case OP_XOR_INT_LIT16:
++        case OP_SHL_INT:
++        case OP_SHL_INT_2ADDR:
++        case OP_SHL_INT_LIT8:
++        case OP_INT_TO_BYTE:
++        case OP_INT_TO_SHORT:
++        case OP_INT_TO_CHAR:
++        case kMirOpPhi:
++            safe = true;
++            break;
++        default:
++            if (dvmCompilerIsOpcodeConditionalBranch (opcode) == true)
++            {
++                //Technically for the if bytecodes we don't know if they are safe.
++                //But when we do our analysis we will check them explicitly.
++                safe = true;
++            }
++
++            if ((dvmCompilerDataFlowAttributes[opcode] & DF_SETS_CONST) != 0)
++            {
++                //Constants only define so they don't use the result of our cast
++                safe = true;
++            }
++
++            //Others most likely aren't safe. This includes integer operations: div, rem, shr, and ushr.
++            break;
++    }
++
++    return safe;
++}
++
++/**
++ * @brief Helper to detect whether the MIR is ok to use sink cast optimization.
+  * @param cUnit the CompilationUnit
+  * @param info the LoopInformation
+- * @param mir the MIR instruction
++ * @param mir the MIR instruction to check
++ * @return true if it is safe to use the MIR in sink cast optimization.
+  */
+-static void sinkCastByteCodes (CompilationUnit *cUnit, LoopInformation *info, MIR *mir)
++static bool isInstructionSafeForCastSinking (const CompilationUnit *cUnit, const LoopInformation *info, const MIR *mir)
+ {
+-    // if current mir is not supported for cast sinking optimization
++    //Get opcode
++    Opcode opcode = mir->dalvikInsn.opcode;
++
++    //Get dataflow flags
++    int flags = dvmCompilerDataFlowAttributes[opcode];
++
++    //First off, we only sink casts that aren't wide associated
++    if ( (flags & DF_DA_WIDE) != 0 || ( (flags & DF_UB_WIDE) != 0))
++    {
++        return false;
++    }
++
++    return isSafeInPresenceOfCasts (opcode);
++}
++
++/**
++ * @brief Analyze whether our VR candidate is used. Fill vrOkToSinkDependsOn map if we can be sunk only
++ * if other VR is sunk, return true if we are not sunk in any conditions.
++ * @param cUnit the CompilationUnit
++ * @param info the LoopInformation
++ * @param phi the root Phi node in a loop corresponding to our VR
++ * @param vr the candidate VR to sink
++ * @param vrOkToSinkDependsOn the map is filled by this function and means that our VR can be sunk
++ * only if other VRs in this map are sunk
++ * @return true ifour candidate will not be sunk in any conditions
++ */
++static bool fillDependencyFromOthers (CompilationUnit *cUnit, LoopInformation *info, MIR *phi, int vr, std::multimap<int, int> &vrOkToSinkDependsOn)
++{
++    //what should be considered on this iteration
++    std::set<SSARepresentation *> defToCheck;
++
++    //what should be considered on next iteration
++    std::set<SSARepresentation *> defToCheckNextIter;
++
++    //what is added already for consideration to avoid redundant checks
++    std::set<SSARepresentation *> defAddedForCheck;
++
++    //Start from Phi node
++    {
++        SSARepresentation *ssaRep = phi->ssaRep;
++        if (ssaRep == 0)
++        {
++            //Something went wrong
++            return true;
++        }
++
++        defToCheck.insert (ssaRep);
++        defAddedForCheck.insert (ssaRep);
++    }
++
++    while (true)
++    {
++        for (std::set<SSARepresentation *>::iterator it = defToCheck.begin (); it != defToCheck.end (); ++it)
++        {
++            SSARepresentation *ssaRep = *it;
++
++            if (ssaRep->numDefs != 1 || ssaRep->defs == 0)
++            {
++                //Something went wrong
++                return true;
++            }
++
++            int def = ssaRep->defs[0];
++
++            //If def leaves a loop, we can sink only if vr corresponding to this def is sunk
++            //Still need to check other uses because it can be used in some operation wich is not allowed
++            if (info->isSSARegLeavesLoop (cUnit, def) == true)
++            {
++                int otherVR = dvmExtractSSARegister (cUnit, def);
++
++                //If it is we are, so ignore this dependancy
++                if (vr != otherVR)
++                {
++                    vrOkToSinkDependsOn.insert (std::pair<int, int> (vr, otherVR));
++                }
++            }
++
++            //Traverse all its uses
++            for (SUsedChain *usedChain = ssaRep->usedNext[0]; usedChain != 0; usedChain = usedChain->nextUse)
++            {
++                //Get the MIR
++                MIR *next = usedChain->mir;
++
++                //No need to look outside a loop
++                if (info->contains (next->bb) == false)
++                {
++                    continue;
++                }
++
++                //If there is a usage in instruction we do not support => no chances to sink
++                if (isInstructionSafeForCastSinking (cUnit, info, next) == false)
++                {
++                    return true;
++                }
++
++                //If it is a comparison so we can sink only if that VR is sunk also
++                bool isOpcodeConditionalBranch = dvmCompilerIsOpcodeConditionalBranch (next->dalvikInsn.opcode);
++                if (isOpcodeConditionalBranch == true)
++                {
++                    int otherVR = dvmExtractSSARegister (cUnit, def);
++
++                    if (vr != otherVR)
++                    {
++                        vrOkToSinkDependsOn.insert (std::pair<int, int> (vr, otherVR));
++                    }
++                }
++                else
++                {
++                    //We are defining some VR inside a loop, so we should check it then
++                    if (next->ssaRep == 0)
++                    {
++                        //Something went wrong
++                        return true;
++                    }
++                    if (defAddedForCheck.find (next->ssaRep) == defAddedForCheck.end ())
++                    {
++                        defToCheckNextIter.insert (next->ssaRep);
++                        defAddedForCheck.insert (next->ssaRep);
++                    }
++                }
++            }
++        }
++
++        //Wether new work came
++        if (defToCheckNextIter.empty () == true)
++        {
++            break;
++        }
++
++        defToCheck = defToCheckNextIter;
++        defToCheckNextIter.clear ();
++    }
++
++    //Dependancy is filled
++    return false;
++}
++
++/**
++ * @brief Check whether candidate has chances to be sunk
++ * @param cUnit the CompilationUnit
++ * @param info the LoopInformation
++ * @param mir the MIR instruction corresponding to cast candidate
++ * @param isPeelingRequired the variable is set to true by this function in case peeling will be required.
++ * @param okToSink cast MIR will be added to this map if it is ok to sink this cast
++ * @param potentialOkToSink cast MIR will be added to this map if it is potentially can be sunk
++ * @param vrOkToSinkDependsOn the map represents dependancy - VR can be sunk only if corresponding VR are sunk
++ */
++static void sinkCastByteCodes (CompilationUnit *cUnit, LoopInformation *info, MIR *mir, bool &isPeelingRequired,
++        std::set<MIR*> &okToSink, std::set<MIR*> &potentialOkToSink, std::multimap<int, int> &vrOkToSinkDependsOn)
++{
++    // if current cast mir is not supported for cast sinking optimization
+     if (isCastSinkable(mir) == false)
+     {
+         return;
+@@ -217,7 +438,16 @@ static void sinkCastByteCodes (CompilationUnit *cUnit, LoopInformation *info, MI
+         return;
+     }
+ 
+-    //Get def-use chain for the single def
++    //Klocwork checks
++    if (ssaRep->numDefs != 1 || ssaRep->defs == 0 || ssaRep->usedNext == 0)
++    {
++        return;
++    }
++
++    //Get the VR we are working on
++    int vr = dvmExtractSSARegister (cUnit, ssaRep->defs[0]);
++
++    //Get def-use chain for the single def, wide-defs are excluded in isCastSinkable
+     const SUsedChain *usedChain = ssaRep->usedNext[0];
+ 
+     //If the casted VR is used, we have work to do
+@@ -230,41 +460,71 @@ static void sinkCastByteCodes (CompilationUnit *cUnit, LoopInformation *info, MI
+             //Get the MIR
+             MIR *next = usedChain->mir;
+ 
+-            //It must the PHI node or an IF
+-            if (next->dalvikInsn.opcode != static_cast<Opcode> (kMirOpPhi) && (dvmCompilerIsMIRConditional (next) == false))
++            //if the use inside our loop we need more checks
++            if (info->contains (next->bb) == true)
+             {
+-                return;
+-            }
++                bool isOpcodeConditionalBranch = dvmCompilerIsOpcodeConditionalBranch (next->dalvikInsn.opcode);
++                //It must the PHI node or an IF
++                if (next->dalvikInsn.opcode != static_cast<Opcode> (kMirOpPhi) && (isOpcodeConditionalBranch == false))
++                {
++                    vrOkToSinkDependsOn.erase (vr);
++                    return;
++                }
+ 
+-            //If next use mir within current block is a if
+-            if (dvmCompilerIsMIRConditional (next) == true)
+-            {
+-               //Check if the nextUse allows a valid cast sinking
+-               if (checkValidCastingForIV(cUnit, info, next, mir) == false)
+-               {
+-                   return;
+-               }
++                //If next use mir within current loop is a if
++                if (isOpcodeConditionalBranch == true)
++                {
++                   //Check if the nextUse allows a valid cast sinking
++                   if (checkValidCastingForIV(cUnit, info, next, mir) == false)
++                   {
++                       vrOkToSinkDependsOn.erase (vr);
++                       return;
++                   }
++
++                   //It is safe but we need a peeling
++                   isPeelingRequired = true;
++                }
++
++                //If it is a Phi node we should ensure that it is a main Phi node of the loop
++                if (next->dalvikInsn.opcode == static_cast<Opcode> (kMirOpPhi))
++                {
++                    if (next != info->getPhiInstruction (cUnit, vr))
++                    {
++                        vrOkToSinkDependsOn.erase (vr);
++                        return;
++                    }
++
++                    //We're returning to entry of the loop, check impact on other VRs
++                    //fillDependencyFromOthers will add elements in vrOkToSinkDependsOn
++                    //if there are any dependancy and return false if no chances to sink
++                    if (fillDependencyFromOthers (cUnit, info, next, vr, vrOkToSinkDependsOn) == true)
++                    {
++                        vrOkToSinkDependsOn.erase (vr);
++                        return;
++                    }
++                }
+             }
+         }
+     }
+-
+-    //Check if we can peel the loop
+-    bool result = dvmCompilerPeel (cUnit, info);
+-
+-    //Always peel first for the moment because peeling isn't that smart
+-    if (result == false)
++    else
+     {
++        //Something went wrong: we have a cast in a loop, so at least we should have a Phi node
++        //But we do not! It means that there is some bug in a Compiler
++        //Report it and skip this cast for safety
++        char buffer[256];
++        dvmCompilerExtendedDisassembler (cUnit, mir, & (mir->dalvikInsn), buffer, sizeof (buffer));
++        ALOGE ("JIT ERROR: no expected Phi node for cast: %04x %s", mir->offset, buffer);
+         return;
+     }
+ 
+-    //Ok we definitely can sink this MIR
+-    //First step, remove it
+-    bool removed = dvmCompilerRemoveMIR (mir);
+-
+-    if (removed == true)
++    //ok to sink only if there are no dependancy
++    if (vrOkToSinkDependsOn.count (vr) == 0)
+     {
+-        //Now add it to exits
+-        info->addInstructionToExits (cUnit, mir);
++        okToSink.insert (mir);
++    }
++    else
++    {
++        potentialOkToSink.insert (mir);
+     }
+ }
+ 
+@@ -283,21 +543,119 @@ static bool tryCastSinking (CompilationUnit *cUnit, LoopInformation *info, void
+         return true;
+     }
+ 
+-    //Get the entry basic block
+-    BasicBlock *bb = info->getEntryBlock ();
++    bool isPeelingRequired = false;
++
++    //Check whether loop cannot throw any exception or peeling will help us
++    if (info->canThrow (cUnit))
++    {
++        isPeelingRequired  = info->guaranteedToThrowFirstIteration (cUnit);
++        if (isPeelingRequired == false)
++        {
++            //We can throw, so reject optimization for this loop but consider others
++            return true;
++        }
++    }
++
++    //Casts which are ok to sink
++    std::set<MIR*> okToSink;
++    std::set<MIR*> potentialOkToSink;
++    //vr is ok to sink if all dependant VRs are sunk
++    std::multimap<int, int> vrOkToSinkDependsOn;
+ 
+-    //Paranoid
+-    assert (bb != 0);
++    //Get the BasicBlock vector for this loop
++    BitVector *blocks = info->getBasicBlocks ();
+ 
+-    for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++    //Iterate through them
++    BitVectorIterator bvIterator;
++    dvmBitVectorIteratorInit (blocks, &bvIterator);
++    for (BasicBlock *bb = dvmCompilerGetNextBasicBlockViaBitVector (bvIterator, cUnit->blockList); bb != 0;
++                     bb = dvmCompilerGetNextBasicBlockViaBitVector (bvIterator, cUnit->blockList))
+     {
+-        //Get the opcode
+-        Opcode opcode = mir->dalvikInsn.opcode;
++        //Iterate over instructions to find candidates
++        for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++        {
++            //Get the opcode
++            Opcode opcode = mir->dalvikInsn.opcode;
++
++            //Check if it is a cast
++            if (opcode >= OP_INT_TO_LONG && opcode <= OP_INT_TO_SHORT)
++            {
++                sinkCastByteCodes (cUnit, info, mir, isPeelingRequired, okToSink, potentialOkToSink, vrOkToSinkDependsOn);
++            }
++        }
++    }
+ 
+-        //Check if it is a cast
+-        if (opcode >= OP_INT_TO_LONG && opcode <= OP_INT_TO_SHORT)
++    //Peel Loop if needed
++    if (okToSink.empty () == false && isPeelingRequired == true)
++    {
++        bool result = dvmCompilerPeel (cUnit, info);
++        if (result == false)
+         {
+-            sinkCastByteCodes (cUnit, info, mir);
++            return true;
++        }
++    }
++
++    //ok we are ready to sink
++    while (okToSink.empty () == false)
++    {
++        for (std::set<MIR*>::iterator it = okToSink.begin (); it != okToSink.end (); ++it)
++        {
++            MIR *mir = *it;
++
++            //Ok we definitely can sink this MIR
++            //First step, remove it
++            bool removed = dvmCompilerRemoveMIR (mir);
++
++            if (removed == true)
++            {
++                //Now add it to exits
++                info->addInstructionToExits (cUnit, mir);
++
++                //Now we need to clean dependancy data
++                if (mir->ssaRep != 0 && mir->ssaRep->numDefs == 1 && mir->ssaRep->defs != 0)
++                {
++                    int vr = dvmExtractSSARegister (cUnit, mir->ssaRep->defs[0]);
++
++                    for (std::multimap<int,int>::iterator it = vrOkToSinkDependsOn.begin (); it != vrOkToSinkDependsOn.end ();)
++                    {
++                        if ((*it).second == vr)
++                        {
++                            vrOkToSinkDependsOn.erase (it++);
++                        }
++                        else
++                        {
++                            it++;
++                        }
++                    }
++                }
++            }
++        }
++
++        okToSink.clear ();
++        //Try to find whether we can sink more
++        for (std::set<MIR*>::iterator it = potentialOkToSink.begin (); it != potentialOkToSink.end (); )
++        {
++            bool okNow = false;
++            MIR *mir = *it;
++
++            if (mir->ssaRep != 0 && mir->ssaRep->numDefs == 1 && mir->ssaRep->defs != 0)
++            {
++                int vr = dvmExtractSSARegister (cUnit, mir->ssaRep->defs[0]);
++                if (vrOkToSinkDependsOn.count (vr) == 0)
++                {
++                    okToSink.insert (mir);
++                    okNow = true;
++                }
++            }
++
++            if (okNow == true)
++            {
++                potentialOkToSink.erase (it++);
++            }
++            else
++            {
++                it++;
++            }
+         }
+     }
+ 
+diff --git a/vm/compiler/Utility.cpp b/vm/compiler/Utility.cpp
+index c9e6c37..0402c92 100644
+--- a/vm/compiler/Utility.cpp
++++ b/vm/compiler/Utility.cpp
+@@ -629,10 +629,10 @@ BasicBlock *dvmCompilerGetNextBasicBlockViaBitVector (BitVectorIterator &bvItera
+     return bb;
+ }
+ 
+-bool dvmCompilerIsMIRConditional (MIR *mir)
++bool dvmCompilerIsOpcodeConditionalBranch (int opcode)
+ {
+     //Get dex flags
+-    int dexFlags = dvmCompilerGetOpcodeFlags (mir->dalvikInsn.opcode);
++    int dexFlags = dvmCompilerGetOpcodeFlags (opcode);
+ 
+     //Can it continue and can it branch?
+     bool result = (dexFlags == (kInstrCanContinue|kInstrCanBranch));
+diff --git a/vm/compiler/Vectorization.cpp b/vm/compiler/Vectorization.cpp
+index ee9f5b5..2448a7d 100644
+--- a/vm/compiler/Vectorization.cpp
++++ b/vm/compiler/Vectorization.cpp
+@@ -95,7 +95,7 @@ static bool isVectorizable (MIR *mir)
+     }
+ 
+     //We also allow conditionals in vectorized loops
+-    if (dvmCompilerIsMIRConditional (mir) == true)
++    if (dvmCompilerIsOpcodeConditionalBranch (mir->dalvikInsn.opcode) == true)
+     {
+         return true;
+     }
+@@ -475,7 +475,7 @@ static bool fillVectorizationInformation (const CompilationUnit *cUnit, LoopInfo
+         }
+ 
+         //If this the IV bytecode, ignore it (we handle it later
+-        if (mir->dalvikInsn.vA == vrIV && dvmCompilerIsMIRConditional (mir) == false)
++        if (mir->dalvikInsn.vA == vrIV && dvmCompilerIsOpcodeConditionalBranch (mir->dalvikInsn.opcode) == false)
+         {
+             continue;
+         }
+@@ -525,7 +525,7 @@ static bool fillVectorizationInformation (const CompilationUnit *cUnit, LoopInfo
+             }
+ 
+             //If the next used is not the if OR if there is another use, we bail as well
+-            if (dvmCompilerIsMIRConditional (used) == false || next->nextUse != 0)
++            if (dvmCompilerIsOpcodeConditionalBranch (used->dalvikInsn.opcode) == false || next->nextUse != 0)
+             {
+                 return false;
+             }
+@@ -1020,7 +1020,7 @@ static bool haveSafeAccumulation (CompilationUnit *cUnit, LoopInformation *loopI
+         return false;
+     }
+ 
+-    if (loopInfo->isBasicBlockInLoop (chain->mir->bb) == false)
++    if (loopInfo->contains (chain->mir->bb) == false)
+     {
+         //This must be in the loop
+         return false;
+-- 
+1.7.4.1
+

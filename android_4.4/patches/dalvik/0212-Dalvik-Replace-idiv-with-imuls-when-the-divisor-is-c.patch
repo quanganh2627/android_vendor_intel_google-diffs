@@ -1,0 +1,372 @@
+From cf0d7f9c2df34b3fe445576f08d5918bda5e0bae Mon Sep 17 00:00:00 2001
+From: Qiming Shi <qiming.shi@intel.com>
+Date: Thu, 6 Jun 2013 09:12:37 +0800
+Subject: Dalvik: Replace idiv with imuls when the divisor is constant
+
+BZ: 114056
+
+Replacing idiv with a sequence of equivalent instruction, including 2
+imuls. This could benifit BenchmarkPi from ~400ms to ~300ms.
+
+For the detailed algorithm description, please refer to BZ 114056 & 108366
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I39357480ea01ce9d9789f5a9809d500b8b99a825
+Orig-MCG-Change-Id: Ic1a6b6e51384fb774cde0fc06625266a06bbbf40
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/codegen/x86/BytecodeVisitor.cpp |  107 +++++++++++++++++++++------
+ vm/compiler/codegen/x86/Lower.cpp           |   64 ++++++++++++++++
+ vm/compiler/codegen/x86/Lower.h             |   15 ++++
+ vm/compiler/codegen/x86/LowerAlu.cpp        |  102 ++++++++++++++++++++++++--
+ 4 files changed, 257 insertions(+), 31 deletions(-)
+
+diff --git a/vm/compiler/codegen/x86/BytecodeVisitor.cpp b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+index 6d40c34..2853d09 100644
+--- a/vm/compiler/codegen/x86/BytecodeVisitor.cpp
++++ b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+@@ -5472,31 +5472,90 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+     case OP_REM_INT:
+     case OP_DIV_INT_2ADDR:
+     case OP_REM_INT_2ADDR: //hard-code %eax, %edx (dividend in edx:eax; quotient in eax; remainder in edx)
+-        infoArray[0].regNum = 2;
+-        infoArray[0].refCount = 7; //define, update, use
+-        infoArray[0].physicalType = LowOpndRegType_gp;
+-        infoArray[1].regNum = PhysicalReg_EAX; //dividend, quotient
+-        infoArray[1].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
+-        infoArray[1].shareWithVR = false;
+-        infoArray[2].regNum = PhysicalReg_EDX; //export_pc, output for REM
+-        infoArray[2].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
+-        infoArray[3].regNum = 1;
+-        infoArray[3].refCount = 2; //define, use
+-        infoArray[3].physicalType = LowOpndRegType_scratch;
+-        infoArray[4].regNum = 3;
+-        infoArray[4].refCount = 4; //define, use
+-        infoArray[4].physicalType = LowOpndRegType_gp;
+-        infoArray[5].regNum = PhysicalReg_EBX;
+-        infoArray[5].refCount = 2; //define, use
+-        infoArray[5].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
+-        if(inst_op == OP_DIV_INT || inst_op == OP_DIV_INT_2ADDR) {
+-            infoArray[1].refCount = 11;
+-            infoArray[2].refCount = 9;
+-        } else {
+-            infoArray[1].refCount = 10;
+-            infoArray[2].refCount = 12;
+-        }
+-        return 6;
++        if (inst_op == OP_DIV_INT || inst_op == OP_REM_INT) {
++            v2 = currentMIR->dalvikInsn.vC;
++        }else {
++            v2 = currentMIR->dalvikInsn.vB;
++        }
++        isConst = isVirtualRegConstant(v2, LowOpndRegType_gp, &tmpvalue, false);
++        if (isConst > 0) {
++            int magic, shift;
++            calculateMagicAndShift(tmpvalue, &magic, &shift);
++            if (tmpvalue == 1) {
++                infoArray[0].regNum = 2;
++                infoArray[0].refCount = 2;
++                infoArray[0].physicalType = LowOpndRegType_gp;
++                infoArray[1].regNum = PhysicalReg_EAX;
++                infoArray[1].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++                infoArray[1].shareWithVR = false;
++                infoArray[1].refCount = 2;
++                return 2;
++            }else if(tmpvalue == -1) {
++                //TODO: Add case for divisor -1, now using the origin algorithm
++            }else {
++                infoArray[0].regNum = 2;
++                infoArray[0].physicalType = LowOpndRegType_gp;
++                infoArray[1].regNum = PhysicalReg_EAX;
++                infoArray[1].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++                infoArray[1].shareWithVR = false;
++                infoArray[2].regNum = PhysicalReg_EDX;
++                infoArray[2].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++                infoArray[3].regNum = 1;
++                infoArray[3].physicalType = LowOpndRegType_gp;
++                if (inst_op == OP_REM_INT || inst_op == OP_REM_INT_2ADDR) {
++                    infoArray[0].refCount = 8;
++                    infoArray[1].refCount = 7;
++                    infoArray[2].refCount = 8;
++                    infoArray[3].refCount = 3;
++                    if ((tmpvalue > 0 && magic < 0) || (tmpvalue < 0 && magic > 0)) {
++                        infoArray[3].refCount++;
++                        infoArray[2].refCount++;
++                    }
++                    if (shift != 0) {
++                        infoArray[2].refCount++;
++                    }
++                }else {
++                    infoArray[0].refCount = 6;
++                    infoArray[1].refCount = 4;
++                    infoArray[2].refCount = 6;
++                    infoArray[3].refCount = 1;
++                    if ((tmpvalue > 0 && magic < 0) || (tmpvalue < 0 && magic > 0)) {
++                        infoArray[3].refCount++;
++                        infoArray[2].refCount++;
++                    }
++                    if (shift != 0) {
++                        infoArray[2].refCount++;
++                    }
++                }
++               return 4;
++            }
++        }else {
++            infoArray[0].regNum = 2;
++            infoArray[0].refCount = 7; //define, update, use
++            infoArray[0].physicalType = LowOpndRegType_gp;
++            infoArray[1].regNum = PhysicalReg_EAX; //dividend, quotient
++            infoArray[1].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++            infoArray[1].shareWithVR = false;
++            infoArray[2].regNum = PhysicalReg_EDX; //export_pc, output for REM
++            infoArray[2].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++            infoArray[3].regNum = 1;
++            infoArray[3].refCount = 2; //define, use
++            infoArray[3].physicalType = LowOpndRegType_scratch;
++            infoArray[4].regNum = 3;
++            infoArray[4].refCount = 4; //define, use
++            infoArray[4].physicalType = LowOpndRegType_gp;
++            infoArray[5].regNum = PhysicalReg_EBX;
++            infoArray[5].refCount = 2; //define, use
++            infoArray[5].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++            if(inst_op == OP_DIV_INT || inst_op == OP_DIV_INT_2ADDR) {
++                infoArray[1].refCount = 11;
++                infoArray[2].refCount = 9;
++            } else {
++                infoArray[1].refCount = 10;
++                infoArray[2].refCount = 12;
++            }
++            return 6;
++         }
+ 
+     case OP_ADD_INT_LIT16:
+     case OP_MUL_INT_LIT16:
+diff --git a/vm/compiler/codegen/x86/Lower.cpp b/vm/compiler/codegen/x86/Lower.cpp
+index 03cc0df..324043d 100644
+--- a/vm/compiler/codegen/x86/Lower.cpp
++++ b/vm/compiler/codegen/x86/Lower.cpp
+@@ -1206,3 +1206,67 @@ int getLabelOffset (unsigned int blockId) {
+     //Now return the label
+     return bbO1->label->lop.generic.offset;
+ }
++
++
++/**
++ * @brief Calculate magic number and shift for a given divisor
++ * @param divisor divisor number for calculation
++ * @param magic hold calculated magic number
++ * @param shift hold calculated shift
++ * @return void
++ */
++void calculateMagicAndShift(int divisor, int* magic, int* shift) {
++    int p = 31;
++    unsigned abs_d, abs_nc, delta, quotient1, remainder1, quotient2, remainder2, tmp;
++    const unsigned two31 = 1 << p;
++
++    /* According to H.S.Warren's Hacker's Delight Chapter 10 and
++       T,Grablund, P.L.Montogomery's Division by invariant integers using multiplication
++       The magic number M and shift S can be calculated in the following way:
++       Let nc be the most positive value of numerator(n) such that nc = kd - 1, where divisor(d) >=2
++       Let nc be the most negative value of numerator(n) such that nc = kd + 1, where divisor(d) <= -2
++       Thus nc can be calculated like:
++       nc = 2^31 + 2^31 % d - 1, where d >= 2
++       nc = -2^31 + (2^31 + 1) % d, where d >= 2.
++
++       So the shift p is the smallest p satisfying
++       2^p > nc * (d - 2^p % d), where d >= 2
++       2^p > nc * (d + 2^p % d), where d <= -2.
++
++       the magic number M is calcuated by
++       M = (2^p + d - 2^p % d) / d, where d >= 2
++       M = (2^p - d - 2^p % d) / d, where d <= -2.
++
++       Notice that p is always bigger than or equal to 32, so we just return 32-p as the shift number S. */
++
++    // Initialize
++    abs_d = abs(divisor);
++    tmp = two31 + ((unsigned)divisor >> 31);
++    abs_nc = tmp - 1 - tmp % abs_d;
++    quotient1 = two31 / abs_nc;
++    remainder1 = two31 % abs_nc;
++    quotient2 = two31 / abs_d;
++    remainder2 = two31 % abs_d;
++
++    // To avoid handling both positive and negative divisor, Hacker's Delight introduces a method to handle
++    // these 2 cases together to avoid duplication.
++    do {
++        p++;
++        quotient1 = 2 * quotient1;
++        remainder1 = 2 * remainder1;
++        if (remainder1 >= abs_nc){
++            quotient1++;
++            remainder1 = remainder1 - abs_nc;
++        }
++        quotient2 = 2 * quotient2;
++        remainder2 = 2 * remainder2;
++        if (remainder2 >= abs_d){
++            quotient2++;
++            remainder2 = remainder2 - abs_d;
++        }
++        delta = abs_d - remainder2;
++    }while (quotient1 < delta || (quotient1 == delta && remainder1 == 0));
++
++    *magic = (divisor > 0) ? (quotient2 + 1) : (-quotient2 - 1);
++    *shift = p - 32;
++}
+diff --git a/vm/compiler/codegen/x86/Lower.h b/vm/compiler/codegen/x86/Lower.h
+index 5d9b8f7..46c4a7c 100644
+--- a/vm/compiler/codegen/x86/Lower.h
++++ b/vm/compiler/codegen/x86/Lower.h
+@@ -1376,6 +1376,21 @@ char* findCodeForLabel(const char* label);
+ int getLabelOffset (unsigned int bbIdx);
+ #endif
+ int isPowerOfTwo(int imm);
++
++/** @brief calculate the magic number and shift for a given divisor
++    @details For a division by a signed integer constant, we can always
++     find a magic number M and a shift S. Thus we can transform the div
++     operation to a serial of multiplies, adds, shifts. This function
++     is used to calcuate the magic number and shift for a given divisor.
++     For the detailed desrciption and proof of
++     this optimization, please refer to "Hacker's Delight", Henry S.
++     Warren, Jr., chapter 10.
++    @param divisor the given divisor we need to calculate
++    @param magic pointer to hold the magic number
++    @param shift pointer to hold the shift
++*/
++void calculateMagicAndShift(int divisor, int* magic, int* shift);
++
+ void move_chain_to_mem(OpndSize size, int imm,
+                         int disp, int base_reg, bool isBasePhysical);
+ void move_chain_to_reg(OpndSize size, int imm, int reg, bool isPhysical);
+diff --git a/vm/compiler/codegen/x86/LowerAlu.cpp b/vm/compiler/codegen/x86/LowerAlu.cpp
+index c1d3331..67952e8 100644
+--- a/vm/compiler/codegen/x86/LowerAlu.cpp
++++ b/vm/compiler/codegen/x86/LowerAlu.cpp
+@@ -805,16 +805,25 @@ int op_ushr_int_2addr(const MIR * mir) {
+ }
+ 
+ #define P_GPR_1 PhysicalReg_EBX
+-//!common code to handle integer DIV & REM, it used GPR
+-
+-//!The special case: when op0 == minint && op1 == -1, return 0 for isRem, return 0x80000000 for isDiv
+-//!There are four merge points in the control flow for this bytecode
+-//!make sure the reg. alloc. state is the same at merge points by calling transferToState
+-int common_div_rem_int(bool isRem, int vA, int v1, int v2)
+-{
++/**
++ * @brief common code to handle integer DIV & REM, it used GPR
++ *  If the divisor is a constant at compiler time, use the algorithm from "Hacker's Delight", Henry S.
++ *  Warren, Jr., chapter 10. to simplify the code.
++ *  The special case: when op0 == minint && op1 == -1, return 0 for isRem, return 0x80000000 for isDiv
++ *  There are four merge points in the control flow for this bytecode
++ *  make sure the reg. alloc. state is the same at merge points by calling transferToState
++ * @param isRem true for REM, false for DIV
++ * @param vA the destination VR
++ * @param v1 the source VR for numerator
++ * @param v2 the source VR for divisor
++ * @return value >= 0 when handled
++ */
++int common_div_rem_int(bool isRem, int vA, int v1, int v2) {
+     get_virtual_reg(v1, OpndSize_32, PhysicalReg_EAX, true);
+     move_imm_to_reg(OpndSize_32, 0, PhysicalReg_EDX, true);
+     get_virtual_reg(v2, OpndSize_32, 2, false);
++
++    // Handle the div 0 case
+     compare_imm_reg(OpndSize_32, 0, 2, false);
+     handlePotentialException(
+                                        Condition_E, Condition_NE,
+@@ -826,6 +835,85 @@ int common_div_rem_int(bool isRem, int vA, int v1, int v2)
+     conditional_jump(Condition_Z, ".common_div_rem_int_divdone", true);
+ 
+     transferToState(1);
++
++    // Handle the case where the divisor is a constant at compile time
++    int divisor[2];
++    int isConst = isVirtualRegConstant(v2, LowOpndRegType_gp, divisor, false);
++    if (isConst > 0){
++        int magic;
++        int shift;
++        calculateMagicAndShift(divisor[0], &magic, &shift);
++        switch(divisor[0]) {
++            case 1:
++                if(isRem == false) {
++                    set_virtual_reg(vA, OpndSize_32, PhysicalReg_EAX, true);
++                }else {
++                    set_VR_to_imm(vA, OpndSize_32, 0);
++                }
++                return 0;
++            case -1:
++                // We could potentially do better but for now we just use the original generic code generation
++                break;
++            default:
++                // According to H.S.Warren's Hacker's Delight Chapter 10 and
++                // T,Grablund, P.L.Montogomery's Division by invariant integers using multiplication
++                // For a integer divided by a constant,
++                // we can always find a magic number M and a shift S. Thus,
++                // For d >= 2,
++                //     int(n/d) = floor(n/d) = floor(M*n/2^S), while n > 0
++                //     int(n/d) = ceil(n/d) = floor(M*n/2^S) +1, while n < 0.
++                // For d <= -2,
++                //     int(n/d) = ceil(n/d) = floor(M*n/2^S) +1 , while n > 0
++                //     int(n/d) = floor(n/d) = floor(M*n/2^S), while n < 0.
++                // We implement this algorithm in the following way:
++                // 1. multiply magic number m and numerator n, get the higher 32bit result in EDX
++                // 2. if divisor > 0 and magic < 0, add numerator to EDX
++                //    if divisor < 0 and magic > 0, sub numerator to EDX
++                // 3. if S !=0, SAR S bits for EDX
++                // 4. add 1 to EDX if EDX < 0
++                // 5. Thus, EDX is the quotient
++
++                // mov %eax, %tmp1
++                // mov magic, %tmp2
++                // imul %tmp2
++                move_reg_to_reg(OpndSize_32, PhysicalReg_EAX, true, 1, false);
++                move_imm_to_reg(OpndSize_32, magic, 2, false);
++                alu_unary_reg(OpndSize_32, imul_opc, 2, false);
++                // v2>0 && M<0
++                if (divisor[0] > 0 && magic < 0){
++                    alu_binary_reg_reg(OpndSize_32, add_opc, 1, false, PhysicalReg_EDX, true);
++                }else if (divisor[0] < 0 && magic > 0){
++                // v2<0 && M>0
++                    alu_binary_reg_reg(OpndSize_32, sub_opc, 1, false, PhysicalReg_EDX, true);
++                }
++                // sarl shift, %edx
++                if (shift != 0)
++                    alu_binary_imm_reg(OpndSize_32, sar_opc, shift, PhysicalReg_EDX, true);
++                // mov %edx, %tmp2
++                // shrl 31, %edx
++                // add %tmp2, %edx
++                move_reg_to_reg(OpndSize_32, PhysicalReg_EDX, true, 2, false);
++                alu_binary_imm_reg(OpndSize_32, shr_opc, 31, PhysicalReg_EDX, true);
++                alu_binary_reg_reg(OpndSize_32, add_opc, 2, false, PhysicalReg_EDX, true);
++
++                if (isRem == false){
++                    set_virtual_reg(vA, OpndSize_32, PhysicalReg_EDX, true);
++                }else {
++                     //mov %edx, %eax
++                     //mov v2, %tmp2
++                     //imul %tmp2
++                     //sub %eax, %tmp1
++                     //mov %tmp1, vA
++                    move_reg_to_reg(OpndSize_32, PhysicalReg_EDX, true, PhysicalReg_EAX, true);
++                    move_imm_to_reg(OpndSize_32, divisor[0], 2, false);
++                    alu_unary_reg(OpndSize_32, imul_opc, 2, false);
++                    alu_binary_reg_reg(OpndSize_32, sub_opc, PhysicalReg_EAX, true, 1, false);
++                    set_virtual_reg(vA, OpndSize_32, 1, false);
++                }
++                return 0;
++        }
++    }
++
+     //Find out Numerator | Denominator
+     move_reg_to_reg(OpndSize_32, PhysicalReg_EAX, true, 3, false);
+     alu_binary_reg_reg(OpndSize_32, or_opc, 2, false, 3, false);
+-- 
+1.7.4.1
+

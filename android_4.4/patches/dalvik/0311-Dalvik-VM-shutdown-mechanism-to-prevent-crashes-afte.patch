@@ -1,0 +1,149 @@
+From 1c1c0efe78194cb74a010d945c47afb39f98d618 Mon Sep 17 00:00:00 2001
+From: aleksey.v.ignatenko <avignate@nstdrlel243b2.(none)>
+Date: Wed, 31 Jul 2013 17:41:36 +0700
+Subject: Dalvik: VM shutdown mechanism to prevent crashes after System.exit
+
+BZ: 79051
+
+Disable default signal handler to ignore crashes if any during VM exit
+because we don't care of crashes when System.exit is triggered. The new
+signal handler introduced ignores crash signals in VM shutdown mode and
+redirects signals to default handler otherwise.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: yes
+
+Change-Id: I1d1a2640d5fb277561489989015fb74b003af5ec
+Orig-MCG-Change-Id: I44e1b79c22d13d7b1e8d4ed7d7a674cfb22b9c3e
+Signed-off-by: aleksey.v.ignatenko <avignate@nstdrlel243b2.(none)>
+Signed-off-by: aleksey.v.ignatenko <avignate@lab-dyn-116-248.ins.intel.com>
+Reviewed-on: http://android.intel.com:8080/118454
+Reviewed-by: Ignatenko, Aleksey V <aleksey.v.ignatenko@intel.com>
+Reviewed-by: Lupusoru, Razvan A <razvan.a.lupusoru@intel.com>
+Reviewed-by: Beyler, Jean Christophe <jean.christophe.beyler@intel.com>
+Reviewed-by: Katkov, Serguei I <serguei.i.katkov@intel.com>
+Reviewed-by: lab_aqa <lab_aqa@intel.com>
+Reviewed-by: Semukhina, Elena V <elena.v.semukhina@intel.com>
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/Globals.h                    |    3 +++
+ vm/Init.cpp                     |    2 ++
+ vm/SignalCatcher.cpp            |   27 +++++++++++++++++++++++++++
+ vm/SignalCatcher.h              |    7 +++++++
+ vm/native/java_lang_Runtime.cpp |    6 ++++++
+ 5 files changed, 45 insertions(+), 0 deletions(-)
+
+diff --git a/vm/Globals.h b/vm/Globals.h
+index 3efcacb..3b8e391 100644
+--- a/vm/Globals.h
++++ b/vm/Globals.h
+@@ -35,6 +35,7 @@
+ 
+ #include <stdarg.h>
+ #include <pthread.h>
++#include <signal.h>
+ 
+ /* private structures */
+ struct GcHeap;
+@@ -136,6 +137,8 @@ struct DvmGlobals {
+ 
+     char*       jniTrace;
+     bool        reduceSignals;
++    /* disable fatal errors elimination on VM shutdown */
++    bool        disableVMExitErrorsElimination;
+     bool        noQuitHandler;
+     bool        verifyDexChecksum;
+     char*       stackTraceFile;     // for SIGQUIT-inspired output
+diff --git a/vm/Init.cpp b/vm/Init.cpp
+index 17fb7b1..69728c6 100644
+--- a/vm/Init.cpp
++++ b/vm/Init.cpp
+@@ -1345,6 +1345,8 @@ int processOptions(int argc, const char* const argv[], bool ignoreUnrecognized)
+             }
+         } else if (strcmp(argv[i], "-Xrs") == 0) {
+             gDvm.reduceSignals = true;
++        } else if (strcmp(argv[i], "-Xdisablevmexiterrorselimination") == 0) {
++            gDvm.disableVMExitErrorsElimination = true;
+         } else if (strcmp(argv[i], "-Xnoquithandler") == 0) {
+             /* disables SIGQUIT handler thread while still blocking SIGQUIT */
+             /* (useful if we don't want thread but system still signals us) */
+diff --git a/vm/SignalCatcher.cpp b/vm/SignalCatcher.cpp
+index 0404c4b..0dc05a8 100644
+--- a/vm/SignalCatcher.cpp
++++ b/vm/SignalCatcher.cpp
+@@ -34,6 +34,33 @@
+ 
+ static void* signalCatcherThreadStart(void* arg);
+ 
++/**
++ * @brief Ignore fatal signals after System.exit()
++ * @details Java spec does not specify VM behavior after System.exit() call.
++ * Therefore we legaly ignore fatal signals on VM shutdown phase after
++ * System.exit() was called to avoid unneeded tombstones
++ * CAUTION! This function should be called with care because it can
++ * potentially harm Dalvik behaviour if called in unappropriate place
++ * E.g. in case of signal based optimizations
++ */
++void dvmIgnoreSignalsOnVMExit(void)
++{
++    if (gDvm.disableVMExitErrorsElimination == true) {
++        return;
++    }
++
++    ALOGI("System.exit() call: started ignoring fatal signals");
++
++    /* Ignore fatal signals after System.exit()*/
++    signal(SIGSEGV, SIG_IGN);
++    signal(SIGILL,  SIG_IGN);
++    signal(SIGABRT, SIG_IGN);
++    signal(SIGBUS,  SIG_IGN);
++    signal(SIGIOT,  SIG_IGN);
++    signal(SIGFPE,  SIG_IGN);
++    signal(SIGPIPE, SIG_IGN);
++}
++
+ /*
+  * Crank up the signal catcher thread.
+  *
+diff --git a/vm/SignalCatcher.h b/vm/SignalCatcher.h
+index d1d7a18..996405d 100644
+--- a/vm/SignalCatcher.h
++++ b/vm/SignalCatcher.h
+@@ -22,4 +22,11 @@
+ bool dvmSignalCatcherStartup(void);
+ void dvmSignalCatcherShutdown(void);
+ 
++/*
++ * Set the current signal handler to ignore
++ * fatal signals.  This can be used during
++ * VM shutdown stage
++ */
++void dvmIgnoreSignalsOnVMExit(void);
++
+ #endif  // DALVIK_SIGNALCATCHER_H_
+diff --git a/vm/native/java_lang_Runtime.cpp b/vm/native/java_lang_Runtime.cpp
+index 2d1c4fe..17dbd60 100644
+--- a/vm/native/java_lang_Runtime.cpp
++++ b/vm/native/java_lang_Runtime.cpp
+@@ -57,6 +57,12 @@ static void Dalvik_java_lang_Runtime_nativeExit(const u4* args,
+     dvmCompilerDumpStats();
+ #endif
+     ALOGD("Calling exit(%d)", status);
++
++    /* Ignore fatal signals starting this point as
++     * we are exiting now
++     */
++    dvmIgnoreSignalsOnVMExit();
++
+     exit(status);
+ }
+ 
+-- 
+1.7.4.1
+

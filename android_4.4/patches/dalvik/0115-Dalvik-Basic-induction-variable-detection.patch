@@ -1,0 +1,798 @@
+From 18c970716a563a0827e03c10e0b94dc00dd40c5e Mon Sep 17 00:00:00 2001
+From: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Date: Thu, 14 Mar 2013 13:56:24 -0700
+Subject: Dalvik: Basic induction variable detection
+
+BZ: 92854
+
+This patch enables basic induction variable detection using the new loop
+infrastructure. In order to do this successfully and support other optimizations
+that will use this information, new methods were added to the LoopInformation
+class. Among these is being able to get IV list, get inter iteration dependent
+variables, check if instruction is executed every iteration, and also get
+Phi node that defines a given SSA register. It also augments MIRs to know the
+BasicBlock that contains them.
+
+This does not rely on building expression trees and thus for now it only supports
+detecting basic IVs that are non-wide, and are updated using add-int, add-int/2addr,
+sub-int, sub-int/2addr, add-int/lit8, or add-int/lit16.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I69d83b06350ffffc915caca461249e1242bce813
+Orig-MCG-Change-Id: I41e14b882947d2d2bbf0949bba03fc12d36c2792
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/Compiler.h            |   12 ++
+ vm/compiler/CompilerIR.h          |    3 +-
+ vm/compiler/Dataflow.cpp          |  265 +++++++++++++++++++++++++++++++++++++
+ vm/compiler/IntermediateRep.cpp   |   14 ++-
+ vm/compiler/LoopInformation.cpp   |  168 +++++++++++++++++++++++
+ vm/compiler/LoopInformation.h     |   60 +++++++++
+ vm/compiler/LoopOpt.cpp           |   22 +++-
+ vm/compiler/SSATransformation.cpp |   17 +--
+ 8 files changed, 543 insertions(+), 18 deletions(-)
+
+diff --git a/vm/compiler/Compiler.h b/vm/compiler/Compiler.h
+index 4ee6d39..2627ba4 100644
+--- a/vm/compiler/Compiler.h
++++ b/vm/compiler/Compiler.h
+@@ -195,6 +195,9 @@ struct SSARepresentation;
+ struct GrowableList;
+ struct JitEntry;
+ struct MIR;
++#ifdef ARCH_IA32
++class LoopInformation;
++#endif
+ 
+ bool dvmCompilerSetupCodeCache(void);
+ bool dvmCompilerArchInit(void);
+@@ -224,6 +227,10 @@ void dvmCompilerInlineMIR(struct CompilationUnit *cUnit,
+                           JitTranslationInfo *info);
+ void dvmInitializeSSAConversion(struct CompilationUnit *cUnit);
+ int dvmConvertSSARegToDalvik(const struct CompilationUnit *cUnit, int ssaReg);
++//Extract the subscript from a SSA register
++unsigned int dvmExtractSSASubscript (const CompilationUnit *cUnit, int ssaReg);
++//Extract the register from a SSA register
++unsigned int dvmExtractSSARegister (const CompilationUnit *cUnit, int ssaReg);
+ bool dvmCompilerLoopOpt(struct CompilationUnit *cUnit);
+ 
+ /**
+@@ -239,8 +246,13 @@ bool dvmCompilerDoSSAConversion(struct CompilationUnit *cUnit,
+                                 struct BasicBlock *bb);
+ bool dvmCompilerDoConstantPropagation(struct CompilationUnit *cUnit,
+                                       struct BasicBlock *bb);
++#ifndef ARCH_IA32
+ bool dvmCompilerFindInductionVariables(struct CompilationUnit *cUnit,
+                                        struct BasicBlock *bb);
++#else
++void dvmCompilerFindInductionVariables(struct CompilationUnit *cUnit,
++                                            LoopInformation *info);
++#endif
+ /* Clear the visited flag for each BB */
+ bool dvmCompilerClearVisitedFlag(struct CompilationUnit *cUnit,
+                                  struct BasicBlock *bb);
+diff --git a/vm/compiler/CompilerIR.h b/vm/compiler/CompilerIR.h
+index 8dc69b3..a1e671e 100644
+--- a/vm/compiler/CompilerIR.h
++++ b/vm/compiler/CompilerIR.h
+@@ -167,6 +167,7 @@ typedef struct MIR {
+     unsigned int width;
+     unsigned int offset;
+     unsigned int topologicalOrder;      //Topological order of the MIR in the entire CFG
++    BasicBlock *bb;                     //BasicBlock containing the MIR
+     struct MIR *prev;
+     struct MIR *next;
+     struct SSARepresentation *ssaRep;
+@@ -370,7 +371,7 @@ void dvmCompilerInsertLIRAfter(LIR *currentLIR, LIR *newLIR);
+ void dvmCompilerAbort(CompilationUnit *cUnit);
+ 
+ /* Remove a MIR from a BasicBlock: returns true on success */
+-bool dvmCompilerRemoveMIR (BasicBlock *bb, const MIR *mir);
++bool dvmCompilerRemoveMIR (BasicBlock *bb, MIR *mir);
+ 
+ /* Insert a BasicBlock between a parent and child */
+ bool dvmCompilerInsertBasicBlockBetween (BasicBlock *newBlock, BasicBlock *parent, BasicBlock *child);
+diff --git a/vm/compiler/Dataflow.cpp b/vm/compiler/Dataflow.cpp
+index 75ef05e..3573814 100644
+--- a/vm/compiler/Dataflow.cpp
++++ b/vm/compiler/Dataflow.cpp
+@@ -17,9 +17,11 @@
+ #include "Dalvik.h"
+ #include "Dataflow.h"
+ #include "Loop.h"
++#include "LoopInformation.h"
+ #include "libdex/DexOpcodes.h"
+ 
+ #include <queue>
++#include <vector>
+ 
+ /*
+  * Main table containing data flow attributes for each bytecode. The
+@@ -815,6 +817,36 @@ int dvmConvertSSARegToDalvik(const CompilationUnit *cUnit, int ssaReg)
+       return GET_ELEM_N(cUnit->ssaToDalvikMap, int, ssaReg);
+ }
+ 
++/**
++ * @brief Extract the SSA subscript from a SSA register
++ * @param cUnit the CompilationUnit
++ * @param ssaReg the SSA register we want to extract from
++ * @return the subscript for ssaReg
++ */
++unsigned int dvmExtractSSASubscript (const CompilationUnit *cUnit, int ssaReg)
++{
++    //First get the dalvik register
++    int reg = dvmConvertSSARegToDalvik (cUnit, ssaReg);
++
++    //Then get the subscript from it
++    return DECODE_SUB (reg);
++}
++
++/**
++ * @brief Extract the SSA register value from a SSA register
++ * @param cUnit the CompilationUnit
++ * @param ssaReg the SSA register we want to extract from
++ * @return the register for ssaReg
++ */
++unsigned int dvmExtractSSARegister (const CompilationUnit *cUnit, int ssaReg)
++{
++    //First get the dalvik register
++    int reg = dvmConvertSSARegToDalvik (cUnit, ssaReg);
++
++    //Then get the subscript from it
++    return DECODE_REG (reg);
++}
++
+ /*
+  * Utility function to convert encoded SSA register value into Dalvik register
+  * and subscript pair. Each SSA register can be used to index the
+@@ -1888,6 +1920,239 @@ bool dvmCompilerFindInductionVariables(struct CompilationUnit *cUnit,
+     }
+     return true;
+ }
++#else
++
++/**
++ * @brief Detects whether the phi node is a basic IV. If it is, then it
++ * augments the loop with that information.
++ * @param cUnit The compilation unit
++ * @param info The loop information for current loop.
++ * @param phi MIR representing the phi node
++ * @return Returns whether basic IV was found.
++ */
++bool detectAndInitializeBasicIV(CompilationUnit *cUnit,
++                                LoopInformation *info,
++                                MIR *phi)
++{
++    //Get the SSA representation
++    SSARepresentation *ssaRep = phi->ssaRep;
++
++    //Paranoid
++    if (ssaRep == 0 || ssaRep->uses == 0 || ssaRep->defs == 0)
++    {
++        return false;
++    }
++
++    //For now accept only PHI nodes that have two uses and one define
++    if (ssaRep->numDefs != 1 || ssaRep->numUses != 2)
++    {
++        return false;
++    }
++
++    //Get local copy of where the uses are defined
++    MIR **defWhere = ssaRep->defWhere;
++
++    //If we have more than one use, we should have links to definition
++    if (defWhere == 0)
++    {
++        return false;
++    }
++
++    //Keep track of MIR that is candidate for identifying simple IV
++    MIR *candidate = 0;
++
++    //Go through each of the PHI's uses
++    for (int use = 0; use < ssaRep->numUses; use++)
++    {
++        //Get MIR that defines the use
++        MIR *defMIR = defWhere[use];
++
++        //If we cannot find the definition nor any uses, then just continue
++        if (defMIR == 0 || defMIR->ssaRep == 0
++                || defMIR->ssaRep->uses == 0) {
++            continue;
++        }
++
++        //A phi node having a single define was part of criteria of getting
++        //here. But just in case that changes, assert it now.
++        assert(ssaRep->numDefs == 1);
++
++        //Go through each use of the MIR to compare with define of phi node
++        for (int mirUse = 0; mirUse < defMIR->ssaRep->numUses; mirUse++)
++        {
++            //If the use matches the definition from phi node, we found
++            // a candidate
++            if (ssaRep->defs[0] == defMIR->ssaRep->uses[mirUse])
++            {
++                candidate = defMIR;
++                break;
++            }
++        }
++
++        //If we have a potential candidate, we need to make sure that this
++        //dominates every backward chaining cell.
++        if (candidate != 0)
++        {
++            //If candidate is executed per iteration of current loop, then we
++            //can keep it and run it through the IV detection criteria
++            if (info->executedPerIteration (cUnit, candidate) == true)
++            {
++                break;
++            }
++
++            //If we get here it means that the candidate doesn't have to be
++            //executed per iteration and thus it cannot be an IV. Therefore,
++            //we reset the candidate now.
++            candidate = 0;
++        }
++    }
++
++    //Assume that we will not find a basic IV
++    bool foundBasicIV = false;
++
++    //If we found a candidate, check that it matches criteria for basic IV
++    if (candidate != 0)
++    {
++        BitVector *isConstantV = cUnit->isConstantV;
++        bool deltaIsConstant = false;
++        int deltaValue;
++
++        //TODO This code should be using expression tree instead of going
++        //through each bytecode like this
++        switch (candidate->dalvikInsn.opcode)
++        {
++            case OP_ADD_INT:
++            case OP_ADD_INT_2ADDR:
++                if (dvmIsBitSet(isConstantV, candidate->ssaRep->uses[1]))
++                {
++                    deltaValue = (*cUnit->constantValues)[candidate->ssaRep->uses[1]];
++                    deltaIsConstant = true;
++                }
++                break;
++            case OP_SUB_INT:
++            case OP_SUB_INT_2ADDR:
++                if (dvmIsBitSet(isConstantV, candidate->ssaRep->uses[1]))
++                {
++                    deltaValue = - (*cUnit->constantValues)[candidate->ssaRep->uses[1]];
++                    deltaIsConstant = true;
++                }
++                break;
++            case OP_ADD_INT_LIT8:
++            case OP_ADD_INT_LIT16:
++                deltaValue = candidate->dalvikInsn.vC;
++                deltaIsConstant = true;
++                break;
++            default:
++                break;
++        }
++
++        if (deltaIsConstant == true)
++        {
++            GrowableList & ivList = info->getInductionVariableList();
++            InductionVariableInfo *ivInfo = static_cast<InductionVariableInfo *> (
++                    dvmCompilerNew (sizeof (*ivInfo), false));
++
++            ivInfo->ssaReg = candidate->ssaRep->uses[0];
++            ivInfo->basicSSAReg = candidate->ssaRep->uses[0];
++            ivInfo->m = 1;         // always 1 to basic iv
++            ivInfo->c = 0;         // N/A to basic iv
++            ivInfo->inc = deltaValue;
++            dvmInsertGrowableList (&ivList, (intptr_t) ivInfo);
++
++            foundBasicIV = true;
++        }
++    }
++
++    return foundBasicIV;
++}
++
++/**
++ * @brief Looks through loop structure to find induction variables.
++ * @param cUnit The compilation unit
++ * @param info The loop information for current loop.
++ */
++void dvmCompilerFindInductionVariablesHelper(CompilationUnit *cUnit,
++                                             LoopInformation *info)
++{
++    //Get the loop entry BB
++    BasicBlock *entry = info->getEntryBlock();
++
++    //Paranoid
++    if (entry == 0)
++    {
++        return;
++    }
++
++    //Clear the induction variable information and inter-iteration variables
++    GrowableList & ivList = info->getInductionVariableList();
++    dvmClearGrowableList (&ivList);
++
++    //Clear inter iteration variables
++    info->clearInterIterationVariables ();
++
++    //Go through the PHI nodes to find the simple IVs
++    for (MIR *phi = entry->firstMIRInsn; phi != 0; phi = phi->next)
++    {
++        //If we run into a non-PHI node, we are done
++        if (static_cast<int>(phi->dalvikInsn.opcode) != static_cast<int>(kMirOpPhi))
++        {
++            break;
++        }
++
++        detectAndInitializeBasicIV(cUnit, info, phi);
++
++        //Also add it as a inter-iteration variable
++        SSARepresentation *ssa = phi->ssaRep;
++
++        if (ssa != 0)
++        {
++            //Add each definition
++            int max = ssa->numDefs;
++            for (int i = 0; i < max; i++)
++            {
++                int value = ssa->defs[i];
++
++                //Get dalvik register
++                value = dvmExtractSSARegister (cUnit, value);
++
++                //Add it to the loop information
++                info->addInterIterationVariable (value);
++            }
++        }
++    }
++}
++
++/**
++ * @brief Looks through all of the loops to find the induction variables.
++ * @param cUnit The compilation unit
++ * @param info The loop information for outer most loop.
++ */
++void dvmCompilerFindInductionVariables(CompilationUnit *cUnit,
++                                       LoopInformation *info)
++{
++    //If the loop information has not been set up we have no IVs to detect
++    if (info == 0)
++    {
++        return;
++    }
++
++    //Find the induction variables for this loop
++    dvmCompilerFindInductionVariablesHelper(cUnit, info);
++
++    //Find out how many nested loops we have
++    unsigned int nbr = info->getNestedNbr ();
++
++    // Find induction variables for each child as well
++    for (unsigned int i = 0; i < nbr; i++)
++    {
++        LoopInformation *inner = info->getNested (i);
++
++        //Paranoid
++        assert(inner != 0);
++
++        dvmCompilerFindInductionVariables (cUnit, inner);
++    }
++}
+ #endif
+ 
+ /* Setup the basic data structures for SSA conversion */
+diff --git a/vm/compiler/IntermediateRep.cpp b/vm/compiler/IntermediateRep.cpp
+index 5b59355..c16d260 100644
+--- a/vm/compiler/IntermediateRep.cpp
++++ b/vm/compiler/IntermediateRep.cpp
+@@ -51,6 +51,9 @@ void dvmCompilerAppendMIR(BasicBlock *bb, MIR *mir)
+         mir->next = NULL;
+         bb->lastMIRInsn = mir;
+     }
++
++    //Set BB for mir
++    mir->bb = bb;
+ }
+ 
+ /* Insert an MIR instruction to the head of a basic block */
+@@ -66,6 +69,9 @@ void dvmCompilerPrependMIR(BasicBlock *bb, MIR *mir)
+         mir->prev = NULL;
+         bb->firstMIRInsn = mir;
+     }
++
++    //Set BB for mir
++    mir->bb = bb;
+ }
+ 
+ /* Insert an MIR instruction after the specified MIR */
+@@ -82,6 +88,9 @@ void dvmCompilerInsertMIRAfter(BasicBlock *bb, MIR *currentMIR, MIR *newMIR)
+         /* Is the last MIR in the block */
+         bb->lastMIRInsn = newMIR;
+     }
++
++    //Set BB for mir
++    newMIR->bb = bb;
+ }
+ 
+ /*
+@@ -139,7 +148,7 @@ void dvmCompilerInsertLIRAfter(LIR *currentLIR, LIR *newLIR)
+  * @param mir the MIR
+  * @return whether it succeeded
+  */
+-bool dvmCompilerRemoveMIR (BasicBlock *bb, const MIR *mir)
++bool dvmCompilerRemoveMIR (BasicBlock *bb, MIR *mir)
+ {
+     //Paranoid
+     if (bb == 0 || mir == 0)
+@@ -187,6 +196,9 @@ bool dvmCompilerRemoveMIR (BasicBlock *bb, const MIR *mir)
+             bb->lastMIRInsn = prev;
+         }
+ 
++        //Remove bb
++        mir->bb = 0;
++
+         //Found it and removed it
+         return true;
+     }
+diff --git a/vm/compiler/LoopInformation.cpp b/vm/compiler/LoopInformation.cpp
+index aa12389..501ba99 100644
+--- a/vm/compiler/LoopInformation.cpp
++++ b/vm/compiler/LoopInformation.cpp
+@@ -16,10 +16,14 @@
+ 
+ #include "CompilerIR.h"
+ #include "Dalvik.h"
++#include "Dataflow.h"
+ #include "LoopInformation.h"
+ 
+ LoopInformation::LoopInformation (void)
+ {
++    //Set BitVector to 0
++    interIterationVariables = 0;
++
+     //Call initialization
+     init ();
+ }
+@@ -49,7 +53,19 @@ void LoopInformation::init (const Method *method)
+         //Put an excessively high number
+         scratchRegisters = ~0;
+     }
++
++    if (interIterationVariables == 0)
++    {
++        interIterationVariables = dvmCompilerAllocBitVector (1, true);
++    }
++    else
++    {
++        dvmClearAllBits (interIterationVariables);
++    }
++
++    // Initialize growable lists
+     dvmInitGrowableList (&nested, 1);
++    dvmInitGrowableList (&inductionVariableList, 1);
+ }
+ 
+ /**
+@@ -423,3 +439,155 @@ LoopInformation *LoopInformation::getNested (unsigned int i) const
+ 
+     return (LoopInformation *) dvmGrowableListGetElement (&nested, i);
+ }
++
++bool LoopInformation::executedPerIteration (CompilationUnit *cUnit, const MIR *mir) const
++{
++    //Paranoid
++    assert (mir != 0);
++
++    //Get the mir's BasicBlock
++    BasicBlock *current = mir->bb;
++
++    //Paranoid
++    if (current == 0)
++    {
++        return false;
++    }
++
++    //Go through the backward chaining cells
++    BitVectorIterator bvIterator;
++
++    //Get predecessors
++    dvmBitVectorIteratorInit (backward, &bvIterator);
++    while (true) {
++        //Get the next iterator
++        int blockIdx = dvmBitVectorIteratorNext(&bvIterator);
++
++        //If it is finished, exit
++        if (blockIdx == -1)
++        {
++            break;
++        }
++
++        BasicBlock *bwcc = (BasicBlock*) (dvmGrowableListGetElement(&cUnit->blockList, blockIdx));
++
++        //Paranoid
++        if (bwcc == 0)
++        {
++            continue;
++        }
++
++        //To prove that the mir is executed per iteration, it's block must dominate each backward chaining cell
++        if (dvmIsBitSet (bwcc->dominators, current->id) == false)
++        {
++            return false;
++        }
++    }
++
++    //The instruction is always executed
++    return true;
++}
++
++bool LoopInformation::isAnInductionVariable (CompilationUnit *cUnit, unsigned int vr)
++{
++    //Go through the induction variable list
++    GrowableListIterator iterator;
++    dvmGrowableListIteratorInit(&inductionVariableList, &iterator);
++
++    while (true)
++    {
++        InductionVariableInfo *info = (InductionVariableInfo *) (dvmGrowableListIteratorNext(&iterator));
++
++        //Bail at the end
++        if (info == 0)
++        {
++            break;
++        }
++
++        //Get the ssa register for this induction
++        int ssaReg = info->ssaReg;
++
++        //Is it a match?
++        if (dvmExtractSSARegister (cUnit, ssaReg) == vr)
++        {
++            return true;
++        }
++    }
++
++    //Did not find it
++    return false;
++}
++
++MIR *LoopInformation::getPhiInstruction (CompilationUnit *cUnit, unsigned int vr) const
++{
++    //Get the BasicBlock vector for this loop
++    BitVector *blocks = const_cast<BitVector *> (getBasicBlocks ());
++
++    //Iterate through them
++    BitVectorIterator bvIterator;
++
++    dvmBitVectorIteratorInit (blocks, &bvIterator);
++    while (true)
++    {
++        //Get block index
++        int blockIdx = dvmBitVectorIteratorNext (&bvIterator);
++
++        //If done, bail
++        if (blockIdx == -1)
++        {
++            break;
++        }
++
++        BasicBlock *bb = (BasicBlock*) (dvmGrowableListGetElement(&cUnit->blockList, blockIdx));
++
++        //Paranoid
++        if (bb == 0)
++        {
++            break;
++        }
++
++        //Go through its instructions
++        for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++        {
++            //Get dalvik instruction
++            DecodedInstruction &insn = mir->dalvikInsn;
++
++            //Is it a phi node?
++            if (insn.opcode == static_cast<Opcode> (kMirOpPhi))
++            {
++                //Get ssa representation
++                SSARepresentation *ssa = mir->ssaRep;
++
++                //Paranoid
++                assert (ssa != 0 && ssa->numDefs == 1);
++
++                //Does it define our vr?
++                int ssaReg = ssa->defs[0];
++
++                //Is it a match?
++                if (dvmExtractSSARegister (cUnit, ssaReg) == vr)
++                {
++                    return mir;
++                }
++            }
++        }
++    }
++
++    //Did not find it
++    return 0;
++}
++
++bool LoopInformation::isInterIterationVariable (unsigned int vr) const
++{
++    return dvmIsBitSet (interIterationVariables, vr);
++}
++
++void LoopInformation::addInterIterationVariable (unsigned int vr)
++{
++    dvmSetBit (interIterationVariables, vr);
++}
++
++void LoopInformation::clearInterIterationVariables (void)
++{
++    dvmClearAllBits (interIterationVariables);
++}
+diff --git a/vm/compiler/LoopInformation.h b/vm/compiler/LoopInformation.h
+index 612387d..a899a92 100644
+--- a/vm/compiler/LoopInformation.h
++++ b/vm/compiler/LoopInformation.h
+@@ -22,6 +22,7 @@
+ //Forward declarations
+ struct BasicBlock;
+ struct BitVector;
++class CompilationUnit;
+ 
+ /**
+   * @class LoopInformation
+@@ -60,6 +61,12 @@ class LoopInformation
+         /** @brief Registers available */
+         unsigned int scratchRegisters;
+ 
++        /** @brief Inter-iteration dependent variables */
++        BitVector *interIterationVariables;
++
++        /** @brief List of Induction Variables */
++        GrowableList inductionVariableList;
++
+         /**
+          * @brief Fill the basicBlock vector with the BasicBlocks composing the loop
+          * @param bb the current BasicBlock
+@@ -217,6 +224,59 @@ class LoopInformation
+          * @param value the new value for the scratch register
+          */
+          void setScratchRegisters (unsigned int value) {scratchRegisters = value;}
++
++         /**
++          * @brief Get the list with induction variables.
++          * @return Returns the list containing IVs.
++          */
++         GrowableList & getInductionVariableList (void) {return inductionVariableList;}
++
++         /**
++          * @brief Is the instruction executed every iteration?
++          * @param cUnit the CompilationUnit
++          * @param mir the MIR instruction
++          * @return whether mir is executed every iteration
++          */
++         bool executedPerIteration (CompilationUnit *cUnit, const MIR *mir) const;
++
++         /**
++          * @brief Is a VR an induction variable for the loop?
++          * @param cUnit the CompilationUnit
++          * @param vr the VR we are curious about
++          * @return whether vr is an induction variable
++          */
++         bool isAnInductionVariable (CompilationUnit *cUnit, unsigned int vr);
++
++         /**
++          * @brief Get the Phi node defining a given SSA register
++          * @param cUnit the CompilationUnit
++          * @param vr the virtual register we want the phi node from
++          * @return 0 if not found, the MIR otherwise
++          */
++         MIR *getPhiInstruction (CompilationUnit *cUnit, unsigned int vr) const;
++
++         /**
++          * @brief Add a variable as an inter-iteration variable
++          * @param vr the virtual register
++          */
++         void addInterIterationVariable (unsigned int vr);
++
++         /**
++          * @brief Is a variable an inter-iteration variable?
++          * @return whether or not a variable is inter-iteration dependent
++          */
++         bool isInterIterationVariable (unsigned int vr) const;
++
++         /**
++          * @brief Return the inter-iteration BitVector
++          * @return the inter-iteration BitVector
++          */
++         BitVector *getInterIterationVariables (void) const {return interIterationVariables;}
++
++         /**
++          * @brief Clear inter iteration variables
++          */
++         void clearInterIterationVariables (void);
+ };
+ 
+ #endif
+diff --git a/vm/compiler/LoopOpt.cpp b/vm/compiler/LoopOpt.cpp
+index a119a9a..131034f 100644
+--- a/vm/compiler/LoopOpt.cpp
++++ b/vm/compiler/LoopOpt.cpp
+@@ -92,10 +92,26 @@ bool dvmCompilerCalculateBasicBlockInformation (CompilationUnit *cUnit, bool fil
+         //Call build loop it does the work for us
+         bool res = dvmCompilerBuildLoop (cUnit, filter);
+ 
+-        //Then call loop information fill
+-        if (cUnit->loopInformation != 0)
++        //If we succeeded
++        if (res == true)
+         {
+-            cUnit->loopInformation->fillLoopInformation ();
++            //Then call loop information fill
++            if (cUnit->loopInformation != 0)
++            {
++                cUnit->loopInformation->fillLoopInformation ();
++            }
++
++            //Clear the constants
++            cUnit->constantValues->clear ();
++
++            //Finally, get the constant information and set the cUnit correctly
++            dvmCompilerDataFlowAnalysisDispatcher(cUnit,
++                    dvmCompilerDoConstantPropagation,
++                    kAllNodes,
++                    false /* isIterative */);
++
++            //Finally, find the induction variables
++            dvmCompilerFindInductionVariables (cUnit, cUnit->loopInformation);
+         }
+         return res;
+     }
+diff --git a/vm/compiler/SSATransformation.cpp b/vm/compiler/SSATransformation.cpp
+index 2341dc1..393cd6f 100644
+--- a/vm/compiler/SSATransformation.cpp
++++ b/vm/compiler/SSATransformation.cpp
+@@ -927,6 +927,9 @@ bool dvmCompilerBuildLoop(CompilationUnit *cUnit, bool filter)
+     //We suppose here that SSA has been done already
+     dvmCompilerDataFlowAnalysisDispatcher (cUnit, buildDefUseChain, kBreadthFirstTraversal, false);
+ 
++    //Just for safety, reset walkData
++    cUnit->walkData = 0;
++
+     //Now we want to handle the constant values of the trace
+     //First clear the BitVector
+     if (cUnit->isConstantV != 0)
+@@ -934,19 +937,7 @@ bool dvmCompilerBuildLoop(CompilationUnit *cUnit, bool filter)
+         dvmClearAllBits (cUnit->isConstantV);
+     }
+ 
+-    //Clear the constants
+-    cUnit->constantValues->clear ();
+-
+-    //Finally, get the constant information and set the cUnit correctly
+-    dvmCompilerDataFlowAnalysisDispatcher(cUnit,
+-                                          dvmCompilerDoConstantPropagation,
+-                                          kAllNodes,
+-                                          false /* isIterative */);
+-
+-    //Just for safety, reset walkData
+-    cUnit->walkData = 0;
+-
+-    //Finally any value without a definition might have one now, handle them now
++    //Before anything else: any value without a definition might have one now, handle them now
+     data.handleNoDefinitions ();
+ 
+     return true;
+-- 
+1.7.4.1
+

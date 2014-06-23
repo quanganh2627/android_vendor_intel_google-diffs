@@ -1,0 +1,291 @@
+From f8783afa96bfe9e7260a39da66f6c30bc5612526 Mon Sep 17 00:00:00 2001
+From: jerome <jerome.anand@intel.com>
+Date: Mon, 25 Mar 2013 11:27:43 +0530
+Subject: [PORT FROM MAIN][DO NOT UPSTREAM][REMOTE BGM] Audio policy update during BGM
+
+BZ: 95338
+
+1. The audio policy is updated to route all notifications,
+alarm, touch tones, shutter sound to the primary device
+and not interfere with the AV playback happening in the
+remote sink
+
+2. Bluetooth HS support during BGM is added
+
+Change-Id: Icb52ebf3d2bc5423d58febf842530bdb39bfa8b0
+Orig-Change-Id: I55b8af76e211280da3f448080a406d3400eecf07
+Signed-off-by: jerome <jerome.anand@intel.com>
+
+Signed-off-by: jerome <jerome.anand@intel.com>
+---
+ audio/AudioPolicyManagerBase.cpp                 |  125 +++++++++++++++++++++-
+ include/hardware_legacy/AudioPolicyManagerBase.h |   12 ++
+ 2 files changed, 134 insertions(+), 3 deletions(-)
+
+diff --git a/audio/AudioPolicyManagerBase.cpp b/audio/AudioPolicyManagerBase.cpp
+index 5807781..5d3863c 100644
+--- a/audio/AudioPolicyManagerBase.cpp
++++ b/audio/AudioPolicyManagerBase.cpp
+@@ -40,7 +40,8 @@
+ 
+ namespace android_audio_legacy {
+ 
+-bool AudioPolicyManagerBase :: mIsDirectOutputActive;
++
++bool AudioPolicyManagerBase::mIsDirectOutputActive;
+ 
+ // ----------------------------------------------------------------------------
+ // AudioPolicyInterface implementation
+@@ -558,7 +559,21 @@ audio_io_handle_t AudioPolicyManagerBase::getOutput(AudioSystem::stream_type str
+ {
+     audio_io_handle_t output = 0;
+     uint32_t latency = 0;
++#ifdef BGM_ENABLED
++    // override the strategy if BGM is enabled
++    routing_strategy strategy = getStrategyforbackgroundsink((AudioSystem::stream_type)stream);
++#else
+     routing_strategy strategy = getStrategy((AudioSystem::stream_type)stream);
++#endif //BGM_ENABLED
++
++#ifdef BGM_ENABLED
++    //There can be scenarios where the user selects/deselects bgm support
++    //  hence check for the support before opening any output
++    if (IsBackgroundMusicSupported(stream)) {
++       ALOGV("[BGMUSIC] Enabling remote background music support");
++    }
++#endif //BGM_ENABLED
++
+     audio_devices_t device = getDeviceForStrategy(strategy, false /*fromCache*/);
+     ALOGV("getOutput() stream %d, samplingRate %d, format %d, channelMask %x, flags %x",
+           stream, samplingRate, format, channelMask, flags);
+@@ -676,6 +691,20 @@ audio_io_handle_t AudioPolicyManagerBase::getOutput(AudioSystem::stream_type str
+ 
+     ALOGV("getOutput() returns output %d", output);
+ 
++#ifdef BGM_ENABLED
++  //The check for flag is added to over come dummy getoutputs with
++  // invalid parameters JIC
++  //We check for flags as there can be a possibility of deep buffer
++  // enabled music streams in addition to BGM sink stream
++    if ((stream == AudioSystem::MUSIC)
++        && (mBGMOutput == 0)
++        && ((flags != 0)||(flags == (AudioSystem::output_flags)AUDIO_OUTPUT_FLAG_REMOTE_BGM))
++        && (mIsBGMEnabled)
++        && (device & AUDIO_DEVICE_OUT_REMOTE_BGM_SINK)) {
++            mBGMOutput = output;
++    }
++#endif //BGM_ENABLED
++
+     return output;
+ }
+ 
+@@ -764,7 +793,11 @@ status_t AudioPolicyManagerBase::startOutput(audio_io_handle_t output,
+ 
+     if (outputDesc->mRefCount[stream] == 1) {
+         audio_devices_t newDevice = getNewDevice(output, false /*fromCache*/);
++#ifdef BGM_ENABLED
++        routing_strategy strategy = getStrategyforbackgroundsink(stream);
++#else
+         routing_strategy strategy = getStrategy(stream);
++#endif //BGM_ENABLED
+         bool shouldWait = isSonificationStrategy(strategy);
+         uint32_t waitMs = 0;
+         bool force = false;
+@@ -2013,7 +2046,11 @@ void AudioPolicyManagerBase::checkOutputForStrategy(routing_strategy strategy)
+         }
+         // Move tracks associated to this strategy from previous output to new output
+         for (int i = 0; i < (int)AudioSystem::NUM_STREAM_TYPES; i++) {
++#ifdef BGM_ENABLED
++            if (getStrategyforbackgroundsink((AudioSystem::stream_type)i) == strategy) {
++#else
+             if (getStrategy((AudioSystem::stream_type)i) == strategy) {
++#endif //BGM_ENABLED
+                 //FIXME see fixme on name change
+                 mpClientInterface->setStreamOutput((AudioSystem::stream_type)i,
+                                                    dstOutputs[0] /* ignored */);
+@@ -2136,7 +2173,11 @@ audio_devices_t AudioPolicyManagerBase::getNewDevice(audio_io_handle_t output, b
+ }
+ 
+ uint32_t AudioPolicyManagerBase::getStrategyForStream(AudioSystem::stream_type stream) {
++#ifdef BGM_ENABLED
++    return (uint32_t)getStrategyforbackgroundsink(stream);
++#else
+     return (uint32_t)getStrategy(stream);
++#endif //BGM_ENABLED
+ }
+ 
+ audio_devices_t AudioPolicyManagerBase::getDevicesForStream(AudioSystem::stream_type stream) {
+@@ -2147,14 +2188,42 @@ audio_devices_t AudioPolicyManagerBase::getDevicesForStream(AudioSystem::stream_
+     if (stream < (AudioSystem::stream_type) 0 || stream >= AudioSystem::NUM_STREAM_TYPES) {
+         devices = AUDIO_DEVICE_NONE;
+     } else {
+-        AudioPolicyManagerBase::routing_strategy strategy = getStrategy(stream);
++#ifdef BGM_ENABLED
++        AudioPolicyManagerBase::routing_strategy strategy  = getStrategyforbackgroundsink(stream);
++#else
++        AudioPolicyManagerBase::routing_strategy strategy  = getStrategy(stream);
++#endif //BGM_ENABLED
+         devices = getDeviceForStrategy(strategy, true /*fromCache*/);
+     }
+     return devices;
+ }
+ 
++#ifdef BGM_ENABLED
++AudioPolicyManagerBase::routing_strategy AudioPolicyManagerBase::getStrategyforbackgroundsink(
++        AudioSystem::stream_type stream) {
++
++    // if bgm is enabled, all notifications, alarm, touch tones must be
++    // routed to the primary device user and it must not interfere with
++    // the remote user playback
++    if(mIsBGMEnabled) {
++      switch (stream) {
++      case AudioSystem::DTMF:
++      case AudioSystem::SYSTEM:
++      case AudioSystem::TTS:
++      case AudioSystem::ENFORCED_AUDIBLE:
++          return STRATEGY_BACKGROUND_MUSIC;
++      default:
++        ALOGVV("unsupported BGM strategy");
++      } //switch
++    } //if
++
++    return getStrategy(stream);
++}
++#endif// BGM_ENABLED
++
+ AudioPolicyManagerBase::routing_strategy AudioPolicyManagerBase::getStrategy(
+         AudioSystem::stream_type stream) {
++
+     // stream to strategy mapping
+     switch (stream) {
+     case AudioSystem::VOICE_CALL:
+@@ -2416,6 +2485,44 @@ audio_devices_t AudioPolicyManagerBase::getDeviceForStrategy(routing_strategy st
+         }
+         } break;
+ 
++    case STRATEGY_BACKGROUND_MUSIC: {
++
++#ifdef BGM_ENABLED
++        uint32_t device2 = 0;
++
++        ALOGV("[BGMUSIC] STRATEGY_BACKGROUND_MUSIC");
++
++        if (mHasA2dp && (mForceUse[AudioSystem::FOR_MEDIA] != AudioSystem::FORCE_NO_BT_A2DP) &&
++            (getA2dpOutput() != 0) && !mA2dpSuspended) {
++            if (device2 == 0) {
++                device2 = mAvailableOutputDevices & AudioSystem::DEVICE_OUT_BLUETOOTH_A2DP;
++            }
++            if (device2 == 0) {
++                device2 = mAvailableOutputDevices & AudioSystem::DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES;
++            }
++            if (device2 == AUDIO_DEVICE_NONE) {
++                device2 = mAvailableOutputDevices & AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_SPEAKER;
++            }
++        }
++        if (device2 == AUDIO_DEVICE_NONE) {
++            device2 = mAvailableOutputDevices & AUDIO_DEVICE_OUT_WIRED_HEADPHONE;
++        }
++        if (device2 == 0) {
++            device2 = mAvailableOutputDevices & AudioSystem::DEVICE_OUT_WIRED_HEADSET;
++        }
++        if (device2 == 0) {
++            device2 = mAvailableOutputDevices & AudioSystem::DEVICE_OUT_SPEAKER;
++        }
++
++        device |= device2;
++        if (device) break;
++        device = mDefaultOutputDevice;
++        if (device == 0) {
++            ALOGE("[BGMUSIC] getDeviceForStrategy() no device found for STRATEGY_BACKGROUND_MUSIC");
++        }
++#endif //BGM_ENABLED
++        } //STRATEGY_BACKGROUND_MUSIC
++        break;
+     default:
+         ALOGW("getDeviceForStrategy() unknown strategy: %d", strategy);
+         break;
+@@ -2916,7 +3023,11 @@ float AudioPolicyManagerBase::computeVolume(int stream,
+     // - always attenuate ring tones and notifications volume by 6dB
+     // - if music is playing, always limit the volume to current music volume,
+     // with a minimum threshold at -36dB so that notification is always perceived.
++#ifdef BGM_ENABLED
++    const routing_strategy stream_strategy = getStrategyforbackgroundsink((AudioSystem::stream_type)stream);
++#else
+     const routing_strategy stream_strategy = getStrategy((AudioSystem::stream_type)stream);
++#endif //BGM_ENABLED
+ 
+     if ((device & (AudioSystem::DEVICE_OUT_BLUETOOTH_A2DP |
+             AudioSystem::DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES |
+@@ -3016,7 +3127,7 @@ status_t AudioPolicyManagerBase::checkAndSetVolume(int stream,
+        // get the newly forced sink
+          audio_devices_t device2 = getDeviceForStrategy(STRATEGY_BACKGROUND_MUSIC, false /*fromCache*/);
+          float volume = computeVolume(stream, index, device2);
+-         ALOGV("[BGMUSIC] compute volume for the forced active sink = %d for device %x",volume, device2);
++         ALOGV("[BGMUSIC] compute volume for the forced active sink = %f for device %x",volume, device2);
+          //apply the new volume for the primary output
+          //TODO - needs to be extended for all attached sinks other than primary
+          mpClientInterface->setStreamVolume((AudioSystem::stream_type)stream, volume,
+@@ -3052,7 +3163,11 @@ void AudioPolicyManagerBase::setStrategyMute(routing_strategy strategy,
+ {
+     ALOGVV("setStrategyMute() strategy %d, mute %d, output %d", strategy, on, output);
+     for (int stream = 0; stream < AudioSystem::NUM_STREAM_TYPES; stream++) {
++#ifdef BGM_ENABLED
++        if (getStrategyforbackgroundsink((AudioSystem::stream_type)stream) == strategy) {
++#else
+         if (getStrategy((AudioSystem::stream_type)stream) == strategy) {
++#endif //BGM_ENABLED
+             setStreamMute(stream, on, output, delayMs, device);
+         }
+     }
+@@ -3106,7 +3221,11 @@ void AudioPolicyManagerBase::handleIncallSonification(int stream, bool starting,
+     // interfere with the device used for phone strategy
+     // if stateChange is true, we are called from setPhoneState() and we must mute or unmute as
+     // many times as there are active tracks on the output
++#ifdef BGM_ENABLED
++    const routing_strategy stream_strategy = getStrategyforbackgroundsink((AudioSystem::stream_type)stream);
++#else
+     const routing_strategy stream_strategy = getStrategy((AudioSystem::stream_type)stream);
++#endif //BGM_ENABLED
+     if (isStreamOfTypeSonification((AudioSystem::stream_type)stream)) {
+         AudioOutputDescriptor *outputDesc = mOutputs.valueFor(mPrimaryOutput);
+         ALOGV("handleIncallSonification() stream %d starting %d device %x stateChange %d",
+diff --git a/include/hardware_legacy/AudioPolicyManagerBase.h b/include/hardware_legacy/AudioPolicyManagerBase.h
+index cef7510..7ab48f5 100644
+--- a/include/hardware_legacy/AudioPolicyManagerBase.h
++++ b/include/hardware_legacy/AudioPolicyManagerBase.h
+@@ -151,6 +151,7 @@ protected:
+             STRATEGY_SONIFICATION_LOCAL,
+             STRATEGY_DTMF,
+             STRATEGY_ENFORCED_AUDIBLE,
++            STRATEGY_BACKGROUND_MUSIC,
+             NUM_STRATEGIES
+         };
+ 
+@@ -587,6 +588,12 @@ protected:
+         uint32_t        mTestLatencyMs;
+ #endif //AUDIO_POLICY_TEST
+ 
++#ifdef BGM_ENABLED
++        /*flag to keep track of background music*/
++        bool     mIsBGMEnabled;
++        audio_io_handle_t mBGMOutput;
++#endif /*BGM_ENABLED*/
++
+ private:
+         static float volIndexToAmpl(audio_devices_t device, const StreamDescriptor& streamDesc,
+                 int indexInUi);
+@@ -594,6 +601,11 @@ private:
+         //    routing of notifications
+         void handleNotificationRoutingForStream(AudioSystem::stream_type stream);
+         static bool isVirtualInputDevice(audio_devices_t device);
++#ifdef BGM_ENABLED
++        bool IsBackgroundMusicSupported(AudioSystem::stream_type stream);
++        // return the strategy corresponding to a given stream type in case of BGM
++        routing_strategy getStrategyforbackgroundsink(AudioSystem::stream_type stream);
++#endif // BGM_ENABLED
+         // Custom properties map
+         DefaultKeyedVector<String8, String8> mCustomPropertiesMap;
+ };
+-- 
+1.7.4.1
+

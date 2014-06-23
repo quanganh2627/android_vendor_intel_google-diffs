@@ -1,0 +1,203 @@
+From 9aa7baedad86d7b7ab43b7836029b2f8677bfc13 Mon Sep 17 00:00:00 2001
+From: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Date: Wed, 25 Sep 2013 13:41:42 -0700
+Subject: Dalvik: Disable possible class initialization in inlining
+
+BZ: 141510
+
+The inlining logic allows the compiler to possibly load classes but current
+compiler design does not allow it to act as an interpreter thread. Thus,
+GC and compiler can run in parallel and thus if loading happens, it may be
+a possible issue.
+
+Additionally, command line flag -Xjitdisablepredictedinlining has been added
+in order to disable just inlining of cases where prediction is needed.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I7305ff96da1868dfed24880386950e52699c47e6
+Orig-MCG-Change-Id: I850a49295daa6f6bb60171f33619d1bf7418695f
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Reviewed-on: http://android.intel.com:8080/134724
+Reviewed-by: Banerji, Udayan <udayan.banerji@intel.com>
+Reviewed-by: Beyler, Jean Christophe <jean.christophe.beyler@intel.com>
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: Hartley, Timothy D <timothy.d.hartley@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/Init.cpp                          |    3 ++
+ vm/compiler/InlineTransformation.cpp |   51 ++++++++++++++++++++++++++--------
+ vm/compiler/codegen/Optimizer.h      |    3 +-
+ 3 files changed, 44 insertions(+), 13 deletions(-)
+
+diff --git a/vm/Init.cpp b/vm/Init.cpp
+index 0d3ad3e..dd8cca7 100644
+--- a/vm/Init.cpp
++++ b/vm/Init.cpp
+@@ -184,6 +184,7 @@ static void usage(const char* progName)
+     dvmFprintf(stderr, "  -Xjitregisterization:<value> Request a maximum of registerization requests\n");
+     dvmFprintf(stderr, "  -Xjitdisableinlining Disables all method inlining\n");
+     dvmFprintf(stderr, "  -Xjitinliningmethodsizemax:<value> The maximum number of bytecodes a method can have to be considered for inlining\n");
++    dvmFprintf(stderr, "  -Xjitdisablepredictedinlining Disable method inlining that is done on a predicted method");
+ #if defined(VTUNE_DALVIK)
+     dvmFprintf(stderr, "  -Xjitsepdalvik\n");
+     dvmFprintf(stderr, "  -Xjitvtuneinfo:{none,jit,dex,src}\n");
+@@ -1627,6 +1628,8 @@ int processOptions(int argc, const char* const argv[], bool ignoreUnrecognized)
+                 dvmFprintf (stderr, "Refusing option for %s, it is not a valid number: "
+                         "must be only a strictly positive number\n", argv[i]);
+             }
++        } else if (strncmp(argv[i], "-Xjitdisablepredictedinlining", strlen ("-Xjitdisablepredictedinlining")) == 0) {
++            gDvmJit.disableOpt |= 1 << kPredictedMethodInlining;
+         } else if (strncmp(argv[i], "-Xjitoldloops", 13) == 0) {
+             gDvmJit.oldLoopDetection = true;
+         } else if (strncmp(argv[i], "-Xjitignorepasses:", strlen ("-Xjitignorepasses:")) == 0) {
+diff --git a/vm/compiler/InlineTransformation.cpp b/vm/compiler/InlineTransformation.cpp
+index e53743e..72a6cbc 100755
+--- a/vm/compiler/InlineTransformation.cpp
++++ b/vm/compiler/InlineTransformation.cpp
+@@ -57,6 +57,7 @@ enum InliningFailure
+     kInliningCalleeTooLarge,             //!< @brief Used when callee is too large
+     kInliningCalleeNotLeaf,              //!< @brief Used when callee is not a leaf
+     kInliningMethodComplicated,          //!< @brief Used when method is too complicated for inliner
++    kInliningClassNotLoaded,             //!< @brief Used when we try to find class object but cannot because it is not loaded
+ };
+ 
+ /**
+@@ -160,6 +161,9 @@ static const char *getFailureMessage (InliningFailure failure)
+         case kInliningMethodComplicated:
+             message = "method is too complicated for inliner";
+             break;
++        case kInliningClassNotLoaded:
++            message = "cannot find class object needed to create devirtualization check";
++            break;
+         default:
+             break;
+     }
+@@ -431,11 +435,11 @@ static inline bool isRangeInvoke (Opcode opcode)
+ }
+ 
+ /**
+- * @brief Used to check whether invoke is virtual or interface
++ * @brief Used to check if invoke is polymorphic and as a result needs prediction for inlining
+  * @param opcode The opcode to check
+- * @return Returns whether the invoke is virtual or interface
++ * @return Returns true if a prediction for inlining needs to be made
+  */
+-static inline bool isVirtualInvoke (Opcode opcode)
++static inline bool doesInvokeNeedPrediction (Opcode opcode)
+ {
+     switch (opcode)
+     {
+@@ -453,7 +457,6 @@ static inline bool isVirtualInvoke (Opcode opcode)
+ 
+     //If we get here we do not have a virtual invoke
+     return false;
+-
+ }
+ 
+ /**
+@@ -696,8 +699,20 @@ static MIR *createPredictionCheck (MIR *invoke)
+     //Get the callsite info to use to find class
+     CallsiteInfo *callsiteInfo = invoke->meta.callsiteInfo;
+ 
+-    //Find named class using loader from meta information
+-    ClassObject *clazz = dvmFindClassNoInit (callsiteInfo->classDescriptor, callsiteInfo->classLoader);
++    /**
++     * @warning Here we try to find named class using loader from meta information. Note that this
++     * is only safe to call from compiler because it does not initiate an actual load. If all backends
++     * could support pointer pools and had a section when the compiler thread would act as an interpreter,
++     * then we could possibly allow class resolution. Please note that this code assumes that the
++     * classLoader is a valid object that we still have a reference to.
++     */
++    ClassObject *clazz = dvmLookupClass (callsiteInfo->classDescriptor, callsiteInfo->classLoader, false);
++
++    //Class has not been loaded and for now we avoid loading from compiler
++    if (clazz == 0)
++    {
++        return 0;
++    }
+ 
+     //Get the class literal since there is a unique instance of the class
+     assert (sizeof (clazz) == sizeof (u4));
+@@ -753,6 +768,15 @@ static InliningFailure manipulateCFGForPrediction (GrowableList &callerBasicBloc
+     //Remember MIR previous to the invoke
+     MIR *beforeInvoke = invoke->prev;
+ 
++    //Create prediction check first. The reason we do that is so that we can reject in case
++    //creation of check is not successful.
++    MIR *checkPrediction = createPredictionCheck (invoke);
++
++    if (checkPrediction == 0)
++    {
++        return kInliningClassNotLoaded;
++    }
++
+     //Remove the invoke and move-result from their BBs
+     InliningFailure removed = removeInvokeAndMoveResult (callerBasicBlocks, invoke, moveResult);
+ 
+@@ -762,9 +786,6 @@ static InliningFailure manipulateCFGForPrediction (GrowableList &callerBasicBloc
+         return removed;
+     }
+ 
+-    //Create prediction check
+-    MIR *checkPrediction = createPredictionCheck (invoke);
+-
+     //We insert our check in place of the invoke
+     dvmCompilerInsertMIRAfter (invokeBB, beforeInvoke, checkPrediction);
+ 
+@@ -1803,6 +1824,10 @@ static bool handleInlining (CompilationUnit *cUnit, JitTranslationInfo *info, Ba
+     assert (invoke != 0);
+     assert ((static_cast<int> (dvmCompilerGetOpcodeFlags (opcode)) & kInstrInvoke) != 0);
+ 
++    //Figure out early if we need to make a prediction for the inlining.
++    //We would need to make a prediction in case of a polymorphic call.
++    bool isPredicted = doesInvokeNeedPrediction (opcode);
++
+     //Assume we will successfully inline
+     InliningFailure inlined = kInliningSuccess;
+ 
+@@ -1814,6 +1839,11 @@ static bool handleInlining (CompilationUnit *cUnit, JitTranslationInfo *info, Ba
+     {
+         inlined = kInliningDisabled;
+     }
++    //Then check if we need to make prediction but predicted inlining is disabled
++    else if ((gDvmJit.disableOpt & (1 << kPredictedMethodInlining)) != 0 && isPredicted == true)
++    {
++        inlined = kInliningDisabled;
++    }
+     //Disable inlining when doing method tracing
+     else if (gDvmJit.methodTraceSupport)
+     {
+@@ -1851,9 +1881,6 @@ static bool handleInlining (CompilationUnit *cUnit, JitTranslationInfo *info, Ba
+             calleeMethod = invoke->meta.callsiteInfo->method;
+         }
+ 
+-        //Keep track of whether the invoke is of polymorphic method
+-        bool isPredicted = isVirtualInvoke (opcode);
+-
+         //If we do not have a predicted invoke and we still don't know method, we try to resolve it
+         if (isPredicted == false && calleeMethod == 0)
+         {
+diff --git a/vm/compiler/codegen/Optimizer.h b/vm/compiler/codegen/Optimizer.h
+index 0485149..ea608d1 100644
+--- a/vm/compiler/codegen/Optimizer.h
++++ b/vm/compiler/codegen/Optimizer.h
+@@ -31,7 +31,8 @@ enum optControlVector {
+     kMethodInlining,
+     kMethodJit,
+     kShortJumpOffset,
+-    kElimConstInitOpt
++    kElimConstInitOpt,
++    kPredictedMethodInlining,
+ };
+ 
+ /* Forward declarations */
+-- 
+1.7.4.1
+

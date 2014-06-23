@@ -1,0 +1,2091 @@
+From 82d1c0afde783a1b2542eb53800454a1f2aa2309 Mon Sep 17 00:00:00 2001
+From: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Date: Mon, 1 Apr 2013 12:04:07 -0700
+Subject: Dalvik: Build expression trees
+
+BZ: 93475
+
+Enables expression tree building for Dalvik middle-end. Currently
+supports building expressions trees for add, sub, mul, and const
+bytecodes.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: If05656e2f891a6f87bf2864eff19cdb567769b07
+Orig-MCG-Change-Id: Iea705032d8d385ada6d92edbf5aceae0e1a25f1e
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ libdex/InstrUtils.cpp           |   54 +++
+ libdex/InstrUtils.h             |    7 +
+ vm/Dvm.mk                       |    3 +-
+ vm/compiler/CompilerIR.h        |    6 +
+ vm/compiler/Dataflow.cpp        |  114 +++----
+ vm/compiler/Dataflow.h          |    9 +
+ vm/compiler/Expression.cpp      |  828 +++++++++++++++++++++++++++++++++++++++
+ vm/compiler/Expression.h        |  814 ++++++++++++++++++++++++++++++++++++++
+ vm/compiler/IntermediateRep.cpp |   11 +
+ 9 files changed, 1778 insertions(+), 68 deletions(-)
+ create mode 100644 vm/compiler/Expression.cpp
+ create mode 100644 vm/compiler/Expression.h
+
+diff --git a/libdex/InstrUtils.cpp b/libdex/InstrUtils.cpp
+index be343f0..2d3b895 100644
+--- a/libdex/InstrUtils.cpp
++++ b/libdex/InstrUtils.cpp
+@@ -676,3 +676,57 @@ size_t dexGetWidthFromInstruction(const u2* insns)
+ 
+     return width;
+ }
++
++/**
++ * @brief Given a decoded instruction, it checks whether the instruction
++ * sets a constant and if it does, more information is provided about the
++ * constant being set.
++ * @param decInsn The input decoded instruction.
++ * @param lowConst Updated by function to represent the lower 32 bits of
++ * the constant being set.
++ * @param highConst Updated by function to represent the higher 32 bits
++ * of the constant being set.
++ * @param wide Updated by function whether a wide constant is being set by
++ * bytecode.
++ * @return Returns false if the decoded instruction does not represent a
++ * constant bytecode.
++ */
++bool dexGetConstant (const DecodedInstruction &dInsn, int &lowConst,
++        int &highConst, bool &wide)
++{
++    bool setsConst = true;
++
++    switch (dInsn.opcode) {
++        case OP_CONST_4:
++        case OP_CONST_16:
++        case OP_CONST:
++            wide = false;
++            lowConst = dInsn.vB;
++            break;
++        case OP_CONST_HIGH16:
++            wide = false;
++            lowConst = dInsn.vB << 16;
++            break;
++        case OP_CONST_WIDE_16:
++        case OP_CONST_WIDE_32:
++            wide = true;
++            lowConst = dInsn.vB;
++            highConst = 0;
++            break;
++        case OP_CONST_WIDE:
++            wide = true;
++            lowConst = (int) dInsn.vB_wide;
++            highConst = (int) (dInsn.vB_wide >> 32);
++            break;
++        case OP_CONST_WIDE_HIGH16:
++            wide = true;
++            lowConst = 0;
++            highConst = dInsn.vB << 16;
++            break;
++        default:
++            setsConst = false;
++            break;
++    }
++
++    return setsConst;
++}
+diff --git a/libdex/InstrUtils.h b/libdex/InstrUtils.h
+index 76993a5..5af1664 100644
+--- a/libdex/InstrUtils.h
++++ b/libdex/InstrUtils.h
+@@ -192,4 +192,11 @@ DEX_INLINE InstructionIndexType dexGetIndexTypeFromOpcode(Opcode opcode)
+  */
+ void dexDecodeInstruction(const u2* insns, DecodedInstruction* pDec);
+ 
++/*
++ * Given a decoded instruction representing a const bytecode, it updates
++ * the out arguments with proper values as dictated by the constant bytecode.
++ */
++bool dexGetConstant (const DecodedInstruction &dInsn, int &lowConst,
++        int &highConst, bool &wide);
++
+ #endif  // LIBDEX_INSTRUTILS_H_
+diff --git a/vm/Dvm.mk b/vm/Dvm.mk
+index 724aac0..a55c84d 100644
+--- a/vm/Dvm.mk
++++ b/vm/Dvm.mk
+@@ -360,7 +360,8 @@ ifeq ($(dvm_arch),x86)
+               compiler/BBOptimization.cpp \
+               compiler/LoopInformation.cpp \
+               compiler/SSAWalkData.cpp \
+-              compiler/RegisterizationME.cpp
++              compiler/RegisterizationME.cpp \
++              compiler/Expression.cpp
+        # need apache harmony x86 encoder/decoder
+        LOCAL_C_INCLUDES += \
+ 	      dalvik/vm/compiler/codegen/x86/libenc
+diff --git a/vm/compiler/CompilerIR.h b/vm/compiler/CompilerIR.h
+index a1e671e..a7ff4a4 100644
+--- a/vm/compiler/CompilerIR.h
++++ b/vm/compiler/CompilerIR.h
+@@ -356,6 +356,12 @@ typedef struct CompilationUnit {
+ 
+ BasicBlock *dvmCompilerNewBB(BBType blockType, int blockId);
+ 
++/**
++ * @brief Used for allocating a new MIR.
++ * @return Returns the newly created MIR.
++ */
++MIR *dvmCompilerNewMIR(void);
++
+ void dvmCompilerAppendMIR(BasicBlock *bb, MIR *mir);
+ 
+ void dvmCompilerPrependMIR(BasicBlock *bb, MIR *mir);
+diff --git a/vm/compiler/Dataflow.cpp b/vm/compiler/Dataflow.cpp
+index 3573814..6e7acb7 100644
+--- a/vm/compiler/Dataflow.cpp
++++ b/vm/compiler/Dataflow.cpp
+@@ -467,13 +467,13 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_DA | DF_UB,
+ 
+     // 90 OP_ADD_INT vAA, vBB, vCC
+-    DF_DA | DF_UB | DF_UC | DF_IS_LINEAR,
++    DF_DA | DF_UB | DF_UC | DF_IS_LINEAR | DF_ADD_EXPRESSION,
+ 
+     // 91 OP_SUB_INT vAA, vBB, vCC
+-    DF_DA | DF_UB | DF_UC | DF_IS_LINEAR,
++    DF_DA | DF_UB | DF_UC | DF_IS_LINEAR | DF_SUBTRACT_EXPRESSION,
+ 
+     // 92 OP_MUL_INT vAA, vBB, vCC
+-    DF_DA | DF_UB | DF_UC,
++    DF_DA | DF_UB | DF_UC | DF_MULTIPLY_EXPRESSION,
+ 
+     // 93 OP_DIV_INT vAA, vBB, vCC
+     DF_DA | DF_UB | DF_UC,
+@@ -500,13 +500,13 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_DA | DF_UB | DF_UC,
+ 
+     // 9B OP_ADD_LONG vAA, vBB, vCC
+-    DF_DA_WIDE | DF_UB_WIDE | DF_UC_WIDE,
++    DF_DA_WIDE | DF_UB_WIDE | DF_UC_WIDE | DF_ADD_EXPRESSION,
+ 
+     // 9C OP_SUB_LONG vAA, vBB, vCC
+-    DF_DA_WIDE | DF_UB_WIDE | DF_UC_WIDE,
++    DF_DA_WIDE | DF_UB_WIDE | DF_UC_WIDE | DF_SUBTRACT_EXPRESSION,
+ 
+     // 9D OP_MUL_LONG vAA, vBB, vCC
+-    DF_DA_WIDE | DF_UB_WIDE | DF_UC_WIDE,
++    DF_DA_WIDE | DF_UB_WIDE | DF_UC_WIDE | DF_MULTIPLY_EXPRESSION,
+ 
+     // 9E OP_DIV_LONG vAA, vBB, vCC
+     DF_DA_WIDE | DF_UB_WIDE | DF_UC_WIDE,
+@@ -533,13 +533,13 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_DA_WIDE | DF_UB_WIDE | DF_UC,
+ 
+     // A6 OP_ADD_FLOAT vAA, vBB, vCC
+-    DF_DA | DF_UB | DF_UC | DF_FP_A | DF_FP_B | DF_FP_C,
++    DF_DA | DF_UB | DF_UC | DF_FP_A | DF_FP_B | DF_FP_C | DF_ADD_EXPRESSION,
+ 
+     // A7 OP_SUB_FLOAT vAA, vBB, vCC
+-    DF_DA | DF_UB | DF_UC | DF_FP_A | DF_FP_B | DF_FP_C,
++    DF_DA | DF_UB | DF_UC | DF_FP_A | DF_FP_B | DF_FP_C | DF_SUBTRACT_EXPRESSION,
+ 
+     // A8 OP_MUL_FLOAT vAA, vBB, vCC
+-    DF_DA | DF_UB | DF_UC | DF_FP_A | DF_FP_B | DF_FP_C,
++    DF_DA | DF_UB | DF_UC | DF_FP_A | DF_FP_B | DF_FP_C | DF_MULTIPLY_EXPRESSION,
+ 
+     // A9 OP_DIV_FLOAT vAA, vBB, vCC
+     DF_DA | DF_UB | DF_UC | DF_FP_A | DF_FP_B | DF_FP_C,
+@@ -548,13 +548,13 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_DA | DF_UB | DF_UC | DF_FP_A | DF_FP_B | DF_FP_C,
+ 
+     // AB OP_ADD_DOUBLE vAA, vBB, vCC
+-    DF_DA_WIDE | DF_UB_WIDE | DF_UC_WIDE | DF_FP_A | DF_FP_B | DF_FP_C,
++    DF_DA_WIDE | DF_UB_WIDE | DF_UC_WIDE | DF_FP_A | DF_FP_B | DF_FP_C | DF_ADD_EXPRESSION,
+ 
+     // AC OP_SUB_DOUBLE vAA, vBB, vCC
+-    DF_DA_WIDE | DF_UB_WIDE | DF_UC_WIDE | DF_FP_A | DF_FP_B | DF_FP_C,
++    DF_DA_WIDE | DF_UB_WIDE | DF_UC_WIDE | DF_FP_A | DF_FP_B | DF_FP_C | DF_SUBTRACT_EXPRESSION,
+ 
+     // AD OP_MUL_DOUBLE vAA, vBB, vCC
+-    DF_DA_WIDE | DF_UB_WIDE | DF_UC_WIDE | DF_FP_A | DF_FP_B | DF_FP_C,
++    DF_DA_WIDE | DF_UB_WIDE | DF_UC_WIDE | DF_FP_A | DF_FP_B | DF_FP_C | DF_MULTIPLY_EXPRESSION,
+ 
+     // AE OP_DIV_DOUBLE vAA, vBB, vCC
+     DF_DA_WIDE | DF_UB_WIDE | DF_UC_WIDE | DF_FP_A | DF_FP_B | DF_FP_C,
+@@ -563,13 +563,13 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_DA_WIDE | DF_UB_WIDE | DF_UC_WIDE | DF_FP_A | DF_FP_B | DF_FP_C,
+ 
+     // B0 OP_ADD_INT_2ADDR vA, vB
+-    DF_DA | DF_UA | DF_UB,
++    DF_DA | DF_UA | DF_UB | DF_ADD_EXPRESSION,
+ 
+     // B1 OP_SUB_INT_2ADDR vA, vB
+-    DF_DA | DF_UA | DF_UB,
++    DF_DA | DF_UA | DF_UB | DF_SUBTRACT_EXPRESSION,
+ 
+     // B2 OP_MUL_INT_2ADDR vA, vB
+-    DF_DA | DF_UA | DF_UB,
++    DF_DA | DF_UA | DF_UB | DF_MULTIPLY_EXPRESSION,
+ 
+     // B3 OP_DIV_INT_2ADDR vA, vB
+     DF_DA | DF_UA | DF_UB,
+@@ -596,13 +596,13 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_DA | DF_UA | DF_UB,
+ 
+     // BB OP_ADD_LONG_2ADDR vA, vB
+-    DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE,
++    DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE | DF_ADD_EXPRESSION,
+ 
+     // BC OP_SUB_LONG_2ADDR vA, vB
+-    DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE,
++    DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE | DF_SUBTRACT_EXPRESSION,
+ 
+     // BD OP_MUL_LONG_2ADDR vA, vB
+-    DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE,
++    DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE | DF_MULTIPLY_EXPRESSION,
+ 
+     // BE OP_DIV_LONG_2ADDR vA, vB
+     DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE,
+@@ -629,13 +629,13 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_DA_WIDE | DF_UA_WIDE | DF_UB,
+ 
+     // C6 OP_ADD_FLOAT_2ADDR vA, vB
+-    DF_DA | DF_UA | DF_UB | DF_FP_A | DF_FP_B,
++    DF_DA | DF_UA | DF_UB | DF_FP_A | DF_FP_B | DF_ADD_EXPRESSION,
+ 
+     // C7 OP_SUB_FLOAT_2ADDR vA, vB
+-    DF_DA | DF_UA | DF_UB | DF_FP_A | DF_FP_B,
++    DF_DA | DF_UA | DF_UB | DF_FP_A | DF_FP_B | DF_SUBTRACT_EXPRESSION,
+ 
+     // C8 OP_MUL_FLOAT_2ADDR vA, vB
+-    DF_DA | DF_UA | DF_UB | DF_FP_A | DF_FP_B,
++    DF_DA | DF_UA | DF_UB | DF_FP_A | DF_FP_B | DF_MULTIPLY_EXPRESSION,
+ 
+     // C9 OP_DIV_FLOAT_2ADDR vA, vB
+     DF_DA | DF_UA | DF_UB | DF_FP_A | DF_FP_B,
+@@ -644,13 +644,13 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_DA | DF_UA | DF_UB | DF_FP_A | DF_FP_B,
+ 
+     // CB OP_ADD_DOUBLE_2ADDR vA, vB
+-    DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE | DF_FP_A | DF_FP_B,
++    DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE | DF_FP_A | DF_FP_B | DF_ADD_EXPRESSION,
+ 
+     // CC OP_SUB_DOUBLE_2ADDR vA, vB
+-    DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE | DF_FP_A | DF_FP_B,
++    DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE | DF_FP_A | DF_FP_B | DF_SUBTRACT_EXPRESSION,
+ 
+     // CD OP_MUL_DOUBLE_2ADDR vA, vB
+-    DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE | DF_FP_A | DF_FP_B,
++    DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE | DF_FP_A | DF_FP_B | DF_MULTIPLY_EXPRESSION,
+ 
+     // CE OP_DIV_DOUBLE_2ADDR vA, vB
+     DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE | DF_FP_A | DF_FP_B,
+@@ -659,13 +659,13 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE | DF_FP_A | DF_FP_B,
+ 
+     // D0 OP_ADD_INT_LIT16 vA, vB, #+CCCC
+-    DF_DA | DF_UB,
++    DF_DA | DF_UB | DF_ADD_EXPRESSION,
+ 
+     // D1 OP_RSUB_INT vA, vB, #+CCCC
+-    DF_DA | DF_UB,
++    DF_DA | DF_UB | DF_SUBTRACT_EXPRESSION,
+ 
+     // D2 OP_MUL_INT_LIT16 vA, vB, #+CCCC
+-    DF_DA | DF_UB,
++    DF_DA | DF_UB | DF_MULTIPLY_EXPRESSION,
+ 
+     // D3 OP_DIV_INT_LIT16 vA, vB, #+CCCC
+     DF_DA | DF_UB,
+@@ -683,13 +683,13 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_DA | DF_UB,
+ 
+     // D8 OP_ADD_INT_LIT8 vAA, vBB, #+CC
+-    DF_DA | DF_UB | DF_IS_LINEAR,
++    DF_DA | DF_UB | DF_IS_LINEAR | DF_ADD_EXPRESSION,
+ 
+     // D9 OP_RSUB_INT_LIT8 vAA, vBB, #+CC
+-    DF_DA | DF_UB,
++    DF_DA | DF_UB | DF_SUBTRACT_EXPRESSION,
+ 
+     // DA OP_MUL_INT_LIT8 vAA, vBB, #+CC
+-    DF_DA | DF_UB,
++    DF_DA | DF_UB | DF_MULTIPLY_EXPRESSION,
+ 
+     // DB OP_DIV_INT_LIT8 vAA, vBB, #+CC
+     DF_DA | DF_UB,
+@@ -1692,49 +1692,29 @@ bool dvmCompilerDoConstantPropagation(CompilationUnit *cUnit, BasicBlock *bb)
+         int dfAttributes =
+             dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
+ 
+-        DecodedInstruction *dInsn = &mir->dalvikInsn;
+-
+         if (!(dfAttributes & DF_HAS_DEFS)) continue;
+ 
+         /* Handle instructions that set up constants directly */
+         if (dfAttributes & DF_SETS_CONST) {
+-            if (dfAttributes & DF_DA) {
+-                switch (dInsn->opcode) {
+-                    case OP_CONST_4:
+-                    case OP_CONST_16:
+-                    case OP_CONST:
+-                        setConstant(cUnit, mir->ssaRep->defs[0], dInsn->vB);
+-                        break;
+-                    case OP_CONST_HIGH16:
+-                        setConstant(cUnit, mir->ssaRep->defs[0],
+-                                    dInsn->vB << 16);
+-                        break;
+-                    default:
+-                        break;
+-                }
+-            } else if (dfAttributes & DF_DA_WIDE) {
+-                switch (dInsn->opcode) {
+-                    case OP_CONST_WIDE_16:
+-                    case OP_CONST_WIDE_32:
+-                        setConstant(cUnit, mir->ssaRep->defs[0], dInsn->vB);
+-                        setConstant(cUnit, mir->ssaRep->defs[1], 0);
+-                        break;
+-                    case OP_CONST_WIDE:
+-                        setConstant(cUnit, mir->ssaRep->defs[0],
+-                                    (int) dInsn->vB_wide);
+-                        setConstant(cUnit, mir->ssaRep->defs[1],
+-                                    (int) (dInsn->vB_wide >> 32));
+-                        break;
+-                    case OP_CONST_WIDE_HIGH16:
+-                        setConstant(cUnit, mir->ssaRep->defs[0], 0);
+-                        setConstant(cUnit, mir->ssaRep->defs[1],
+-                                    dInsn->vB << 16);
+-                        break;
+-                    default:
+-                        break;
++            int lowConst = 0, highConst = 0;
++            bool isWide = false;
++
++            bool setsConst = dexGetConstant (mir->dalvikInsn, lowConst,
++                    highConst, isWide);
++
++            //Since we always know we have a constant set expression, this
++            //should always be true.
++            if (setsConst == true)
++            {
++                setConstant (cUnit, mir->ssaRep->defs[0], lowConst);
++
++                if (isWide == true)
++                {
++                    setConstant (cUnit, mir->ssaRep->defs[1], highConst);
+                 }
+             }
+-        /* Handle instructions that set up constants directly */
++
++        /* Handle instructions that set constant by moving it from another register */
+         } else if (dfAttributes & DF_IS_MOVE) {
+             int i;
+ 
+diff --git a/vm/compiler/Dataflow.h b/vm/compiler/Dataflow.h
+index 23f6707..fe37e55 100644
+--- a/vm/compiler/Dataflow.h
++++ b/vm/compiler/Dataflow.h
+@@ -48,6 +48,9 @@ typedef enum DataFlowAttributePos {
+     kSetter,
+     kCall,
+     kClobbersMemory,
++    kAddExpression,
++    kSubtractExpression,
++    kMultiplyExpression,
+ } DataFlowAttributes;
+ 
+ #define DF_NOP                  0
+@@ -78,6 +81,12 @@ typedef enum DataFlowAttributePos {
+ #define DF_IS_SETTER            (1 << kSetter)
+ #define DF_IS_CALL              (1 << kCall)
+ #define DF_CLOBBERS_MEMORY      (1 << kClobbersMemory)
++#define DF_ADD_EXPRESSION       (1 << kAddExpression)
++#define DF_SUBTRACT_EXPRESSION  (1 << kSubtractExpression)
++#define DF_MULTIPLY_EXPRESSION  (1 << kMultiplyExpression)
++//Note that we are getting close to overflowing the DF properties
++//since we use an int as representation. If you are adding something
++//new here, you should be careful.
+ 
+ #define DF_HAS_USES             (DF_UA | DF_UB | DF_UC | DF_UA_WIDE | \
+                                  DF_UB_WIDE | DF_UC_WIDE)
+diff --git a/vm/compiler/Expression.cpp b/vm/compiler/Expression.cpp
+new file mode 100644
+index 0000000..776d638
+--- /dev/null
++++ b/vm/compiler/Expression.cpp
+@@ -0,0 +1,828 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "Expression.h"
++#include "Dataflow.h"
++#include <sstream>
++#include <utility>
++#include <algorithm>
++
++std::vector<Expression *> UnaryExpression::getChildren (void) const
++{
++    std::vector<Expression *> child;
++
++    //Unary expressions only have one child
++    child.push_back (operand);
++
++    return child;
++}
++
++std::vector<Expression *> BinaryExpression::getChildren (void) const
++{
++    std::vector<Expression *> children;
++
++    //Binary expressions have two children
++    children.push_back (lhs);
++    children.push_back (rhs);
++
++    return children;
++}
++
++std::string BinaryExpression::toString (const CompilationUnit * cUnit)
++{
++    std::string expressionString;
++
++    expressionString.append ("(");
++    expressionString.append (assignmentTo->toString (cUnit));
++    expressionString.append (" = ");
++
++    //For phi expressions we need to prepend before printing
++    //operands.
++    if (expKind == ExpKind_Phi)
++    {
++        expressionString.append ("PHI");
++    }
++
++    expressionString.append ("(");
++
++    //Print lhs operand first
++    expressionString.append (lhs->toString (cUnit));
++
++    //Now we print the operation
++    if (expKind == ExpKind_Add)
++    {
++        expressionString.append (" + ");
++    }
++    else if (expKind == ExpKind_Sub)
++    {
++        expressionString.append (" - ");
++    }
++    else if (expKind == ExpKind_Mul)
++    {
++        expressionString.append (" * ");
++    }
++    else if (expKind == ExpKind_Phi)
++    {
++        expressionString.append (", ");
++    }
++    else
++    {
++        expressionString.append (" ?? ");
++
++        //In the assert world, we want to know if we added a new
++        //expression kind without updating the toString
++        assert(false);
++    }
++
++    //Now we can print rhs operand
++    expressionString.append (rhs->toString (cUnit));
++    expressionString.append ("))");
++
++    return expressionString;
++}
++
++std::string UnaryExpression::toString (const CompilationUnit * cUnit)
++{
++    std::string expressionString;
++
++    expressionString.append ("(");
++    expressionString.append (assignmentTo->toString (cUnit));
++    expressionString.append (" = ");
++    expressionString.append (operand->toString (cUnit));
++    expressionString.append (")");
++
++    return expressionString;
++}
++
++std::string VirtualRegister::toString (const CompilationUnit * cUnit)
++{
++    std::stringstream ss;
++
++    //For readability, we convert to dalvik register
++    int lowDalvikReg = dvmExtractSSARegister (cUnit, this->lowSsaReg);
++
++    ss << "v" << lowDalvikReg;
++
++    //If our virtual register is wide, we print the VR for the high bits
++    if (isWide ())
++    {
++        //Technically we could print lowDalvikReg+1, but converting
++        //is not as brittle.
++        int highDalvikReg = dvmExtractSSARegister (cUnit, this->highSsaReg);
++
++        ss << ",v" << highDalvikReg;
++    }
++
++    return ss.str ();
++}
++
++std::string ConstantExpression::toString (const CompilationUnit * cUnit)
++{
++    std::stringstream ss;
++
++    //Since we don't know how the constant will be interpreted, we always
++    //print its 64-bit int representation.
++    ss << getValue<int64_t> ();
++
++    return ss.str ();
++}
++
++Expression * Expression::mirToExpression (MIR * mir,
++        std::map<VirtualRegister *, Expression *> * vrToExpression)
++{
++    //If mir is null, we have no expression to build
++    if (mir == 0)
++    {
++        return 0;
++    }
++
++    //Get local copy of opcode
++    int dalvikOpcode = mir->dalvikInsn.opcode;
++
++    Expression * result = 0;
++
++    //In order to figure out how to create the expression, we look at flags
++    //from the dataflow information. However, a better approach here would be
++    //to update opcode-gen to automatically generate tables with this
++    //information for every bytecode. That can only work when expression
++    //implementation is complete.
++    if (dvmCompilerDataFlowAttributes[dalvikOpcode] & DF_ADD_EXPRESSION)
++    {
++        result = BinaryExpression::mirToExpression (mir, vrToExpression,
++                ExpKind_Add);
++    }
++    else if (dvmCompilerDataFlowAttributes[dalvikOpcode]
++            & DF_SUBTRACT_EXPRESSION)
++    {
++        result = BinaryExpression::mirToExpression (mir, vrToExpression,
++                ExpKind_Sub);
++    }
++    else if (dvmCompilerDataFlowAttributes[dalvikOpcode]
++            & DF_MULTIPLY_EXPRESSION)
++    {
++        result = BinaryExpression::mirToExpression (mir, vrToExpression,
++                ExpKind_Mul);
++    }
++    else if (dvmCompilerDataFlowAttributes[dalvikOpcode] & DF_SETS_CONST)
++    {
++        result = UnaryExpression::mirToExpression (mir, vrToExpression,
++                ExpKind_ConstSet);
++    }
++    else if (dalvikOpcode == kMirOpPhi)
++    {
++        result = BinaryExpression::mirToExpression (mir, vrToExpression,
++                ExpKind_Phi);
++    }
++
++    return result;
++}
++
++std::map<MIR *, Expression *> Expression::mirsToExpressions (
++        const std::vector<MIR *> & listOfMirs)
++{
++    std::map<VirtualRegister *, Expression *> vrToExpression;
++    std::map<MIR *, Expression *> mirToExpressionMap;
++
++    for (std::vector<MIR *>::const_iterator iter = listOfMirs.begin ();
++            iter != listOfMirs.end (); iter++)
++    {
++        //Get the mir
++        MIR * mir = (*iter);
++
++        //Convert mir to expression
++        Expression * result = mirToExpression (mir, &vrToExpression);
++
++        //We insert the mapping into the map. Note that null expression
++        //is allowed to be inserted.
++        mirToExpressionMap.insert (
++                std::pair<MIR *, Expression *> (mir, result));
++    }
++
++    return mirToExpressionMap;
++}
++
++BinaryExpression * BinaryExpression::mirToExpression (MIR * mir,
++        std::map<VirtualRegister *, Expression *> * vrToExpression,
++        ExpressionKind expKind)
++{
++    //If mir is null, we have no expression to build
++    if (mir == 0)
++    {
++        return 0;
++    }
++
++    //Get local copy of ssa representation
++    SSARepresentation * ssaRep = mir->ssaRep;
++
++    //We cannot build the expression for assignment to without ssa rep
++    if (ssaRep == 0)
++    {
++        return 0;
++    }
++
++    //If we don't have at least one definition we cannot create an assignment
++    //expression.
++    if (ssaRep->numDefs <= 0 || ssaRep->defs == 0)
++    {
++        return 0;
++    }
++
++    //The results of all binary expressions must be assigned to a VR so we create
++    //an expression for that first. We must create the VR and thus we don't need
++    //a map to look for an expression tree.
++    VirtualRegister * assignTo = 0;
++    Expression * assignToExpr = 0;
++
++    {
++        bool isWide = (ssaRep->numDefs == 1) ? false : true;
++        int lowSsaReg = ssaRep->defs[0];
++        int highSsaReg = isWide ? ssaRep->defs[1] : 0;
++
++        assignToExpr = VirtualRegister::convertToVR (0, lowSsaReg, highSsaReg,
++                isWide);
++    }
++
++    if (assignToExpr != 0)
++    {
++        //Because of how we built it, it should be a virtual register but we
++        //are just being paranoid
++        if (assignToExpr->isVirtualRegister () == true)
++        {
++            assignTo = static_cast<VirtualRegister *> (assignToExpr);
++        }
++    }
++
++    //If we fail at creating the VR we are assigning to, then we cannot
++    //complete successfully
++    if (assignTo == 0)
++    {
++        return 0;
++    }
++
++    Expression *lhs = 0, *rhs = 0;
++
++    //Since we are generating for a binary expression, there must be two operands
++    //Thus we look at the number of uses to figure out which of the following
++    //scenarios we are dealing with:
++    // 1. One use means one operand is non-wide VR and other is literal
++    // 2. Two uses means both operands are non-wide VRs
++    // 3. Four uses means both operands are wide VRs
++
++    if (ssaRep->numUses == 1)
++    {
++        assert (ssaRep->uses != 0);
++
++        lhs = VirtualRegister::convertToVR (vrToExpression, ssaRep->uses[0]);
++
++        int literalValue = mir->dalvikInsn.vC;
++        rhs = ConstantExpression::newExpression (literalValue);
++    }
++    else if (ssaRep->numUses == 2)
++    {
++        assert (ssaRep->uses != 0);
++
++        lhs = VirtualRegister::convertToVR (vrToExpression, ssaRep->uses[0]);
++        rhs = VirtualRegister::convertToVR (vrToExpression, ssaRep->uses[1]);
++    }
++    else if (ssaRep->numUses == 4)
++    {
++        assert (ssaRep->uses != 0);
++
++        lhs = VirtualRegister::convertToVR (vrToExpression, ssaRep->uses[0],
++                ssaRep->uses[1], true);
++        rhs = VirtualRegister::convertToVR (vrToExpression, ssaRep->uses[2],
++                ssaRep->uses[3], true);
++    }
++    else
++    {
++        //An assumption we made must be wrong if we get here. In assert world
++        //we want to fail if we get here.
++        assert (false);
++
++        return 0;
++    }
++
++    //If we did not generate operands successfully, then we cannot fully
++    //generate the expression.
++    if (lhs == 0 || rhs == 0)
++    {
++        return 0;
++    }
++
++    BinaryExpression * result = 0;
++
++    //Now we put together the operands to create a binary expression
++    if (expKind != ExpKind_Invalid)
++    {
++        //In order to create expression, we must first find out the
++        //primitive type of the result.
++        ExpressionType expType = BytecodeExpression::getExpressionType (
++                mir->dalvikInsn.opcode);
++
++        //If we know the type, we can create the binary expression
++        if (expType != ExpType_Invalid)
++        {
++            result = BinaryExpression::newExpression (mir, assignTo, lhs, rhs,
++                    expKind, expType);
++        }
++    }
++
++    //If we have created an expression, we should add its tree to the mapping
++    //of VRs to Expressions
++    if (result != 0 && vrToExpression != 0)
++    {
++        vrToExpression->insert (
++                std::pair<VirtualRegister *, Expression *> (assignTo, result));
++    }
++
++    //Return the expression
++    return result;
++
++}
++
++UnaryExpression * UnaryExpression::mirToExpression (MIR * mir,
++        std::map<VirtualRegister *, Expression *> * vrToExpression,
++        ExpressionKind expKind)
++{
++    //If mir is null, we have no expression to build
++    if (mir == 0)
++    {
++        return 0;
++    }
++
++    //Get local copy of the ssa representation
++    SSARepresentation * ssaRep = mir->ssaRep;
++
++    //We cannot build the expression for assignment to without ssa rep
++    if (ssaRep == 0)
++    {
++        return 0;
++    }
++
++    //If we don't have at least one definition we cannot create an assignment
++    //expression.
++    if (ssaRep->numDefs <= 0 || ssaRep->defs == 0)
++    {
++        return 0;
++    }
++
++    //The results of all unary expressions must be assigned to a VR so we create
++    //an expression for that first. We must create the VR and thus we don't need
++    //a map to look for an expression tree.
++    VirtualRegister * assignTo = 0;
++    Expression * assignToExpr = 0;
++
++    {
++        bool isWide = (ssaRep->numDefs == 1) ? false : true;
++        int lowSsaReg = ssaRep->defs[0];
++        int highSsaReg = isWide ? ssaRep->defs[1] : 0;
++
++        assignToExpr = VirtualRegister::convertToVR (0, lowSsaReg, highSsaReg,
++                isWide);
++    }
++
++    if (assignToExpr != 0)
++    {
++        //Because of how we built it, it should be a virtual register but we
++        //are just being paranoid
++        if (assignToExpr->isVirtualRegister () == true)
++        {
++            assignTo = static_cast<VirtualRegister *> (assignToExpr);
++        }
++    }
++
++    //If we fail at creating the VR we are assigning to, then we cannot
++    //complete successfully
++    if (assignTo == 0)
++    {
++        return 0;
++    }
++
++    Expression * operand = 0;
++
++    //Since we are generating for a unary expression, there must be one operand.
++    //Thus we look at the number of uses to figure out which of the following
++    //scenarios we are dealing with:
++    // 1. Zero uses mean that we are dealing with either wide or non-wide constant
++    // 2. One use means that operand is a non-wide VR
++    // 3. Two uses means that operand is a wide VR
++
++    if (ssaRep->numUses == 0)
++    {
++        bool isWide = false;
++        int lowConstant = 0, highConstant = 0;
++
++        bool setsConst = dexGetConstant (mir->dalvikInsn, lowConstant,
++                highConstant, isWide);
++
++        //If we have a constant set expression, then we can build
++        //a constant expression for the operand
++        if (setsConst == true)
++        {
++            operand = ConstantExpression::newExpression (lowConstant,
++                    highConstant, isWide);
++        }
++    }
++    else if (ssaRep->numUses == 1)
++    {
++        assert(ssaRep->uses != 0);
++
++        operand = VirtualRegister::convertToVR (vrToExpression, ssaRep->uses[0]);
++    }
++    else if (ssaRep->numUses == 2)
++    {
++        assert(ssaRep->uses != 0);
++
++        operand = VirtualRegister::convertToVR (vrToExpression, ssaRep->uses[0],
++                ssaRep->uses[1], true);
++    }
++    else
++    {
++        //An assumption we made must be wrong if we get here. In assert world
++        //we want to fail if we get here.
++        assert (false);
++
++        return 0;
++    }
++
++    //If we did not generate operands successfully, then we cannot fully
++    //generate the expression
++    if (operand == 0)
++    {
++        return 0;
++    }
++
++    UnaryExpression * result = 0;
++
++    //Now we need to create expressions for the operands of the binary expression
++    //we are generating.
++    if (expKind != ExpKind_Invalid)
++    {
++        ExpressionType expType = BytecodeExpression::getExpressionType (
++                mir->dalvikInsn.opcode);
++
++        //Some of the unary expressions have unknown type until a use.
++        //For example, this applies to const bytecodes. Thus we do not
++        //check whether expType is invalid.
++
++        result = UnaryExpression::newExpression (mir, assignTo, operand,
++                expKind, expType);
++    }
++
++    //If we have created an expression, we should add its tree to the mapping
++    //of VRs to Expressions
++    if (result != 0 && vrToExpression != 0)
++    {
++        vrToExpression->insert (
++                std::pair<VirtualRegister *, Expression *> (assignTo, result));
++    }
++
++    //Return the expression
++    return result;
++
++}
++
++BinaryExpression * BinaryExpression::newExpression (MIR * mir,
++        VirtualRegister * assignTo, Expression * lhs, Expression * rhs,
++        ExpressionKind expKind, ExpressionType expType)
++{
++    //Create space for the expression
++    void * space = dvmCompilerNew (sizeof(BinaryExpression), false);
++
++    //If we don't have all parts of expression, we cannot create it
++    if (mir == 0 || assignTo == 0 || lhs == 0 || rhs == 0)
++    {
++        return 0;
++    }
++
++    //Call constructor
++    BinaryExpression * result = new (space) BinaryExpression (assignTo, lhs,
++            rhs, expKind, expType, mir);
++
++    return result;
++}
++
++UnaryExpression * UnaryExpression::newExpression (MIR * mir,
++        VirtualRegister * assignTo, Expression * operand,
++        ExpressionKind expKind, ExpressionType expType)
++{
++    //Create space for the expression
++    void * space = dvmCompilerNew (sizeof(UnaryExpression), false);
++
++    //If we don't have all parts of expression, we cannot create it
++    if (mir == 0 || assignTo == 0 || operand == 0)
++    {
++        return 0;
++    }
++
++    //Call constructor
++    UnaryExpression * result = new (space) UnaryExpression (assignTo, operand,
++            expKind, expType, mir);
++
++    return result;
++}
++
++ConstantExpression * ConstantExpression::newExpression (int32_t lowInitialValue,
++        int32_t highInitialValue, bool wide)
++{
++    //Create space for a new constant
++    void * space = dvmCompilerNew (sizeof(ConstantExpression), false);
++
++    ConstantExpression * result;
++
++    //Call constructor using given initial value
++    if (wide == false)
++    {
++        result = new (space) ConstantExpression (lowInitialValue);
++    }
++    else
++    {
++        result = new (space) ConstantExpression (lowInitialValue,
++                highInitialValue);
++    }
++
++    return result;
++}
++
++Expression * VirtualRegister::convertToVR (
++        std::map<VirtualRegister *, Expression *> * vrToExpression,
++        int lowSsaReg, int highSsaReg, bool wide)
++{
++    //Create space for a VR
++    void * space = dvmCompilerNew (sizeof(VirtualRegister), false);
++
++    VirtualRegister * result = 0;
++
++    //Call constructor
++    if (wide == false)
++    {
++        result = new (space) VirtualRegister (lowSsaReg);
++    }
++    else
++    {
++        result = new (space) VirtualRegister (lowSsaReg, highSsaReg);
++    }
++
++    //Look to see if we have an existing expression for this VR
++    Expression * existingExpression = result->findExpressionForVR (
++            vrToExpression);
++
++    //If we have an existing expression, return that instead
++    if (existingExpression != 0)
++    {
++        return existingExpression;
++    }
++    else
++    {
++        return result;
++    }
++}
++
++Expression * VirtualRegister::findExpressionForVR (
++        std::map<VirtualRegister *, Expression *> * vrToExpression)
++{
++    //If the mapping doesn't exist, then there is nothing to find
++    if (vrToExpression == 0)
++    {
++        return 0;
++    }
++
++    std::map<VirtualRegister *, Expression *>::const_iterator iter;
++
++    //Look for an expression for the VR
++    iter = std::find_if (vrToExpression->begin (), vrToExpression->end (),
++            VirtualRegisterMappingComparator (this));
++
++    //If we didn't find an expression in the map for this VR, return 0.
++    //Otherwise, return the expression we found.
++    if (iter == vrToExpression->end ())
++    {
++        return 0;
++    }
++    else
++    {
++        return iter->second;
++    }
++}
++
++bool VirtualRegisterMappingComparator::operator() (
++        const std::pair<VirtualRegister *, Expression *> vrToExpressionMapping)
++{
++    VirtualRegister * toCompareWith = vrToExpressionMapping.first;
++
++    if (toCompareWith == 0)
++    {
++        return false;
++    }
++
++    //If wideness does not match, the VRs are not equal
++    if (holder->isWide () != toCompareWith->isWide ())
++    {
++        return false;
++    }
++
++    //If low ssa reg does not match, then the VRs are not equal
++    if (holder->lowSsaReg != toCompareWith->lowSsaReg)
++    {
++        return false;
++    }
++
++    //If high ssa reg does not match, then the VRs are not equal
++    if (holder->highSsaReg != toCompareWith->highSsaReg)
++    {
++        return false;
++    }
++
++    //If we made it this far, must be that the VRs are equal
++    return true;
++}
++
++MIR * BytecodeExpression::createMir (ExpressionKind expKind,
++        ExpressionType expType, int assignToVR, int lhsVR, int rhsVR)
++{
++    MIR * mir = 0;
++
++    //This method supports only non-wide VRs and thus only supports
++    //creating float and int MIRs
++    if (expType != ExpType_Int && expType != ExpType_Float)
++    {
++        return 0;
++    }
++
++    //Assume we will find an opcode we can use
++    bool foundOpcode = true;
++    Opcode opcode;
++
++    //As an enhancement to this logic, we could also allow 2addr forms
++    //to be used.
++    switch (expKind)
++    {
++        case ExpKind_Add:
++            opcode = (expType == ExpType_Int) ? OP_ADD_INT : OP_ADD_FLOAT;
++            break;
++        case ExpKind_Sub:
++            opcode = (expType == ExpType_Int) ? OP_SUB_INT : OP_SUB_FLOAT;
++            break;
++        case ExpKind_Mul:
++            opcode = (expType == ExpType_Int) ? OP_MUL_INT : OP_MUL_FLOAT;
++            break;
++        default:
++            foundOpcode = false;
++            break;
++    }
++
++    //If we didn't find an opcode we cannot generate a MIR
++    if (foundOpcode == false)
++    {
++        return 0;
++    }
++
++    //Create the MIR and assign the fields
++    mir = dvmCompilerNewMIR ();
++    mir->dalvikInsn.opcode = opcode;
++    mir->dalvikInsn.vA = assignToVR;
++    mir->dalvikInsn.vB = lhsVR;
++    mir->dalvikInsn.vC = rhsVR;
++
++    return mir;
++
++}
++
++ExpressionType BytecodeExpression::getExpressionType (Opcode dalvikOpcode)
++{
++    ExpressionType expType;
++
++    switch (dalvikOpcode)
++    {
++        case OP_NEG_INT:
++        case OP_NOT_INT:
++        case OP_LONG_TO_INT:
++        case OP_FLOAT_TO_INT:
++        case OP_DOUBLE_TO_INT:
++        case OP_INT_TO_BYTE:
++        case OP_INT_TO_CHAR:
++        case OP_INT_TO_SHORT:
++        case OP_ADD_INT:
++        case OP_SUB_INT:
++        case OP_MUL_INT:
++        case OP_DIV_INT:
++        case OP_REM_INT:
++        case OP_AND_INT:
++        case OP_OR_INT:
++        case OP_XOR_INT:
++        case OP_SHL_INT:
++        case OP_SHR_INT:
++        case OP_ADD_INT_2ADDR:
++        case OP_SUB_INT_2ADDR:
++        case OP_MUL_INT_2ADDR:
++        case OP_DIV_INT_2ADDR:
++        case OP_REM_INT_2ADDR:
++        case OP_AND_INT_2ADDR:
++        case OP_OR_INT_2ADDR:
++        case OP_XOR_INT_2ADDR:
++        case OP_SHL_INT_2ADDR:
++        case OP_SHR_INT_2ADDR:
++        case OP_USHR_INT_2ADDR:
++        case OP_ADD_INT_LIT16:
++        case OP_RSUB_INT:
++        case OP_MUL_INT_LIT16:
++        case OP_DIV_INT_LIT16:
++        case OP_REM_INT_LIT16:
++        case OP_AND_INT_LIT16:
++        case OP_OR_INT_LIT16:
++        case OP_XOR_INT_LIT16:
++        case OP_ADD_INT_LIT8:
++        case OP_RSUB_INT_LIT8:
++        case OP_MUL_INT_LIT8:
++        case OP_DIV_INT_LIT8:
++        case OP_REM_INT_LIT8:
++        case OP_AND_INT_LIT8:
++        case OP_OR_INT_LIT8:
++        case OP_XOR_INT_LIT8:
++        case OP_SHL_INT_LIT8:
++        case OP_SHR_INT_LIT8:
++        case OP_USHR_INT_LIT8:
++            expType = ExpType_Int;
++            break;
++        case OP_NEG_LONG:
++        case OP_NOT_LONG:
++        case OP_INT_TO_LONG:
++        case OP_FLOAT_TO_LONG:
++        case OP_DOUBLE_TO_LONG:
++        case OP_USHR_INT:
++        case OP_ADD_LONG:
++        case OP_SUB_LONG:
++        case OP_MUL_LONG:
++        case OP_DIV_LONG:
++        case OP_REM_LONG:
++        case OP_AND_LONG:
++        case OP_OR_LONG:
++        case OP_XOR_LONG:
++        case OP_SHL_LONG:
++        case OP_SHR_LONG:
++        case OP_USHR_LONG:
++        case OP_ADD_LONG_2ADDR:
++        case OP_SUB_LONG_2ADDR:
++        case OP_MUL_LONG_2ADDR:
++        case OP_DIV_LONG_2ADDR:
++        case OP_REM_LONG_2ADDR:
++        case OP_AND_LONG_2ADDR:
++        case OP_OR_LONG_2ADDR:
++        case OP_XOR_LONG_2ADDR:
++        case OP_SHL_LONG_2ADDR:
++        case OP_SHR_LONG_2ADDR:
++        case OP_USHR_LONG_2ADDR:
++            expType = ExpType_Long;
++            break;
++        case OP_NEG_FLOAT:
++        case OP_INT_TO_FLOAT:
++        case OP_LONG_TO_FLOAT:
++        case OP_DOUBLE_TO_FLOAT:
++        case OP_ADD_FLOAT:
++        case OP_SUB_FLOAT:
++        case OP_MUL_FLOAT:
++        case OP_DIV_FLOAT:
++        case OP_REM_FLOAT:
++        case OP_ADD_FLOAT_2ADDR:
++        case OP_SUB_FLOAT_2ADDR:
++        case OP_MUL_FLOAT_2ADDR:
++        case OP_DIV_FLOAT_2ADDR:
++        case OP_REM_FLOAT_2ADDR:
++            expType = ExpType_Float;
++            break;
++        case OP_NEG_DOUBLE:
++        case OP_INT_TO_DOUBLE:
++        case OP_LONG_TO_DOUBLE:
++        case OP_FLOAT_TO_DOUBLE:
++        case OP_ADD_DOUBLE:
++        case OP_SUB_DOUBLE:
++        case OP_MUL_DOUBLE:
++        case OP_DIV_DOUBLE:
++        case OP_REM_DOUBLE:
++        case OP_ADD_DOUBLE_2ADDR:
++        case OP_SUB_DOUBLE_2ADDR:
++        case OP_MUL_DOUBLE_2ADDR:
++        case OP_DIV_DOUBLE_2ADDR:
++        case OP_REM_DOUBLE_2ADDR:
++            expType = ExpType_Double;
++            break;
++        default:
++            expType = ExpType_Invalid;
++            break;
++    }
++
++    return expType;
++}
+diff --git a/vm/compiler/Expression.h b/vm/compiler/Expression.h
+new file mode 100644
+index 0000000..b3520f8
+--- /dev/null
++++ b/vm/compiler/Expression.h
+@@ -0,0 +1,814 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef EXPRESSION_H_
++#define EXPRESSION_H_
++
++#include <string>
++#include <vector>
++#include <map>
++#include "Dataflow.h"
++
++// Forward declarations
++struct MIR;
++class VirtualRegister;
++class VirtualRegisterMappingComparator;
++struct CompilationUnit;
++
++/**
++ * @brief Defines kind of expression depending on number of operands
++ * and semantics of operation.
++ * @details There is a 1:N mapping between this an ExpressionKind.
++ */
++enum GeneralExpressionKind
++{
++    GenExpKind_NoExp,     //!< No expression
++    GenExpKind_UnaryExp,  //!< Unary expression
++    GenExpKind_BinaryExp, //!< Binary expression
++};
++
++/**
++ * @brief Defines kind of expression depending on operation.
++ */
++enum ExpressionKind
++{
++    ExpKind_Invalid = 0,  //!< Invalid kind (noexp)
++    ExpKind_ConstSet,     //!< Constant set bytecode (unop)
++    ExpKind_Add,          //!< Addition (binop)
++    ExpKind_Sub,          //!< Subtraction (binop)
++    ExpKind_Mul,          //!< Multiplication (binop)
++    ExpKind_Phi,          //!< Phi node (binop)
++};
++
++/**
++ * @brief Defines type of expression depending on primitive type
++ * of result after operation is applied to operands.
++ */
++enum ExpressionType
++{
++    ExpType_Invalid = 0,  //!< invalid type
++    ExpType_Int,          //!< expression represents operation on int (32-bit)
++    ExpType_Long,         //!< expression represents operation on long (64-bit)
++    ExpType_Float,        //!< expression represents operation on float (32-bit)
++    ExpType_Double,       //!< expression represents operation on double (64-bit)
++};
++
++/**
++ * @brief Base virtual class for representing an expression.
++ */
++class Expression
++{
++public:
++    /**
++     * @brief Constructor.
++     */
++    Expression (void)
++    {
++    }
++
++    /**
++     * @brief Destructor.
++     */
++    virtual ~Expression (void)
++    {
++    }
++
++    /**
++     * @brief Converts expression to string representation.
++     * @param cUnit the compilation unit.
++     * @return string representation.
++     */
++    virtual std::string toString (const CompilationUnit * cUnit) = 0;
++
++    /**
++     * @brief Used to get a list of children.
++     * @return Returns vector of child expressions.
++     */
++    virtual std::vector<Expression *> getChildren (void) const
++    {
++        return std::vector<Expression *> ();
++    }
++
++    /**
++     * @brief Returns true if expression represents a dalvik bytecode.
++     */
++    virtual bool isBytecodeExpression (void) const
++    {
++        return false;
++    }
++
++    /**
++     * @brief Returns true if expression is a literal.
++     */
++    virtual bool isConstant (void) const
++    {
++        return false;
++    }
++
++    /**
++     * @brief Returns true if expression evaluates to a constant value.
++     */
++    virtual bool evaluatesToConstant (void) const
++    {
++        return false;
++    }
++
++    /**
++     * @brief Returns true if expression represent a virtual register.
++     */
++    virtual bool isVirtualRegister (void) const
++    {
++        return false;
++    }
++
++    /**
++     * @brief Converts a MIR to an expression.
++     * @details Uses vrToExpression in order to find expressions for the
++     * operands of the MIR in order to create an expression tree.
++     * @param mir Dalvik bytecode.
++     * @param vrToExpression Map of virtual registers and corresponding
++     * expression that was used to assign a value to it. Only expressions
++     * that are unary or binary expressions can be in this list since others
++     * do not assign to a VR.
++     * @return Returns expression representing the MIR or null if
++     * conversion is not successful.
++     */
++    static Expression * mirToExpression (MIR * mir,
++            std::map<VirtualRegister *, Expression *> * vrToExpression = 0);
++
++    /**
++     * @brief Converts a list of MIRs to expressions.
++     * @details Takes the MIRs in order and converts them to expression.
++     * If during conversion of a MIR we find that we have already generated
++     * an expression for another MIR that sets the current operand, we use
++     * the other expression to create an expression tree.
++     * @param listOfMirs Vector of MIRs.
++     * @return Returns a map of each MIR to its corresponding expression.
++     * If conversion was not successful, the map will contain a null
++     * expression for that MIR.
++     */
++    static std::map<MIR *, Expression *> mirsToExpressions (
++            const std::vector<MIR *> & listOfMirs);
++};
++
++/**
++ * @brief Expression used for representing wide and non-wide virtual registers.
++ */
++class VirtualRegister: public Expression
++{
++public:
++    /**
++     * @brief Non-wide virtual register constructor
++     * @param ssaReg the ssa register representing the VR.
++     */
++    VirtualRegister (int ssaReg) :
++            Expression (), lowSsaReg (ssaReg), highSsaReg (0), wide (false)
++    {
++    }
++
++    /**
++     * @brief Wide virtual register constructor
++     * @param lowSsaReg the ssa register representing the low VR
++     * @param highSsaReg the ssa register representing the high VR
++     */
++    VirtualRegister (int lowSsaReg, int highSsaReg) :
++            Expression (), lowSsaReg (lowSsaReg), highSsaReg (highSsaReg), wide (
++                    true)
++    {
++    }
++
++    /**
++     * @brief Destructor
++     */
++    virtual ~VirtualRegister (void)
++    {
++    }
++
++    /**
++     * @brief Always returns true since class represents virtual register.
++     */
++    bool isVirtualRegister (void) const
++    {
++        return true;
++    }
++
++    /**
++     * @brief Returns whether the virtual register represented is wide or not.
++     */
++    bool isWide (void) const
++    {
++        return wide;
++    }
++
++    /**
++     * @brief Converts one of the ssa registers (or two for wide case) to
++     * representation of virtual register.
++     * @details Once a virtual register is created, we then look through the
++     * vrToExpression map and if we find a match of an expression for that VR,
++     * we return that instead.
++     * @param vrToExpression Map of virtual registers to expressions used to
++     * assign to them. Allowed to be null.
++     * @param lowSsaReg the ssa register representing the low VR
++     * @param highSsaReg the ssa register representing the high VR
++     * @param wide whether we are to construct a wide VR
++     * @return Returns expression tree representing the operand. It is either
++     * a virtual register or an expression tree that was used to assign to it.
++     */
++    static Expression * convertToVR (
++            std::map<VirtualRegister *, Expression *> * vrToExpression,
++            int lowSsaReg, int highSsaReg = 0, bool wide = false);
++
++    /**
++     * @brief Converts virtual register to string representation.
++     * @param cUnit the compilation unit.
++     * @return string representation.
++     */
++    std::string toString (const CompilationUnit * cUnit);
++
++    /**
++     * @brief The comparator must be able to access the fields of the
++     * virtual register.
++     */
++    friend class VirtualRegisterMappingComparator;
++
++protected:
++    /**
++     * @brief Low ssa register.
++     */
++    int lowSsaReg;
++
++    /**
++     * @brief High ssa register (only applicable if wide).
++     */
++    int highSsaReg;
++
++    /**
++     * @brief Wideness of the virtual register.
++     */
++    bool wide;
++
++private:
++    /**
++     * @brief Default Constructor
++     * @details Disabled by making it private.
++     */
++    VirtualRegister (void);
++
++    /**
++     * @brief Helper method to look for an expression for self.
++     * @param vrToExpression Map of virtual registers to expression trees.
++     * @return Returns found expression. If nothing was found, returns 0.
++     */
++    Expression * findExpressionForVR (
++            std::map<VirtualRegister *, Expression *> * vrToExpression);
++};
++
++/**
++ * @brief Helper class for being able to compare VirtualRegister instances
++ * for equality.
++ */
++class VirtualRegisterMappingComparator: std::unary_function<VirtualRegister *,
++        bool>
++{
++public:
++    /**
++     * @brief Constructor.
++     * @param vR Virtual register we want to compare against.
++     */
++    VirtualRegisterMappingComparator (VirtualRegister * vR)
++    {
++        holder = vR;
++    }
++
++    /**
++     * @brief Functor used for checking for equality among two VRs.
++     * @param vrToExpressionMapping Pair of virtual register to expression. Only
++     * key is used for comparison.
++     * @return Returns true if key from pair matches the virtual register
++     * we are looking for.
++     */
++    bool operator() (
++            const std::pair<VirtualRegister *, Expression *> vrToExpressionMapping);
++
++private:
++    /**
++     * @brief Used to keep track of the virtual register we are comparing other
++     * instances against in order to find a match.
++     */
++    VirtualRegister * holder;
++};
++
++/**
++ * @brief Virtual class used to represent dalvik bytecodes.
++ * @details There is a 1:1 mapping between a Dalvik bytecode and a
++ * BytecodeExpression
++ */
++class BytecodeExpression: public Expression
++{
++public:
++    /**
++     * @brief Constructor of bytecode expression
++     * @param assignTo Virtual register that expression assigns to.
++     * Cannot be null.
++     * @param expKind Expression kind
++     * @param expType Expression type
++     * @param insn MIR associated with expression. Cannot be null.
++     */
++    BytecodeExpression (VirtualRegister * assignTo, ExpressionKind (expKind),
++            ExpressionType expType, MIR * insn) :
++            Expression (), assignmentTo (assignTo), mir (insn), expKind (
++                    expKind), expType (expType)
++    {
++        assert(assignTo != 0);
++        assert(insn != 0);
++    }
++
++    /**
++     * @brief Destructor.
++     */
++    virtual ~BytecodeExpression (void)
++    {
++    }
++
++    /**
++     * @brief Always returns true since this is a bytecode expression.
++     */
++    bool isBytecodeExpression (void) const
++    {
++        return true;
++    }
++
++    /**
++     * @brief Returns virtual register that the bytecode expression
++     * assigns to.
++     */
++    virtual VirtualRegister * getAssignmentTo (void) const
++    {
++        return this->assignmentTo;
++    }
++
++    /**
++     * @brief Get the associated MIR
++     * @return The MIR associated with the Expression.
++     */
++    virtual MIR * getMir (void) const
++    {
++        return mir;
++    }
++
++    /**
++     * @brief Returns expression kind.
++     */
++    virtual ExpressionKind getExpressionKind (void) const
++    {
++        return expKind;
++    }
++
++    /**
++     * @brief Returns expression type depending on type of result
++     * and not on the operands.
++     */
++    virtual ExpressionType getExpressionType (void) const
++    {
++        return expType;
++    }
++
++    /**
++     * @brief Used to create a MIR when given parameters that can build
++     * expression. This can only be used for float and int versions.
++     * @param expKind Expression kind
++     * @param expType Expression type
++     * @param assignToVR Dalvik register we are assigning to (not ssa)
++     * @param lhsVR Dalvik register for lhs operand
++     * @param rhsVR Dalvik register for rhs operand
++     * @return MIR that was created. If no MIR was created, returns 0.
++     */
++    static MIR * createMir (ExpressionKind expKind, ExpressionType expType,
++            int assignToVR, int lhsVR, int rhsVR = 0);
++
++protected:
++    /**
++     * @brief Keeps track of virtual register we are assigning to.
++     * @details Dalvik bytecodes always have a virtual register that the result
++     * is assigned to. In order to simplify dealing with expression tree, we
++     * keep the assignment to as part of the b
++     */
++    VirtualRegister * assignmentTo;
++
++    /**
++     * @brief Associated MIR.
++     */
++    MIR * mir;
++
++    /**
++     * @brief Keeps track of expression kind of this expression.
++     */
++    ExpressionKind expKind;
++
++    /**
++     * @brief Defines the type of the result of the operation. Namely, this defines
++     * type of assignmentTo field in how it is intended to be interpreted.
++     */
++    ExpressionType expType;
++
++    /**
++     * @brief Returns general expression kind (noexp, unexp, or binexp) for
++     * the dalvik opcode.
++     * @param dalvikOpcode dalvik opcode
++     */
++    static GeneralExpressionKind getGenExpressionKind (Opcode dalvikOpcode);
++
++    /**
++     * @brief Returns expression kind for the dalvik opcode.
++     * @param dalvikOpcode dalvik opcode
++     */
++    static ExpressionKind getExpressionKind (Opcode dalvikOpcode);
++
++    /**
++     * @brief Returns expression type for the dalvik opcode.
++     * @param dalvikOpcode dalvik opcode
++     */
++    static ExpressionType getExpressionType (Opcode dalvikOpcode);
++
++private:
++    /**
++     * @brief Default Constructor
++     * @details Disabled by making it private.
++     */
++    BytecodeExpression (void);
++};
++
++/**
++ * @brief Used to represent a bytecode expression which has two operands.
++ * @details Used with bytecodes of form "binop vAA, vBB, vCC",
++ * "binop/2addr vA, vB", "binop/lit16 vA, vB, #+CCCC", and
++ * "binop/lit8 vAA, vBB, #+CC"
++ */
++class BinaryExpression: public BytecodeExpression
++{
++public:
++    /**
++     * @brief Constructor for binary bytecode expression.
++     * @param assignTo Virtual register that expression assigns to.
++     * Cannot be null.
++     * @param lhs Expression tree for the lhs operand. Cannot be null.
++     * @param rhs Expression tree for the rhs operand. Cannot be null.
++     * @param expKind Expression kind
++     * @param expType Expression type
++     * @param mir MIR associated with expression. Cannot be null.
++     */
++    BinaryExpression (VirtualRegister * assignTo, Expression * lhs,
++            Expression * rhs, ExpressionKind expKind, ExpressionType expType,
++            MIR * mir) :
++            BytecodeExpression (assignTo, expKind, expType, mir), lhs (lhs), rhs (
++                    rhs)
++    {
++        assert(lhs != 0);
++        assert(rhs != 0);
++    }
++
++    /**
++     * @brief Destructor
++     */
++    virtual ~BinaryExpression (void)
++    {
++    }
++
++    /**
++     * @brief Returns the lhs expression.
++     */
++    Expression * getLhs (void) const
++    {
++        return this->lhs;
++    }
++
++    /**
++     * @brief Returns the rhs expression.
++     */
++    Expression * getRhs (void) const
++    {
++        return this->rhs;
++    }
++
++    /**
++     * @brief Returns whether both of the operands evaluate to a constant.
++     */
++    bool evaluatesToConstant (void) const
++    {
++        return lhs->evaluatesToConstant () && rhs->evaluatesToConstant ();
++    }
++
++    /**
++     * @brief Returns a vector which contains both operands.
++     */
++    std::vector<Expression *> getChildren (void) const;
++
++    /**
++     * @brief Converts binary expression to string representation.
++     * @param cUnit the compilation unit.
++     * @return string representation.
++     */
++    std::string toString (const CompilationUnit * cUnit);
++
++    /**
++     * @brief Converts a MIR to expression representation.
++     * @param mir The dalvik MIR to convert.
++     * @param vrToExpression Map of virtual registers and corresponding
++     * expression that was used to assign a value to it. Note that this
++     * is updated by function when new expression is successfully created.
++     * @param expKind Expression kind
++     * @return Newly created expression. If failed to create, returns 0.
++     */
++    static BinaryExpression * mirToExpression (MIR * mir,
++            std::map<VirtualRegister *, Expression *> * vrToExpression,
++            ExpressionKind expKind);
++
++    /**
++     * @brief Creates an instance of BinaryExpression in arena space.
++     * @param mir MIR associated with expression. Cannot be null.
++     * @param assignTo Virtual register that expression assigns to.
++     * @param lhs Expression tree for the lhs operand.
++     * @param rhs Expression tree for the rhs operand.
++     * @param expKind Expression kind
++     * @param expType Expression type
++     * @return Returns newly created expression or 0 when one cannot
++     * be created from the given arguments.
++     */
++    static BinaryExpression * newExpression (MIR * mir,
++            VirtualRegister * assignTo, Expression * lhs, Expression * rhs,
++            ExpressionKind expKind, ExpressionType expType);
++
++protected:
++    /**
++     * @brief Keeps track of the lhs operand.
++     */
++    Expression * lhs;
++
++    /**
++     * @brief Keeps track of the rhs operand.
++     */
++    Expression * rhs;
++
++private:
++    /**
++     * @brief Default Constructor
++     * @details Disabled by making it private.
++     */
++    BinaryExpression (void);
++};
++
++/**
++ * @brief
++ * @details Used with bytecodes of form "unop vA, vB", const, and move
++ */
++class UnaryExpression: public BytecodeExpression
++{
++public:
++    /**
++     * @brief Constructor for unary bytecode expression.
++     * @param assignTo Virtual register that expression assigns to.
++     * Cannot be null.
++     * @param operand Expression tree for the operand. Cannot be null.
++     * @param expKind Expression kind
++     * @param expType Expression type
++     * @param mir MIR associated with expression. Cannot be null.
++     */
++    UnaryExpression (VirtualRegister * assignTo, Expression * operand,
++            ExpressionKind expKind, ExpressionType expType, MIR * mir) :
++            BytecodeExpression (assignTo, expKind, expType, mir), operand (
++                    operand)
++    {
++        assert(operand != 0);
++    }
++
++    /**
++     * @brief Destructor.
++     */
++    virtual ~UnaryExpression (void)
++    {
++    }
++
++    /**
++     * @brief Returns whether the operand evaluates to a constant.
++     */
++    bool evaluatesToConstant (void) const
++    {
++        return operand->evaluatesToConstant ();
++    }
++
++    /**
++     * @brief Returns a vector containing the single operand.
++     */
++    std::vector<Expression *> getChildren (void) const;
++
++    /**
++     * @brief Converts unary expression to string representation.
++     * @param cUnit the compilation unit.
++     * @return string representation.
++     */
++    std::string toString (const CompilationUnit * cUnit);
++
++    /**
++     * @brief Creates an instance of UnaryExpression in arena space.
++     * @param mir MIR associated with expression. Cannot be null.
++     * @param assignTo Virtual register that expression assigns to.
++     * @param operand Expression tree for the operand.
++     * @param expKind Expression kind
++     * @param expType Expression type
++     * @return Returns newly created expression or 0 when one cannot
++     * be created from the given arguments.
++     */
++    static UnaryExpression * newExpression (MIR * mir,
++            VirtualRegister * assignTo, Expression * operand,
++            ExpressionKind expKind, ExpressionType expType);
++
++    /**
++     * @brief Converts a MIR to expression representation.
++     * @param mir The dalvik MIR to convert.
++     * @param vrToExpression Map of virtual registers and corresponding
++     * expression that was used to assign a value to it. Note that this
++     * is updated by function when new expression is successfully created.
++     * @param expKind Expression kind
++     * @return Newly created expression. If failed to create, returns 0.
++     */
++    static UnaryExpression * mirToExpression (MIR * mir,
++            std::map<VirtualRegister *, Expression *> * vrToExpression,
++            ExpressionKind expKind);
++
++protected:
++    /**
++     * @brief Used to keep track of the expression tree of operand.
++     */
++    Expression * operand;
++
++private:
++    /**
++     * @brief Default Constructor
++     * @details Disabled by making it private.
++     */
++    UnaryExpression (void);
++};
++
++/**
++ * @brief Expression used to represent a constant.
++ */
++class ConstantExpression: public Expression
++{
++public:
++    /**
++     * @brief Constructor of non-wide constant.
++     * @param constant constant represented as 32-bit integer.
++     */
++    ConstantExpression (int32_t constant) :
++            wide (false)
++    {
++        value = static_cast<int64_t> (constant);
++    }
++
++    /**
++     * @brief Constructor of wide constant.
++     * @param lowConstant constant of low bits represented as 32-bit integer.
++     * @param highConstant constant of high bits represented as 32-bit integer.
++     */
++    ConstantExpression (int32_t lowConstant, int32_t highConstant) :
++            wide (true)
++    {
++        value = (static_cast<int64_t> (highConstant) << 32)
++                | (static_cast<int64_t> (lowConstant));
++    }
++
++    /**
++     * @brief Constructor of non-wide constant.
++     * @param constant constant represented as 32-bit floating point value.
++     */
++    ConstantExpression (float constant) :
++            wide (false)
++    {
++        //We need to break strict aliasing rules so we quiet down compiler
++        //by using char* first.
++        char *ptr = reinterpret_cast<char *> (&constant);
++
++        value = static_cast<int64_t> (*reinterpret_cast<int32_t*> (ptr));
++    }
++
++    /**
++     * @brief Constructor of wide constant.
++     * @param constant constant represented as 64-bit floating point value.
++     */
++    ConstantExpression (double constant) :
++            wide (true)
++    {
++        //We need to break strict aliasing rules so we quiet down compiler
++        //by using char* first.
++        char *ptr = reinterpret_cast<char *> (&constant);
++
++        value = *reinterpret_cast<int64_t*> (ptr);
++    }
++
++    /**
++     * @brief Constructor of wide constant.
++     * @param constant constant represented as 64-bit integer.
++     */
++    ConstantExpression (int64_t constant) :
++            wide (true)
++    {
++        value = constant;
++    }
++
++    /**
++     * @brief Destructor.
++     */
++    virtual ~ConstantExpression (void)
++    {
++    }
++
++    /**
++     * @brief Always returns true because this represents a constant.
++     */
++    bool isConstant (void) const
++    {
++        return true;
++    }
++
++    /**
++     * @brief Always returns true because this evaluates to a constant
++     */
++    bool evaluatesToConstant (void) const
++    {
++        return true;
++    }
++
++
++    /**
++     * @brief Returns whether the constant is wide (64-bit) or not.
++     */
++    bool isWide (void) const
++    {
++        return wide;
++    }
++
++    /**
++     * @brief Returns constant value into desired primitive type.
++     * @tparam Desired type of constant value
++     */
++    template<typename desired_type>
++    desired_type getValue (void)
++    {
++        //Since the backing store is 64-bit integer, we need to
++        //reinterpret to desired type.
++        return *reinterpret_cast<desired_type *> (&value);
++    }
++
++    /**
++     * @brief Converts constant to string representation.
++     * @details Since it is not known how the value will be interpreted,
++     * everything gets printed as a 64-bit integer.
++     * @param cUnit the compilation unit.
++     * @return string representation.
++     */
++    std::string toString (const CompilationUnit * cUnit);
++
++    /**
++     * @brief Used to create a ConstantExpression using arena.
++     * @param lowInitialValue The constant value of low bits.
++     * @param highInitialValue The constant value of high bits (wide
++     * must be true)
++     * @param wide Whether we are creating a wide (64-bit) constant.
++     * @return Returns the constant expression instance created.
++     */
++    static ConstantExpression * newExpression (int32_t lowInitialValue,
++            int32_t highInitialValue = 0, bool wide = false);
++
++private:
++    /**
++     * @brief Default Constructor
++     * @details Disabled by making it private.
++     */
++    ConstantExpression (void);
++
++    /**
++     * @brief Backing store for constant value since we don't know how it
++     * will be used when we create it.
++     */
++    int64_t value;
++
++    /**
++     * @brief Used to keep track of wideness of constant.
++     */
++    bool wide;
++};
++
++#endif /* EXPRESSION_H_ */
+diff --git a/vm/compiler/IntermediateRep.cpp b/vm/compiler/IntermediateRep.cpp
+index c16d260..659f729 100644
+--- a/vm/compiler/IntermediateRep.cpp
++++ b/vm/compiler/IntermediateRep.cpp
+@@ -38,6 +38,17 @@ BasicBlock *dvmCompilerNewBB(BBType blockType, int blockId)
+     return bb;
+ }
+ 
++/* Allocate a new MIR */
++MIR *dvmCompilerNewMIR (void)
++{
++    //Allocate the new MIR on the arena
++    MIR *newMir = static_cast<MIR *> (dvmCompilerNew (sizeof (*newMir), true));
++
++    //Since we zero'ed out all fields, there's nothing else we can or
++    //need to initialize. So simply return the new MIR.
++    return newMir;
++}
++
+ /* Insert an MIR instruction to the end of a basic block */
+ void dvmCompilerAppendMIR(BasicBlock *bb, MIR *mir)
+ {
+-- 
+1.7.4.1
+

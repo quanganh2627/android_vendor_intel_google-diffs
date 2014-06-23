@@ -1,0 +1,157 @@
+From 0e6950406b533ad9b34203bd474969c5cabfeab8 Mon Sep 17 00:00:00 2001
+From: Jean Trivelly <jean.trivelly@intel.com>
+Date: Wed, 28 Nov 2012 17:51:00 +0100
+Subject: [PORT FROM MAIN] tethering/widi: Limit DHCP server network interface coverage
+
+BZ: 17348
+
+The use case USB tethering/3G + WiDi was not working because of conflicts
+between  DHCP servers.
+
+The problem is that the Tethering DHCP server covers all the network
+interfaces instead of covering only the Tethered interfaces.
+
+This patches modifies netd in order the tethering and WiDi DHCP servers
+to cover only the necessary interfaces, and thus beeing able to activate
+the scenario USB tethering/3G + widi.
+
+Feature   : Wlan
+Category  : Improvement
+Purpose   : AOSP+
+Origin    : Upstream
+Upstream-candidate: no
+
+Change-Id: I2aa4362c28187dcf556ea1e7fe3c1fe8e415889d
+Orig-Change-Id: Ic73e6b9a815566a16c1dd3a079ef0ac69f4c4c84
+Signed-off-by: Jean Trivelly <jean.trivelly@intel.com>
+Reviewed-on: http://android.intel.com:8080/77539
+Reviewed-by: Bachot, Jean-michel <jean-michel.bachot@intel.com>
+Tested-by: Champciaux, Nicolas <nicolas.champciaux@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+---
+ TetherController.cpp |   50 +++++++++++++++++++++++++++++++++++++++++++++++---
+ TetherController.h   |    3 +++
+ 2 files changed, 50 insertions(+), 3 deletions(-)
+
+diff --git a/TetherController.cpp b/TetherController.cpp
+index 743742c..b498195 100644
+--- a/TetherController.cpp
++++ b/TetherController.cpp
+@@ -38,6 +38,9 @@ TetherController::TetherController() {
+     mDnsForwarders = new NetAddressCollection();
+     mDaemonFd = -1;
+     mDaemonPid = 0;
++    mAddrs = (struct in_addr*)NULL;
++    mNum_addrs = 0;
++    mIntTetherRestart = 0;
+ }
+ 
+ TetherController::~TetherController() {
+@@ -49,6 +52,7 @@ TetherController::~TetherController() {
+     mInterfaces->clear();
+ 
+     mDnsForwarders->clear();
++    free(mAddrs);
+ }
+ 
+ int TetherController::setIpFwdEnabled(bool enable) {
+@@ -113,6 +117,23 @@ int TetherController::startTethering(int num_addrs, struct in_addr* addrs) {
+         return -1;
+     }
+ 
++    /*Remember the provided DHCP range if not already done*/
++    if (!mIntTetherRestart) {
++        /* Free the previous remember addrs*/
++        free(mAddrs);
++
++        /* Copy the new addrs*/
++        mAddrs = (struct in_addr*)malloc(sizeof (struct in_addr*) * num_addrs);
++        mNum_addrs = num_addrs;
++        for (int addrIndex=0; addrIndex < mNum_addrs;) {
++            mAddrs[addrIndex] = addrs[addrIndex];
++            addrIndex++;
++            mAddrs[addrIndex] = addrs[addrIndex];
++            addrIndex++;
++        }
++    }
++    mIntTetherRestart = 0;
++
+     /*
+      * TODO: Create a monitoring thread to handle and restart
+      * the daemon if it exits prematurely
+@@ -134,7 +155,7 @@ int TetherController::startTethering(int num_addrs, struct in_addr* addrs) {
+             close(pipefd[0]);
+         }
+ 
+-        int num_processed_args = 7 + (num_addrs/2) + 1; // 1 null for termination
++        int num_processed_args = 9 + mInterfaces->size() + (num_addrs/2) + 1; // 1 null for termination
+         char **args = (char **)malloc(sizeof(char *) * num_processed_args);
+         args[num_processed_args - 1] = NULL;
+         args[0] = (char *)"/system/bin/dnsmasq";
+@@ -144,9 +165,19 @@ int TetherController::startTethering(int num_addrs, struct in_addr* addrs) {
+         // TODO: pipe through metered status from ConnService
+         args[4] = (char *)"--dhcp-option-force=43,ANDROID_METERED";
+         args[5] = (char *)"--pid-file";
+-        args[6] = (char *)"";
++        args[6] = (char *)"-z";
++        args[7] = (char *)"-Ilo";
++        args[8] = (char *)"";
++
++        int nextArg = 9;
++
++         /*Activate the DHCP server only on tethered interfaces*/
++        InterfaceCollection *ilist = mInterfaces;
++        InterfaceCollection::iterator it;
++        for (it = ilist->begin(); it != ilist->end(); ++it) {
++            asprintf(&(args[nextArg++]),"-i%s", *it);
++        }
+ 
+-        int nextArg = 7;
+         for (int addrIndex=0; addrIndex < num_addrs;) {
+             char *start = strdup(inet_ntoa(addrs[addrIndex++]));
+             char *end = strdup(inet_ntoa(addrs[addrIndex++]));
+@@ -273,6 +304,13 @@ int TetherController::tetherInterface(const char *interface) {
+     ALOGD("tetherInterface(%s)", interface);
+     mInterfaces->push_back(strdup(interface));
+ 
++    /* Restart DHCP server to take in account the new tethered interface*/
++    if(mDaemonPid) {
++        mIntTetherRestart = 1;
++        stopTethering();
++        startTethering(mNum_addrs, mAddrs);
++    }
++
+     if (applyDnsInterfaces()) {
+         InterfaceCollection::iterator it;
+         for (it = mInterfaces->begin(); it != mInterfaces->end(); ++it) {
+@@ -297,6 +335,12 @@ int TetherController::untetherInterface(const char *interface) {
+         if (!strcmp(interface, *it)) {
+             free(*it);
+             mInterfaces->erase(it);
++            /* Restart DHCP server to take in account the deleted interface*/
++            if(mDaemonPid) {
++                mIntTetherRestart = 1;
++                stopTethering();
++                startTethering(mNum_addrs, mAddrs);
++            }
+ 
+             return applyDnsInterfaces();
+         }
+diff --git a/TetherController.h b/TetherController.h
+index 4da10b0..f9a920a 100644
+--- a/TetherController.h
++++ b/TetherController.h
+@@ -29,6 +29,9 @@ class TetherController {
+     NetAddressCollection *mDnsForwarders;
+     pid_t                 mDaemonPid;
+     int                   mDaemonFd;
++    struct in_addr* mAddrs;
++    int mNum_addrs;
++    int mIntTetherRestart;
+ 
+ public:
+     TetherController();
+-- 
+1.7.4.1
+

@@ -1,0 +1,852 @@
+From c2830b011ec364e0f27064e99b934c52cfaca2e7 Mon Sep 17 00:00:00 2001
+From: Serguei Katkov <serguei.i.katkov@intel.com>
+Date: Wed, 24 Jul 2013 15:36:30 +0700
+Subject: Dalvik: PCG - Do not generate Chaining Cell if call to it is optimized away
+
+BZ: 124606
+
+PCG backend is able to optimize away a reference to chaining cell.
+In that case there is no need to generate a chaining cell at all.
+
+The patch also re-factors Relocation data structure.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I952192f8e98a57cf4449433e64e1071482d21069
+Orig-MCG-Change-Id: I7c20e7a40b47ff69422df145667061acfe8b7ba6
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+Reviewed-on: http://android.intel.com:8080/119844
+Reviewed-by: Lupusoru, Razvan A <razvan.a.lupusoru@intel.com>
+Reviewed-by: Hartley, Timothy D <timothy.d.hartley@intel.com>
+Reviewed-by: lab_aqa <lab_aqa@intel.com>
+Reviewed-by: Provodin, Vitaly A <vitaly.a.provodin@intel.com>
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: Beyler, Jean Christophe <jean.christophe.beyler@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+---
+ vm/compiler/codegen/x86/pcg/Android.mk             |    2 +
+ .../codegen/x86/pcg/ChainingCellException.cpp      |  129 +++++++++++++-------
+ vm/compiler/codegen/x86/pcg/Client.cpp             |   32 ++++--
+ vm/compiler/codegen/x86/pcg/CodeGeneration.cpp     |    2 +-
+ vm/compiler/codegen/x86/pcg/CompilationUnitPCG.cpp |   59 +++++----
+ vm/compiler/codegen/x86/pcg/CompilationUnitPCG.h   |   33 ++---
+ vm/compiler/codegen/x86/pcg/DataStructures.h       |   16 +--
+ vm/compiler/codegen/x86/pcg/Labels.cpp             |   59 ---------
+ vm/compiler/codegen/x86/pcg/Labels.h               |    7 -
+ vm/compiler/codegen/x86/pcg/Relocation.cpp         |   73 +++++++++++
+ vm/compiler/codegen/x86/pcg/Relocation.h           |   88 +++++++++++++
+ 11 files changed, 321 insertions(+), 179 deletions(-)
+ create mode 100644 vm/compiler/codegen/x86/pcg/Relocation.cpp
+ create mode 100644 vm/compiler/codegen/x86/pcg/Relocation.h
+
+diff --git a/vm/compiler/codegen/x86/pcg/Android.mk b/vm/compiler/codegen/x86/pcg/Android.mk
+index dcf2317..73c9b38 100644
+--- a/vm/compiler/codegen/x86/pcg/Android.mk
++++ b/vm/compiler/codegen/x86/pcg/Android.mk
+@@ -60,6 +60,7 @@ LOCAL_SRC_FILES := \
+     LowerOther.cpp \
+     PcgInterface.cpp \
+     PersistentInfo.cpp \
++    Relocation.cpp \
+     UtilityPCG.cpp
+ 
+ LOCAL_SHARED_LIBRARIES += libcutils libdvm libdl
+@@ -176,6 +177,7 @@ ifeq ($(WITH_HOST_DALVIK),true)
+         LowerOther.cpp \
+         PcgInterface.cpp \
+         PersistentInfo.cpp \
++        Relocation.cpp \
+         UtilityPCG.cpp
+ 
+     LOCAL_C_INCLUDES += \
+diff --git a/vm/compiler/codegen/x86/pcg/ChainingCellException.cpp b/vm/compiler/codegen/x86/pcg/ChainingCellException.cpp
+index dccd3d2..1e83dec 100644
+--- a/vm/compiler/codegen/x86/pcg/ChainingCellException.cpp
++++ b/vm/compiler/codegen/x86/pcg/ChainingCellException.cpp
+@@ -73,6 +73,14 @@ static uint8_t* dvmCompilerPcgEmitSingletonChainingCell (CompilationUnitPCG *cUn
+ {
+     const uint8_t *cellBegin = currCachePtr;
+ 
++    // First thing we should check whether there is a reference to our chaining cell
++    const CRelocation *relocation = cUnit->findRelocation (blockSymbol);
++    if (relocation == 0)
++    {
++        // No reference so no change in code cache
++        return currCachePtr;
++    }
++
+     // Make sure we don't overflow the code cache
+     if (freeSpace < SINGLETON_CC_SIZE)
+     {
+@@ -113,8 +121,7 @@ static uint8_t* dvmCompilerPcgEmitSingletonChainingCell (CompilationUnitPCG *cUn
+     currCachePtr += 4;
+ 
+     // Finally, lay down the address in the code where this chaining cell is referenced.
+-    const SRelocation &relocation = cUnit->findRelocation (blockSymbol);
+-    * ( (const uint8_t**)currCachePtr) = startAddr + relocation.codeOffset;
++    * ( (const uint8_t**)currCachePtr) = startAddr + relocation->getCodeOffset();
+     if (cUnit->checkDebugMask (DebugMaskBytecode) == true)
+     {
+         ALOGI ("    codePtr: 0x%p\n", * ( (const uint8_t**)currCachePtr));
+@@ -161,6 +168,14 @@ static uint8_t* dvmCompilerPcgEmitPredictedChainingCell (CompilationUnitPCG *cUn
+ {
+     const uint8_t *cellBegin = currCachePtr;
+ 
++    // First thing we should check whether there is a reference to our chaining cell
++    const CRelocation *relocation = cUnit->findRelocation (blockSymbol);
++    if (relocation == 0)
++    {
++        // No reference so no change in code cache
++        return currCachePtr;
++    }
++
+     // Make sure we don't overflow the code cache
+     if (freeSpace < PREDICTED_CC_SIZE)
+     {
+@@ -221,6 +236,14 @@ static uint8_t* dvmCompilerPcgEmitHotChainingCell (CompilationUnitPCG *cUnit,
+ {
+     const uint8_t *cellBegin = currCachePtr;
+ 
++    // First thing we should check whether there is a reference to our chaining cell
++    const CRelocation *relocation = cUnit->findRelocation (blockSymbol);
++    if (relocation == 0)
++    {
++        // No reference so no change in code cache
++        return currCachePtr;
++    }
++
+     // Make sure we don't overflow the code cache
+     if (freeSpace < HOT_CC_SIZE)
+     {
+@@ -237,9 +260,6 @@ static uint8_t* dvmCompilerPcgEmitHotChainingCell (CompilationUnitPCG *cUnit,
+     // block should land here, so bind the symbol to this address.
+     dvmCompilerPcgBindSymbolAddress (blockSymbol, currCachePtr);
+ 
+-    // Get the relocation object for references to this cell
+-    SRelocation relocation = cUnit->findRelocation (blockSymbol);
+-
+     // Now lay down the call instruction.
+     *currCachePtr++ = 0xe8;
+ 
+@@ -264,7 +284,7 @@ static uint8_t* dvmCompilerPcgEmitHotChainingCell (CompilationUnitPCG *cUnit,
+     currCachePtr += 4;
+ 
+     // Lay down the address in the code where this chaining cell is referenced.
+-    * ( (const uint8_t**)currCachePtr) = startAddr + relocation.codeOffset;
++    * ( (const uint8_t**)currCachePtr) = startAddr + relocation->getCodeOffset ();
+     if (cUnit->checkDebugMask (DebugMaskBytecode) == true)
+     {
+         ALOGI ("    codePtr: 0x%p\n", * ( (const uint8_t**)currCachePtr));
+@@ -273,14 +293,9 @@ static uint8_t* dvmCompilerPcgEmitHotChainingCell (CompilationUnitPCG *cUnit,
+ 
+     // Finally, lay out a flag to signal whether the reference is absolute or
+     // PC-relative.
+-    int isRelative = 0;
+-
+-    if (relocation.relocationType == CGRelocationTypePC32)
+-    {
+-        isRelative = 1;
+-    }
+-
++    int isRelative = (relocation->getType () == CGRelocationTypePC32) ? 1 : 0;
+     * ( (int *)currCachePtr) = isRelative;
++
+     if (cUnit->checkDebugMask (DebugMaskBytecode) == true)
+     {
+         ALOGI ("    isMove: 0x%08x\n", * ( (int *)currCachePtr));
+@@ -351,6 +366,16 @@ static uint8_t* dvmCompilerPcgEmitNormalChainingCell (
+     CGSymbol blockSymbol = bb->chainingCellSymbol;
+     const uint8_t *cellBegin = currCachePtr;
+ 
++    // First thing we should check whether there is a reference to our chaining cell
++    // But if predecessor is switch we should generate it anyway
++    BasicBlockPCG * switchBB = getPredecessorSwitchBasicBlock(cUnit, bb);
++    const CRelocation *relocation = cUnit->findRelocation (blockSymbol);
++    if (relocation == 0 && switchBB == 0)
++    {
++        // No reference so no change in code cache
++        return currCachePtr;
++    }
++
+     // Make sure we don't overflow the code cache
+     if (freeSpace < NORMAL_CC_SIZE)
+     {
+@@ -397,14 +422,8 @@ static uint8_t* dvmCompilerPcgEmitNormalChainingCell (
+     }
+     currCachePtr += 4;
+ 
+-    BasicBlockPCG * switchBB = getPredecessorSwitchBasicBlock(cUnit, bb);
+     if (switchBB != 0)
+     {
+-        // This chaining cell is associated with a switch statement
+-        SRelocation * relocation =
+-            static_cast <SRelocation *>
+-            (dvmCompilerNew(sizeof(SRelocation), false));
+-
+         // First we need to create a symbol for the switch table entry
+         // so that we can refer to it now
+         std::string switchBBName;
+@@ -422,15 +441,14 @@ static uint8_t* dvmCompilerPcgEmitNormalChainingCell (
+         // Now that we have a symbol, we can create a relocation tracker for it
+         const SClientSymbolInfo *clientSymbolInfo =
+             singletonPtr<PersistentInfo> ()->getSymbolInfo (switchEntrySymbol);
+-        relocation->targetSymbol = clientSymbolInfo;
+-        relocation->addend = (int32_t)0;
+-        relocation->codeOffset = (uint32_t)currCachePtr - (uint32_t)startAddr;
+-        relocation->relocationType = CGRelocationType32;
++        // This chaining cell is associated with a switch statement
++        CRelocation * swRelocation = CRelocation::create (
++            clientSymbolInfo, (int32_t)0, (uint32_t)currCachePtr - (uint32_t)startAddr, CGRelocationType32);
+ 
+         // That should be sufficient to accomplish the write to this location,
+         // once the switch table entry symbol gets associated with an address,
+         // so make sure we store it in the list
+-        SwitchTableCCXRef xref = { relocation, bb };
++        SwitchTableCCXRef xref = { swRelocation, bb };
+         switchChainingCellEntries->push_back(xref);
+ 
+         // Just put something in the cell, so we don't print anything wrong
+@@ -441,8 +459,7 @@ static uint8_t* dvmCompilerPcgEmitNormalChainingCell (
+     {
+         // Lay down the address in the code where this chaining cell is
+         // referenced.
+-        const SRelocation &relocation = cUnit->findRelocation (blockSymbol);
+-        * ( (const uint8_t**)currCachePtr) = startAddr + relocation.codeOffset;
++        * ( (const uint8_t**)currCachePtr) = startAddr + relocation->getCodeOffset ();
+     }
+ 
+     if (cUnit->checkDebugMask (DebugMaskBytecode) == true)
+@@ -453,11 +470,7 @@ static uint8_t* dvmCompilerPcgEmitNormalChainingCell (
+ 
+     // Finally, lay down the isSwitch flag (because switch cells need to cause
+     // absolute targets to be patched, not relative targets
+-    int isSwitch = 0;
+-    if (switchBB != 0)
+-    {
+-        isSwitch = 1;
+-    }
++    int isSwitch = switchBB != 0 ? 1 : 0;
+ 
+     * ( (int*)currCachePtr) = isSwitch;
+     if (cUnit->checkDebugMask (DebugMaskBytecode) == true)
+@@ -488,6 +501,16 @@ static uint8_t* dvmCompilerPcgEmitBackwardBranchChainingCell (CompilationUnitPCG
+ {
+     const uint8_t *cellBegin = currCachePtr;
+ 
++    // First thing we should check whether there is a reference to our chaining cell
++    CGSymbol blockSymbol = bb->chainingCellSymbol;
++    CGSymbol writebackSymbol = bb->writebackTargetSymbol;
++
++    if (cUnit->findRelocation (blockSymbol) == 0)
++    {
++        // No reference so no change in code cache
++        return currCachePtr;
++    }
++
+     // Make sure we don't overflow the code cache
+     if (freeSpace < BACKWARD_BRANCH_CC_SIZE)
+     {
+@@ -506,9 +529,6 @@ static uint8_t* dvmCompilerPcgEmitBackwardBranchChainingCell (CompilationUnitPCG
+     // which might encode an instruction in an unexpected way when multiple
+     // choices are available.
+ 
+-    CGSymbol blockSymbol = bb->chainingCellSymbol;
+-    CGSymbol writebackSymbol = bb->writebackTargetSymbol;
+-
+     // This is the "real" beginning of the chaining cell.  Any branches to this
+     // block should land here, so bind the symbol to this address.
+     dvmCompilerPcgBindSymbolAddress (blockSymbol, currCachePtr);
+@@ -539,8 +559,20 @@ static uint8_t* dvmCompilerPcgEmitBackwardBranchChainingCell (CompilationUnitPCG
+     currCachePtr += 4;
+ 
+     // Lay down the address in the code where this chaining cell is referenced.
+-    const SRelocation &relocation = cUnit->findRelocation (writebackSymbol);
+-    * ( (const uint8_t**)currCachePtr) = startAddr + relocation.codeOffset;
++    const CRelocation *relocation = cUnit->findRelocation (writebackSymbol);
++    if (relocation == 0)
++    {
++        ALOGI ("JIT INFO: PCG: writebackSymbol is not found");
++
++        //Bail using a LCG error, this will have to get changed
++        //For the moment just make it fail with the generic error
++        SET_JIT_ERROR (kJitErrorCodegen);
++
++        //Just return because this is already a bad enough situation
++        return currCachePtr;
++    }
++
++    * ( (const uint8_t**)currCachePtr) = startAddr + relocation->getCodeOffset ();
+     if (cUnit->checkDebugMask (DebugMaskBytecode) == true)
+     {
+         ALOGI ("    codePtr: 0x%p\n", * ( (const uint8_t**)currCachePtr));
+@@ -935,14 +967,27 @@ uint8_t *dvmCompilerPcgEmitChainingCells (CompilationUnitPCG *cUnit,
+                     return 0;
+             }
+ 
+-            if (newCachePtr == false)
++            if (newCachePtr == 0)
+             {
+                 // The code cache is full.  Return 0 to indicate this.
+                 SET_JIT_ERROR(kJitErrorCodeCacheFull);
+                 return 0;
+             }
+-            freeSpace -= (newCachePtr - cachePtr);
+-            cachePtr = newCachePtr;
++
++            // If no code was emmitted for chaining cell we should reflect it in count
++            if (newCachePtr == cachePtr)
++            {
++                if (cUnit->checkDebugMask (DebugMaskBytecode) == true)
++                {
++                    ALOGI ("JIT_INFO: PCG: Translation for block %d skipped due to no-reference from code", blockId);
++                }
++                pcgChainCellCounts.u.count[i]--;
++            }
++            else
++            {
++                freeSpace -= (newCachePtr - cachePtr);
++                cachePtr = newCachePtr;
++            }
+         }
+     }
+ 
+@@ -1048,15 +1093,15 @@ uint8_t* dvmCompilerPcgEmitSwitchTables(CompilationUnitPCG *cUnit,
+         for (it = switchChainingCellEntries->begin();
+              it != switchChainingCellEntries->end(); it++)
+         {
+-            SRelocation *switchTableEntryRelocation = it->relocation;
++            CRelocation *switchTableEntryRelocation = it->relocation;
+             BasicBlockPCG *chainingCellBlock = it->chainingCellBB;
+ 
+             // Now that we know where the symbol should live, bind it, and add the
+             // finalized relocation to the tracking system
+             dvmCompilerPcgBindSymbolAddress (
+-                switchTableEntryRelocation->targetSymbol->cgSymbol,
++                switchTableEntryRelocation->getSymbolInfo ()->cgSymbol,
+                 currCachePtr);
+-            cUnit->addRelocation(*switchTableEntryRelocation);
++            cUnit->addRelocation(switchTableEntryRelocation);
+ 
+             // And since the chaining cell locations have already been bound,
+             // find that address, and put it here in the switch table entry
+diff --git a/vm/compiler/codegen/x86/pcg/Client.cpp b/vm/compiler/codegen/x86/pcg/Client.cpp
+index dd90f3f..9031ef2 100644
+--- a/vm/compiler/codegen/x86/pcg/Client.cpp
++++ b/vm/compiler/codegen/x86/pcg/Client.cpp
+@@ -204,15 +204,27 @@ void CGAddRelocationToClient (void *clientRoutineHandle, uint64_t codeOffset, CG
+     //Paranoid
+     assert (cUnit != 0);
+ 
+-    SRelocation relocation;
+-
+-    const SClientSymbolInfo *clientSymbolInfo = singletonPtr<PersistentInfo> ()->getSymbolInfo (symbol);
+-    relocation.targetSymbol = clientSymbolInfo;
+-    relocation.addend = (int32_t)addend;
+-    relocation.codeOffset = (uint32_t)codeOffset;
+-    relocation.relocationType = relocationType;
+-
+-    //Add a relocation to the list
+-    cUnit->addRelocation (relocation);
++    SClientSymbolInfo *clientSymbolInfo = singletonPtr<PersistentInfo> ()->getSymbolInfo (symbol);
++    if (clientSymbolInfo != 0)
++    {
++        CRelocation *relocation = CRelocation::create (clientSymbolInfo, (int32_t)addend, (uint32_t)codeOffset, relocationType);
++        if (relocation != 0)
++        {
++            //Add a relocation to the list
++            cUnit->addRelocation (relocation);
++        }
++        else
++        {
++            ALOGE ("\n+++ PCG ERROR +++ Could not create a relocation");
++            //TODO: use the error framework
++            exit (-1);
++        }
++    }
++    else
++    {
++        ALOGE ("\n+++ PCG ERROR +++ Could not find a Symbol Info");
++        //TODO: use the error framework
++        exit (-1);
++    }
+ }
+ 
+diff --git a/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp b/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
+index 278654b..81f2065 100644
+--- a/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
++++ b/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
+@@ -1502,7 +1502,7 @@ void dvmCompilerPcgEmitCode (CompilationUnitPCG *cUnit, JitTranslationInfo* info
+         return;
+     }
+ 
+-    dvmCompilerPcgResolveSymbolReferences (cUnit, startAddr);
++    cUnit->resolveAllRelocations (startAddr);
+ 
+     // Update the necessary state following the successful compilation.
+     // cUint->baseAddr is the function entry point.  So is info->codeAddress.
+diff --git a/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.cpp b/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.cpp
+index ab006d6..e8c7325 100644
+--- a/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.cpp
++++ b/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.cpp
+@@ -105,6 +105,24 @@ CGTemp CompilationUnitPCG::getCurrentTemporaryVR (bool increment)
+     return res;
+ }
+ 
++bool CompilationUnitPCG::addRelocation (CRelocation *relocation)
++{
++    // no relocation => nothing to add
++    if (relocation == 0)
++    {
++        return false;
++    }
++
++    const SClientSymbolInfo *info = relocation->getSymbolInfo ();
++
++    // Relocation creation guarantees that info cannot be 0, so just assert it
++    assert (info != 0);
++
++    // Keep the correspondance of symbol to relocation in multimap
++    relocations.insert (std::pair<CGSymbol, CRelocation*>(info->cgSymbol, relocation));
++    return true;
++}
++
+ /**
+  * @details findRelocation attempts to find a reference to the specified symbol
+  * in the code.  This routine is specifically used to find references to the
+@@ -116,29 +134,27 @@ CGTemp CompilationUnitPCG::getCurrentTemporaryVR (bool increment)
+  * cell structure expects there to be exactly one reference, but currently
+  * there may be more than one.)
+  *
+- * If no reference is found, we return a dummy relocation at code offset 0.
++ * If no reference is found, we return 0.
+  * This situation should only be possible if all references to the chaining
+  * cell were optimized away (such as can happen if a branch direction may be
+  * computed at compile time).
+  */
+-const SRelocation &CompilationUnitPCG::findRelocation (CGSymbol symbol)
++const CRelocation *CompilationUnitPCG::findRelocation (CGSymbol symbol)
+ {
+-    static SRelocation dummy = {0, 0, 0, CGRelocationTypePC32};
++    std::multimap<CGSymbol, CRelocation*>::iterator result = relocations.find (symbol);
+ 
+-    for (std::vector<SRelocation>::iterator it = relocations.begin(); it != relocations.end(); ++it)
+-    {
+-        //Get local version
+-        SRelocation &elem = *it;
++    // If relocation is not found we return 0
++    CRelocation *relocation = (result == relocations.end()) ? 0 : result->second;
++    return relocation;
++}
+ 
+-        //Is it the same as ours?
+-        if (elem.targetSymbol->cgSymbol == symbol)
+-        {
+-            return elem;
+-        }
++// Perform symbol relocation.  The input argument is the address of the start of the routine
++void CompilationUnitPCG::resolveAllRelocations (uint8_t *codePtr)
++{
++    for (std::multimap<CGSymbol,CRelocation*>::iterator it = relocations.begin(); it != relocations.end(); ++it)
++    {
++        it->second->resolve (codePtr);
+     }
+-
+-    //Otherwise it is not found
+-    return dummy;
+ }
+ 
+ void CompilationUnitPCG::registerizeAnalysisDone (void)
+@@ -222,17 +238,6 @@ void CompilationUnitPCG::registerizeAnalysisDone (void)
+     }
+ }
+ 
+-const SRelocation *CompilationUnitPCG::getRelocation (unsigned int nbr) const
+-{
+-    //Paranoid
+-    if (nbr >= relocations.size ())
+-    {
+-        return 0;
+-    }
+-
+-    return & (relocations.at (nbr));
+-}
+-
+ SSANumInfo &CompilationUnitPCG::getSSANumInformation (int ssaNum)
+ {
+     return ssaNumInfo[ssaNum];
+@@ -399,7 +404,7 @@ CGSymbol CompilationUnitPCG::getBlockSymbol (CGLabel blockLabel)
+  * @details Some block address might have been referenced by the block's CGSymbol.
+  * Now that the code has been laid down, we can compute the addresses of those
+  * symbols.  This needs to be done before we attempt to resolve references
+- * to these symbols in dvmCompilerPcgResolveSymbolReferences
++ * to these symbols.
+  */
+ void CompilationUnitPCG::bindBlockSymbolAddresses (uint8_t *startAddr)
+ {
+diff --git a/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.h b/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.h
+index 3b2e0e3..e9e2040 100644
+--- a/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.h
++++ b/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.h
+@@ -22,6 +22,7 @@
+ 
+ #include "CompilerIR.h"
+ #include "DataStructures.h"
++#include "Relocation.h"
+ #include "libpcg.h"
+ 
+ //Forward Declaration
+@@ -105,8 +106,8 @@ class CompilationUnitPCG: public CompilationUnit
+         /** @brief Virtual Machine Pointer Register */
+         CGTemp vmPtrReg;
+ 
+-        /** @brief SRelocation list */
+-        std::vector<SRelocation> relocations;
++        /** @brief Relocation map */
++        std::multimap<CGSymbol, CRelocation*> relocations;
+ 
+         /** @brief Information about the SSA number */
+         std::map<int, SSANumInfo> ssaNumInfo;
+@@ -227,30 +228,24 @@ class CompilationUnitPCG: public CompilationUnit
+         void setVMPtr (CGInst ptr) {vmPtr = ptr;}
+ 
+         /**
+-          * @brief Add a relocation
+-          * @param relocation add a relocation to the list
+-          */
+-        void addRelocation (const SRelocation &relocation) {relocations.push_back (relocation);}
+-
+-        /**
+-         * @brief Return the number of relocations
+-         * @return the number of relocations
++         * @brief Add a relocation
++         * @param relocation add a relocation to the map
++         * @return true if relocation is added
+          */
+-        unsigned int getNbrRelocations (void) const {return relocations.size ();}
++        bool addRelocation (CRelocation *relocation);
+ 
+         /**
+-         * @brief Return a given relocation
+-         * @param nbr the index to the relocation
+-         * @return the SRelocation we care about
++         * @brief Find any relocation corresponding to symbol reference
++         * @param symbol the symbol we are looking for
++         * @return the CRelocation, can return 0 if no relocations found
+          */
+-        const SRelocation *getRelocation (unsigned int nbr) const;
++        const CRelocation *findRelocation (CGSymbol symbol);
+ 
+         /**
+-         * @brief Find a symbol reference
+-         * @param symbol the symbol we are looking for
+-         * @return the SRelocation, can return a dummy symbol, all fields to 0 except type
++         * @brief Resolve all registered relocations
++         * @param codePtr the code section for the trace generation
+          */
+-        const SRelocation &findRelocation (CGSymbol symbol);
++        void resolveAllRelocations (uint8_t *codePtr);
+ 
+         /**
+          * @brief Get a SSA information structure
+diff --git a/vm/compiler/codegen/x86/pcg/DataStructures.h b/vm/compiler/codegen/x86/pcg/DataStructures.h
+index 8b40a2e..2f37d8d 100644
+--- a/vm/compiler/codegen/x86/pcg/DataStructures.h
++++ b/vm/compiler/codegen/x86/pcg/DataStructures.h
+@@ -70,28 +70,16 @@ typedef struct sClientSymbolInfo
+     CGSymbol cgSymbol; /**< @brief CGSymbol of the symbol */
+ } SClientSymbolInfo;
+ 
+-/**
+- * @class SRelocation
+- * @brief SRelocation provides information about a relocation and how to patch it
+- */
+-typedef struct sRelocation
+-{
+-    const SClientSymbolInfo *targetSymbol;   /**< @brief The symbol that needs to be referenced */
+-    int32_t addend;                          /**< @brief A constant offset to be added to &targetSymbol in the calculation of the symbol reference */
+-    uint32_t codeOffset;                     /**< @brief The offset from the start of the routine where the reference is needed */
+-    CGRelocationType relocationType;         /**< @brief The type of relocation  (absolute vs. PC-relative) */
+-} SRelocation;
+-
+-
+ // forward declaration
+ struct BasicBlockPCG;
++class CRelocation;
+ 
+ /**
+  * @class SwitchTableCCXRef
+  * @brief SwitchTableCCXRef provides information for how to map a switch table entry to its chaining cell
+  */
+ struct SwitchTableCCXRef {
+-    SRelocation * relocation;           /**< @brief A ptr to a relocation to keep track of the chaining cell / switch table entry x-ref */
++    CRelocation * relocation;          /**< @brief A ptr to a relocation to keep track of the chaining cell / switch table entry x-ref */
+     BasicBlockPCG * chainingCellBB;     /**< @brief A ptr to the chaining cell this relocation is associated with */
+ };
+ 
+diff --git a/vm/compiler/codegen/x86/pcg/Labels.cpp b/vm/compiler/codegen/x86/pcg/Labels.cpp
+index e522a20..c129798 100644
+--- a/vm/compiler/codegen/x86/pcg/Labels.cpp
++++ b/vm/compiler/codegen/x86/pcg/Labels.cpp
+@@ -23,65 +23,6 @@
+ #include "Singleton.h"
+ #include "UtilityPCG.h"
+ 
+-// Perform symbol relocation.  The input argument is the address of the start of the routine
+-void dvmCompilerPcgResolveSymbolReferences (const CompilationUnitPCG *cUnit, uint8_t *codePtr)
+-{
+-    const SRelocation *relocation;
+-
+-    //Get maximum number of relocations
+-    unsigned int max = cUnit->getNbrRelocations ();
+-
+-    //Walk the relocation list
+-    for (unsigned int i = 0; i < max; i++)
+-    {
+-        //Get relocation
+-        relocation = cUnit->getRelocation (i);
+-
+-        //Paranoid test
+-        if (relocation == 0)
+-        {
+-            //Bail using a LCG error, this will have to get changed
+-            //For the moment just make it fail with the generic error
+-            SET_JIT_ERROR (kJitErrorCodegen);
+-
+-            //Just return because this is already a bad enough situation
+-            return;
+-        }
+-
+-        uint8_t *symbolAddress = (uint8_t*) relocation->targetSymbol->address;
+-        void *ip = codePtr + relocation->codeOffset;
+-
+-        switch (relocation->relocationType)
+-        {
+-           case CGRelocationType32:
+-               {
+-                   //Get uint32_t data types
+-                   uint32_t reloc = (uint32_t) (symbolAddress + relocation->addend);
+-                   uint32_t *ptr = static_cast<uint32_t *> (ip);
+-                   *ptr = reloc;
+-               }
+-               break;
+-
+-           case CGRelocationTypePC32:
+-               {
+-                   //Get uint32_t data types
+-                   uint32_t *ptr = static_cast<uint32_t *> (ip);
+-                   uint8_t *ptr8uint = static_cast<uint8_t *> (ip);
+-                   uint32_t reloc = (uint32_t) (symbolAddress - ptr8uint + relocation->addend);
+-                   *ptr = reloc;
+-               }
+-               break;
+-
+-           default:
+-               // Unsupported relocation type.
+-               ALOGI ("JIT_INFO: Unsupported relocation type %d in dvmCompilerPcgResolveSymbolReferences\n", relocation->relocationType);
+-               //TODO: Change this to use the error framework
+-               assert (0);
+-               break;
+-        }
+-    }
+-}
+-
+ /**
+  * @details createSymbol creates a new CGSymbol with the specified name and address.
+  *  The symbol is created and returned, and a SClientSymbolInfo structure is created and inserted into the pcgSymbolMap.
+diff --git a/vm/compiler/codegen/x86/pcg/Labels.h b/vm/compiler/codegen/x86/pcg/Labels.h
+index a7530ae..f487f70 100644
+--- a/vm/compiler/codegen/x86/pcg/Labels.h
++++ b/vm/compiler/codegen/x86/pcg/Labels.h
+@@ -54,11 +54,4 @@ void dvmCompilerPcgBindSymbolAddress (CGSymbol cgSymbol, void *address);
+  */
+ void dvmCompilerPcgBindBlockLabel (BasicBlockPCG *bb);
+ 
+-/**
+- * @brief Resolve the relocations
+- * @param cUnit the CompilationUnitPCG
+- * @param code_ptr the code section for the trace generation
+- */
+-void dvmCompilerPcgResolveSymbolReferences (const CompilationUnitPCG* cUnit, uint8_t *code_ptr);
+-
+ #endif
+diff --git a/vm/compiler/codegen/x86/pcg/Relocation.cpp b/vm/compiler/codegen/x86/pcg/Relocation.cpp
+new file mode 100644
+index 0000000..b22d48d
+--- /dev/null
++++ b/vm/compiler/codegen/x86/pcg/Relocation.cpp
+@@ -0,0 +1,73 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "CompilerIR.h"
++#include "Relocation.h"
++
++CRelocation *CRelocation::create (const SClientSymbolInfo *targetSymbol, int32_t addend, uint32_t codeOffset, CGRelocationType relocationType)
++{
++    if (targetSymbol == 0)
++    {
++        return 0;
++    }
++
++    // Make space on arena for this instance
++    void * space = dvmCompilerNew(sizeof(CRelocation), true);
++
++    // Ensure that constructor is called
++    CRelocation *newRelocation = new (space) CRelocation (targetSymbol, addend, codeOffset, relocationType);
++
++    // Paranoid because dvmCompilerNew should never return 0
++    assert(newRelocation != 0);
++
++    return newRelocation;
++}
++
++void CRelocation::resolve (uint8_t *codePtr)
++{
++    uint8_t *symbolAddress = (uint8_t*) targetSymbol->address;
++    void *ip = codePtr + codeOffset;
++
++    switch (relocationType)
++    {
++       case CGRelocationType32:
++           {
++               //Get uint32_t data types
++               uint32_t reloc = (uint32_t) (symbolAddress + addend);
++               uint32_t *ptr = static_cast<uint32_t *> (ip);
++               *ptr = reloc;
++           }
++           break;
++
++       case CGRelocationTypePC32:
++           {
++               //Get uint32_t data types
++               uint32_t *ptr = static_cast<uint32_t *> (ip);
++               uint8_t *ptr8uint = static_cast<uint8_t *> (ip);
++               uint32_t reloc = (uint32_t) (symbolAddress - ptr8uint + addend);
++               *ptr = reloc;
++           }
++           break;
++
++       default:
++           // Unsupported relocation type.
++           ALOGI ("JIT_INFO: PCG: Unsupported relocation type %d in CRelocation::resolve", relocationType);
++           //TODO: Change this to use the error framework
++           assert (0);
++           break;
++    }
++}
++
+diff --git a/vm/compiler/codegen/x86/pcg/Relocation.h b/vm/compiler/codegen/x86/pcg/Relocation.h
+new file mode 100644
+index 0000000..326ef51
+--- /dev/null
++++ b/vm/compiler/codegen/x86/pcg/Relocation.h
+@@ -0,0 +1,88 @@
++/*
++ * Copyright  (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0  (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef H_RELOCATION
++#define H_RELOCATION
++
++#include "libpcg.h"
++#include "DataStructures.h"
++
++/**
++ * @class CRelocation
++ * @brief CRelocation provides information about a relocation and how to patch it
++ */
++class CRelocation
++{
++private:
++    /** @brief The symbol that needs to be referenced */
++    const SClientSymbolInfo *targetSymbol;
++
++    /** @brief A constant offset to be added to &targetSymbol in the calculation of the symbol reference */
++    const int32_t addend;
++
++    /** @brief The offset from the start of the routine where the reference is needed */
++    const uint32_t codeOffset;
++
++    /** @brief The type of relocation  (absolute vs. PC-relative) */
++    const CGRelocationType relocationType;
++
++    /**
++     * @brief private Constructor
++     * @param _targetSymbol the symbol that needs to be referenced
++     * @param _addend a constant offset to be added to &targetSymbol in the calculation of the symbol reference
++     * @param _codeOffset the offset from the start of the routine where the reference is needed
++     * @param _relocationType the type of relocation  (absolute vs. PC-relative)
++     */
++    CRelocation (const SClientSymbolInfo *_targetSymbol, const int32_t _addend, const uint32_t _codeOffset, const CGRelocationType _relocationType) :
++        targetSymbol (_targetSymbol), addend (_addend), codeOffset (_codeOffset), relocationType (_relocationType) {}
++
++public:
++    /**
++     * @brief static method to create an instance of CRelocation
++     * @details allocates memory in compile arena
++     * @param targetSymbol the symbol that needs to be referenced
++     * @param addend a constant offset to be added to &targetSymbol in the calculation of the symbol reference
++     * @param codeOffset the offset from the start of the routine where the reference is needed
++     * @param relocationType the type of relocation  (absolute vs. PC-relative)
++     * @return new instance of CRelocation or null if parameters are invalid
++     */
++    static CRelocation *create (const SClientSymbolInfo *targetSymbol, int32_t addend, uint32_t codeOffset, CGRelocationType relocationType);
++
++    /**
++     * @brief returns the symbol that needs to be referenced
++     * @return the symbol that needs to be referenced
++     */
++    const SClientSymbolInfo *getSymbolInfo (void) const { return targetSymbol; }
++
++    /**
++     * @brief returns the offset from the start of the routine where the reference is needed
++     * @return the offset from the start of the routine where the reference is needed
++     */
++    uint32_t getCodeOffset (void) const {return codeOffset;}
++
++    /**
++     * @brief returns the type of relocation  (absolute vs. PC-relative)
++     * @return the type of relocation  (absolute vs. PC-relative)
++     */
++    CGRelocationType getType (void) const {return relocationType;}
++
++    /**
++     * @brief Resolve this relocation
++     * @param codePtr the code section for the trace generation
++     */
++    void resolve (uint8_t *codePtr);
++};
++#endif
+-- 
+1.7.4.1
+

@@ -1,0 +1,169 @@
+From 6dc38b19a68659909fcd2b1f1eba8284cae32530 Mon Sep 17 00:00:00 2001
+From: Tim Hartley <timothy.d.hartley@intel.com>
+Date: Tue, 15 Oct 2013 12:01:57 -0700
+Subject: Dalvik: Fix for WITH_JIT_TUNING builds with PCG GL
+
+BZ: 145394
+
+This patch fixes a small problem where we were missing
+a parameter (for WITH_JIT_TUNING builds) to dvmJitToInterpNoChain
+when punting to the interpreter on big switch cases. The symptom
+was a segmentation fault in the interpreter's call to
+dvmBumpNoChain.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Ieaf260bc9f819db0d160fd996fcf1cc9d489556b
+Orig-MCG-Change-Id: Ia92cc2baf059422b5aebdc307d2dfe49b9d8971b
+Signed-off-by: Tim Hartley <timothy.d.hartley@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/codegen/x86/pcg/LowerJump.cpp  |   65 ++++++++++++++++++++++-----
+ vm/compiler/codegen/x86/pcg/LowerJump.h    |   11 +++++
+ vm/compiler/codegen/x86/pcg/LowerOther.cpp |    5 ++
+ 3 files changed, 69 insertions(+), 12 deletions(-)
+
+diff --git a/vm/compiler/codegen/x86/pcg/LowerJump.cpp b/vm/compiler/codegen/x86/pcg/LowerJump.cpp
+index 3e7867d..4d42f25 100644
+--- a/vm/compiler/codegen/x86/pcg/LowerJump.cpp
++++ b/vm/compiler/codegen/x86/pcg/LowerJump.cpp
+@@ -29,19 +29,14 @@ void dvmCompilerPcgTranslateDirectJumpToBlock (BasicBlockPCG *bb)
+ }
+ 
+ /**
+- * @details Create a JSR and conditionally add an spaddi depending on whether we're registerizing, or not.
++ * @brief Create a JSR
++ * @param symbol the CGsymbol to jump to
++ * @param parms a pointer to an array of CGInst parameters, ending in a CGInstInvalid (0 is fine)
++ * @param reg a CGInst with a register containing an address to jump to (CGInstInvalid is fine)
++ * @return the JSR CGInst
+  */
+-CGInst dvmCompilerPcgCreateJsr (CompilationUnitPCG *cUnit, CGSymbol symbol, CGInst *parms, CGInst reg)
++static CGInst createJsr (CGSymbol symbol, CGInst *parms, CGInst reg)
+ {
+-    if (symbol != CGSymbolInvalid && reg != CGInstInvalid)
+-    {
+-        cUnit->errorHandler->setError (kJitErrorPcgJsrCreation);
+-        return CGInstInvalid;
+-    }
+-
+-    CGInst spadd = CGCreateNewInst ("spaddi", "ri", CGGetStackPointerDef (), 0);
+-    CGSetRreg (spadd, "esp");
+-
+     if (parms != 0)
+     {
+         if (reg != CGInstInvalid)
+@@ -55,7 +50,7 @@ CGInst dvmCompilerPcgCreateJsr (CompilationUnitPCG *cUnit, CGSymbol symbol, CGIn
+     }
+     else
+     {
+-        if (reg != 0)
++        if (reg != CGInstInvalid)
+         {
+             return CGCreateNewInst ("jsr", "r", reg);
+         }
+@@ -67,6 +62,52 @@ CGInst dvmCompilerPcgCreateJsr (CompilationUnitPCG *cUnit, CGSymbol symbol, CGIn
+ }
+ 
+ 
++/**
++ * @details Create a JSR and add an spaddi
++ */
++CGInst dvmCompilerPcgCreateJsr (CompilationUnitPCG *cUnit, CGSymbol symbol, CGInst *parms, CGInst reg)
++{
++    if (symbol != CGSymbolInvalid && reg != CGInstInvalid)
++    {
++        cUnit->errorHandler->setError (kJitErrorPcgJsrCreation);
++        return CGInstInvalid;
++    }
++
++    CGInst spadd = CGCreateNewInst ("spaddi", "ri", CGGetStackPointerDef (), 0);
++    CGSetRreg (spadd, "esp");
++
++    return createJsr (symbol, parms, reg);
++}
++
++#if defined(WITH_JIT_TUNING)
++/**
++ * @details Create a JSR, add an spaddi, and store the kSwitchOverflow value on the stack
++ */
++CGInst dvmCompilerPcgCreateJsrWithKSwitchOverflow (CompilationUnitPCG *cUnit, CGSymbol symbol, CGInst *parms, CGInst reg)
++{
++    if (symbol != CGSymbolInvalid && reg != CGInstInvalid)
++    {
++        cUnit->errorHandler->setError (kJitErrorPcgJsrCreation);
++        return CGInstInvalid;
++    }
++
++    CGInst spadd = CGCreateNewInst ("spaddi", "ri", CGGetStackPointerDef (), 0);
++
++    /* Fall back to interpreter after resolving address of switch target.
++     * Indicate a kSwitchOverflow. Note: This is not an "overflow". But it helps
++     * count the times we return from a Switch
++     */
++    CGInst switchOverflowFlag = CGCreateNewInst ("mov", "i", kSwitchOverflow);
++    CGInst store = dvmCompilerPcgCreateSimpleStore (CGGetStackPointerDef (),
++        0, switchOverflowFlag);
++
++    CGInst stackPtrInEsp = CGCreateNewInst ("mov", "r", CGGetStackPointerDef ());
++    CGSetRreg (stackPtrInEsp, "esp");
++
++    return createJsr (symbol, parms, reg);
++}
++#endif
++
+ void dvmCompilerPcgTranslateConditionalJump (BasicBlockPCG *bb, CGInst a, const char *cond, CGInst b)
+ {
+     CGLabel targetLabel = bb->takenLabel;
+diff --git a/vm/compiler/codegen/x86/pcg/LowerJump.h b/vm/compiler/codegen/x86/pcg/LowerJump.h
+index 1452d0c..0a888be 100644
+--- a/vm/compiler/codegen/x86/pcg/LowerJump.h
++++ b/vm/compiler/codegen/x86/pcg/LowerJump.h
+@@ -39,6 +39,17 @@ void dvmCompilerPcgTranslateDirectJumpToBlock (BasicBlockPCG *bb);
+  */
+ CGInst dvmCompilerPcgCreateJsr (CompilationUnitPCG *cUnit, CGSymbol symbol, CGInst *parms = 0, CGInst reg = CGInstInvalid);
+ 
++#if defined(WITH_JIT_TUNING)
++/**
++ * @brief Create JSR and pass kSwitchOverflow on the stack
++ * @param symbol the CGSymbol
++ * @param parms the instruction (default: 0)
++ * @param reg the register (default: CGInstInvalid)
++ * @return the instruction generated
++ */
++CGInst dvmCompilerPcgCreateJsrWithKSwitchOverflow (CompilationUnitPCG * cUnit, CGSymbol symbol, CGInst *parms = 0, CGInst reg = CGInstInvalid);
++#endif
++
+ /**
+  * @brief Create a conditional jump
+  * @param bb the BasicBlockPCG
+diff --git a/vm/compiler/codegen/x86/pcg/LowerOther.cpp b/vm/compiler/codegen/x86/pcg/LowerOther.cpp
+index 1711657..4782a1e 100644
+--- a/vm/compiler/codegen/x86/pcg/LowerOther.cpp
++++ b/vm/compiler/codegen/x86/pcg/LowerOther.cpp
+@@ -381,6 +381,7 @@ static void dvmCompilerPcgCreateSwitchPunt (
+     CGInst rPCInst = CGCreateNewInst ("mov", "i", rPC);
+     CGInst newRPCInst = CGCreateNewInst ("add", "rr",
+         rPCInst, shiftedEntryInst);
++
+     CGInst rPCInEaxInst = CGCreateNewInst ("mov", "r", newRPCInst);
+     CGSetRreg (rPCInEaxInst, "eax");
+ 
+@@ -394,7 +395,11 @@ static void dvmCompilerPcgCreateSwitchPunt (
+     //Paranoid
+     assert (callback != 0);
+ 
++#if defined(WITH_JIT_TUNING)
++    dvmCompilerPcgCreateJsrWithKSwitchOverflow (cUnit, callback, noChainParms);
++#else
+     dvmCompilerPcgCreateJsr (cUnit, callback, noChainParms);
++#endif
+ }
+ 
+ void dvmCompilerPcgTranslatePackedSwitch (CompilationUnitPCG *cUnit, MIR *mir)
+-- 
+1.7.4.1
+

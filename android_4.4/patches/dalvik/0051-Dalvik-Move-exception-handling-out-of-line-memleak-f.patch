@@ -1,0 +1,629 @@
+From 90106e6d9804c48c3ef3c4edcdb0a8881f4ca61b Mon Sep 17 00:00:00 2001
+From: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Date: Thu, 17 Jan 2013 15:09:00 -0800
+Subject: Dalvik: Move exception handling out of line (memleak fixed)
+
+BZ: 78224
+
+Before this patch, the exception handling restore state is generated inline.
+For example, the code sequence for null check:
+test %esi,%esi // null check
+jnz after_exception
+mov #5eb324c2, -8(%edi) // save PC
+mov %edx,0(%edi) // save v0 back to memory
+jmp exception_handling_cell
+after_exception:
+// rest of instructions
+
+After this patch, the exception handling restore state is moved out of line:
+test %esi,%esi
+jz exception_restore_state_0
+// rest of instructions
+exception_restore_state_0:
+mov #5eb324c2, -8(%edi) // save PC
+mov %edx,0(%edi) // save v0 back to memory
+jmp exception_handling_cell
+
+This change is done to reduce icache footprint and also ensure that the likely
+path is fallthrough (namely that jz exception_restore_state_0 will usually
+fallthrough to next instruction).
+
+This patch is a second resubmission and contains a memory leak fix and
+an invalid memory access fixed.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I1ea986f2b304e82db530df5c373fc2835ca3ad7f
+Orig-MCG-Change-Id: Id81de4378c156aa84a5c23331ae4464216906579
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/Dvm.mk                                     |    5 +-
+ vm/compiler/codegen/x86/AnalysisO1.cpp        |    2 +-
+ vm/compiler/codegen/x86/CodegenInterface.cpp  |   12 ++-
+ vm/compiler/codegen/x86/ExceptionHandling.cpp |  144 ++++++++++++++++++++++
+ vm/compiler/codegen/x86/ExceptionHandling.h   |  107 +++++++++++++++++
+ vm/compiler/codegen/x86/Lower.cpp             |    3 +
+ vm/compiler/codegen/x86/LowerHelper.cpp       |  159 ++++++++++++++++---------
+ vm/compiler/codegen/x86/LowerJump.cpp         |    3 +-
+ 8 files changed, 370 insertions(+), 65 deletions(-)
+ create mode 100644 vm/compiler/codegen/x86/ExceptionHandling.cpp
+ create mode 100644 vm/compiler/codegen/x86/ExceptionHandling.h
+
+diff --git a/vm/Dvm.mk b/vm/Dvm.mk
+index 912c957..6a876fe 100644
+--- a/vm/Dvm.mk
++++ b/vm/Dvm.mk
+@@ -350,8 +350,9 @@ ifeq ($(dvm_arch),x86)
+               compiler/codegen/$(dvm_arch_variant)/NcgHelper.cpp \
+               compiler/codegen/$(dvm_arch_variant)/LowerGetPut.cpp \
+               compiler/codegen/$(dvm_arch_variant)/Schedule.cpp \
+-	      compiler/codegen/$(dvm_arch_variant)/InstructionGeneration.cpp \
+-	      compiler/LoopOpt.cpp \
++              compiler/codegen/$(dvm_arch_variant)/InstructionGeneration.cpp \
++              compiler/codegen/$(dvm_arch_variant)/ExceptionHandling.cpp \
++              compiler/LoopOpt.cpp \
+               compiler/Checks.cpp
+        # need apache harmony x86 encoder/decoder
+        LOCAL_C_INCLUDES += \
+diff --git a/vm/compiler/codegen/x86/AnalysisO1.cpp b/vm/compiler/codegen/x86/AnalysisO1.cpp
+index 417a5b0..eb91dbb 100644
+--- a/vm/compiler/codegen/x86/AnalysisO1.cpp
++++ b/vm/compiler/codegen/x86/AnalysisO1.cpp
+@@ -868,7 +868,7 @@ int codeGenBasicBlock(const Method* method, BasicBlock_O1* bb) {
+ #ifdef DEBUG_COMPILE_TABLE
+             dumpCompileTable();
+ #endif
+-            globalShortMap = NULL;
++            freeShortMap();
+             if (isCurrentByteCodeJump(mir->dalvikInsn.opcode))
+                 lastByteCodeIsJump = true;
+             //lowerByteCode will call globalVREndOfBB if it is jump
+diff --git a/vm/compiler/codegen/x86/CodegenInterface.cpp b/vm/compiler/codegen/x86/CodegenInterface.cpp
+index ad70c50..ccefd97 100644
+--- a/vm/compiler/codegen/x86/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/CodegenInterface.cpp
+@@ -24,6 +24,8 @@
+ #include "NcgAot.h"
+ #include "compiler/codegen/CompilerCodegen.h"
+ #include "InstructionGeneration.h"
++#include "Singleton.h"
++#include "ExceptionHandling.h"
+ 
+ #ifdef HAVE_ANDROID_OS
+ #include <cutils/properties.h>
+@@ -1455,15 +1457,19 @@ gen_fallthrough:
+             }
+         }
+     }
++
++    // Now that we finished handling all of the MIR BBs, we can dump all exception handling
++    // restore state to the code stream
++    singletonPtr<ExceptionHandlingRestoreState>()->dumpAllExceptionHandlingRestoreState();
++
+ #if 0
+     dvmCompilerApplyGlobalOptimizations(cUnit);
+ #endif
+     endOfTrace(false);
+ 
+     if (gDvmJit.codeCacheFull) {
+-        /* We hit code cache size limit inside endofTrace(false).
+-         * Bail out for this trace!
+-         */
++        // We hit code cache size limit either after dumping exception handling
++        // state or after calling endOfTrace. Bail out for this trace!
+         ALOGI("JIT code cache full after endOfTrace (trace uses %uB)", (stream - streamStart));
+         cUnit->baseAddr = NULL;
+         PROTECT_CODE_CACHE(stream, unprotected_code_cache_bytes);
+diff --git a/vm/compiler/codegen/x86/ExceptionHandling.cpp b/vm/compiler/codegen/x86/ExceptionHandling.cpp
+new file mode 100644
+index 0000000..2169611
+--- /dev/null
++++ b/vm/compiler/codegen/x86/ExceptionHandling.cpp
+@@ -0,0 +1,144 @@
++/*
++ * Copyright (C) 2010-2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ * @file ExceptionHandling.cpp
++ * @brief Implements interfaces and utilities used for managed exception handling.
++ */
++
++#include "Lower.h"
++#include "ExceptionHandling.h"
++#include "NcgAot.h"
++#include "Scheduler.h"
++#include "Singleton.h"
++
++ExceptionHandlingRestoreState::ExceptionHandlingRestoreState(void) :
++        uniqueStreamId(0), lastLabelGenerated(NULL) {
++    // For now, there's nothing else we need to do in constructor
++}
++
++ExceptionHandlingRestoreState::~ExceptionHandlingRestoreState(void) {
++    this->reset();
++}
++
++void ExceptionHandlingRestoreState::reset(void) {
++    this->streams.clear();
++    this->targets.clear();
++    this->lastLabelGenerated = NULL;
++    this->uniqueStreamId = 0;
++
++    // We must free the labels we inserted
++    freeShortMap();
++}
++
++char * ExceptionHandlingRestoreState::getUniqueLabel(void) {
++    // Allocate a label
++    char * label = static_cast<char *>(dvmCompilerNew(LABEL_SIZE, false));
++
++    // Give it a unique name
++    snprintf(label, LABEL_SIZE, "exception_restore_state_%d",
++            this->uniqueStreamId);
++
++    // Ensure future ids will be unique
++    this->uniqueStreamId++;
++
++    // Save label generated
++    this->lastLabelGenerated = label;
++
++    return label;
++}
++
++void ExceptionHandlingRestoreState::createExceptionHandlingStream(
++        char * beginningOfStream, char * endOfStream,
++        const char * targetLabel) {
++    // Just converting some pointers to unsigned ints to do some math.
++    unsigned int beginning = reinterpret_cast<unsigned int>(beginningOfStream);
++    unsigned int end = reinterpret_cast<unsigned int>(endOfStream);
++    size_t lengthOfTargetLabel = strlen(targetLabel);
++
++    // Developer needs to ensure that this doesn't happen
++    assert(end > beginning);
++
++    // Calculate size of exception handling instructions
++    size_t sizeOfStream = end - beginning;
++
++    // Create the new stream using compiler arena
++    char * newStream = static_cast<char *>(dvmCompilerNew(sizeOfStream, false));
++
++    // Copy instructions to the new stream
++    memcpy(newStream, beginningOfStream, sizeOfStream);
++
++    // Reset stream pointer now
++    stream = beginningOfStream;
++
++    // Add new stream to list of exception handling stream
++    this->streams.push_back(std::make_pair(newStream, sizeOfStream));
++
++    // Create a copy of the targetLabel because we cannot assume it won't be destroyed
++    // before we use it. Ensure that it can fit the entire old label, that is all zeros
++    // on allocation, and that it has room for the terminating null.
++    char * targetLabelCopy = static_cast<char *>(dvmCompilerNew(
++            lengthOfTargetLabel + 1, true));
++
++    // Copy string to our label copy. Allocation already ensures null termination
++    strncpy(targetLabelCopy, targetLabel, lengthOfTargetLabel);
++
++    // Save the name of own label and name of target label so we know
++    // where to generate jump to
++    this->targets.push_back(std::make_pair(this->lastLabelGenerated, targetLabelCopy));
++}
++
++void ExceptionHandlingRestoreState::dumpAllExceptionHandlingRestoreState(void) {
++    // Flush scheduler queue before copying to stream
++    if (gDvmJit.scheduling)
++        singletonPtr<Scheduler>()->signalEndOfNativeBasicBlock();
++
++    // Go through each saved restore state
++    for (unsigned int i = 0; i < this->streams.size(); ++i) {
++        size_t sizeOfExceptionRestore = this->streams[i].second;
++
++        // Ensure that we won't overfill the code cache
++        if (gDvmJit.codeCacheByteUsed + (stream - streamStart)
++                + sizeOfExceptionRestore + CODE_CACHE_PADDING
++                > gDvmJit.codeCacheSize) {
++            gDvmJit.codeCacheFull = true;
++            this->reset();
++            return;
++        }
++
++        char * label = this->targets[i].first;
++        char * targetLabel = this->targets[i].second;
++
++        // JIT verbosity
++        if (dump_x86_inst)
++            LOGD("LOWER %s @%p", label, stream);
++
++        // Insert label exception_restore_state_# where # is the unique identifier
++        insertLabel(label, true);
++
++        // Copy to instruction stream
++        memcpy(stream, this->streams[i].first, sizeOfExceptionRestore);
++
++        // After the copy, we still need to update stream pointer
++        stream = stream + sizeOfExceptionRestore;
++
++        // Jump to the target error label
++        unconditional_jump_global_API(targetLabel, false);
++    }
++
++    // Since we dumped to code stream, we can clear out the data structures
++    this->reset();
++}
+diff --git a/vm/compiler/codegen/x86/ExceptionHandling.h b/vm/compiler/codegen/x86/ExceptionHandling.h
+new file mode 100644
+index 0000000..dafc750
+--- /dev/null
++++ b/vm/compiler/codegen/x86/ExceptionHandling.h
+@@ -0,0 +1,107 @@
++/*
++ * Copyright (C) 2010-2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ * @file ExceptionHandling.h
++ * @brief Defines interfaces and implements utilities used for managed exception handling.
++ */
++
++#include <vector>
++#include <utility> // for std::pair
++
++/**
++ * @brief Used to defer committing instructions for exception handling
++ * restore state before punting to interpreter or common exception handler
++ */
++class ExceptionHandlingRestoreState {
++private:
++    /**
++     * @brief List of streams created for exception handling restore state
++     * along with their sizes.
++     * @details This is a list of stream pointers and their corresponding sizes.
++     */
++    std::vector<std::pair<char *, size_t> > streams;
++
++    /**
++     * @brief For each exception handling stream, contains a pair of stream's
++     * name and its target.
++     */
++    std::vector<std::pair<char *, char *> > targets;
++
++    /**
++     * @brief Counter to ensure some uniqueness for labels generated.
++     */
++    unsigned int uniqueStreamId;
++
++    /**
++     * @brief Keeps track of last label generated.
++     */
++    char * lastLabelGenerated;
++
++    // Declare the copy constructor and the equal operator as private to
++    // prevent copying
++    ExceptionHandlingRestoreState(ExceptionHandlingRestoreState const&);
++    void operator=(ExceptionHandlingRestoreState const&);
++
++public:
++    /**
++     * @brief Default constructor
++     */
++    ExceptionHandlingRestoreState(void);
++
++    /**
++     * @brief Default destructor
++     */
++    ~ExceptionHandlingRestoreState(void);
++
++    /**
++     * @brief Generates a label which will be used to tag
++     * exception handling restore state.
++     * @details Does not guarantee uniqueness across instances of this
++     * class. Does not guarantee uniqueness after
++     * dumpAllExceptionHandlingRestoreState is called.
++     * @return label for exception handling restore state
++     */
++    char * getUniqueLabel(void);
++
++    /**
++     * @brief Creates stream for exception handling and copies all
++     * instructions for the restore state to this stream.
++     * @details It uses the last label generated as the label for this
++     * stream. It resets stream pointer to be beginningOfStream.
++     * @param beginningOfStream Pointer to stream before exception handling
++     * restore state was dumped.
++     * @param endOfStream Pointer to stream after exception handling
++     * restore state was dumped.
++     * @param targetLabel label of target error
++     */
++    void createExceptionHandlingStream(char * beginningOfStream,
++            char * endOfStream, const char * targetLabel);
++
++    /**
++     * @brief Copies all of the buffered exception handling restore states
++     * to the instruction stream.
++     * @details After dumping each of the exception handling restore states to the
++     * stream, it generates a jump to the error name label (which ends up punting
++     * to interpreter).
++     */
++    void dumpAllExceptionHandlingRestoreState(void);
++
++    /**
++     * @brief Resets state of instance.
++     */
++    void reset(void);
++};
+diff --git a/vm/compiler/codegen/x86/Lower.cpp b/vm/compiler/codegen/x86/Lower.cpp
+index 2e621b4..f90b34a 100644
+--- a/vm/compiler/codegen/x86/Lower.cpp
++++ b/vm/compiler/codegen/x86/Lower.cpp
+@@ -35,6 +35,8 @@
+ #if defined VTUNE_DALVIK
+ #include "compiler/JitProfiling.h"
+ #endif
++#include "Singleton.h"
++#include "ExceptionHandling.h"
+ 
+ //statistics for optimization
+ int num_removed_nullCheck;
+@@ -466,6 +468,7 @@ void startOfTrace(const Method* method, LowOpBlockLabel* labelList, int exceptio
+     methodDataWorklist = NULL;
+     globalShortWorklist = NULL;
+     globalNCGWorklist = NULL;
++    singletonPtr<ExceptionHandlingRestoreState>()->reset();
+ 
+     streamMethodStart = stream;
+     //initialize mapFromBCtoNCG
+diff --git a/vm/compiler/codegen/x86/LowerHelper.cpp b/vm/compiler/codegen/x86/LowerHelper.cpp
+index ab3a353..bb07d4a 100644
+--- a/vm/compiler/codegen/x86/LowerHelper.cpp
++++ b/vm/compiler/codegen/x86/LowerHelper.cpp
+@@ -48,6 +48,7 @@ When allocating a physical register for an operand, we can't spill the operands
+ #include "interp/InterpState.h"
+ #include "Scheduler.h"
+ #include "Singleton.h"
++#include "ExceptionHandling.h"
+ 
+ extern "C" int64_t __divdi3(int64_t, int64_t);
+ extern "C" int64_t __moddi3(int64_t, int64_t);
+@@ -232,14 +233,7 @@ LowOpImm* dump_imm(Mnemonic m, OpndSize size, int imm) {
+ //! \param updateSecondOperand This is true when second operand needs updated
+ void dump_imm_update(int imm, char* codePtr, bool updateSecondOperand) {
+     // These encoder call do not need to go through scheduler since they need
+-    // to be dumped at a specific location in code stream. However, there might
+-    // be a request to update a location which hasn't had code lowered, but this
+-    // shouldn't happen.
+-    if(codePtr > stream) { //! \warning Assumes code stream is incremental
+-        LOGE("ERROR: Trying to update the immediate of an instruction, "
+-                "but instruction is not in code stream yet!");
+-        dvmAbort();
+-    }
++    // to be dumped at a specific location in code stream.
+     if(updateSecondOperand)
+         encoder_update_imm_rm(imm, codePtr);
+     else // update first operand
+@@ -2207,79 +2201,128 @@ int boundCheck(int vr_array, int reg_array, bool isPhysical_array,
+     return 0;
+ }
+ 
+-//!generate native code to perform null check
+-
+-//!
++/**
++ * @brief Generates native code to perform null check
++ * @param reg temporary or physical register to test
++ * @param isPhysical flag to indicate whether parameter reg is physical
++ * register
++ * @param exceptionNum
++ * @param vr virtual register for which the null check is being done
++ * @return >= 0 on success
++ */
+ int nullCheck(int reg, bool isPhysical, int exceptionNum, int vr) {
+-    char label[LABEL_SIZE];
++    const char * errorName = "common_errNullObject";
+ 
+-    if(gDvm.executionMode == kExecutionModeNcgO1) {
+-        //nullCheck optimization is available in O1 mode only
+-        if(isVRNullCheck(vr, OpndSize_32)) {
+-            updateRefCount2(reg, LowOpndRegType_gp, isPhysical);
+-            if(exceptionNum <= 1) {
+-                updateRefCount2(PhysicalReg_EDX, LowOpndRegType_gp, true);
+-                updateRefCount2(PhysicalReg_EDX, LowOpndRegType_gp, true);
+-            }
+-            num_removed_nullCheck++;
+-            return 0;
++    //nullCheck optimization is available in O1 mode only
++    if(gDvm.executionMode == kExecutionModeNcgO1 && isVRNullCheck(vr, OpndSize_32)) {
++        updateRefCount2(reg, LowOpndRegType_gp, isPhysical);
++        if(exceptionNum <= 1) {
++            updateRefCount2(PhysicalReg_EDX, LowOpndRegType_gp, true);
++            updateRefCount2(PhysicalReg_EDX, LowOpndRegType_gp, true);
+         }
+-        compare_imm_reg(OpndSize_32, 0, reg, isPhysical);
++        num_removed_nullCheck++;
++        return 0;
++    }
++
++    compare_imm_reg(OpndSize_32, 0, reg, isPhysical);
++
++    // Get a label for exception handling restore state
++    char * newStreamLabel =
++            singletonPtr<ExceptionHandlingRestoreState>()->getUniqueLabel();
++
++    // Since we are not doing the exception handling restore state inline, in case of
++    // ZF=1 we must jump to the BB that restores the state
++    conditional_jump(Condition_E, newStreamLabel, true);
++
++    // We can save stream pointer now since this follows a jump and ensures that
++    // scheduler already flushed stream
++    char * originalStream = stream;
++
++    if (gDvm.executionMode == kExecutionModeNcgO1) {
+         rememberState(exceptionNum);
+-        snprintf(label, LABEL_SIZE, "after_exception_%d", exceptionNum);
+-        conditional_jump(Condition_NE, label, true);
+-        if(exceptionNum > 1)
++        if (exceptionNum > 1) {
+             nextVersionOfHardReg(PhysicalReg_EDX, 2); //next version has 2 ref count
+-        export_pc(); //use %edx
++        }
++    }
++
++    export_pc(); //use %edx
++
++    if(gDvm.executionMode == kExecutionModeNcgO1) {
+         constVREndOfBB();
+         beforeCall("exception"); //dump GG, GL VRs
+-        unconditional_jump_global_API("common_errNullObject", false);
+-        insertLabel(label, true);
++    }
++
++    // We must flush scheduler queue now before we copy to exception handling
++    // stream.
++    if(gDvmJit.scheduling)
++        singletonPtr<Scheduler>()->signalEndOfNativeBasicBlock();
++
++    // Move all instructions to a deferred stream that will be dumped later
++    singletonPtr<ExceptionHandlingRestoreState>()->createExceptionHandlingStream(
++            originalStream, stream, errorName);
++
++    if(gDvm.executionMode == kExecutionModeNcgO1) {
+         goToState(exceptionNum);
+         setVRNullCheck(vr, OpndSize_32);
+-    } else {
+-        compare_imm_reg(OpndSize_32, 0, reg, isPhysical);
+-        snprintf(label, LABEL_SIZE, "after_exception_%d", exceptionNum);
+-        conditional_jump(Condition_NE, label, true);
+-        export_pc(); //use %edx
+-        unconditional_jump_global_API("common_errNullObject", false);
+-        insertLabel(label, true);
+     }
++
+     return 0;
+ }
+-//!generate native code to handle potential exception
+ 
+-//!
++/**
++ * @brief Generates code to handle potential exception
++ * @param code_excep Condition code to take exception path
++ * @param code_okay Condition code to skip exception
++ * @param exceptionNum
++ * @param errName Name of exception to handle
++ * @return >= 0 on success
++ */
+ int handlePotentialException(
+                              ConditionCode code_excep, ConditionCode code_okay,
+                              int exceptionNum, const char* errName) {
+-    char label[LABEL_SIZE];
++    // Get a label for exception handling restore state
++    char * newStreamLabel =
++            singletonPtr<ExceptionHandlingRestoreState>()->getUniqueLabel();
+ 
+-    if(gDvm.executionMode == kExecutionModeNcgO1) {
++    // Since we are not doing the exception handling restore state inline, in case of
++    // code_excep we must jump to the BB that restores the state
++    conditional_jump(code_excep, newStreamLabel, true);
++
++    // We can save stream pointer now since this follows a jump and ensures that
++    // scheduler already flushed stream
++    char * originalStream = stream;
++
++    if (gDvm.executionMode == kExecutionModeNcgO1) {
+         rememberState(exceptionNum);
+-        snprintf(label, LABEL_SIZE, "after_exception_%d", exceptionNum);
+-        conditional_jump(code_okay, label, true);
+-        if(exceptionNum > 1)
++        if (exceptionNum > 1) {
+             nextVersionOfHardReg(PhysicalReg_EDX, 2); //next version has 2 ref count
+-        export_pc(); //use %edx
++        }
++    }
++
++    export_pc(); //use %edx
++
++    if(gDvm.executionMode == kExecutionModeNcgO1) {
+         constVREndOfBB();
+         beforeCall("exception"); //dump GG, GL VRs
+-        if(!strcmp(errName, "common_throw_message")) {
+-            move_imm_to_reg(OpndSize_32, LstrInstantiationErrorPtr, PhysicalReg_ECX, true);
+-        }
+-        unconditional_jump_global_API(errName, false);
+-        insertLabel(label, true);
++    }
++
++    if(!strcmp(errName, "common_throw_message")) {
++        move_imm_to_reg(OpndSize_32, LstrInstantiationErrorPtr, PhysicalReg_ECX, true);
++    }
++
++    // We must flush scheduler queue now before we copy to exception handling
++    // stream.
++    if(gDvmJit.scheduling)
++        singletonPtr<Scheduler>()->signalEndOfNativeBasicBlock();
++
++    // Move all instructions to a deferred stream that will be dumped later
++    singletonPtr<ExceptionHandlingRestoreState>()->createExceptionHandlingStream(
++            originalStream, stream, errName);
++
++    if(gDvm.executionMode == kExecutionModeNcgO1) {
+         goToState(exceptionNum);
+-    } else {
+-        snprintf(label, LABEL_SIZE, "after_exception_%d", exceptionNum);
+-        conditional_jump(code_okay, label, true);
+-        export_pc(); //use %edx
+-        if(!strcmp(errName, "common_throw_message")) {
+-            move_imm_to_reg(OpndSize_32, LstrInstantiationErrorPtr, PhysicalReg_ECX, true);
+-        }
+-        unconditional_jump_global_API(errName, false);
+-        insertLabel(label, true);
+     }
++
+     return 0;
+ }
+ //!generate native code to get the self pointer from glue
+diff --git a/vm/compiler/codegen/x86/LowerJump.cpp b/vm/compiler/codegen/x86/LowerJump.cpp
+index a08701c..e0f8282 100644
+--- a/vm/compiler/codegen/x86/LowerJump.cpp
++++ b/vm/compiler/codegen/x86/LowerJump.cpp
+@@ -488,7 +488,8 @@ int getRelativeOffset(const char* target, bool isShortTerm, JmpCall_type type, b
+                !strcmp(target, ".new_array_done") ||
+                !strcmp(target, ".fill_array_data_done") ||
+                !strcmp(target, ".inlined_string_compare_done") ||
+-               !strncmp(target, "after_exception", 15)) {
++               !strncmp(target, "after_exception", 15) ||
++               !strncmp(target, "exception_restore_state_", 24)) {
+ #ifdef SUPPORT_IMM_16
+                 *immSize = OpndSize_16;
+ #else
+-- 
+1.7.4.1
+

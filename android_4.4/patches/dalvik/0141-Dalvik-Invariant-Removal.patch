@@ -1,0 +1,1796 @@
+From c849d1ca248e47c2b92c2ec1633a0cd71e086889 Mon Sep 17 00:00:00 2001
+From: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Date: Sat, 6 Apr 2013 13:50:57 -0700
+Subject: Dalvik: Invariant Removal
+
+BZ: 98297
+
+Added a invariant hoisting and sinking to the loop optimization framework.
+
+- InvariantRemoval.cpp, InvariantRemoval.h:
+    - Contains the invariant hoisting pass
+    - Contains the iget hoisting/iput sinking pass
+
+- AccumulationSinking.cpp:
+    - Made the addInstructionsToBasicBlock and addInstructionsToBasicBlocks
+        global into a function dvmCompilerAddInstructionsToBasicBlocks
+
+- BBOptimization.cpp:
+    - Update the bb field for instructions
+    - Added an extra gate for peeling:
+        - For the moment we only use peeling if we can hoist, we cannot hoist
+            if there are SGET bytecodes in the loop due to a dataflow bug
+
+CompilerIR.h, IntermediateRep.cpp:
+    - Added functions to help add instructions, remove instructions from
+        BasicBlocks
+    - Also added dvmCompilerIsSsaLiveOutOfBB to determine a live-out SSA
+        register
+
+LoopInformation.cpp, LoopInformation.h:
+    - Changed the handling of scratch registers
+    - Added an API for handling and keeping track of scratch registers
+
+LoopRegisterUsage.cpp, LoopRegisterUsage.h:
+    - Made checkVariant and usesAreInvariant global
+    - Fixed a minor issue with the memory aliasing pass
+
+RegisterizationME.cpp:
+    - Made the registerization be allowed all the time
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I7cead1ab2da28210cae9f1c6a6e096db242a8956
+Orig-MCG-Change-Id: I6e54216472414a298acbfae10e14d94a73bd109d
+Signed-off-by: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/Dvm.mk                           |    1 +
+ vm/compiler/AccumulationSinking.cpp |   57 +---
+ vm/compiler/BBOptimization.cpp      |   67 +++-
+ vm/compiler/CompilerIR.h            |   39 ++
+ vm/compiler/IntermediateRep.cpp     |  175 +++++++-
+ vm/compiler/InvariantRemoval.cpp    |  852 +++++++++++++++++++++++++++++++++++
+ vm/compiler/InvariantRemoval.h      |   48 ++
+ vm/compiler/LoopInformation.cpp     |   83 +++-
+ vm/compiler/LoopInformation.h       |   42 ++-
+ vm/compiler/LoopOpt.cpp             |    5 +
+ vm/compiler/LoopRegisterUsage.cpp   |   56 +---
+ vm/compiler/LoopRegisterUsage.h     |    8 +
+ vm/compiler/RegisterizationME.cpp   |    2 +-
+ 13 files changed, 1310 insertions(+), 125 deletions(-)
+ create mode 100644 vm/compiler/InvariantRemoval.cpp
+ create mode 100644 vm/compiler/InvariantRemoval.h
+
+diff --git a/vm/Dvm.mk b/vm/Dvm.mk
+index a91e785..d92d72a 100644
+--- a/vm/Dvm.mk
++++ b/vm/Dvm.mk
+@@ -359,6 +359,7 @@ ifeq ($(dvm_arch),x86)
+               compiler/LoopOpt.cpp \
+               compiler/Checks.cpp \
+               compiler/LoopRegisterUsage.cpp \
++              compiler/InvariantRemoval.cpp \
+               compiler/Pass.cpp \
+               compiler/BBOptimization.cpp \
+               compiler/LoopInformation.cpp \
+diff --git a/vm/compiler/AccumulationSinking.cpp b/vm/compiler/AccumulationSinking.cpp
+index fcfad1c..6797223 100644
+--- a/vm/compiler/AccumulationSinking.cpp
++++ b/vm/compiler/AccumulationSinking.cpp
+@@ -562,57 +562,6 @@ static void removeAccumulations(const std::vector<MIR *> & toRemove)
+ }
+ 
+ /**
+- * @brief Add instructions to the BasicBlock
+- * @param bb the BasicBlock
+- * @param toAdd a vector of Instructions to add to bb
+- */
+-static void addInstructionsToBasicBlock (BasicBlock *bb, const std::vector<MIR *> &toAdd)
+-{
+-    //If it is nil, we don't do anything
+-    if (bb == 0)
+-    {
+-        return;
+-    }
+-
+-    //Add a copy of each MIR
+-    for (std::vector<MIR *>::const_iterator it = toAdd.begin (); it != toAdd.end (); it++)
+-    {
+-        MIR *newMIR = dvmCompilerCopyMIR (*it);
+-
+-        dvmCompilerAppendMIR (bb, newMIR);
+-    }
+-}
+-
+-/**
+- * @brief Add instructions to the BasicBlock in a BitVector
+- * @param basicBlocks a BitVector containing the BasicBlocks
+- * @param toAdd a vector of Instructions to add to bb
+- */
+-static void addInstructionsToBasicBlocks (CompilationUnit *cUnit, BitVector *basicBlocks, const std::vector<MIR *> &toAdd)
+-{
+-    //Iterate on the exit blocks
+-    BitVectorIterator bvIterator;
+-    dvmBitVectorIteratorInit (basicBlocks, &bvIterator);
+-
+-    while (true)
+-    {
+-        //Get the block index
+-        int blockIdx = dvmBitVectorIteratorNext (&bvIterator);
+-
+-        //If we are done
+-        if (blockIdx == -1)
+-        {
+-            break;
+-        }
+-
+-        BasicBlock *bb = (BasicBlock *) dvmGrowableListGetElement(&cUnit->blockList, blockIdx);
+-
+-        //Now add to the basic block
+-        addInstructionsToBasicBlock (bb, toAdd);
+-    }
+-}
+-
+-/**
+  * @brief Sink the accumulations
+  * @param cUnit the CompilationUnit
+  * @param info the LoopInformation
+@@ -626,13 +575,13 @@ static void sinkAccumulations (CompilationUnit *cUnit, LoopInformation *info, co
+     BitVector *bv = const_cast<BitVector *> (info->getExitLoops ());
+ 
+     //Add the instructions to the basic blocks defined by the vector
+-    addInstructionsToBasicBlocks (cUnit, bv, toSink);
++    dvmCompilerAddInstructionsToBasicBlocks (cUnit, bv, toSink);
+ 
+     //Now get the backward chaining cells
+     bv = const_cast<BitVector *> (info->getBackwardBranches ());
+ 
+     //Add the instructions to the basic blocks defined by the vector
+-    addInstructionsToBasicBlocks (cUnit, bv, toSink);
++    dvmCompilerAddInstructionsToBasicBlocks (cUnit, bv, toSink);
+ }
+ 
+ /**
+@@ -671,7 +620,7 @@ static void handleLoop (CompilationUnit *cUnit, LoopInformation *info)
+     sinkAccumulations (cUnit, info, toSink);
+ 
+     //Step 6: Hoist the initial value decrementation
+-    addInstructionsToBasicBlock (info->getPreHeader (), toHoist);
++    dvmCompilerAddInstructionsToBasicBlock (info->getPreHeader (), toHoist);
+ 
+     //Step 7: Remove MIRs no longer needed
+     removeAccumulations (toRemove);
+diff --git a/vm/compiler/BBOptimization.cpp b/vm/compiler/BBOptimization.cpp
+index 280c3e1..6fecf53 100644
+--- a/vm/compiler/BBOptimization.cpp
++++ b/vm/compiler/BBOptimization.cpp
+@@ -119,6 +119,13 @@ bool dvmCompilerMergeBasicBlocks (CompilationUnit *cUnit, BasicBlock *bb)
+     bb->taken = child->taken;
+     bb->fallThrough = child->fallThrough;
+ 
++    //Update all children MIRs, they are now in bb
++    while (firstInsn != 0)
++    {
++        firstInsn->bb = bb;
++        firstInsn = firstInsn->next;
++    }
++
+     child->hidden = true;
+     child->firstMIRInsn = 0;
+     child->lastMIRInsn = 0;
+@@ -900,7 +907,7 @@ bool dvmCompilerFormLoop (CompilationUnit *cUnit, BasicBlock *bb)
+                 info = static_cast<LoopInformation *> (dvmCompilerNew (sizeof (*info), true));
+ 
+                 //Call explicitly init
+-                info->init (cUnit->method);
++                info->init ();
+ 
+                 //Set entry
+                 info->setEntryBlock (bb);
+@@ -1384,6 +1391,59 @@ bool dvmCompilerFixChainingCellPredecessors (CompilationUnit *cUnit, BasicBlock
+  * Peeling pass: we want to peel an iteration of the loop
+  */
+ 
++/**
++ * @brief Parse the instructions, do we support them?
++ * @param mir the instruction
++ * @return whether we support the instruction
++ */
++bool notPeelSupported (MIR *mir)
++{
++    //Get the instruction
++    DecodedInstruction &insn = mir->dalvikInsn;
++
++    //Get the opcode
++    int opcode = insn.opcode;
++
++    switch (opcode)
++    {
++        case OP_SGET:
++        case OP_SGET_WIDE:
++        case OP_SGET_OBJECT:
++        case OP_SGET_BOOLEAN:
++        case OP_SGET_BYTE:
++        case OP_SGET_CHAR:
++        case OP_SGET_SHORT:
++        case OP_SPUT:
++        case OP_SPUT_WIDE:
++        case OP_SPUT_OBJECT:
++        case OP_SPUT_BOOLEAN:
++        case OP_SPUT_BYTE:
++        case OP_SPUT_CHAR:
++        case OP_SPUT_SHORT:
++        //Rejecting agets/aputs because they always have instance associated with them
++        //so when coloring we need to take care of this case.
++        case OP_AGET:
++        case OP_AGET_WIDE:
++        case OP_AGET_OBJECT:
++        case OP_AGET_BOOLEAN:
++        case OP_AGET_BYTE:
++        case OP_AGET_CHAR:
++        case OP_AGET_SHORT:
++        case OP_APUT:
++        case OP_APUT_WIDE:
++        case OP_APUT_OBJECT:
++        case OP_APUT_BOOLEAN:
++        case OP_APUT_BYTE:
++        case OP_APUT_CHAR:
++        case OP_APUT_SHORT:
++            return false;
++        default:
++            break;
++    }
++
++    return true;
++}
++
+ //The gate function:
+ //  For the moment just do a simple loop
+ bool dvmCompilerPeelGate (const CompilationUnit *cUnit, const Pass *curPass)
+@@ -1432,6 +1492,11 @@ bool dvmCompilerPeelGate (const CompilationUnit *cUnit, const Pass *curPass)
+                     {
+                         haveGetter = true;
+                     }
++
++                    if (notPeelSupported (mir) == false)
++                    {
++                        return false;
++                    }
+                 }
+ 
+                 return (haveGetter == true && haveSetter == true);
+diff --git a/vm/compiler/CompilerIR.h b/vm/compiler/CompilerIR.h
+index 194b3b9..ee18a11 100644
+--- a/vm/compiler/CompilerIR.h
++++ b/vm/compiler/CompilerIR.h
+@@ -437,6 +437,8 @@ BasicBlock *dvmCompilerNewBBinCunit (CompilationUnit *cUnit, BBType blockType);
+  */
+ MIR *dvmCompilerNewMIR(void);
+ 
++MIR *dvmCompilerNewMoveMir (int sourceVR, int destVR, bool wide);
++
+ void dvmCompilerAppendMIR(BasicBlock *bb, MIR *mir);
+ 
+ void dvmCompilerPrependMIR(BasicBlock *bb, MIR *mir);
+@@ -453,6 +455,13 @@ void dvmCompilerAbort(CompilationUnit *cUnit);
+ 
+ /* Remove a MIR from a BasicBlock: returns true on success */
+ bool dvmCompilerRemoveMIR (BasicBlock *bb, MIR *mir);
++/* Remove a MIR using its internal BasicBlock pointer */
++bool dvmCompilerRemoveMIR (MIR *mir);
++
++void dvmCompilerAddInstructionsToBasicBlock (BasicBlock *bb, const std::vector<MIR *> &toAdd);
++
++void dvmCompilerAddInstructionsToBasicBlocks (CompilationUnit *cUnit, BitVector *basicBlocks,
++        const std::vector<MIR *> &toAdd);
+ 
+ /* Insert a BasicBlock between a parent and child */
+ bool dvmCompilerInsertBasicBlockBetween (BasicBlock *newBlock, BasicBlock *parent, BasicBlock *child);
+@@ -466,6 +475,36 @@ void dvmCompilerUpdatePredecessors(BasicBlock *parent, BasicBlock *oldChild, Bas
+ /* Copy a MIR */
+ MIR *dvmCompilerCopyMIR (MIR *orig);
+ 
++/**
++ * @brief Determines if ssa reg define is live out of current basic block.
++ * @param cUnit The compilation unit.
++ * @param bb The basic block we want to look at.
++ * @param ssaReg The ssa representation of the dalvik register whose define
++ * we want to look for.
++ * @return Returns whether or not the ssa register is the last define of that
++ * virtual register in the current basic block. If no virtual register define
++ * is found, then simply returns true.
++ */
++bool dvmCompilerIsSsaLiveOutOfBB (CompilationUnit *cUnit, BasicBlock *bb, int ssaReg);
++
++/**
++ * @brief Is the instruction's results invariant: depends on opcode and operands
++ * @param mir the MIR instruction
++ * @param variants the currently known variants of the loop
++ * @param skipUses The number of uses we want to skip when making the invariant decision
++ * @return whether or not the operation is invariant or not
++ */
++bool dvmCompilerUsesAreInvariant (const MIR *mir, const BitVector *variants, int skipUses = 0);
++
++/**
++ * @brief Check if an instruction is invariant or not
++ * @param elem the instruction
++ * @param variants the variant BitVector
++ * @param skipUses The number of uses we want to skip when making the variant decision
++ * @return whether the instruction is variant
++ */
++bool dvmCompilerCheckVariant (MIR *elem, BitVector *variants, int skipUses = 0);
++
+ /* Debug Utilities */
+ void dvmCompilerDumpCompilationUnit(CompilationUnit *cUnit);
+ 
+diff --git a/vm/compiler/IntermediateRep.cpp b/vm/compiler/IntermediateRep.cpp
+index f75a931..1db9044 100644
+--- a/vm/compiler/IntermediateRep.cpp
++++ b/vm/compiler/IntermediateRep.cpp
+@@ -168,6 +168,22 @@ void dvmCompilerInsertLIRAfter(LIR *currentLIR, LIR *newLIR)
+ }
+ 
+ /*
++ * @brief Remove a MIR using its internal BasicBlock pointer
++ * @param mir MIR to be removed
++ */
++bool dvmCompilerRemoveMIR (MIR *mir)
++{
++    //Paranoid
++    if (mir == 0)
++    {
++        return 0;
++    }
++
++    //Call generic function
++    return dvmCompilerRemoveMIR (mir->bb, mir);
++}
++
++/*
+  * @brief Remove an MIR from a BasicBlock
+  * @param bb the BasicBlock
+  * @param mir the MIR
+@@ -232,6 +248,58 @@ bool dvmCompilerRemoveMIR (BasicBlock *bb, MIR *mir)
+     return false;
+ }
+ 
++/**
++ * @brief Add instructions to the BasicBlock
++ * @param bb the BasicBlock
++ * @param toAdd a vector of Instructions to add to bb
++ */
++void dvmCompilerAddInstructionsToBasicBlock (BasicBlock *bb, const std::vector<MIR *> &toAdd)
++{
++    //If it is nil, we don't do anything
++    if (bb == 0)
++    {
++        return;
++    }
++
++    //Add a copy of each MIR
++    for (std::vector<MIR *>::const_iterator it = toAdd.begin (); it != toAdd.end (); it++)
++    {
++        MIR *newMIR = dvmCompilerCopyMIR (*it);
++
++        dvmCompilerAppendMIR (bb, newMIR);
++    }
++}
++
++/**
++ * @brief Add instructions to the BasicBlock in a BitVector
++ * @param basicBlocks a BitVector containing the BasicBlocks
++ * @param toAdd a vector of Instructions to add to bb
++ */
++void dvmCompilerAddInstructionsToBasicBlocks (CompilationUnit *cUnit, BitVector *basicBlocks,
++        const std::vector<MIR *> &toAdd)
++{
++    //Iterate on the exit blocks
++    BitVectorIterator bvIterator;
++    dvmBitVectorIteratorInit (basicBlocks, &bvIterator);
++
++    while (true)
++    {
++        //Get the block index
++        int blockIdx = dvmBitVectorIteratorNext (&bvIterator);
++
++        //If we are done
++        if (blockIdx == -1)
++        {
++            break;
++        }
++
++        BasicBlock *bb = (BasicBlock *) dvmGrowableListGetElement(&cUnit->blockList, blockIdx);
++
++        //Now add to the basic block
++        dvmCompilerAddInstructionsToBasicBlock (bb, toAdd);
++    }
++}
++
+ bool dvmCompilerInsertBasicBlockBetween (BasicBlock *newBlock, BasicBlock *parent, BasicBlock *child)
+ {
+     //Paranoid
+@@ -368,7 +436,67 @@ MIR *dvmCompilerFindLowestMIRInColor (MIR *elem)
+     return elem;
+ }
+ 
+-/*
++/* Determines if ssa reg define is live out of current basic block. */
++bool dvmCompilerIsSsaLiveOutOfBB (CompilationUnit *cUnit, BasicBlock *bb, int ssaReg)
++{
++    //Paranoid
++    if (bb == 0)
++    {
++        //Since we don't have a BB, be safe and say that the ssa is live out
++        return true;
++    }
++
++    //In order to determine if the ssa reg is live out, we scan all MIRs in backward order. If we find a def
++    //that has a different ssa number but same dalvik register, then the ssa reg user asked about cannot
++    //be the one that is live out of this BB.
++
++    //Get the dalvik register
++    int dalvikReg = dvmExtractSSARegister (cUnit, ssaReg);
++
++    //Walk through the MIRs backwards
++    for (MIR *mir = bb->lastMIRInsn; mir != 0; mir = mir->prev)
++    {
++        //Get ssa rep
++        SSARepresentation *ssaRep = mir->ssaRep;
++
++        //Go through the defines for this MIR
++        for (int i = 0; i < ssaRep->numDefs; i++)
++        {
++            //Paranoid
++            assert(ssaRep->defs != 0);
++
++            //Get the ssa reg
++            int defSsaReg = ssaRep->defs[i];
++
++            //Get dalvik reg
++            int defDalvikReg = dvmExtractSSARegister (cUnit, defSsaReg);
++
++            //Compare dalvik regs
++            if (dalvikReg == defDalvikReg)
++            {
++                //We found a def of the register that we are being asked about
++
++                //If ssa regs don't match, then the one user asked about is not
++                //live out. If they do match, then it is live out.
++                if (ssaReg == defSsaReg)
++                {
++                    return true;
++                }
++                else
++                {
++                    return false;
++                }
++            }
++        }
++    }
++
++    //If we get to this point we couldn't find a define of register user asked about.
++    //Let's assume the user knows what he's doing so we can be safe and say that if we
++    //couldn't find a def, it is live out.
++    return true;
++}
++
++/**
+  * @brief Generates a move MIR.
+  * @param sourceVR The virtual register to move from.
+  * @param destVR The virtual register to move to.
+@@ -376,7 +504,7 @@ MIR *dvmCompilerFindLowestMIRInColor (MIR *elem)
+  * this flag is set.
+  * @return Returns the mir that represents the desired move.
+  */
+-static MIR *generateMove (int sourceVR, int destVR, bool wide)
++MIR *dvmCompilerNewMoveMir (int sourceVR, int destVR, bool wide)
+ {
+     MIR *mir = dvmCompilerNewMIR ();
+ 
+@@ -391,6 +519,49 @@ static MIR *generateMove (int sourceVR, int destVR, bool wide)
+     return mir;
+ }
+ 
++bool dvmCompilerUsesAreInvariant (const MIR *mir, const BitVector *variants, int skipUses)
++{
++    //Ok now we care about the uses: if they are invariant, the result is as well
++    SSARepresentation *ssaRep = mir->ssaRep;
++
++    //If no ssaRep, we know nothing
++    if (ssaRep == 0)
++    {
++        return false;
++    }
++
++    //Get uses
++    int numUses = ssaRep->numUses;
++
++    //In some scenarios we want to skip some of the uses when making the decision
++    //for whether uses are invariant. So let's do some sanity checking here.
++    if (skipUses < 0)
++    {
++        skipUses = 0;
++    }
++
++    for (int i = skipUses; i < numUses; i++)
++    {
++        //Get local use
++        int use = ssaRep->uses[i];
++
++        //Is it a variant already?
++        if (dvmIsBitSet (variants, use) == true)
++        {
++            return false;
++        }
++    }
++
++    //If we got to here, then it is invariant, just return true
++    return true;
++}
++
++bool dvmCompilerCheckVariant (MIR *elem, BitVector *variants, int skipUses)
++{
++    //In the general case, we only care about the uses
++    return (dvmCompilerUsesAreInvariant (elem, variants, skipUses) == false);
++}
++
+ bool dvmCompilerRewriteMirUses (DecodedInstruction &dalvikInsn, int oldVR,
+         int newVR)
+ {
+diff --git a/vm/compiler/InvariantRemoval.cpp b/vm/compiler/InvariantRemoval.cpp
+new file mode 100644
+index 0000000..899154a
+--- /dev/null
++++ b/vm/compiler/InvariantRemoval.cpp
+@@ -0,0 +1,852 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "CompilerIR.h"
++#include "Dalvik.h"
++#include "Dataflow.h"
++#include "InvariantRemoval.h"
++#include "LoopInformation.h"
++#include "Pass.h"
++#include "BBOptimization.h"
++
++static bool usesAreInChosen (CompilationUnit *cUnit, std::map<MIR *, bool> &chosen, MIR *mir)
++{
++    LoopInformation *info = cUnit->loopInformation;
++
++    //Go through the ssa
++    SSARepresentation *ssaRep = mir->ssaRep;
++
++    if (ssaRep == 0)
++    {
++        //Conservative
++        return false;
++    }
++
++    int max = ssaRep->numUses;
++
++    for (int i = 0; i < max; i++)
++    {
++        //Go to defwhere
++        MIR *defined = ssaRep->defWhere[i];
++
++        if (defined != 0)
++        {
++            //If the defined is in the loop
++            if (info->isBasicBlockInLoop (defined->bb) == true)
++            {
++                //It must be in the chosen
++                if (chosen.find (defined) != chosen.end ())
++                {
++                    return true;
++                }
++            }
++        }
++    }
++
++    return false;
++}
++
++static bool findInvariantsInPeelHelper (CompilationUnit *cUnit, BasicBlock *bb)
++{
++    std::map<MIR *, bool> chosen;
++
++    //Only care about peeled BasicBlocks
++    if (bb->peeled == false)
++    {
++        //We did not change the BasicBlock
++        return false;
++    }
++
++    //Ok, let's go through the BasicBlocks and filter, but add the selection
++    std::vector<MIR *> *selection = static_cast<std::vector<MIR *> *> (cUnit->passData);
++
++    for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        //Is it an invariant
++        if (mir->invariant == true)
++        {
++            //Get the flags
++            int flags = dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
++
++            //Ignore it if it's a setter and not a sput/sget
++            if ( (flags & DF_IS_SETTER) == 0 &&
++                 (mir->dalvikInsn.opcode < OP_SGET ||
++                  mir->dalvikInsn.opcode > OP_SPUT_SHORT) &&
++                 (mir->dalvikInsn.opcode < OP_CONST_4 ||
++                  mir->dalvikInsn.opcode > OP_CONST_CLASS) &&
++                  static_cast<int> (mir->dalvikInsn.opcode) < kMirOpPhi &&
++                  ( (flags & (DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE)) == 0)
++                )
++            {
++                //Also do not take it if any of its define is not in the chosen or in the loop
++                if (usesAreInChosen (cUnit, chosen, mir) == false)
++                {
++                    selection->push_back (mir);
++                    chosen[mir] = true;
++                }
++            }
++        }
++    }
++
++    //Did not change the BasicBlock
++    return false;
++}
++
++static void findInvariantsInPeel (CompilationUnit *cUnit, std::vector<MIR *> &selection)
++{
++    //Ok, let's go through the BasicBlocks and filter, but add the selection
++    cUnit->passData = static_cast<void *> (&selection);
++
++    //Now go find the invariants
++    dvmCompilerDataFlowAnalysisDispatcher (cUnit, findInvariantsInPeelHelper, kAllNodes, false);
++
++    //Clear it
++    cUnit->passData = 0;
++}
++
++static void findReplacement (CompilationUnit *cUnit, MIR* mir, int &current, int max,
++                             std::map<MIR *, bool> &chosen, std::map<int, int> &localValueNumberingDef,
++                             std::map<int, int> &replacements)
++{
++    //First, go through the mirs, is there one no longer needed
++    for (std::map<MIR *, bool>::iterator it = chosen.begin (); it != chosen.end (); it++)
++    {
++        //Get MIR
++        MIR *start = it->first;
++
++        //Now go down the def-use chain (remember, ssaRep is there and only one def)
++        assert (start != 0 && start->ssaRep != 0 && start->ssaRep->numDefs == 1);
++
++        //Get usedNext chain for the first def
++        SUsedChain *chain = start->ssaRep->usedNext[0];
++
++        //Suppose it is in the list: there must be at least one element to consider reusing it
++        bool reUseIt = (chain != 0);
++
++        //Go down the chain, are all the instructions in the chosen map?
++        while (chain != 0)
++        {
++            //Check if it's chosen, if it is we can reuse it
++            reUseIt = (chosen.find (chain->mir) != chosen.end ());
++
++            if (reUseIt == false)
++            {
++                break;
++            }
++            else
++            {
++                //Ok we might not be able to depending on the topological order
++                MIR *chained = chain->mir;
++
++                if (chained->topologicalOrder > mir->topologicalOrder)
++                {
++                    reUseIt = false;
++                    break;
++                }
++            }
++
++            //Go to the next use
++            chain = chain->nextUse;
++        }
++
++        //If we can reuse this one
++        if (reUseIt == true)
++        {
++            //Keeping it
++            chosen[mir] = true;
++
++            //Keep the same color
++            replacements[mir->ssaRep->defs[0]] = localValueNumberingDef[start->localValueNumber];
++            return;
++        }
++    }
++
++    //Cannot reuse one, do we still have a scratch for it?
++    if (current < max)
++    {
++        //Get the define register
++        int def = mir->ssaRep->defs[0];
++
++        //Get the local value numbering color
++        int color = mir->localValueNumber;
++
++        //Get replacement:
++        int replacement = 0;
++
++        //If we already have it in the map, use that
++        std::map<int, int>::const_iterator it = localValueNumberingDef.find (color);
++
++        if (it != localValueNumberingDef.end ())
++        {
++            replacement = it->second;
++        }
++        else
++        {
++            //Get replacement
++            replacement = cUnit->loopInformation->getFreeScratchRegisters (cUnit);
++
++            //Mark it in
++            localValueNumberingDef[color] = replacement;
++
++            //Increase scratch number used
++            current++;
++        }
++
++        //Add to replacement
++        replacements[def] = replacement;
++
++        //Accept it
++        chosen[mir] = true;
++    }
++}
++
++static void filterInvariants (CompilationUnit *cUnit, std::vector<MIR *> &selection, std::map<int, int> &scratchReplacements)
++{
++    std::map<MIR *, bool> chosen;
++    std::map<int, int> localValueNumberingDef;
++
++    int max = dvmArchSpecGetNumberOfScratch ();
++    int current = cUnit->loopInformation->getScratchRegisters ();
++
++    for (std::vector<MIR *>::iterator it = selection.begin (); it != selection.end (); it++)
++    {
++        //Retrieve the MIR
++        MIR *mir = *it;
++
++        //Paranoid
++        assert (mir->ssaRep != 0);
++
++        //For the moment, refuse any element that has more than one define
++        if (mir->ssaRep->numDefs > 1)
++        {
++            continue;
++        }
++
++        //If there isn't a define, then just accept it
++        if (mir->ssaRep->numDefs == 0)
++        {
++            chosen[mir] = true;
++            continue;
++        }
++
++        //Handle the invariant
++        findReplacement (cUnit, mir, current, max, chosen, localValueNumberingDef, scratchReplacements);
++    }
++
++    //Update the selection
++    selection.clear ();
++    for (std::map<MIR *, bool>::iterator it = chosen.begin (); it != chosen.end (); it++)
++    {
++        MIR *mir = it->first;
++
++        //Only push if not nil
++        if (mir != 0)
++        {
++            selection.push_back (mir);
++        }
++    }
++}
++
++static void hoistInvariants (CompilationUnit *cUnit, LoopInformation *loopInfo, std::vector<MIR *> &selection,
++        std::map<int, int> &replacements, std::vector<MIR *> &moves)
++{
++    //Get the preheader
++    BasicBlock *preHeader = loopInfo->getPreHeader ();
++
++    //Now install the selected instructions into the preheader
++    for (std::vector<MIR *>::const_iterator iter = selection.begin (); iter != selection.end (); iter++)
++    {
++        //Get the invariant mir for the peeled iteration
++        MIR *peeledMir = *iter;
++
++        //The invariant instructions in peel must be copied from loop
++        if (peeledMir->copiedFrom == 0)
++        {
++            continue;
++        }
++
++        //Get the equivalent mir from the loop
++        MIR *mirInLoop = peeledMir->copiedFrom;
++
++        //Make a copy of the mir from loop because we want to hoist it into preheader
++        MIR *copy = dvmCompilerCopyMIR (mirInLoop);
++
++        //Copy the ssa as well so we don't have to regenerate in middle of this pass
++        //and we need it in order to find the uses of the define from this MIR.
++        //But we need to be careful and reset it from the copy after we're done.
++        copy->ssaRep = mirInLoop->ssaRep;
++
++        //Paranoid
++        if (peeledMir->ssaRep == 0 || peeledMir->ssaRep->defs == 0 || peeledMir->ssaRep->numDefs <= 0
++                || mirInLoop->ssaRep == 0 || mirInLoop->ssaRep->defs == 0 || mirInLoop->ssaRep->numDefs <= 0)
++        {
++            continue;
++        }
++
++        //If we successfully rewrite selected MIRs to use temporary, we will need
++        //to have a move from the temp back to original register at all loop exits.
++        //Since the problem is simplified and we have only one BB with one backward
++        //branch and one loop exit block, those are the only places we need to sink.
++        //And since all exit points are dominated by the single BB, we just need to
++        //figure out if the ssa we replaced is the last define live out of the single
++        //BB. If it is, then we need to generate a move.
++        //There is only one BB so it's easy here, we will need to generalize otherwise
++        bool needMove = dvmCompilerIsSsaLiveOutOfBB (cUnit, loopInfo->getEntryBlock (),
++                mirInLoop->ssaRep->defs[0]) == true;
++
++        bool rewriteSuccess = false;
++
++        //So since our selection looked through the peel, we should have a mapping between the
++        //ssa define of peeled MIR and the replacement temporary we want to use.
++        int oldSsa = peeledMir->ssaRep->defs[0];
++        int oldReg = dvmExtractSSARegister (cUnit, oldSsa);
++        int newReg = 0;
++
++        //Now try to rewrite the define if we find the temp VR we are supposed to use
++        if (replacements.find (oldSsa) != replacements.end ())
++        {
++            newReg = replacements[oldSsa];
++
++            rewriteSuccess = dvmCompilerRewriteMirDef (copy, oldReg, newReg);
++        }
++
++        //If we successfully completed the rewrite, then we can add it to the preheader
++        if (rewriteSuccess == true)
++        {
++            //Add the hoisted MIR to loop preheader
++            dvmCompilerAppendMIR (preHeader, copy);
++
++            if (needMove == true)
++            {
++                //Since we want to ensure correctness, we make sure that we copy back from rewritten
++                //register to the original register at all loop exits. So we can generate moves now.
++                bool isWide = (mirInLoop->ssaRep->numDefs > 1);
++                MIR *move = dvmCompilerNewMoveMir (newReg, oldReg, isWide);
++
++                moves.push_back (move);
++            }
++        }
++
++        //Since we reused the ssaRep from the MIR we copied from, we must reset it right now
++        copy->ssaRep = 0;
++
++        //Finally, we can remove the mir from the loop
++        dvmCompilerRemoveMIR (mirInLoop);
++    }
++}
++
++/**
++ * @brief Helper function to find the Iget/Iput couple that we'd like to hoist and sink and fill the vector
++ * @param cUnit the CompilationUnit
++ * @param info the LoopInformation
++ * @param bb the BasicBlock
++ * @param candidates the vector of Iget/Iput pairs
++ */
++static void findIgetIputCandidatesHelper (CompilationUnit *cUnit, const LoopInformation *info, const BasicBlock *bb, std::vector<std::pair<MIR *, MIR *> > &candidates)
++{
++    //Go through the instructions
++    for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        //Get the flags
++        int flags = dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
++
++        //Is it a Iget ? and not wide
++        if ( ( (flags & DF_IS_GETTER) != 0))
++        {
++            //Get color chain
++            SInstructionColor &color = mir->color;
++
++            //Ok we have a get, let's see if it's the first of the color
++            if (color.prev == 0)
++            {
++                //It is, good, let's see if the next is a put
++                MIR *potentialPut = color.next;
++
++                //First not null and same BB
++                if (potentialPut != 0 && potentialPut->bb == mir->bb)
++                {
++                    //It should also be the only other MIR of the color
++                    if (potentialPut->color.next == 0)
++                    {
++                        //Ok, now is it a put?
++                        int flags = dvmCompilerDataFlowAttributes[potentialPut->dalvikInsn.opcode];
++
++                        //Is it a Iput ?
++                        if ( (flags & DF_IS_SETTER) != 0)
++                        {
++                            //We have our pair, let's make sure they are using the same registers for getting/setting
++                            if ( (mir->dalvikInsn.vA == potentialPut->dalvikInsn.vA) &&
++                                 (mir->dalvikInsn.vB == potentialPut->dalvikInsn.vB) &&
++                                 (mir->dalvikInsn.vC == potentialPut->dalvikInsn.vC))
++                            {
++                                //Final question is: are all the uses of the get invariant to the loop
++                                SSARepresentation *ssaRep = mir->ssaRep;
++
++                                //Suppose it is invariant
++                                bool usesAreInvariant = true;
++                                //Also are the definitions of each use not in the loop?
++                                bool notInLoop = true;
++
++                                //If no SSA, be conservative
++                                if (ssaRep == 0)
++                                {
++                                    usesAreInvariant = false;
++                                }
++                                else
++                                {
++                                    //Walk the uses
++                                    int max = ssaRep->numUses;
++                                    for (int i = 0; i < max; i++)
++                                    {
++                                        //Get local version
++                                        int use = ssaRep->uses[i];
++
++                                        //If not invariant, mark the boolean flag and bail
++                                        if (info->isInvariant (use) == false)
++                                        {
++                                            usesAreInvariant = false;
++                                            break;
++                                        }
++
++                                        //Ok, what about in the loop?
++                                        MIR *defined = ssaRep->defWhere[i];
++
++                                        //If it is in the loop, mark the boolean flag and bail
++                                        if (defined != 0 && info->isBasicBlockInLoop (defined->bb) == true)
++                                        {
++                                            notInLoop = false;
++                                            break;
++                                        }
++                                    }
++                                }
++
++                                //Also is the put must be putting the last ssa of the loop
++                                bool lastSSA = dvmCompilerIsSsaLiveOutOfBB (cUnit, info->getEntryBlock (), potentialPut->ssaRep->uses[0]) == true;
++                                //Second use if there
++                                if (potentialPut->ssaRep->numUses > 1)
++                                {
++                                    lastSSA = (lastSSA == true) && dvmCompilerIsSsaLiveOutOfBB (cUnit, info->getEntryBlock (), potentialPut->ssaRep->uses[1]) == true;
++                                }
++
++                                //If both flags are true, we can continue
++                                if (usesAreInvariant == true && notInLoop == true && lastSSA == true)
++                                {
++                                    //Ok, we can add it to the candidates now
++                                    candidates.push_back (std::make_pair<MIR *, MIR*> (mir, potentialPut));
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++}
++
++/**
++ * @brief Hoist an iget instruction
++ * @param cUnit the CompilationUnit,
++ * @param info the LoopInformation
++ * @param mir the MIR instruction
++ * @param scratch the scratch register to use as a temporary
++ */
++static void hoistIget (const CompilationUnit *cUnit, const LoopInformation *info, MIR *mir, int scratch)
++{
++    /*
++     * Simple algorithm: try to rewrite the definition and its uses
++     * If we fail in rewriting/removing the instruction, we are done.
++     * However, no need to tell the iput about this, it can get sunk independently
++     */
++
++    //First rewrite the instruction
++    int oldReg = mir->dalvikInsn.vA;
++    bool success = dvmCompilerRewriteMirDef (mir, oldReg, scratch);
++
++    //If we failed to remove it, we are done
++    if (success == false)
++    {
++        return;
++    }
++
++    //Simplest to hoist it is to remove it, set it in the preheader, and use a temporary for it
++    bool res = dvmCompilerRemoveMIR (mir);
++
++    //If we failed to remove it, we are done
++    if (res == false)
++    {
++        return;
++    }
++
++    //Get the preheader
++    BasicBlock *preheader = info->getPreHeader ();
++
++    //Append to it
++    dvmCompilerAppendMIR (preheader, mir);
++}
++
++/**
++ * @brief Try to sink an iput instruction, doing a few checks before
++ * @param cUnit the CompilationUnit,
++ * @param info the LoopInformation
++ * @param mir the MIR instruction
++ * @param iget associated iget MIR instruction
++ * @param scratch the scratch register to use as a temporary
++ */
++static void sinkIput (CompilationUnit *cUnit, LoopInformation *info, MIR *mir, MIR *iget, int scratch)
++{
++    //Get the SSA representation
++    SSARepresentation *ssaRep = mir->ssaRep;
++
++    //Paranoid
++    assert (ssaRep != 0 && ssaRep->numUses > 0);
++
++    //Iput has the data to be stored in uses[0] and its definition is in defWhere[0]
++    //First thing to do is actually go to the define of the mir that does the data for the iput
++    MIR *defined = ssaRep->defWhere[0];
++
++    //Normally, because the iget's vA is == to the iput's vA, we should have at least one defWhere
++    assert (defined != 0 && defined->ssaRep != 0);
++
++    //If the iget instruction is different than the iput (which should always be the case otherwise this iget/iput is useless)
++    if (iget != defined)
++    {
++        //Get vA
++        int oldReg = mir->dalvikInsn.vA;
++
++        //Rewrite it with the scratch, this should automatically change the iput by the way
++        bool rewriteSuccess = dvmCompilerRewriteMirDef (defined, oldReg, scratch);
++
++        //Paranoid: if the rewrite failed, we have nothing to do anymore, we can't safely sink it
++        //Note that we don't care if the iget got hoisted or not, the hoist of the iget and the sinking of the iput
++        //can be done independently
++        if (rewriteSuccess == false)
++        {
++            return;
++        }
++
++        //Once done, we can sink it
++        dvmCompilerRemoveMIR (mir);
++
++        //Now we want to sink it to every exit loop and prebackward branches
++        //Put it in a vector we might have an extra move
++        std::vector<MIR *> toMove;
++        toMove.push_back (mir);
++
++        //If we successfully rewrite selected MIRs to use temporary, we will need
++        //to have a move from the temp back to original register at all loop exits.
++        //Since the problem is simplified and we have only one BB with one backward
++        //branch and one loop exit block, those are the only places we need to sink.
++        //And since all exit points are dominated by the single BB, we just need to
++        //figure out if the ssa we replaced is the last define live out of the single
++        //BB. If it is, then we need to generate a move.
++
++        //There is only one BB so it's easy here, we will need to generalize otherwise
++        bool needMove = dvmCompilerIsSsaLiveOutOfBB (cUnit, info->getEntryBlock (), defined->ssaRep->defs[0]) == true;
++
++        if (needMove == true)
++        {
++            //Since we want to ensure correctness, we make sure that we copy back from rewritten
++            //register to the original register at all loop exits. So we can generate moves now.
++            bool isWide = (defined->ssaRep->numDefs > 1);
++            MIR *move = dvmCompilerNewMoveMir (scratch, oldReg, isWide);
++
++            toMove.push_back (move);
++        }
++
++        //Actually sink them
++        info->sinkInstructions (cUnit, toMove);
++    }
++}
++
++/**
++ * @brief Find the Iget/Iput couple that we'd like to hoist and sink and fill the vector
++ * @param cUnit the CompilationUnit
++ * @param info the LoopInformation
++ * @param candidates the vector of Iget/Iput pairs
++ */
++static void findIgetIputCandidates (CompilationUnit *cUnit, LoopInformation *info, std::vector<std::pair<MIR *, MIR *> > &candidates)
++{
++    /*
++     *  The function only adds Iget/Iput couples of the same color, who's address is an invariant,
++     *  if the Iget has a topological order before the iput, in the same BasicBlock, and if there is only the iget and iput in the color
++     *
++     *  We know this is restrictive but it is correct :-), we can loosen certain restrictions later if needed
++     */
++
++     //Go through the loops' BasicBlocks
++    //Get the BasicBlocks
++    const BitVector *blocks = info->getBasicBlocks ();
++
++    //Go through each block
++    BitVectorIterator bvIterator;
++
++    dvmBitVectorIteratorInit ( const_cast<BitVector *> (blocks), &bvIterator);
++    while (true)
++    {
++        BasicBlock *bb = getNextBasicBlockViaBitVector (bvIterator, cUnit);
++
++        //Check if done
++        if (bb == 0)
++        {
++            break;
++        }
++
++        //Call helper function
++        findIgetIputCandidatesHelper (cUnit, info, bb, candidates);
++    }
++}
++
++void dvmCompilerIgetIputRemoval (CompilationUnit *cUnit, Pass *curPass)
++{
++    //Get loop information
++    LoopInformation *info = cUnit->loopInformation;
++
++    //Paranoid
++    assert (info != 0);
++
++    //First job is to find if we have a color with only a get/put in it?
++    std::vector<std::pair<MIR *, MIR*> > candidates;
++
++    //Find IGet/IPut candidates
++    findIgetIputCandidates (cUnit, info, candidates);
++
++    //For each candidate couple, see if we still have a temporary register
++    for (std::vector<std::pair<MIR *, MIR*> >::iterator it = candidates.begin (); it != candidates.end (); it++)
++    {
++        //Get the pair
++        std::pair<MIR *, MIR *> &p = *it;
++
++        //Get Iget
++        MIR *iget = p.first;
++
++        //Get Iput
++        MIR *iput = p.second;
++
++        //Paranoid
++        assert (iget->ssaRep != 0);
++
++        //Width for the couple
++        unsigned int width = iget->ssaRep->numDefs;
++
++        //First, do we have temporaries for it?
++        int scratch = info->getFreeScratchRegisters (cUnit, width);
++
++        //Do we have some?
++        if (scratch > -1)
++        {
++            //Hoist the iget
++            hoistIget (cUnit, info, iget, scratch);
++
++            //Sink the iput
++            sinkIput (cUnit, info, iput, iget, scratch);
++        }
++    }
++}
++
++void dvmCompilerInvariantRemoval (CompilationUnit *cUnit, Pass *curPass)
++{
++    //To make it to this point, we know we have a simple loop
++    LoopInformation *loopInfo = cUnit->loopInformation;
++
++    assert (loopInfo != 0);
++
++    //Needed to hold the selection of MIRs to consider
++    std::vector<MIR *> selection;
++
++    //Find the invariant instructions in peel basicblocks
++    findInvariantsInPeel (cUnit, selection);
++
++    //We need a map that maps the ssa def needed to be replaced to the newly picked register to use
++    std::map<int, int> replacements;
++
++    //Now filter and choose the ones we want
++    filterInvariants (cUnit, selection, replacements);
++
++    //In case we hoist anything and need to rewrite, let's keep track if there are any moves that
++    //we need to sink to the loop exits.
++    std::vector<MIR *> moves;
++
++    //Now go through the invariants
++    hoistInvariants (cUnit, loopInfo, selection, replacements, moves);
++
++    //Finally, sink any moves
++    loopInfo->sinkInstructions (cUnit, moves);
++}
++
++/**
++ * @brief Get the start index we actually care about when trying to decide if
++ * getter/setter access invariant memory location.
++ * @param opcode the considered opcode
++ * @return the start index to be considered when comparing two instructions
++ */
++static int getStartUseIndex (int opcode)
++{
++    //Default result
++    int res = 0;
++
++    //We are basically setting the iputs to their igets counterparts
++    switch (opcode)
++    {
++        case OP_IPUT:
++        case OP_IPUT_OBJECT:
++        case OP_IPUT_BOOLEAN:
++        case OP_IPUT_BYTE:
++        case OP_IPUT_CHAR:
++        case OP_IPUT_SHORT:
++        case OP_IPUT_QUICK:
++        case OP_IPUT_OBJECT_QUICK:
++            //Skip the VR containing what to store
++            res = 1;
++            break;
++        case OP_IPUT_WIDE:
++        case OP_IPUT_WIDE_QUICK:
++            //Skip the two VRs containing what to store
++            res = 2;
++            break;
++        default:
++            //Do nothing in the general case
++            break;
++    }
++
++    return res;
++}
++
++static bool guaranteedToThrowFirstIteration (const CompilationUnit *cUnit, const LoopInformation *loopInfo,
++        const BasicBlock *bb)
++{
++
++    for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        //Get Dalvik instruction
++        DecodedInstruction &insn = mir->dalvikInsn;
++
++        //The extended MIRs do not throw
++        if (static_cast<int> (insn.opcode) >= kMirOpFirst)
++        {
++            continue;
++        }
++
++        int flags = dexGetFlagsFromOpcode(insn.opcode);
++
++        //If instruction cannot throw, then we continue
++        if ((flags & kInstrCanThrow) == 0)
++        {
++            continue;
++        }
++
++        //If this MIR is invariant but can throw, then let's see if it is guaranteed to throw
++        //in the first iteration (peeled iteration)
++        if (mir->invariant == true)
++        {
++            continue;
++        }
++
++        //If we have a divide with literal, then it is guaranteed to throw first iteration if
++        //divisor is 0 and not changing. So continue.
++        if (insn.opcode == OP_DIV_INT_LIT16
++                || insn.opcode == OP_REM_INT_LIT16
++                || insn.opcode == OP_DIV_INT_LIT8
++                || insn.opcode == OP_REM_INT_LIT8)
++        {
++            continue;
++        }
++
++        bool instanceGetterSetter = false;
++
++        //We made it this far so we are looking at variant instructions. Test to see if
++        //it is getter or a setter
++        switch (insn.opcode)
++        {
++            case OP_IGET:
++            case OP_IGET_WIDE:
++            case OP_IGET_OBJECT:
++            case OP_IGET_BOOLEAN:
++            case OP_IGET_BYTE:
++            case OP_IGET_CHAR:
++            case OP_IGET_SHORT:
++            case OP_IPUT:
++            case OP_IPUT_WIDE:
++            case OP_IPUT_OBJECT:
++            case OP_IPUT_BOOLEAN:
++            case OP_IPUT_BYTE:
++            case OP_IPUT_CHAR:
++            case OP_IPUT_SHORT:
++            case OP_IGET_QUICK:
++            case OP_IGET_WIDE_QUICK:
++            case OP_IGET_OBJECT_QUICK:
++            case OP_IPUT_QUICK:
++            case OP_IPUT_WIDE_QUICK:
++            case OP_IPUT_OBJECT_QUICK:
++                instanceGetterSetter = true;
++                break;
++            default:
++                break;
++        }
++
++        //If we have an instance getter/setter we can prove that if memory location is invariant,
++        //we are guaranteed to throw in the peeled iteration
++        if (instanceGetterSetter == true)
++        {
++            bool variant = dvmCompilerCheckVariant (mir, loopInfo->getVariants (), getStartUseIndex (insn.opcode));
++
++            if (variant == false)
++            {
++                continue;
++            }
++        }
++
++        return false;
++    }
++
++
++    return true;
++}
++
++bool dvmCompilerInvariantRemovalGate (const CompilationUnit *cUnit, const Pass *curPass)
++{
++    //We are only able to hoist/remove invariants if we can peel the loop
++    if (dvmCompilerPeelGate (cUnit, curPass) == false)
++    {
++        return false;
++    }
++
++    //Get the loop
++    LoopInformation *loopInfo = cUnit->loopInformation;
++
++    //To make it here we are guaranteed to have just one block
++    const BitVector *bv = loopInfo->getBasicBlocks ();
++
++    assert (dvmCountSetBits (bv) <= 1);
++
++    //Get highest bit since we only have on BB
++    int highest = dvmHighestBitSet (bv);
++
++    //Get the BasicBlock
++    BasicBlock *bb = (BasicBlock *) dvmGrowableListGetElement (&(cUnit->blockList), highest);
++
++    //Paranoid
++    assert (bb != 0);
++
++    //If we are guaranteed to not throw exception in loop because the exception will surely be thrown
++    //in first iteration (the peeled iteration), then we can hoist.
++    if (guaranteedToThrowFirstIteration(cUnit, loopInfo, bb) == false)
++    {
++        return false;
++    }
++
++    //If we make it here, it is safe to hoist invariants
++    return true;
++}
+diff --git a/vm/compiler/InvariantRemoval.h b/vm/compiler/InvariantRemoval.h
+new file mode 100644
+index 0000000..2971aa8
+--- /dev/null
++++ b/vm/compiler/InvariantRemoval.h
+@@ -0,0 +1,48 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef H_INVARIANTREMOVAL
++#define H_INVARIANTREMOVAL
++
++//Forward declarations
++struct CompilationUnit;
++class Pass;
++
++/**
++ * @brief InvariantRemovaling pass: remove any invariants from the loop
++ * @param cUnit the CompilationUnit
++ * @param curPass the current pass
++ */
++void dvmCompilerInvariantRemoval (CompilationUnit *cUnit, Pass *curPass);
++
++/**
++ * @brief Hoist any Iget/Iput couples out of the loop
++ * @param cUnit the CompilationUnit
++ * @param curPass the current pass
++ */
++void dvmCompilerIgetIputRemoval (CompilationUnit *cUnit, Pass *curPass);
++
++/**
++ * @brief Checks to make sure that the invariant removal optimization can be done.
++ * @details Does not approve any loops that can throw exceptions and are not
++ * guaranteed to throw the exception on first iteration.
++ * @param cUnit the CompilationUnit
++ * @param curPass the current pass
++ * @return Returns whether invariant removal optimization can be done.
++ */
++bool dvmCompilerInvariantRemovalGate (const CompilationUnit *cUnit, const Pass *curPass);
++
++#endif
+diff --git a/vm/compiler/LoopInformation.cpp b/vm/compiler/LoopInformation.cpp
+index fc6e40b..4f0c65b 100644
+--- a/vm/compiler/LoopInformation.cpp
++++ b/vm/compiler/LoopInformation.cpp
+@@ -32,7 +32,7 @@ LoopInformation::~LoopInformation (void)
+ {
+ }
+ 
+-void LoopInformation::init (const Method *method)
++void LoopInformation::init (void)
+ {
+     variants = 0;
+     parent = 0;
+@@ -42,16 +42,7 @@ void LoopInformation::init (const Method *method)
+     entry = 0;
+     preHeader = 0;
+     postExitLoop = 0;
+-
+-    if (method != 0)
+-    {
+-        scratchRegisters = dvmArchSpecGetNumberOfScratch();
+-    }
+-    else
+-    {
+-        //Put an excessively high number
+-        scratchRegisters = ~0;
+-    }
++    scratchRegisters = 0;
+ 
+     if (interIterationVariables == 0)
+     {
+@@ -758,7 +749,7 @@ bool dvmCompilerVerySimpleLoopGate (const CompilationUnit *cUnit, const Pass *cu
+     return true;
+ }
+ 
+-bool LoopInformation::isInvariant (unsigned int ssa)
++bool LoopInformation::isInvariant (unsigned int ssa) const
+ {
+     //If we don't have the bitvector, we don't know. So be conservative
+     if (variants == 0)
+@@ -875,3 +866,71 @@ bool LoopInformation::hasInvoke (const CompilationUnit *cUnit) const
+     //It is fine, no invoke instructions seen
+     return false;
+ }
++
++int LoopInformation::getFreeScratchRegisters (CompilationUnit *cUnit, int consecutives)
++{
++    //Do we have free registers?
++    bool res = hasFreeScratchRegisters (cUnit, consecutives);
++
++    if (res == true)
++    {
++        //Remember how many we were using
++        int res = getScratchRegisters ();
++
++        //Set new value
++        setScratchRegisters (res + consecutives);
++
++        //Get the actual scratch register
++        res = dvmArchSpecGetScratchRegister (cUnit->method, res);
++
++        //Return first register
++        return res;
++    }
++
++    //We failed
++    return -1;
++}
++
++bool LoopInformation::hasFreeScratchRegisters (CompilationUnit *cUnit, bool howMany)
++{
++    //Get the maximum number of scratch registers available
++    int max = dvmArchSpecGetNumberOfScratch ();
++
++    //Now how many are we using
++    int currentlyUsing = getScratchRegisters ();
++
++    //We should be smarter about this and be able to free/reuse temporaries
++    //For the moment though, let's just be simple and see if we have space?
++    return (currentlyUsing + howMany <= max);
++}
++
++//Sink a vector of instructions
++void LoopInformation::sinkInstructions (CompilationUnit *cUnit, std::vector<MIR *> &insns) const
++{
++    //We need to sink to the exit loops and the backward chaining cell
++
++    //First, handle the exit loops
++    BitVector *bv = const_cast<BitVector *> (getExitLoops ());
++
++    //Add the instructions to the basic blocks defined by the vector
++    dvmCompilerAddInstructionsToBasicBlocks (cUnit, bv, insns);
++
++    //Now get the backward chaining cells
++    bv = const_cast<BitVector *> (getBackwardBranches ());
++
++    //Add the instructions to the basic blocks defined by the vector
++    dvmCompilerAddInstructionsToBasicBlocks (cUnit, bv, insns);
++}
++
++//Sink an instruction
++void LoopInformation::sinkInstruction (CompilationUnit *cUnit, MIR *insn) const
++{
++    //Create a vector
++    std::vector<MIR *> insns;
++
++    //Push the unique instruction
++    insns.push_back (insn);
++
++    //Call generic function
++    sinkInstructions (cUnit, insns);
++}
+diff --git a/vm/compiler/LoopInformation.h b/vm/compiler/LoopInformation.h
+index a1c46b8..b52bcbc 100644
+--- a/vm/compiler/LoopInformation.h
++++ b/vm/compiler/LoopInformation.h
+@@ -89,9 +89,8 @@ class LoopInformation
+ 
+         /**
+          * @brief Initialize
+-         * @param method the containing Method (default: 0)
+          */
+-        void init (const Method *method = 0);
++        void init (void);
+ 
+         /**
+          * @brief Set Exit Loop Block
+@@ -292,11 +291,18 @@ class LoopInformation
+          void setVariants (BitVector *bv) {variants = bv;}
+ 
+          /**
++          * @brief Gets a bitvector holding variants.
++          * @return Returns bitvector holding the variant registers.
++          *
++          */
++         BitVector *getVariants (void) const {return variants;}
++
++         /**
+           * @brief Is a SSA register an invariant for the loop?
+           * @param ssa the SSA register
+           * @return whether or not it is an invariant for the loop
+           */
+-         bool isInvariant (unsigned int ssa);
++         bool isInvariant (unsigned int ssa) const;
+ 
+          /**
+           * @brief Is the BasicBlock in the loop?
+@@ -330,6 +336,36 @@ class LoopInformation
+           * @param b the value we want (default: true)
+           */
+          void setContainsInvariantInstructions (bool b = true) {containsInvariantInstructions = b;}
++
++         /**
++          * @brief Get a scratch register if possible
++          * @param cUnit the CompilationUnit
++          * @param consecutives how many consecutive registers do you want? This allows the request for consecutive VRs for wide or range cases (default: 1)
++          * @return the lowest new VR scratch register allocated; if consecutives is > 1, suppose VR, VR + 1, ..., VR + consecutives - 1 are allocated; -1 if none found
++          */
++         int getFreeScratchRegisters (CompilationUnit *cUnit, int consecutives = 1);
++
++         /**
++          * @brief Do we have scratch registers available?
++          * @param cUnit the CompilationUnit
++          * @param howMany how many consecutive registers do you want? This allows the request for consecutive VRs for wide or range cases (default: 1)
++          * @return whether we have enough scratch registers or not
++          */
++         bool hasFreeScratchRegisters (CompilationUnit *cUnit, bool howMany);
++
++         /**
++          * @brief Sink a vector of instructions
++          * @param cUnit the CompilationUnit
++          * @param insns the instructions to sink
++          */
++         void sinkInstructions (CompilationUnit *cUnit, std::vector<MIR *> &insns) const;
++
++         /**
++          * @brief Sink an instruction
++          * @param cUnit the CompilationUnit
++          * @param insn the instruction to sink
++          */
++         void sinkInstruction (CompilationUnit *cUnit, MIR *insn) const;
+ };
+ 
+ /**
+diff --git a/vm/compiler/LoopOpt.cpp b/vm/compiler/LoopOpt.cpp
+index 17d60bc..fe2e801 100644
+--- a/vm/compiler/LoopOpt.cpp
++++ b/vm/compiler/LoopOpt.cpp
+@@ -19,6 +19,7 @@
+ #include "Checks.h"
+ #include "Dalvik.h"
+ #include "Dataflow.h"
++#include "InvariantRemoval.h"
+ #include "Loop.h"
+ #include "LoopOpt.h"
+ #include "LoopRegisterUsage.h"
+@@ -74,6 +75,10 @@ START_PASSES
+               0, 0, dvmCompilerVariant, 0, 0),
+     NEW_PASS ("Peel", kAllNodes, 0, dvmCompilerPeelGate,
+               dvmCompilerPeel, 0, 0, 0, kOptimizationBasicBlockChange),
++    NEW_PASS ("Invariant Removal", kAllNodes, 0, dvmCompilerInvariantRemovalGate,
++              dvmCompilerInvariantRemoval, 0, 0, 0, kOptimizationBasicBlockChange),
++    NEW_PASS ("Iget-Iput Removal", kAllNodes, 0, dvmCompilerInvariantRemovalGate,
++              dvmCompilerIgetIputRemoval, 0, 0, 0, kOptimizationBasicBlockChange),
+     NEW_PASS ("Accumulation Sinking", kAllNodes, 0, dvmCompilerSinkAccumulationsGate,
+             0, dvmCompilerAccumulationSinking, 0, 0, kOptimizationBasicBlockChange),
+     //This should be after the last optimization that changes instruction sequence or BB logic
+diff --git a/vm/compiler/LoopRegisterUsage.cpp b/vm/compiler/LoopRegisterUsage.cpp
+index 517b90d..bf7eabe 100644
+--- a/vm/compiler/LoopRegisterUsage.cpp
++++ b/vm/compiler/LoopRegisterUsage.cpp
+@@ -23,54 +23,6 @@
+ #include <set>
+ 
+ /**
+- * @brief Is the instruction's results invariant: depends on opcode and operands
+- * @param mir the MIR instruction
+- * @param variants the currently known variants of the loop
+- * @return whether or not the operation is invariant or not
+- */
+-static bool usesAreInvariant (const MIR *mir, const BitVector *variants)
+-{
+-    //Ok now we care about the uses: if they are invariant, the result is as well
+-    SSARepresentation *ssaRep = mir->ssaRep;
+-
+-    //If no ssaRep, we know nothing
+-    if (ssaRep == 0)
+-    {
+-        return false;
+-    }
+-
+-    //Get uses
+-    int numUses = ssaRep->numUses;
+-
+-    for (int i = 0; i < numUses; i++)
+-    {
+-        //Get local use
+-        int use = ssaRep->uses[i];
+-
+-        //Is it a variant already?
+-        if (dvmIsBitSet (variants, use) == true)
+-        {
+-            return false;
+-        }
+-    }
+-
+-    //If we got to here, then it is invariant, just return true
+-    return true;
+-}
+-
+-/**
+- * @brief Check if an instruction is invariant or not
+- * @param elem the instruction
+- * @param variants the variant BitVector
+- * @return whether the instruction is variant
+- */
+-static bool checkVariant (MIR *elem, BitVector *variants)
+-{
+-    //In the general case, we only care about the uses
+-    return (usesAreInvariant (elem, variants) == false);
+-}
+-
+-/**
+  * @brief Mark the instruction as a variant and set all the defines in the variant BitVector
+  * @param current the MIR instruction
+  * @param variants the variant BitVector
+@@ -137,7 +89,7 @@ static void handleVariants (LoopInformation *info, MIR *highest, BitVector *vari
+         }
+ 
+         //Now check if it's variant
+-        if (checkVariant (current, variants) == true)
++        if (dvmCompilerCheckVariant (current, variants) == true)
+         {
+             haveVariant = true;
+ 
+@@ -507,10 +459,10 @@ static bool similarInstructions (MIR *first, MIR *second, const std::map<MIR *,
+         //It is possible the use is not defined in the trace
+         if (defFirst == 0 || defSecond == 0)
+         {
+-            //That is fine, as long as both are not defined
++            //If one is defined but not the other, then who knows if they alias actually
+             if (defFirst != 0 || defSecond != 0)
+             {
+-                return false;
++                return true;
+             }
+ 
+             //If this happens, then the use actually must be the same SSA register
+@@ -747,7 +699,7 @@ bool dvmCompilerVariant (CompilationUnit *cUnit, BasicBlock *bb)
+             if (opcode < static_cast<int> (kMirOpFirst))
+             {
+                 //If the opcode is alone in its color, we only care about its uses
+-                if (usesAreInvariant (mir, variants) == true)
++                if (dvmCompilerUsesAreInvariant (mir, variants) == true)
+                 {
+                     //Mark the loop information as having invariants
+                     info->setContainsInvariantInstructions ();
+diff --git a/vm/compiler/LoopRegisterUsage.h b/vm/compiler/LoopRegisterUsage.h
+index 7e684ab..d9fa6a8 100644
+--- a/vm/compiler/LoopRegisterUsage.h
++++ b/vm/compiler/LoopRegisterUsage.h
+@@ -30,6 +30,14 @@ class Pass;
+ bool dvmCompilerMemoryAliasing (CompilationUnit *cUnit, BasicBlock *bb);
+ 
+ /**
++ * @brief Value Numbering pass: calculates whether instructions have the same calculation
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock
++ * @return whether the pass changed something in the BasicBlock
++ */
++bool dvmCompilerValueNumbering (CompilationUnit *cUnit, BasicBlock *bb);
++
++/**
+  * @brief Variant pass: detect which instructions are invariant or not
+  * @param cUnit the CompilationUnit
+  * @param bb the BasicBlock
+diff --git a/vm/compiler/RegisterizationME.cpp b/vm/compiler/RegisterizationME.cpp
+index c2581e6..a24c02e 100644
+--- a/vm/compiler/RegisterizationME.cpp
++++ b/vm/compiler/RegisterizationME.cpp
+@@ -608,6 +608,7 @@ static bool parseBlock (BasicBlock *bb)
+             case OP_NEG_FLOAT:
+             case OP_NEG_DOUBLE:
+ 
++            case OP_INT_TO_DOUBLE:
+             case OP_INT_TO_LONG:
+             case OP_INT_TO_FLOAT:
+             case OP_LONG_TO_INT:
+@@ -622,7 +623,6 @@ static bool parseBlock (BasicBlock *bb)
+             case OP_INT_TO_BYTE:
+             case OP_INT_TO_CHAR:
+             case OP_INT_TO_SHORT:
+-
+             //Only a subset of alu
+             case OP_ADD_INT:
+             case OP_SUB_INT:
+-- 
+1.7.4.1
+

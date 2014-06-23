@@ -1,0 +1,212 @@
+From 7b23edcd6224e845a0fc1cca26f2a080536f5f16 Mon Sep 17 00:00:00 2001
+From: Yixin Shou <yixin.shou@intel.com>
+Date: Tue, 15 Oct 2013 11:22:00 -0700
+Subject: Dalvik: Removal of return value storing in inlined abs-double and unnecessary export_pc
+
+BZ: 142218
+
+This patch implement two optimizations on execute-inline bytecode.
+1. removed storing return value for inlined abs-double function call.
+2. removed unnecessary export_pc for some inlined function
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Id078aff3e6b3b3e89a854bc1b106ffe3d83f767d
+Orig-MCG-Change-Id: I08a564f6a454b855bfd1bfdb9b3f77be155bec35
+Signed-off-by: Yixin Shou <yixin.shou@intel.com>
+Reviewed-on: http://android.intel.com:8080/135417
+Reviewed-by: Kreitzer, David L <david.l.kreitzer@intel.com>
+Reviewed-by: Hartley, Timothy D <timothy.d.hartley@intel.com>
+Reviewed-by: lab_aqa <lab_aqa@intel.com>
+Reviewed-by: Semukhina, Elena V <elena.v.semukhina@intel.com>
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/CompilerIR.h                        |    2 +
+ vm/compiler/codegen/x86/lightcg/LowerInvoke.cpp |   30 +++++++++++++---
+ vm/compiler/codegen/x86/lightcg/LowerMove.cpp   |    6 +++
+ vm/compiler/codegen/x86/pcg/LowerCall.cpp       |   43 ++++++++++++++++++++--
+ 4 files changed, 71 insertions(+), 10 deletions(-)
+
+diff --git a/vm/compiler/CompilerIR.h b/vm/compiler/CompilerIR.h
+index 373238e..5c23098 100644
+--- a/vm/compiler/CompilerIR.h
++++ b/vm/compiler/CompilerIR.h
+@@ -190,6 +190,7 @@ typedef enum {
+     kMIRInlinedPred,                    // Invoke is inlined via prediction
+     kMIRCallee,                         // Instruction is inlined from callee
+     kMIRInvokeMethodJIT,                // Callee is JIT'ed as a whole method
++    kMIROptimizedAway,                  // Optimized away mir
+     kMIRIgnoreBailOut,                  // Instruction is safe (no bail out from JIT code)
+ } MIROptimizationFlagPositons;
+ 
+@@ -202,6 +203,7 @@ typedef enum {
+ #define MIR_INLINED_PRED                (1 << kMIRInlinedPred)
+ #define MIR_CALLEE                      (1 << kMIRCallee)
+ #define MIR_INVOKE_METHOD_JIT           (1 << kMIRInvokeMethodJIT)
++#define MIR_OPTIMIZED_AWAY              (1 << kMIROptimizedAway)
+ 
+ typedef struct CallsiteInfo {
+     const char *classDescriptor;
+diff --git a/vm/compiler/codegen/x86/lightcg/LowerInvoke.cpp b/vm/compiler/codegen/x86/lightcg/LowerInvoke.cpp
+index cd3aa68..e74d80e 100644
+--- a/vm/compiler/codegen/x86/lightcg/LowerInvoke.cpp
++++ b/vm/compiler/codegen/x86/lightcg/LowerInvoke.cpp
+@@ -1286,11 +1286,11 @@ int op_execute_inline(const MIR * mir, bool isRange) {
+         vE = vC + 2;
+         vF = vC + 3;
+     }
+-    export_pc();
+     switch (tmp) {
+         case INLINE_EMPTYINLINEMETHOD:
+             return 0;  /* Nop */
+         case INLINE_STRING_LENGTH:
++            export_pc();
+             get_virtual_reg(vC, OpndSize_32, 1, false);
+             compare_imm_reg(OpndSize_32, 0, 1, false);
+             conditional_jump(Condition_NE, ".do_inlined_string_length", true);
+@@ -1306,6 +1306,7 @@ int op_execute_inline(const MIR * mir, bool isRange) {
+             move_reg_to_mem(OpndSize_32, 2, false, OFFSETOF_MEMBER(Thread, interpSave.retval), 3, false);
+             return 0;
+         case INLINE_STRING_IS_EMPTY:
++            export_pc();
+             get_virtual_reg(vC, OpndSize_32, 1, false);
+             compare_imm_reg(OpndSize_32, 0, 1, false);
+             conditional_jump(Condition_NE, ".do_inlined_string_length", true);
+@@ -1378,12 +1379,27 @@ int op_execute_inline(const MIR * mir, bool isRange) {
+             move_reg_to_mem(OpndSize_32, 1, false, OFFSETOF_MEMBER(Thread, interpSave.retval), 2, false);
+             return 0;
+         case INLINE_MATH_ABS_DOUBLE:
+-            get_virtual_reg(vC, OpndSize_64, 1, false);
+-            alu_binary_mem_reg(OpndSize_64, and_opc, LvaluePosInfLong, PhysicalReg_Null, true, 1, false);
+-            get_self_pointer(2, false);
+-            move_reg_to_mem(OpndSize_64, 1, false, OFFSETOF_MEMBER(Thread, interpSave.retval), 2, false);
++            {
++                get_virtual_reg(vC, OpndSize_64, 1, false);
++                alu_binary_mem_reg(OpndSize_64, and_opc, LvaluePosInfLong, PhysicalReg_Null, true, 1, false);
++                MIR* mirNext = mir->next;
++
++                // if next bytecode is a move-result-wide, then we can handle them together here to remove the return value storing
++                if (mirNext != 0 && mirNext->dalvikInsn.opcode == OP_MOVE_RESULT_WIDE)
++                {
++                    int vA = mirNext->dalvikInsn.vA;
++                    set_virtual_reg(vA, OpndSize_64, 1, false);
++                    mirNext->OptimizationFlags |= MIR_OPTIMIZED_AWAY;
++                }
++                else
++                {
++                    get_self_pointer(2, false);
++                    move_reg_to_mem(OpndSize_64, 1, false, OFFSETOF_MEMBER(Thread, interpSave.retval), 2, false);
++                }
++            }
+             return 0;
+         case INLINE_STRING_CHARAT:
++            export_pc();
+             get_virtual_reg(vC, OpndSize_32, 1, false);
+             compare_imm_reg(OpndSize_32, 0, 1, false);
+             conditional_jump(Condition_NE, ".inlined_string_CharAt_arg_validate_1", true);
+@@ -1417,6 +1433,7 @@ int op_execute_inline(const MIR * mir, bool isRange) {
+             move_reg_to_mem(OpndSize_32, 2, false, OFFSETOF_MEMBER(Thread, interpSave.retval), 3, false);
+             return 0;
+         case INLINE_STRING_FASTINDEXOF_II:
++            export_pc();
+ #if defined(USE_GLOBAL_STRING_DEFS)
+             break;
+ #else
+@@ -1506,7 +1523,8 @@ int op_execute_inline(const MIR * mir, bool isRange) {
+             move_reg_to_mem(OpndSize_32, 1, false, OFFSETOF_MEMBER(Thread, interpSave.retval), 3, false);
+             return 0;
+         default:
+-                break;
++            export_pc();
++            break;
+     }
+ #endif
+     get_self_pointer(PhysicalReg_SCRATCH_1, false);
+diff --git a/vm/compiler/codegen/x86/lightcg/LowerMove.cpp b/vm/compiler/codegen/x86/lightcg/LowerMove.cpp
+index df3d07c..e4cc399 100644
+--- a/vm/compiler/codegen/x86/lightcg/LowerMove.cpp
++++ b/vm/compiler/codegen/x86/lightcg/LowerMove.cpp
+@@ -149,6 +149,12 @@ int op_move_result_wide(const MIR * mir) {
+     if (mir->OptimizationFlags & MIR_INLINED)
+         return 0;
+ 
++    // when removal of return value in execute-inline is done, current mir should be skipped and nothing need to be done here
++    if (mir->OptimizationFlags & MIR_OPTIMIZED_AWAY)
++    {
++        return 0;
++    }
++
+     int vA = mir->dalvikInsn.vA;
+     scratchRegs[0] = PhysicalReg_SCRATCH_1;
+     get_return_value(OpndSize_64, 1, false);
+diff --git a/vm/compiler/codegen/x86/pcg/LowerCall.cpp b/vm/compiler/codegen/x86/pcg/LowerCall.cpp
+index 13509b0..8369f0a 100644
+--- a/vm/compiler/codegen/x86/pcg/LowerCall.cpp
++++ b/vm/compiler/codegen/x86/pcg/LowerCall.cpp
+@@ -671,10 +671,39 @@ void dvmCompilerPcgTranslateExecuteInline (CompilationUnitPCG *cUnit, MIR *mir)
+                 CGAddr addr = CGCreateAddr(CGInstInvalid, CGInstInvalid, 0, CGSymbolInvalid, (int32_t)&mask);
+                 CGInst result = CGCreateNewInst("andpd1", "rm", load, addr, 16, (void*)1);
+ 
+-                // Store the return value
+-                self = dvmCompilerPcgGetSelfPointer (cUnit);
+-                addr = CGCreateAddr (self, CGInstInvalid, 0, CGSymbolInvalid, offsetof (Thread, interpSave.retval));
+-                CGCreateNewInst ("movsd1", "mr", addr, 8, (void*)1, result);
++                MIR* mirNext = mir->next;
++
++                // if next bytecode is a move-result-wide, then we can handle them together here to remove the return value storing
++                if (mirNext != 0 && mirNext->dalvikInsn.opcode == OP_MOVE_RESULT_WIDE)
++                {
++                    //Get the SSARepresentation
++                    Opcode dalvikOpCode = mirNext->dalvikInsn.opcode;
++                    SSARepresentation *ssaRep = mirNext->ssaRep;
++
++                    assert (ssaRep != 0);
++
++                    int ssaNum = ssaRep->defs[0];
++                    pcgDtype dtype = dvmCompilerPcgGetDtypeForSSANum (cUnit, ssaNum);
++                    const char *opcode;
++                    int objectSize = (dalvikOpCode == OP_MOVE_RESULT_WIDE) ? 8 : 4;
++
++                    dtype = dvmCompilerPcgApplyDefaultDtype (dtype, objectSize);
++                    dvmCompilerPcgGetOpcodeAndSizeForDtype (dtype, &opcode);
++                    if (dtype == LLreg)
++                    {
++                        result = CGCreateNewInst("movsd12sd", "r", result);
++                        result = CGCreateNewInst("emovdtl", "r", result);
++                    }
++                    dvmCompilerPcgSetVirtualReg (cUnit, ssaNum, opcode, objectSize, result);
++                    mirNext->OptimizationFlags |= MIR_OPTIMIZED_AWAY;
++                }
++                else
++                {
++                    // Store the return value
++                    self = dvmCompilerPcgGetSelfPointer (cUnit);
++                    addr = CGCreateAddr (self, CGInstInvalid, 0, CGSymbolInvalid, offsetof (Thread, interpSave.retval));
++                    CGCreateNewInst ("movsd1", "mr", addr, 8, (void*)1, result);
++                }
+                 return;
+             }
+         case INLINE_STRING_FASTINDEXOF_II:
+@@ -840,6 +869,12 @@ void dvmCompilerPcgTranslateMoveResult (CompilationUnitPCG *cUnit, MIR *mir)
+         return;
+     }
+ 
++    // when removal of return value in execute-inline is done, current mir should be skipped and nothing need to be done here
++    if (mir->OptimizationFlags & MIR_OPTIMIZED_AWAY)
++    {
++        return;
++    }
++
+     //Get the SSARepresentation
+     Opcode dalvikOpCode = mir->dalvikInsn.opcode;
+     SSARepresentation *ssaRep = mir->ssaRep;
+-- 
+1.7.4.1
+

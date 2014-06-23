@@ -1,0 +1,172 @@
+From 15f793050a945ee95f26472ba6f84fc2c10d1c28 Mon Sep 17 00:00:00 2001
+From: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Date: Mon, 5 Aug 2013 08:04:03 -0700
+Subject: Dalvik: New klocwork fixes
+
+BZ: 128558
+
+The patch addresses issues identified with Klocwork
+-ChildBlockIter may use unitialized successorIter field
+-dvmCompilerInsertMIRBefore checks prevMir for null before updating it
+-Ensure that processCanSwitch and processCanBranch don't dereference
+null blocks.
+-Make sure that inlining rewriting fails properly when move-result cannot
+be found.
+-Ensure that we have a MIR when using the Silvermont REHABQ heuristic for
+deciding whether to do a VR load.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I9de1de5903f967edd13829a4758667499fbb3edb
+Orig-MCG-Change-Id: I8b44a6816d6df851446655b9b2c9203a762a558b
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Reviewed-on: http://android.intel.com:8080/125082
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/Frontend.cpp                        |   38 +++++++++++++++--------
+ vm/compiler/InlineTransformation.cpp            |   16 ++++++++--
+ vm/compiler/IntermediateRep.cpp                 |    7 +++-
+ vm/compiler/codegen/x86/lightcg/LowerHelper.cpp |    2 +-
+ 4 files changed, 45 insertions(+), 18 deletions(-)
+
+diff --git a/vm/compiler/Frontend.cpp b/vm/compiler/Frontend.cpp
+index 326882d..397e3fc 100644
+--- a/vm/compiler/Frontend.cpp
++++ b/vm/compiler/Frontend.cpp
+@@ -1324,8 +1324,9 @@ static void processCanBranch(GrowableList *blockList, BasicBlock *curBlock,
+                                        true,
+                                        /* immedPredBlockP */
+                                        &curBlock);
+-    curBlock->taken = takenBlock;
+-    dvmCompilerSetBit(takenBlock->predecessors, curBlock->id);
++
++    //Make the new takenBlock be the taken path of curBlock
++    dvmCompilerReplaceChildBasicBlock (takenBlock, curBlock, kChildTypeTaken);
+ 
+     /* Always terminate the current block for conditional branches */
+     if (flags & kInstrCanContinue) {
+@@ -1348,8 +1349,10 @@ static void processCanBranch(GrowableList *blockList, BasicBlock *curBlock,
+                                                  true,
+                                                  /* immedPredBlockP */
+                                                  &curBlock);
+-        curBlock->fallThrough = fallthroughBlock;
+-        dvmCompilerSetBit(fallthroughBlock->predecessors, curBlock->id);
++
++        //Make the fallthroughBlock be the fallthrough path of curBlock
++        dvmCompilerReplaceChildBasicBlock (fallthroughBlock, curBlock, kChildTypeFallthrough);
++
+     } else if (codePtr < codeEnd) {
+         /* Create a fallthrough block for real instructions (incl. OP_NOP) */
+         if (contentIsInsn (codePtr) == true) {
+@@ -1427,15 +1430,24 @@ static void processCanSwitch(GrowableList *blockList, BasicBlock *curBlock,
+                                           true,
+                                           /* immedPredBlockP */
+                                           &curBlock);
+-        SuccessorBlockInfo *successorBlockInfo =
+-            (SuccessorBlockInfo *) dvmCompilerNew(sizeof(SuccessorBlockInfo),
+-                                                  false);
+-        successorBlockInfo->block = caseBlock;
+-        successorBlockInfo->key = (insn->dalvikInsn.opcode == OP_PACKED_SWITCH)?
+-                                  firstKey + i : keyTable[i];
+-        dvmInsertGrowableList(&curBlock->successorBlockList.blocks,
+-                              (intptr_t) successorBlockInfo);
+-        dvmCompilerSetBit(caseBlock->predecessors, curBlock->id);
++
++        //We should always have a block, especially since we pass argument to create one
++        assert (caseBlock != 0);
++
++        //However, we still need to check here that we have a block because we will be
++        //dereferencing it.
++        if (caseBlock != 0)
++        {
++            SuccessorBlockInfo *successorBlockInfo =
++                (SuccessorBlockInfo *) dvmCompilerNew(sizeof(SuccessorBlockInfo),
++                                                      false);
++            successorBlockInfo->block = caseBlock;
++            successorBlockInfo->key = (insn->dalvikInsn.opcode == OP_PACKED_SWITCH)?
++                                      firstKey + i : keyTable[i];
++            dvmInsertGrowableList(&curBlock->successorBlockList.blocks,
++                                  (intptr_t) successorBlockInfo);
++            dvmCompilerSetBit(caseBlock->predecessors, curBlock->id);
++        }
+     }
+ 
+     /* Fall-through case */
+diff --git a/vm/compiler/InlineTransformation.cpp b/vm/compiler/InlineTransformation.cpp
+index 8aacc10..1cb8e7d 100755
+--- a/vm/compiler/InlineTransformation.cpp
++++ b/vm/compiler/InlineTransformation.cpp
+@@ -894,11 +894,21 @@ static InliningFailure rewriteInlinedMIR (const Method *calleeMethod, MIR *invok
+     }
+     else if ((dfFlags & DF_A_IS_DEFINED_REG) != 0)
+     {
+-        //Since we have a single bytecode with a definition, it must the case that we have a move-result
++        //Since we have a single bytecode with a definition, it must the case that we have a move-result.
++        //So we assert it right now.
+         assert (moveResult != 0);
+ 
+-        //Because we are looking at a simple bytecode, we write directly into register desired by move-result
+-        newInsn.vA = moveResult->dalvikInsn.vA;
++        //When not in assert world we need to actually check that we have a move-result
++        if (moveResult != 0)
++        {
++            //Because we are looking at a simple bytecode, we write directly into register desired by move-result
++            newInsn.vA = moveResult->dalvikInsn.vA;
++        }
++        else
++        {
++            //We were expecting to have a move-result but we didn't find it
++            return kInliningCannotFindMoveResult;
++        }
+     }
+ 
+     if ((dfFlags & DF_B_IS_REG) != 0)
+diff --git a/vm/compiler/IntermediateRep.cpp b/vm/compiler/IntermediateRep.cpp
+index 592c1fb..39eaf89 100644
+--- a/vm/compiler/IntermediateRep.cpp
++++ b/vm/compiler/IntermediateRep.cpp
+@@ -256,7 +256,6 @@ void dvmCompilerInsertMIRBefore (BasicBlock *bb, MIR *mirToInsertBefore, MIR *ne
+         bb->firstMIRInsn = newMIR;
+     }
+ 
+-    prevMIR->next = newMIR;
+     newMIR->prev = prevMIR;
+     newMIR->next = mirToInsertBefore;
+     mirToInsertBefore->prev = newMIR;
+@@ -1293,6 +1292,12 @@ ChildBlockIterator::ChildBlockIterator (BasicBlock *bb)
+     }
+     else
+     {
++        //Static analyzers believe we fail to initialize successorIter so we set up its fields now
++        successorIter.idx = 0;
++        successorIter.size = 0;
++        successorIter.list = 0;
++
++        //We have no successors if the block list is unused
+         haveSuccessors = false;
+     }
+ }
+diff --git a/vm/compiler/codegen/x86/lightcg/LowerHelper.cpp b/vm/compiler/codegen/x86/lightcg/LowerHelper.cpp
+index 48de310..a24b1d0 100644
+--- a/vm/compiler/codegen/x86/lightcg/LowerHelper.cpp
++++ b/vm/compiler/codegen/x86/lightcg/LowerHelper.cpp
+@@ -1927,7 +1927,7 @@ bool alu_imm_to_VR(OpndSize size, ALU_Opcode opc, int srcVR, int destVR, int imm
+             case SRC_IN_MEMORY:
+                 if (caseDest == DEST_SAME_AS_SRC) {
+ 
+-                    // for Silvermont platform
++                    //For Silvermont we use a heuristic to avoid REHABQ hazard.
+                     if (strcmp(ARCH_VARIANT, "x86-slm") == 0) {
+ 
+                         /* Heuristic for inc optimization to avoid store/load REHABQ hazard.
+-- 
+1.7.4.1
+

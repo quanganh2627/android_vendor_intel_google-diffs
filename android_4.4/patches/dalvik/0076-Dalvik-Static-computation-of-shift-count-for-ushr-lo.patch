@@ -1,0 +1,140 @@
+From cec5f4dea488b7fcb5b8fe25fa2f5cc7eb578bf2 Mon Sep 17 00:00:00 2001
+From: Bijoy Jose <bijoy.a.jose@intel.com>
+Date: Tue, 12 Feb 2013 21:14:57 -0800
+Subject: Dalvik: Static computation of shift count for ushr-long byte codes
+
+BZ: 86514
+
+This patch enables PSRLQ instruction with operands of type XMM and imm8
+in the encoder. OP_USHR_LONG and OP_USHR_LONG/2ADDR may have cases where
+VR containing unmasked shift count is a constant. In such cases, this
+improvement will compute masked shift statically, thereby reducing
+execution time.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Iff513831f6424c05475d018c6477505c2e2be30c
+Orig-MCG-Change-Id: Ia513da18874ee16201508615710e50386a6f470a
+Signed-off-by: Bijoy Jose <bijoy.a.jose@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/codegen/x86/BytecodeVisitor.cpp    |   42 ++++++++++++++++-------
+ vm/compiler/codegen/x86/LowerAlu.cpp           |   14 ++++++--
+ vm/compiler/codegen/x86/libenc/enc_tabl.cpp    |    1 +
+ vm/compiler/codegen/x86/libenc/enc_wrapper.cpp |    2 +-
+ 4 files changed, 41 insertions(+), 18 deletions(-)
+
+diff --git a/vm/compiler/codegen/x86/BytecodeVisitor.cpp b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+index 0584254..85ed9fd 100644
+--- a/vm/compiler/codegen/x86/BytecodeVisitor.cpp
++++ b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+@@ -5322,23 +5322,39 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+         if(inst_op == OP_USHR_LONG) {
+             vA = currentMIR->dalvikInsn.vA;
+             v1 = currentMIR->dalvikInsn.vB;
++            v2 = currentMIR->dalvikInsn.vC;
++            isConst = isVirtualRegConstant(v2, LowOpndRegType_gp, &tmpvalue, false);
+         } else {
+             vA = currentMIR->dalvikInsn.vA;
+             v1 = vA;
++            isConst = isVirtualRegConstant(v1, LowOpndRegType_gp, &tmpvalue, false);
+         }
+-        infoArray[0].regNum = 1;
+-        infoArray[0].refCount = 3; //define, update, use
+-        infoArray[0].physicalType = LowOpndRegType_xmm;
+-        if(vA != v1)
+-            infoArray[0].shareWithVR = false;
+-        infoArray[1].regNum = 2;
+-        infoArray[1].refCount = 3; //define, update, use
+-        infoArray[1].physicalType = LowOpndRegType_xmm;
+-        infoArray[1].shareWithVR = false;
+-        infoArray[2].regNum = 3;
+-        infoArray[2].refCount = 2; //define, use
+-        infoArray[2].physicalType = LowOpndRegType_xmm;
+-        return 3;
++        if (isConst == 3) { // case where VR contents is a constant, shift amount is available
++            infoArray[0].regNum = 1;
++            infoArray[0].refCount = 3; //define, update, use
++            infoArray[0].physicalType = LowOpndRegType_xmm;
++            if(vA != v1)
++                infoArray[0].shareWithVR = false;
++            infoArray[1].regNum = 2;
++            infoArray[1].refCount = 1; //define, update, use
++            infoArray[1].physicalType = LowOpndRegType_xmm;
++            infoArray[1].shareWithVR = false;
++            return 2;
++         } else { // case where VR content is not a constant, shift amount has to be read from VR.
++            infoArray[0].regNum = 1;
++            infoArray[0].refCount = 3; //define, update, use
++            infoArray[0].physicalType = LowOpndRegType_xmm;
++            if(vA != v1)
++                infoArray[0].shareWithVR = false;
++            infoArray[1].regNum = 2;
++            infoArray[1].refCount = 3; //define, update, use
++            infoArray[1].physicalType = LowOpndRegType_xmm;
++            infoArray[1].shareWithVR = false;
++            infoArray[2].regNum = 3;
++            infoArray[2].refCount = 2; //define, use
++            infoArray[2].physicalType = LowOpndRegType_xmm;
++            return 3;
++         }
+ 
+     case OP_MUL_LONG: //general purpose register
+         vA = currentMIR->dalvikInsn.vA;//INST_AA(inst);
+diff --git a/vm/compiler/codegen/x86/LowerAlu.cpp b/vm/compiler/codegen/x86/LowerAlu.cpp
+index be4777d..4bdc110 100644
+--- a/vm/compiler/codegen/x86/LowerAlu.cpp
++++ b/vm/compiler/codegen/x86/LowerAlu.cpp
+@@ -1755,10 +1755,16 @@ int common_ushr_long(u2 vA, u2 v1, u2 v2) {
+     get_VR_sd(v1, 1, false);
+     get_VR_ss(v2, 2, false);
+ 
+-    load_sd_global_data_API("shiftMask", 3, false);
+-
+-    alu_binary_reg_reg(OpndSize_64, and_opc, 3, false, 2, false);
+-    alu_binary_reg_reg(OpndSize_64, srl_opc, 2, false, 1, false);
++    int value;
++    int isConst = isVirtualRegConstant(v2, LowOpndRegType_gp, &value, false); //do not update refCount
++    if (isConst == 3) {                     // case where shift amount is available
++        int shiftImm = (0x3f) & (value); // compute masked shift amount statically
++        alu_binary_imm_reg(OpndSize_64, srl_opc, shiftImm, 1, false);
++    } else {                                // case where shift count to be read from VR
++        load_sd_global_data_API("shiftMask", 3, false);
++        alu_binary_reg_reg(OpndSize_64, and_opc, 3, false, 2, false);
++        alu_binary_reg_reg(OpndSize_64, srl_opc, 2, false, 1, false);
++    }
+     set_VR_sd(vA, 1, false);
+     return 0;
+ }
+diff --git a/vm/compiler/codegen/x86/libenc/enc_tabl.cpp b/vm/compiler/codegen/x86/libenc/enc_tabl.cpp
+index b8bb946..da87bf3 100644
+--- a/vm/compiler/codegen/x86/libenc/enc_tabl.cpp
++++ b/vm/compiler/codegen/x86/libenc/enc_tabl.cpp
+@@ -1285,6 +1285,7 @@ BEGIN_OPCODES()
+     {OpcodeInfo::all,   {0x0F, 0xD3, _r},   {mm64, mm_m64}, DU_U },
+ #endif
+     {OpcodeInfo::all,   {0x66, 0x0F, 0xD3, _r}, {xmm64, xmm_m64},   DU_U },
++    {OpcodeInfo::all,   {0x66, 0x0F, 0x73, _2, ib}, {xmm64, imm8},   DU_U },
+ END_OPCODES()
+ END_MNEMONIC()
+ 
+diff --git a/vm/compiler/codegen/x86/libenc/enc_wrapper.cpp b/vm/compiler/codegen/x86/libenc/enc_wrapper.cpp
+index e5eed0e..02e4271 100644
+--- a/vm/compiler/codegen/x86/libenc/enc_wrapper.cpp
++++ b/vm/compiler/codegen/x86/libenc/enc_wrapper.cpp
+@@ -378,7 +378,7 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_imm_reg(Mnemonic m, OpndSize si
+     add_r(args, reg, size); //dst
+     if(m == Mnemonic_IMUL) add_r(args, reg, size); //src CHECK
+     if(m == Mnemonic_SAL || m == Mnemonic_SHR || m == Mnemonic_SHL
+-       || m == Mnemonic_SAR || m == Mnemonic_ROR || m == Mnemonic_PSLLQ)  //fix for shift opcodes
++       || m == Mnemonic_SAR || m == Mnemonic_ROR || m == Mnemonic_PSLLQ || m == Mnemonic_PSRLQ)  //fix for shift opcodes
+       add_imm(args, OpndSize_8, imm, true/*is_signed*/);
+     else
+       add_imm(args, size, imm, true/*is_signed*/);
+-- 
+1.7.4.1
+

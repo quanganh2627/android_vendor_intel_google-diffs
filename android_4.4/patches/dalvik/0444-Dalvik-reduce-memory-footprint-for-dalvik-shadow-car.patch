@@ -1,0 +1,106 @@
+From 3415d45874a4a4a855fa3e18f8921580b7517c4f Mon Sep 17 00:00:00 2001
+From: lzang1 <lin.zang@intel.com>
+Date: Thu, 19 Dec 2013 16:59:05 +0800
+Subject: Dalvik: reduce memory footprint for dalvik-shadow-card-table
+
+BZ: 160080
+
+In dalvik Regional GC implementation, the shadow card table are cleared
+by memset(). This patch reduce the memory footprint by using madvise() instead
+on dalvik-shadow-card-table in LowMemoryMode.
+
+Change-Id: Ife69ad4516d580025c2130fc6d40f5b2f2e03d86
+Category: device enablement
+Domain: AOSP.Dalvik-GC
+Origin: internal
+Upstream-Candidate: no, need rework
+Signed-off-by: lzang1 <lin.zang@intel.com>
+Signed-off-by: Yang Chang <yang.chang@intel.com>
+---
+ vm/alloc/CardTable.cpp |   27 +++++++++++++++++++++++++--
+ vm/alloc/Heap.cpp      |    4 +++-
+ vm/alloc/RegionGC.cpp  |    4 +++-
+ 3 files changed, 31 insertions(+), 4 deletions(-)
+
+diff --git a/vm/alloc/CardTable.cpp b/vm/alloc/CardTable.cpp
+index 8557d82..9eebff2 100644
+--- a/vm/alloc/CardTable.cpp
++++ b/vm/alloc/CardTable.cpp
+@@ -83,6 +83,9 @@ bool dvmCardTableStartup(size_t heapMaximumSize, size_t growthLimit)
+     }
+     gcHeap->shadowCardTableBase = (u1*)shadowCardTableAllocBase;
+     gcHeap->shadowCardTableLength = length;
++
++    // zero out cards with madvise(), discarding all pages in the shardow card table
++    madvise(gcHeap->shadowCardTableBase, length, MADV_DONTNEED);
+     /* End of the shadow card table initialization. */
+ #endif
+ 
+@@ -117,12 +120,32 @@ void dvmClearCardTablePartial(const void *base, unsigned int length){
+     assert(gDvm.gcHeap->cardTableBase != NULL);
+     u1 *biasedBase = gDvm.biasedCardTableBase;
+     u1 *start = biasedBase + ((uintptr_t)base >> GC_CARD_SHIFT);
+-    memset(start, GC_CARD_CLEAN, length/GC_CARD_SIZE);
++
++    if (gDvm.lowMemoryMode) {
++      // zero out partial card table with madvise.
++      // need two steps to do this because we want madvise conduct on pages
++      // 1. get the number of pages will be madvise.
++      // 2. set GC_CARD_CLEAN for the remaind spaces.
++
++      unsigned int TotalLengthNeedClean = length/GC_CARD_SIZE;
++      unsigned int PageLengthNeedClean = ALIGN_DOWN_TO_PAGE_SIZE(TotalLengthNeedClean);
++
++      madvise(start, PageLengthNeedClean, MADV_DONTNEED);
++      memset(start + PageLengthNeedClean, GC_CARD_CLEAN, TotalLengthNeedClean - PageLengthNeedClean);
++    } else {
++      memset(start, GC_CARD_CLEAN, length/GC_CARD_SIZE);
++    }
+ }
+ 
+ void dvmClearShadowCardTable(void){
+     assert(gDvm.gcHeap->cardTableBase != NULL);
+-    memset(gDvm.gcHeap->shadowCardTableBase, GC_CARD_CLEAN, gDvm.gcHeap->shadowCardTableLength);
++    if (gDvm.lowMemoryMode) {
++      // zero out cards with madvise(), discarding all pages in the shardow card table
++      madvise(gDvm.gcHeap->shadowCardTableBase, gDvm.gcHeap->shadowCardTableLength, MADV_DONTNEED);
++    } else {
++      size_t clearSize = dvmGetZygoteHeapSize()/GC_CARD_SIZE;
++      memset(gDvm.gcHeap->shadowCardTableBase, GC_CARD_CLEAN, clearSize);
++    }
+ }
+ #endif
+ 
+diff --git a/vm/alloc/Heap.cpp b/vm/alloc/Heap.cpp
+index f2d62d7..4204d89 100644
+--- a/vm/alloc/Heap.cpp
++++ b/vm/alloc/Heap.cpp
+@@ -707,7 +707,9 @@ void dvmCollectGarbageInternal(const GcSpec* spec)
+          * 1. Clear card table of active heap. Only keep the card table of zygote heap
+          * 2. Scan the heap again from the objects in dirty card table.
+          */
+-        dvmClearCardTablePartial(dvmGetActiveHeapBase(), dvmGetActiveHeapSize());
++        const HeapBitmap* liveBits = dvmHeapSourceGetLiveBits();
++        size_t length = liveBits->max - (uintptr_t)dvmGetActiveHeapBase();
++        dvmClearCardTablePartial(dvmGetActiveHeapBase(), length);
+         dvmHeapReScanMarkedObjects();
+     }
+ #endif
+diff --git a/vm/alloc/RegionGC.cpp b/vm/alloc/RegionGC.cpp
+index 1d2267a..dd431c2 100644
+--- a/vm/alloc/RegionGC.cpp
++++ b/vm/alloc/RegionGC.cpp
+@@ -175,7 +175,9 @@ void regionGcPrepareCardTable()
+          * the results to both. Clear bits in  the card table for the active heap.
+          */
+         regionGcMergeCardTables(gRegionGC);
+-        dvmClearCardTablePartial(dvmGetActiveHeapBase(), dvmGetActiveHeapSize());
++        const HeapBitmap* liveBits = dvmHeapSourceGetLiveBits();
++        size_t length = liveBits->max - (uintptr_t)dvmGetActiveHeapBase();
++        dvmClearCardTablePartial(dvmGetActiveHeapBase(), length);
+     }
+ }
+ 
+-- 
+1.7.4.1
+

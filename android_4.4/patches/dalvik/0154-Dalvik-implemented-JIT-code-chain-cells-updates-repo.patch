@@ -1,0 +1,1621 @@
+From 2c41f85547b52642a5cbda4c2602177fccd0661d Mon Sep 17 00:00:00 2001
+From: yevgeny.y.rouban <yevgeny.y.rouban@intel.com>
+Date: Mon, 22 Apr 2013 14:36:44 +0700
+Subject: Dalvik: implemented JIT code chain cells updates report to VTune JIT API
+
+BZ: 53766
+
+- All chain cell update code, which changes branch targets during JIT code execution, got additional
+  call to SendUpdateToVTune(void * address, unsigned size, unsigned method_id = 0)
+  One exception is made to not send updates during dvmCompilerShutdown(). This is needed to not report
+  all cells unchained by dvmJitUnchainAll().
+
+- VTune JIT API needs method_id in addition to address and size. But during JIT code execution
+  the method is not known. That is why an address to method_id mapping logic is implemented
+  in the MethodCode and MethodCodeMap classes, which are local in JitProfiling.cpp. Address to method_id
+  mapping is built while methods are compiled. Then this mapping is used to resolve method_ids for
+  the update events. This could result in a slight performance drop for massive JIT code updates.
+  If so, consider a redesign of VTune JIT API. It seems that all method_ids can be resolved by VTune JIT reader
+  during the analysis stage (VTune GUI) rather than Dalvik runtime.
+
+- Logging calls are changed to LOGD instead of LOGI.
+
+- Logging is made uniform. Both compilation stage and runtime stage use -Xjitverbose
+  (DvmJitGlobals.printMe) flag instead of the compilation unit verbosity flag (CompilationUnit::printMe),
+  because the later one is unavailable during runtime.
+
+- Files dalvik/vm/compiler/JitProfiling.cpp and dalvik/vm/compiler/JitProfiling.h were imported to
+  the Dalvik from their VTune counterparts amplxe-android-x86/sdk/src/ittnotify/jitprofiling.c
+  and amplxe-android-x86/include/jitprofiling.h. I think this Dalvik code needs a redesign to
+  use the intact versions of jitprofiling code and keep it in sync with the latest VTune public release.
+  JitProfiling.h and JitProfiling.cpp are partially synced with the latest VTune code.
+
+- VTune had a bug in JIT symbol reading module VTune 2013 update 6.
+  It crashed reading JIT API update events from *.jit files (ask Denis Pravdin for details).
+  Dalvik option -Xjitvtuneversion:<build_num> is added to allow users to get JIT API updates for
+  VTune builds starting from 279867. By default the users of VTune 2013 update 6 and older
+  are not affected by this patch. To enable VTune JIT API updates the build_num must be
+  explicitly specified to 279867 or higher. When VTune 2013 update 7 will be released (in a month or so),
+  the VTune JIT API updates should be enabled by default in Dalvik.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I5a8d0f47572785c862008a4dc0f911fb8c7d6847
+Orig-MCG-Change-Id: I0ab8843d97b3c8dc3d2b6ec20ea8a932630ef9d5
+Signed-off-by: yevgeny.y.rouban <yevgeny.y.rouban@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/Globals.h                                 |    8 +
+ vm/Init.cpp                                  |   14 +
+ vm/compiler/Compiler.cpp                     |    3 +
+ vm/compiler/Frontend.cpp                     |   12 +-
+ vm/compiler/JitProfiling.cpp                 |  403 ++++++++++++++------
+ vm/compiler/JitProfiling.h                   |  534 +++++++++++++++++++-------
+ vm/compiler/codegen/x86/CodegenInterface.cpp |  109 +++++-
+ vm/compiler/codegen/x86/Lower.cpp            |   12 +-
+ 8 files changed, 812 insertions(+), 283 deletions(-)
+
+diff --git a/vm/Globals.h b/vm/Globals.h
+index c3604f6..f292f21 100644
+--- a/vm/Globals.h
++++ b/vm/Globals.h
+@@ -777,6 +777,12 @@ enum VTuneInfo {
+     kVTuneInfoByteCode = 2,   // mapping from JIT code to byte code
+     kVTuneInfoJavaCode = 3    // mapping from JIT code to Java code
+ };
++
++#define _STR_VALUE(arg)      #arg
++#define STR_VALUE(arg) _STR_VALUE(arg)
++
++// Update the default VTune build number to the latest public build
++#define VTUNE_VERSION_DEFAULT 279866
+ #endif
+ 
+ /*
+@@ -928,6 +934,8 @@ struct DvmJitGlobals {
+ #if defined(VTUNE_DALVIK)
+     /* Flag to enable VTune support for Dalvik VM */
+     VTuneInfo vtuneInfo;
++    /* Generate jit files compatible with specific VTune build. Default is VTUNE_VERSION_DEFAULT. */
++    int vtuneVersion;
+ #endif
+ 
+     /* Flag to dump compiled binary code in bytes */
+diff --git a/vm/Init.cpp b/vm/Init.cpp
+index 3ae0e6f..a7654bc 100644
+--- a/vm/Init.cpp
++++ b/vm/Init.cpp
+@@ -168,6 +168,7 @@ static void usage(const char* progName)
+ #if defined(VTUNE_DALVIK)
+     dvmFprintf(stderr, "  -Xjitsepdalvik\n");
+     dvmFprintf(stderr, "  -Xjitvtuneinfo:{none,jit,dex,src}\n");
++    dvmFprintf(stderr, "  -Xjitvtuneversion:<build_num> (Generates jit files compatible with specific VTune build. Default is " STR_VALUE(VTUNE_VERSION_DEFAULT) ".)\n");
+ #endif
+     dvmFprintf(stderr, "  -Xjitprofile\n");
+     dvmFprintf(stderr, "  -Xjitdisableopt\n");
+@@ -1285,6 +1286,14 @@ static int processOptions(int argc, const char* const argv[],
+                 dvmFprintf(stderr, "Unrecognized option '%s'\n", argv[i]);
+                 return -1;
+             }
++        } else if (strncmp(argv[i], "-Xjitvtuneversion:", 18) == 0) {
++            char * endP;
++            long vtuneVersion = strtol(argv[i] + 18, &endP, 10);
++            if ((endP != NULL && *endP != '\0') || vtuneVersion == LONG_MAX || vtuneVersion < 0) {
++                dvmFprintf(stderr, "Invalid value for option '%s'\n", argv[i]);
++                return -1;
++            }
++            gDvmJit.vtuneVersion = vtuneVersion;
+ #endif
+         } else if (strncmp(argv[i], "-Xjitprofile", 12) == 0) {
+             gDvmJit.profileMode = kTraceProfilingContinuous;
+@@ -1485,6 +1494,11 @@ static void setCommandLineDefaults()
+      */
+     gDvm.enableRegionGC = true;
+ #endif
++#if defined(VTUNE_DALVIK)
++    gDvmJit.vtuneInfo = kVTuneInfoDisabled;
++    gDvmJit.vtuneVersion = VTUNE_VERSION_DEFAULT;
++#endif
++
+ }
+ 
+ 
+diff --git a/vm/compiler/Compiler.cpp b/vm/compiler/Compiler.cpp
+index e18e6e6..0670649 100644
+--- a/vm/compiler/Compiler.cpp
++++ b/vm/compiler/Compiler.cpp
+@@ -802,6 +802,9 @@ void dvmCompilerShutdown(void)
+     }
+ 
+     /* Break loops within the translation cache */
++#if defined(VTUNE_DALVIK)
++    gDvmJit.vtuneInfo = kVTuneInfoDisabled; // stop sending unchain updates to VTune
++#endif
+     dvmJitUnchainAll();
+ 
+     /*
+diff --git a/vm/compiler/Frontend.cpp b/vm/compiler/Frontend.cpp
+index bf2bdce..6fd8dbf 100644
+--- a/vm/compiler/Frontend.cpp
++++ b/vm/compiler/Frontend.cpp
+@@ -2712,7 +2712,7 @@ static void getLineInfoForJavaCode(const Method* method,
+ /* Notify the trace formation and send the trace information to VTune
+ */
+ static void SendTraceInfoToVTune(CompilationUnit *cUnit, JitTraceDescription *desc) {
+-    if (cUnit->printMe) {
++    if (gDvmJit.printMe == true) {
+         LOGD("JIT API: write a trace of '%s' method in jit file.", cUnit->method->name);
+     }
+ 
+@@ -2765,11 +2765,13 @@ static void SendTraceInfoToVTune(CompilationUnit *cUnit, JitTraceDescription *de
+ 
+     // Send the trace load event to the VTune analyzer
+     int res = iJIT_NotifyEvent(iJVM_EVENT_TYPE_METHOD_LOAD_FINISHED, (void*)&jitMethod);
+-    if (cUnit->printMe) {
+-        if (res) {
+-            LOGD("JIT API: a trace of '%s' method was written successfully address: %p, size: %d.", cUnit->method->name, jitMethod.method_load_address ,jitMethod.method_size);
++    if (gDvmJit.printMe == true) {
++        if (res != 0) {
++            LOGD("JIT API: a trace of '%s' method was written successfully: id=%u, address=%p, size=%d."
++                    , cUnit->method->name, jitMethod.method_id, jitMethod.method_load_address ,jitMethod.method_size);
+         } else {
+-            LOGD("JIT API: failed to write a trace of '%s' method address: %p, size: %d.", cUnit->method->name, jitMethod.method_load_address ,jitMethod.method_size);
++            LOGD("JIT API: failed to write a trace of '%s' method: id=%u, address=%p, size=%d."
++                    , cUnit->method->name, jitMethod.method_id, jitMethod.method_load_address ,jitMethod.method_size);
+         }
+     }
+ }
+diff --git a/vm/compiler/JitProfiling.cpp b/vm/compiler/JitProfiling.cpp
+index 45cbffc..5fea90c 100644
+--- a/vm/compiler/JitProfiling.cpp
++++ b/vm/compiler/JitProfiling.cpp
+@@ -27,29 +27,31 @@
+ #include <stdlib.h>
+ 
+ #include "JitProfiling.h"
++#include <vector>
++#include <algorithm>
+ 
+-static const char rcsid[] = "\n@(#) $Revision: 202703 $\n";
++static const char rcsid[] = "\n@(#) $Revision: 243957 $\n";
+ 
+-#define DLL_ENVIRONMENT_VAR	    "VS_PROFILER"
++#define DLL_ENVIRONMENT_VAR             "VS_PROFILER"
+ 
+ #ifndef NEW_DLL_ENVIRONMENT_VAR
+ #if ITT_ARCH==ITT_ARCH_IA32
+-#define NEW_DLL_ENVIRONMENT_VAR     "INTEL_JIT_PROFILER32"
++#define NEW_DLL_ENVIRONMENT_VAR            "INTEL_JIT_PROFILER32"
+ #else
+-#define NEW_DLL_ENVIRONMENT_VAR	    "INTEL_JIT_PROFILER64"
++#define NEW_DLL_ENVIRONMENT_VAR            "INTEL_JIT_PROFILER64"
+ #endif
+ #endif /* NEW_DLL_ENVIRONMENT_VAR */
+ 
+ #if ITT_PLATFORM==ITT_PLATFORM_WIN
+-#define DEFAULT_DLLNAME         "JitPI.dll"
++#define DEFAULT_DLLNAME                 "JitPI.dll"
+ HINSTANCE m_libHandle = NULL;
+ #else  /* ITT_PLATFORM==ITT_PLATFORM_WIN */
+-#define DEFAULT_DLLNAME         "libJitPI.so"
++#define DEFAULT_DLLNAME                 "libJitPI.so"
+ void* m_libHandle = NULL;
+ #endif /* ITT_PLATFORM==ITT_PLATFORM_WIN */
+ 
+ /* default location of JIT profiling agent on Android */
+-#define ANDROID_JIT_AGENT_PATH     "/data/intel/libittnotify.so"
++#define ANDROID_JIT_AGENT_PATH  "/data/intel/libittnotify.so"
+ 
+ /* the function pointers */
+ typedef unsigned int(*TPInitialize)(void);
+@@ -62,24 +64,25 @@ static iJIT_IsProfilingActiveFlags executionMode = iJIT_NOTHING_RUNNING;
+ 
+ /* end collector dll part. */
+ 
+-/* loadiJIT_Funcs() : this function is called just in the beginning and is responsible
+-** to load the functions from BistroJavaCollector.dll
+-** result:
+-**      on success: the functions loads,    iJIT_DLL_is_missing=0, return value = 1.
+-**      on failure: the functions are NULL, iJIT_DLL_is_missing=1, return value = 0.
+-*/
++/* loadiJIT_Funcs() : this function is called just in the beginning
++ *  and is responsible to load the functions from BistroJavaCollector.dll
++ * result:
++ *  on success: the functions loads, iJIT_DLL_is_missing=0, return value = 1
++ *  on failure: the functions are NULL, iJIT_DLL_is_missing=1, return value = 0
++ */
+ static int loadiJIT_Funcs(void);
+ 
+ /* global representing whether the BistroJavaCollector can't be loaded */
+ static int iJIT_DLL_is_missing = 0;
+ 
+ /* Virtual stack - the struct is used as a virtual stack for each thread.
+-** Every thread initializes with a stack of size INIT_TOP_STACK.
+-** Every method entry decreases from the current stack point,
+-** and when a thread stack reaches its top of stack (return from the global function),
+-** the top of stack and the current stack increase. Notice that when returning from a function
+-** the stack pointer is the address of the function return.
+-*/
++ * Every thread initializes with a stack of size INIT_TOP_STACK.
++ * Every method entry decreases from the current stack point,
++ * and when a thread stack reaches its top of stack (return from the global
++ * function), the top of stack and the current stack increase. Notice that
++ * when returning from a function the stack pointer is the address of
++ * the function return.
++ */
+ #if ITT_PLATFORM==ITT_PLATFORM_WIN
+ static DWORD threadLocalStorageHandle = 0;
+ #else  /* ITT_PLATFORM==ITT_PLATFORM_WIN */
+@@ -97,47 +100,164 @@ typedef struct
+ /* end of virtual stack. */
+ 
+ /*
+-** The function for reporting virtual-machine related events to VTune.
+-** Note: when reporting iJVM_EVENT_TYPE_ENTER_NIDS, there is no need to fill in the stack_id
+-** field in the iJIT_Method_NIDS structure, as VTune fills it.
+-**
+-** The return value in iJVM_EVENT_TYPE_ENTER_NIDS && iJVM_EVENT_TYPE_LEAVE_NIDS events
+-** will be 0 in case of failure.
+-** in iJVM_EVENT_TYPE_METHOD_LOAD_FINISHED event it will be -1 if EventSpecificData == 0
+-** otherwise it will be 0.
++ * This part is written for Dalvik in addition to the original code of VTune's jitprofiling.c.
++ * TODO: It should be extracted to another source file to preserve JitProfiling.cpp
++ * as close as possible to the original jitprofiling.c.
++ *
++ * MethodCode and MethodCodeMap are needed to get method_id by the address when
++ * iJVM_EVENT_TYPE_METHOD_UPDATE events are fired as the chain cell patching
++ * does not provide method_ids, which are needed by VTune.
++ * MethodCodeMap is built with the data provided with the
++ * iJVM_EVENT_TYPE_METHOD_LOAD_FINISHED.
++ */
++struct MethodCode {
++  unsigned id;
++  const char *addr;
++  unsigned size;
++
++  /* Ordered by the start addresses*/
++  bool operator<(const MethodCode &cmp) const {
++      return addr < cmp.addr;
++  }
++
++  /* Exclusive end of the block */
++  const char* end() const {
++      return addr + size;
++  }
++
++  /* Checks if the block contains the specified address*/
++  const bool contains(const char * addr) {
++      return this->addr <= addr && addr < end();
++  }
++};
++
++/* Maintains non-overlapped ordered set of code blocks */
++class MethodCodeMap {
++private:
++    typedef std::vector<MethodCode> Container;
++    typedef Container::iterator It;
++    Container table;
++
++public:
++    /* Adds a new code block with the specified method_id */
++    void setMethodIdForAddress(unsigned method_id, void * codeAddress, unsigned size) {
++        if (size == 0) {
++            return;
++        }
++
++        MethodCode methodCode = {method_id, (char*)codeAddress, size};
++        if (table.size() == 0 || table.back().end() <= codeAddress) {
++            // fast pass: the most frequent case expected.
++            table.push_back(methodCode);
++            return;
++        }
++        It it = std::upper_bound(table.begin(), table.end(), methodCode);
++        It newIt = table.insert(it, methodCode);
++
++        methodCode.addr += size-1;
++        It firstRightNonOverlapped = std::upper_bound(newIt+1, table.end(), methodCode);
++        It lastChangeIt = firstRightNonOverlapped-1;
++        if (newIt < lastChangeIt && lastChangeIt != table.end()) {
++            if (lastChangeIt->end() > newIt->end()) {
++                // fix overlapped successor
++                unsigned diff = newIt->end() - lastChangeIt->addr;
++                lastChangeIt->size -= diff;
++                // assert: lastChangeIt->size > 0
++                lastChangeIt->addr += diff;
++                --lastChangeIt;
++            }
++            // erase included
++            newIt = table.erase(newIt+1, lastChangeIt+1) - 1;
++        }
++
++        //fix overlapped predecessor
++        if (newIt != table.begin()) {
++            It prevIt = newIt - 1;
++            if (prevIt->end() > newIt->addr) {
++                unsigned newPrevSize = newIt->addr - prevIt->addr;
++                if (prevIt->end() > newIt->end()) {
++                    MethodCode rightPart = {prevIt->id, newIt->end(), prevIt->end() - newIt->end()};
++                    prevIt = table.insert(newIt+1, rightPart) - 2;
++                }
++                if (newPrevSize == 0) {
++                    table.erase(prevIt);
++                } else {
++                    prevIt->size = newPrevSize;
++                }
++            }
++        }
++    }
++
++    /* Returns a method_id for the specified address */
++    unsigned getMethodIdForAddress(void * codeAddress) {
++        MethodCode methodCode = {0,(char*)codeAddress,0};
++        It it = std::upper_bound(table.begin(), table.end(), methodCode);
++        if (it == table.begin()) {
++            return 0;
++        }
++        --it;
++        // assert: codeAddress >= it->addr;
++        return (codeAddress < it->end() ? it->id : 0);
++    }
++
++    /* Removes a method, which covers the specified address */
++    void unsetMethodIdForAddress(void * codeAddress) {
++        MethodCode methodCode = {0,(char*)codeAddress,0};
++        It it = std::upper_bound(table.begin(), table.end(), methodCode);
++        if (it == table.begin()) {
++            return;
++        }
++        it--;
++        if (it->addr <= codeAddress && codeAddress < it->end()) {
++            table.erase(it);
++        }
++    }
++};
++
++static MethodCodeMap methodCodeMap;
++
++/*
++ * The function for reporting virtual-machine related events to VTune.
++ * Note: when reporting iJVM_EVENT_TYPE_ENTER_NIDS, there is no need to fill
++ * in the stack_id field in the iJIT_Method_NIDS structure, as VTune fills it.
++ * The return value in iJVM_EVENT_TYPE_ENTER_NIDS &&
++ * iJVM_EVENT_TYPE_LEAVE_NIDS events will be 0 in case of failure.
++ * in iJVM_EVENT_TYPE_METHOD_LOAD_FINISHED event
++ * it will be -1 if EventSpecificData == 0 otherwise it will be 0.
+ */
+ 
+-ITT_EXTERN_C int JITAPI iJIT_NotifyEvent(iJIT_JVM_EVENT event_type, void *EventSpecificData)
++ITT_EXTERN_C int JITAPI
++iJIT_NotifyEvent(iJIT_JVM_EVENT event_type, void *EventSpecificData)
+ {
+     int ReturnValue;
+ 
+-    /*******************************************************************************
+-    ** This section is for debugging outside of VTune.
+-    ** It creates the environment variables that indicates call graph mode.
+-    ** If running outside of VTune remove the remark.
+-    **
+-
+-      static int firstTime = 1;
+-      char DoCallGraph[12] = "DoCallGraph";
+-      if (firstTime)
+-      {
+-      firstTime = 0;
+-      SetEnvironmentVariable( "BISTRO_COLLECTORS_DO_CALLGRAPH", DoCallGraph);
+-      }
+-
+-    ** end of section.
+-    *******************************************************************************/
++    /*
++     * This section is for debugging outside of VTune.
++     * It creates the environment variables that indicates call graph mode.
++     * If running outside of VTune remove the remark.
++     *
++     *
++     * static int firstTime = 1;
++     * char DoCallGraph[12] = "DoCallGraph";
++     * if (firstTime)
++     * {
++     * firstTime = 0;
++     * SetEnvironmentVariable( "BISTRO_COLLECTORS_DO_CALLGRAPH", DoCallGraph);
++     * }
++     *
++     * end of section.
++    */
+ 
+     /* initialization part - the functions have not been loaded yet. This part
+-    **		will load the functions, and check if we are in Call Graph mode.
+-    **		(for special treatment).
+-    */
++     *        will load the functions, and check if we are in Call Graph mode.
++     *        (for special treatment).
++     */
+     if (!FUNC_NotifyEvent)
+     {
+         if (iJIT_DLL_is_missing)
+             return 0;
+ 
+-        // load the Function from the DLL
++        /* load the Function from the DLL */
+         if (!loadiJIT_Funcs())
+             return 0;
+ 
+@@ -145,34 +265,40 @@ ITT_EXTERN_C int JITAPI iJIT_NotifyEvent(iJIT_JVM_EVENT event_type, void *EventS
+     }
+ 
+     /* If the event is method entry/exit, check that in the current mode
+-    ** VTune is allowed to receive it
+-    */
+-    if ((event_type == iJVM_EVENT_TYPE_ENTER_NIDS || event_type == iJVM_EVENT_TYPE_LEAVE_NIDS) &&
++     * VTune is allowed to receive it
++     */
++    if ((event_type == iJVM_EVENT_TYPE_ENTER_NIDS ||
++         event_type == iJVM_EVENT_TYPE_LEAVE_NIDS) &&
+         (executionMode != iJIT_CALLGRAPH_ON))
+     {
+         return 0;
+     }
+     /* This section is performed when method enter event occurs.
+-    ** It updates the virtual stack, or creates it if this is the first
+-    ** method entry in the thread. The stack pointer is decreased.
+-    */
++     * It updates the virtual stack, or creates it if this is the first
++     * method entry in the thread. The stack pointer is decreased.
++     */
+     if (event_type == iJVM_EVENT_TYPE_ENTER_NIDS)
+     {
+ #if ITT_PLATFORM==ITT_PLATFORM_WIN
+-        pThreadStack threadStack = (pThreadStack)TlsGetValue (threadLocalStorageHandle);
++        pThreadStack threadStack =
++            (pThreadStack)TlsGetValue (threadLocalStorageHandle);
+ #else  /* ITT_PLATFORM==ITT_PLATFORM_WIN */
+-        pThreadStack threadStack = (pThreadStack)pthread_getspecific(threadLocalStorageHandle);
++        pThreadStack threadStack =
++            (pThreadStack)pthread_getspecific(threadLocalStorageHandle);
+ #endif /* ITT_PLATFORM==ITT_PLATFORM_WIN */
+ 
+-        // check for use of reserved method IDs
++        /* check for use of reserved method IDs */
+         if ( ((piJIT_Method_NIDS) EventSpecificData)->method_id <= 999 )
+             return 0;
+ 
+         if (!threadStack)
+         {
+-            // initialize the stack.
++            /* initialize the stack. */
+             threadStack = (pThreadStack) calloc (sizeof(ThreadStack), 1);
+-
++            if (!threadStack)
++                return 0;
++            threadStack->TopStack = INIT_TOP_Stack;
++            threadStack->CurrentStack = INIT_TOP_Stack;
+ #if ITT_PLATFORM==ITT_PLATFORM_WIN
+             TlsSetValue(threadLocalStorageHandle,(void*)threadStack);
+ #else  /* ITT_PLATFORM==ITT_PLATFORM_WIN */
+@@ -180,35 +306,28 @@ ITT_EXTERN_C int JITAPI iJIT_NotifyEvent(iJIT_JVM_EVENT event_type, void *EventS
+ #endif /* ITT_PLATFORM==ITT_PLATFORM_WIN */
+         }
+ 
+-        // That's not good if we failed to allocate threadStack.
+-        // However, it doesn't affect us now and it only affects the readers of
+-        // threadLocalStorageHandle. Thus we can allow it to be set to NULL
+-        // and users of it must check that it has been initialized.
+-        if (threadStack != NULL) {
+-            threadStack->TopStack = INIT_TOP_Stack;
+-            threadStack->CurrentStack = INIT_TOP_Stack;
+-
+-            // decrease the stack.
+-            ((piJIT_Method_NIDS) EventSpecificData)->stack_id = (threadStack->CurrentStack)--;
+-        }
+-
++        /* decrease the stack. */
++        ((piJIT_Method_NIDS) EventSpecificData)->stack_id =
++            (threadStack->CurrentStack)--;
+     }
+ 
+     /* This section is performed when method leave event occurs
+-    ** It updates the virtual stack.
+-    **		Increases the stack pointer.
+-    **		If the stack pointer reached the top (left the global function)
+-    **			increase the pointer and the top pointer.
+-    */
++     * It updates the virtual stack.
++     *    Increases the stack pointer.
++     *    If the stack pointer reached the top (left the global function)
++     *        increase the pointer and the top pointer.
++     */
+     if (event_type == iJVM_EVENT_TYPE_LEAVE_NIDS)
+     {
+ #if ITT_PLATFORM==ITT_PLATFORM_WIN
+-        pThreadStack threadStack = (pThreadStack)TlsGetValue (threadLocalStorageHandle);
++        pThreadStack threadStack =
++           (pThreadStack)TlsGetValue (threadLocalStorageHandle);
+ #else  /* ITT_PLATFORM==ITT_PLATFORM_WIN */
+-        pThreadStack threadStack = (pThreadStack)pthread_getspecific(threadLocalStorageHandle);
++        pThreadStack threadStack =
++            (pThreadStack)pthread_getspecific(threadLocalStorageHandle);
+ #endif /* ITT_PLATFORM==ITT_PLATFORM_WIN */
+ 
+-        // check for use of reserved method IDs
++        /* check for use of reserved method IDs */
+         if ( ((piJIT_Method_NIDS) EventSpecificData)->method_id <= 999 )
+             return 0;
+ 
+@@ -218,17 +337,34 @@ ITT_EXTERN_C int JITAPI iJIT_NotifyEvent(iJIT_JVM_EVENT event_type, void *EventS
+             exit (1);
+         }
+ 
+-        ((piJIT_Method_NIDS) EventSpecificData)->stack_id = ++(threadStack->CurrentStack) + 1;
++        ((piJIT_Method_NIDS) EventSpecificData)->stack_id =
++            ++(threadStack->CurrentStack) + 1;
+ 
+-        if (((piJIT_Method_NIDS) EventSpecificData)->stack_id > threadStack->TopStack)
+-            ((piJIT_Method_NIDS) EventSpecificData)->stack_id = (unsigned int)-1;
++        if (((piJIT_Method_NIDS) EventSpecificData)->stack_id
++               > threadStack->TopStack)
++            ((piJIT_Method_NIDS) EventSpecificData)->stack_id =
++                (unsigned int)-1;
+     }
+ 
+     if (event_type == iJVM_EVENT_TYPE_METHOD_LOAD_FINISHED)
+     {
+-        // check for use of reserved method IDs
+-        if ( ((piJIT_Method_Load) EventSpecificData)->method_id <= 999 )
++        /* check for use of reserved method IDs */
++        piJIT_Method_Load pMethodLoadArgs = ((piJIT_Method_Load) EventSpecificData);
++        if ( pMethodLoadArgs->method_id <= 999 )
++            return 0;
++
++        methodCodeMap.setMethodIdForAddress(pMethodLoadArgs->method_id, pMethodLoadArgs->method_load_address, pMethodLoadArgs->method_size);
++    }
++    if (event_type == iJVM_EVENT_TYPE_METHOD_UPDATE)
++    {
++        // resolve method_id by the given address
++        piJIT_Method_Load pMethodLoadArgs = ((piJIT_Method_Load) EventSpecificData);
++        unsigned method_id = methodCodeMap.getMethodIdForAddress(pMethodLoadArgs->method_load_address);
++
++        if (method_id <= 999) {
+             return 0;
++        }
++        pMethodLoadArgs->method_id = method_id;
+     }
+ 
+     ReturnValue = (int)FUNC_NotifyEvent(event_type, EventSpecificData);
+@@ -236,45 +372,56 @@ ITT_EXTERN_C int JITAPI iJIT_NotifyEvent(iJIT_JVM_EVENT event_type, void *EventS
+     return ReturnValue;
+ }
+ 
+-ITT_EXTERN_C void JITAPI iJIT_RegisterCallbackEx(void *userdata, iJIT_ModeChangedEx NewModeCallBackFuncEx) // The new mode call back routine
++/* The new mode call back routine */
++ITT_EXTERN_C void JITAPI
++iJIT_RegisterCallbackEx(void *userdata, iJIT_ModeChangedEx
++                        NewModeCallBackFuncEx)
+ {
+-    // is it already missing... or the load of functions from the DLL failed
++    /* is it already missing... or the load of functions from the DLL failed */
+     if (iJIT_DLL_is_missing || !loadiJIT_Funcs())
+     {
+-        NewModeCallBackFuncEx(userdata, iJIT_NO_NOTIFICATIONS);  // then do not bother with notifications
++        /* then do not bother with notifications */
++        NewModeCallBackFuncEx(userdata, iJIT_NO_NOTIFICATIONS);
+         /* Error: could not load JIT functions. */
+         return;
+     }
+-    // nothing to do with the callback
++    /* nothing to do with the callback */
+ }
+ 
+ /*
+-** This function allows the user to query in which mode, if at all, VTune is running
+-*/
++ * This function allows the user to query in which mode, if at all,
++ *VTune is running
++ */
+ ITT_EXTERN_C iJIT_IsProfilingActiveFlags JITAPI iJIT_IsProfilingActive()
+ {
+-    loadiJIT_Funcs();
++    if (!iJIT_DLL_is_missing)
++    {
++        loadiJIT_Funcs();
++    }
++
+     return executionMode;
+ }
+ 
+-/* this function loads the collector dll (BistroJavaCollector) and the relevant functions.
+-** on success: all functions load,     iJIT_DLL_is_missing = 0, return value = 1.
+-** on failure: all functions are NULL, iJIT_DLL_is_missing = 1, return value = 0.
+-*/
++/* this function loads the collector dll (BistroJavaCollector)
++ * and the relevant functions.
++ * on success: all functions load,     iJIT_DLL_is_missing = 0, return value = 1
++ * on failure: all functions are NULL, iJIT_DLL_is_missing = 1, return value = 0
++ */
+ static int loadiJIT_Funcs()
+ {
+     static int bDllWasLoaded = 0;
+-    char *dllName = (char*)rcsid; // !!! Just to avoid unused code elimination !!!
++    char *dllName = (char*)rcsid; /* !! Just to avoid unused code elimination */
+ #if ITT_PLATFORM==ITT_PLATFORM_WIN
+     DWORD dNameLength = 0;
+ #endif /* ITT_PLATFORM==ITT_PLATFORM_WIN */
+ 
+     if(bDllWasLoaded)
+-    {// dll was already loaded, no need to do it for the second time
++    {
++        /* dll was already loaded, no need to do it for the second time */
+         return 1;
+     }
+ 
+-    // Assumes that the DLL will not be found
++    /* Assumes that the DLL will not be found */
+     iJIT_DLL_is_missing = 1;
+     FUNC_NotifyEvent = NULL;
+ 
+@@ -288,31 +435,34 @@ static int loadiJIT_Funcs()
+         m_libHandle = NULL;
+     }
+ 
+-    // try to get the dll name from the environment
++    /* Try to get the dll name from the environment */
+ #if ITT_PLATFORM==ITT_PLATFORM_WIN
+     dNameLength = GetEnvironmentVariableA(NEW_DLL_ENVIRONMENT_VAR, NULL, 0);
+     if (dNameLength)
+     {
+         DWORD envret = 0;
+         dllName = (char*)malloc(sizeof(char) * (dNameLength + 1));
+-        envret = GetEnvironmentVariableA(NEW_DLL_ENVIRONMENT_VAR, dllName, dNameLength);
++        envret = GetEnvironmentVariableA(NEW_DLL_ENVIRONMENT_VAR,
++                                         dllName, dNameLength);
+         if (envret)
+         {
+-            // Try to load the dll from the PATH...
+-            m_libHandle = LoadLibraryExA(dllName, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
++            /* Try to load the dll from the PATH... */
++            m_libHandle = LoadLibraryExA(dllName,
++                                         NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+         }
+         free(dllName);
+     } else {
+-        // Try to use old VS_PROFILER variable
++        /* Try to use old VS_PROFILER variable */
+         dNameLength = GetEnvironmentVariableA(DLL_ENVIRONMENT_VAR, NULL, 0);
+         if (dNameLength)
+         {
+             DWORD envret = 0;
+             dllName = (char*)malloc(sizeof(char) * (dNameLength + 1));
+-            envret = GetEnvironmentVariableA(DLL_ENVIRONMENT_VAR, dllName, dNameLength);
++            envret = GetEnvironmentVariableA(DLL_ENVIRONMENT_VAR,
++                                             dllName, dNameLength);
+             if (envret)
+             {
+-                // Try to load the dll from the PATH...
++                /* Try to load the dll from the PATH... */
+                 m_libHandle = LoadLibraryA(dllName);
+             }
+             free(dllName);
+@@ -328,7 +478,7 @@ static int loadiJIT_Funcs()
+ #endif
+     if (dllName)
+     {
+-        // Try to load the dll from the PATH...
++        /* Try to load the dll from the PATH... */
+         m_libHandle = dlopen(dllName, RTLD_LAZY);
+     }
+ #endif /* ITT_PLATFORM==ITT_PLATFORM_WIN */
+@@ -342,9 +492,12 @@ static int loadiJIT_Funcs()
+ #endif /* ITT_PLATFORM==ITT_PLATFORM_WIN */
+     }
+ 
+-    // if the dll wasn't loaded - exit.
++    /* if the dll wasn't loaded - exit. */
+     if (!m_libHandle)
+     {
++        iJIT_DLL_is_missing = 1; /* don't try to initialize
++                                  * JIT agent the second time
++                                  */
+         return 0;
+     }
+ 
+@@ -373,15 +526,15 @@ static int loadiJIT_Funcs()
+     executionMode = (iJIT_IsProfilingActiveFlags)FUNC_Initialize();
+ 
+     bDllWasLoaded = 1;
+-    iJIT_DLL_is_missing = 0; // DLL is ok.
++    iJIT_DLL_is_missing = 0; /* DLL is ok. */
+ 
+     /*
+-    ** Call Graph mode: init the thread local storage
+-    ** (need to store the virtual stack there).
+-    */
++     * Call Graph mode: init the thread local storage
++     * (need to store the virtual stack there).
++     */
+     if ( executionMode == iJIT_CALLGRAPH_ON )
+     {
+-        // Allocate a thread local storage slot for the thread "stack"
++        /* Allocate a thread local storage slot for the thread "stack" */
+         if (!threadLocalStorageHandle)
+ #if ITT_PLATFORM==ITT_PLATFORM_WIN
+             threadLocalStorageHandle = TlsAlloc();
+@@ -394,17 +547,19 @@ static int loadiJIT_Funcs()
+ }
+ 
+ /*
+-** This function should be called by the user whenever a thread ends, to free the thread
+-** "virtual stack" storage
+-*/
++ * This function should be called by the user whenever a thread ends,
++ * to free the thread "virtual stack" storage
++ */
+ ITT_EXTERN_C void JITAPI FinalizeThread()
+ {
+     if (threadLocalStorageHandle)
+     {
+ #if ITT_PLATFORM==ITT_PLATFORM_WIN
+-        pThreadStack threadStack = (pThreadStack)TlsGetValue (threadLocalStorageHandle);
++        pThreadStack threadStack =
++            (pThreadStack)TlsGetValue (threadLocalStorageHandle);
+ #else  /* ITT_PLATFORM==ITT_PLATFORM_WIN */
+-        pThreadStack threadStack = (pThreadStack)pthread_getspecific(threadLocalStorageHandle);
++        pThreadStack threadStack =
++            (pThreadStack)pthread_getspecific(threadLocalStorageHandle);
+ #endif /* ITT_PLATFORM==ITT_PLATFORM_WIN */
+         if (threadStack)
+         {
+@@ -420,8 +575,8 @@ ITT_EXTERN_C void JITAPI FinalizeThread()
+ }
+ 
+ /*
+-** This function should be called by the user when the process ends, to free the local
+-** storage index
++ * This function should be called by the user when the process ends,
++ * to free the local storage index
+ */
+ ITT_EXTERN_C void JITAPI FinalizeProcess()
+ {
+@@ -444,16 +599,16 @@ ITT_EXTERN_C void JITAPI FinalizeProcess()
+ }
+ 
+ /*
+-** This function should be called by the user for any method once.
+-** The function will return a unique method ID, the user should maintain the ID for each
+-** method
+-*/
++ * This function should be called by the user for any method once.
++ * The function will return a unique method ID, the user should maintain
++ * the ID for each method
++ */
+ ITT_EXTERN_C unsigned int JITAPI iJIT_GetNewMethodID()
+ {
+     static unsigned int methodID = 0x100000;
+ 
+     if (methodID == 0)
+-        return 0;     // ERROR : this is not a valid value
++        return 0;  /* ERROR : this is not a valid value */
+ 
+     return methodID++;
+ }
+diff --git a/vm/compiler/JitProfiling.h b/vm/compiler/JitProfiling.h
+index 680b887..29f3923 100644
+--- a/vm/compiler/JitProfiling.h
++++ b/vm/compiler/JitProfiling.h
+@@ -17,174 +17,394 @@
+ #ifndef __JITPROFILING_H__
+ #define __JITPROFILING_H__
+ 
+-/***************************************
+- * Various constants used by functions *
+- ***************************************/
++/**
++ * @brief JIT Profiling APIs
++ *
++ * The JIT Profiling API is used to report information about just-in-time
++ * generated code that can be used by performance tools. The user inserts
++ * calls in the code generator to report information before JIT-compiled
++ * code goes to execution. This information is collected at runtime and used
++ * by tools like Intel(R) VTune(TM) Amplifier to display performance metrics
++ * associated with JIT-compiled code.
++ *
++ * These APIs can be used to\n
++ * **Profile trace-based and method-based JIT-compiled
++ * code**. Some examples of environments that you can profile with this APIs:
++ * dynamic JIT compilation of JavaScript code traces, OpenCL JIT execution,
++ * Java/.NET managed execution environments, and custom ISV JIT engines.
++ *
++ * @code
++ * #include <jitprofiling.h>
++ *
++ * if (iJIT_IsProfilingActive != iJIT_SAMPLING_ON) {
++ *     return;
++ * }
++ *
++ * iJIT_Method_Load jmethod = {0};
++ * jmethod.method_id = iJIT_GetNewMethodID();
++ * jmethod.method_name = "method_name";
++ * jmethod.class_file_name = "class_name";
++ * jmethod.source_file_name = "source_file_name";
++ * jmethod.method_load_address = code_addr;
++ * jmethod.method_size = code_size;
++ *
++ * iJIT_NotifyEvent(iJVM_EVENT_TYPE_METHOD_LOAD_FINISHED, (void*)&jmethod);
++ * iJIT_NotifyEvent(iJVM_EVENT_TYPE_SHUTDOWN, NULL);
++ * @endcode
++ *
++ *  * Expected behaviour:
++ *    * If supplied line number information contains multiple source lines for
++ *      the same assembly instruction (code location), then VTune picks up
++ *      the first line number.
++ *
++ * **Analyze split functions** (multiple joint or disjoint code regions
++ * belonged to the same function) **including re-JIT**
++ * with potential overlapping of code regions in time (this is common in
++ * resource-limited environments).
++ * @code
++ * #include <jitprofiling.h>
++ *
++ * unsigned int method_id = iJIT_GetNewMethodID();
++ *
++ * iJIT_Method_Load a = {0};
++ * a.method_id = method_id;
++ * a.method_load_address = acode_addr;
++ * a.method_size = acode_size;
++ *
++ * iJIT_Method_Load b = {0};
++ * b.method_id = method_id;
++ * b.method_load_address = baddr_second;
++ * b.method_size = bsize_second;
++ *
++ * iJIT_NotifyEvent(iJVM_EVENT_TYPE_METHOD_LOAD_FINISHED, (void*)&a);
++ * iJIT_NotifyEvent(iJVM_EVENT_TYPE_METHOD_LOAD_FINISHED, (void*)&b);
++ * @endcode
++ *
++ *  * Expected behaviour:
++ *      * If any iJVM_EVENT_TYPE_METHOD_LOAD_FINISHED event overwrites
++ *        already reported method, then such method becomes invalid and its
++ *        memory region is treated as unloaded.
++ *      * All code regions reported with the same method are considered as
++ *        belonging to the same method. Symbolic information (method name,
++ *        source file name) will be taken from the first notification, all
++ *        subsequent notifications with the same method ID will be processed
++ *        only for line number table information. So VTune will map samples to
++ *        source line using line number table from current notification while
++ *        taking source file name from the very first one.\n
++ *        Clarification of some cases:\n
++ *          * If you register a second code region with a different source file
++ *          name and the same method ID, then this information will be saved and
++ *          will not be considered as extension of the first code region, but
++ *          VTune will use source file of the first code region and map
++ *          performance metrics incorrectly.
++ *          * If you register a second code region with the same source file as
++ *          for the first region and the same method ID, then source file will be
++ *          discarded but, VTune maps metrics to source file correctly.
++ *          * If you register a second code region with a null source file and
++ *          the same method ID, then provided line number info will be associated
++ *          with the source file of the first code region.
++ *
++ * **Explore inline functions** including multi-level hierarchy of
++ * nested inlines to see how performance metrics are distributed through them.
++ *
++ * @code
++ * #include <jitprofiling.h>
++ *
++ *  //                                    method_id   parent_id
++ *  //   [-- c --]                          3000        2000
++ *  //                  [---- d -----]      2001        1000
++ *  //  [---- b ----]                       2000        1000
++ *  // [------------ a ----------------]    1000         n/a
++ *
++ * iJIT_Method_Load a = {0};
++ * a.method_id = 1000;
++ *
++ * iJIT_Method_Inline_Load b = {0};
++ * b.method_id = 2000;
++ * b.parent_method_id = 1000;
++ *
++ * iJIT_Method_Inline_Load c = {0};
++ * c.method_id = 3000;
++ * c.parent_method_id = 2000;
++ *
++ * iJIT_Method_Inline_Load d = {0};
++ * d.method_id = 2001;
++ * d.parent_method_id = 1000;
++ *
++ * iJIT_NotifyEvent(iJVM_EVENT_TYPE_METHOD_LOAD_FINISHED, (void*)&a);
++ * iJIT_NotifyEvent(iJVM_EVENT_TYPE_METHOD_INLINE_LOAD_FINISHED, (void*)&b);
++ * iJIT_NotifyEvent(iJVM_EVENT_TYPE_METHOD_INLINE_LOAD_FINISHED, (void*)&c);
++ * iJIT_NotifyEvent(iJVM_EVENT_TYPE_METHOD_INLINE_LOAD_FINISHED, (void*)&d);
++ * @endcode
++ *
++ *  * Requirements:
++ *      * Each inline (iJIT_Method_Inline_Load) method should be associated
++ *        with two method IDs: one for itself, one for its immediate parent.
++ *      * Address regions of inline methods of the same parent method cannot
++ *        overlap each other.
++ *      * Execution of the parent method must not be started until it and all
++ *        its inlines are reported.
++ *  * Expected behaviour:
++ *      * In case of nested inlines an order of
++ *        iJVM_EVENT_TYPE_METHOD_INLINE_LOAD_FINISHED events is not important.
++ *      * If any event overwrites either inline method or top parent method,
++ *        then the parent including inlines becomes invalid and its memory
++ *        region is treated as unloaded.
++ *
++ * **Life time of allocated data**\n
++ * The client sends an event notification to the agent with event-specific
++ * data, which is a structure. The pointers in the structure refers to memory
++ * allocated by the client, which responsible for releasing it. The pointers are
++ * used by the iJIT_NotifyEvent method to copy client's data in a trace file
++ * and they are not used after the iJIT_NotifyEvent method returns.
++ *
++ */
++
++/**
++ * @defgroup jitapi JIT Profiling
++ * @ingroup internal
++ * @{
++ */
+ 
+-/* event notification */
++/**
++ * @enum iJIT_jvm_event
++ * @brief Enumerator for the types of notifications
++ */
+ typedef enum iJIT_jvm_event
+ {
++    iJVM_EVENT_TYPE_SHUTDOWN = 2,               /**< Send to shutdown the agent.
++                                                 * Use NULL for event data. */
++
++    iJVM_EVENT_TYPE_METHOD_LOAD_FINISHED = 13,  /**< Send when a dynamic code is
++                                                 * JIT compiled and loaded into
++                                                 * memory by the JIT engine but
++                                                 * before the code is executed.
++                                                 * Use iJIT_Method_Load as event
++                                                 * data. */
++/** @cond exclude_from_documentation */
++    iJVM_EVENT_TYPE_METHOD_UNLOAD_START,    /**< Send when a compiled dynamic
++                                             * code is being unloaded from memory.
++                                             * Use iJIT_Method_Load as event data.*/
++/** @endcond */
++
++    iJVM_EVENT_TYPE_METHOD_UPDATE,   /**< Send to provide a new content for
++                                      * an early reported dynamic code.
++                                      * The previous content will be invalidate
++                                      * starting from time of the notification.
++                                      * Use iJIT_Method_Load as event data but
++                                      * required fields are following:
++                                      * - method_id    identify the code to update.
++                                      * - method_load_address    specify start address
++                                      *                          within identified code range
++                                      *                          where update should be started.
++                                      * - method_size            specify length of updated code
++                                      *                          range. */
++
++    iJVM_EVENT_TYPE_METHOD_INLINE_LOAD_FINISHED, /**< Send when an inline dynamic
++                                                  * code is JIT compiled and loaded
++                                                  * into memory by the JIT engine
++                                                  * but before the parent code region
++                                                  * is started executing.
++                                                  * Use iJIT_Method_Load as event data.*/
++
++/** @cond exclude_from_documentation */
++    /* Legacy stuff. Do not use it. */
++    iJVM_EVENT_TYPE_ENTER_NIDS = 19,
++    iJVM_EVENT_TYPE_LEAVE_NIDS
++/** @endcond */
+ 
+-    /* shutdown */
+-    iJVM_EVENT_TYPE_SHUTDOWN = 2,                /* Program exiting
+-                                                  * EventSpecificData NA
+-                                                  */
+-
+-
+-    /* JIT profiling */
+-    iJVM_EVENT_TYPE_METHOD_LOAD_FINISHED=13,     /* issued after method code jitted
+-                                                  * into memory but before code is executed
+-                                                  * EventSpecificData is an iJIT_Method_Load
+-                                                  */
+-
+-    iJVM_EVENT_TYPE_METHOD_UNLOAD_START,         /* issued before unload. Method code will no
+-                                                  * longer be executed, but code and info
+-                                                  * are still in memory. The VTune profiler
+-                                                  * may capture method code only at this point
+-                                                  * EventSpecificData is iJIT_Method_Id
+-                                                  */
+-
+-    /* Method Profiling */
+-
+-    /* method name, Id and stack is supplied */
+-    iJVM_EVENT_TYPE_ENTER_NIDS = 19,             /* issued when a method is about to be entered
+-                                                  * EventSpecificData is iJIT_Method_NIDS
+-                                                  */
+-
+-    /* method name, Id and stack is supplied */
+-    iJVM_EVENT_TYPE_LEAVE_NIDS                   /* issued when a method is about to be left
+-                                                  * EventSpecificData is iJIT_Method_NIDS
+-                                                  */
+ } iJIT_JVM_EVENT;
+ 
++/** @cond exclude_from_documentation */
++/* Legacy stuff. Do not use it. */
+ typedef enum _iJIT_ModeFlags
+ {
+-    iJIT_NO_NOTIFICATIONS          = 0x0000,     /* No need to Notify VTune,
+-                                                  * Since VTune is not running
+-                                                  */
+-    iJIT_BE_NOTIFY_ON_LOAD         = 0x0001,     /* when turned on the jit must call
+-                                                  * iJIT_NotifyEvent
+-                                                  * (
+-                                                  *     iJVM_EVENT_TYPE_METHOD_LOAD_FINISHED,
+-                                                  * )
+-                                                  * for all the method already jitted
+-                                                  */
+-    iJIT_BE_NOTIFY_ON_UNLOAD       = 0x0002,     /* when turned on the jit must call
+-                                                  * iJIT_NotifyEvent
+-                                                  * (
+-                                                  *     iJVM_EVENT_TYPE_METHOD_UNLOAD_FINISHED,
+-                                                  *  ) for all the method that are unloaded
+-                                                  */
+-    iJIT_BE_NOTIFY_ON_METHOD_ENTRY = 0x0004,     /* when turned on the jit must instrument all
+-                                                  * the currently jited code with calls on
+-                                                  * method entries
+-                                                  */
+-    iJIT_BE_NOTIFY_ON_METHOD_EXIT  = 0x0008      /* when turned on the jit must instrument all
+-                                                  * the currently jited code with calls
+-                                                  * on method exit
+-                                                  */
+-} iJIT_ModeFlags;
++    iJIT_NO_NOTIFICATIONS          = 0x0000,
++    iJIT_BE_NOTIFY_ON_LOAD         = 0x0001,
++    iJIT_BE_NOTIFY_ON_UNLOAD       = 0x0002,
++    iJIT_BE_NOTIFY_ON_METHOD_ENTRY = 0x0004,
++    iJIT_BE_NOTIFY_ON_METHOD_EXIT  = 0x0008
+ 
++} iJIT_ModeFlags;
++/** @endcond */
+ 
+- /* Flags used by iJIT_IsProfilingActive() */
++/**
++ * @enum _iJIT_IsProfilingActiveFlags
++ * @brief Enumerator for the agent's mode
++ */
+ typedef enum _iJIT_IsProfilingActiveFlags
+ {
+-    iJIT_NOTHING_RUNNING           = 0x0000,     /* No profiler is running. Currently not used */
+-    iJIT_SAMPLING_ON               = 0x0001,     /* Sampling is running. This is the default value
+-                                                  * returned by iJIT_IsProfilingActive()
+-                                                  */
+-    iJIT_CALLGRAPH_ON              = 0x0002      /* Call Graph is running */
++    iJIT_NOTHING_RUNNING           = 0x0000,    /**< The agent is not running.
++                                                 * iJIT_NotifyEvent calls will
++                                                 * not be processed. */
++    iJIT_SAMPLING_ON               = 0x0001,    /**< The agent is running and
++                                                 * ready to process notifications. */
++
++/** @cond exclude_from_documentation */
++    /* Legacy. Call Graph is running */
++    iJIT_CALLGRAPH_ON              = 0x0002
++/** @endcond */
++
+ } iJIT_IsProfilingActiveFlags;
+ 
+-/* Enumerator for the environment of methods*/
++/** @cond exclude_from_documentation */
++/* Legacy stuff. Do not use it. */
+ typedef enum _iJDEnvironmentType
+ {
+     iJDE_JittingAPI = 2
+-} iJDEnvironmentType;
+-
+-/**********************************
+- * Data structures for the events *
+- **********************************/
+ 
+-/* structure for the events:
+- * iJVM_EVENT_TYPE_METHOD_UNLOAD_START
+- */
++} iJDEnvironmentType;
+ 
+ typedef struct _iJIT_Method_Id
+ {
+-    unsigned int       method_id;              /* Id of the method (same as the one passed in
+-                                                * the iJIT_Method_Load struct
+-                                                */
++    unsigned int method_id;
+ 
+ } *piJIT_Method_Id, iJIT_Method_Id;
+ 
+-
+-/* structure for the events:
+- * iJVM_EVENT_TYPE_ENTER_NIDS,
+- * iJVM_EVENT_TYPE_LEAVE_NIDS,
+- * iJVM_EVENT_TYPE_EXCEPTION_OCCURRED_NIDS
+- */
+-
+ typedef struct _iJIT_Method_NIDS
+ {
+-    unsigned int       method_id;              /* unique method ID */
+-    unsigned int       stack_id;               /* NOTE: no need to fill this field,
+-                                                * it's filled by VTune */
+-    char*              method_name;            /* method name (just the method,
+-                                                * without the class)
+-                                                */
+-} *piJIT_Method_NIDS, iJIT_Method_NIDS;
++    unsigned int method_id;     /**< Unique method ID */
++    unsigned int stack_id;      /**< NOTE: no need to fill this field,
++                                 * it's filled by VTune */
++    char*  method_name;         /**< Method name (just the method, without the class) */
+ 
+-/* structures for the events:
+- * iJVM_EVENT_TYPE_METHOD_LOAD_FINISHED
++} *piJIT_Method_NIDS, iJIT_Method_NIDS;
++/** @endcond */
++
++/**
++ * @details Describes a single entry in the line number information of
++ * a code region that gives information about how the reported code region
++ * is mapped to source file.
++ * Intel(R) VTune(TM) Amplifier uses line number information to attribute
++ * the samples (virtual address) to a line number. \n
++ * It is acceptable to report different code addresses for the same source line:
++ * @code
++ *   Offset LineNumber
++ *      1       2
++ *      12      4
++ *      15      2
++ *      18      1
++ *      21      30
++ *
++ *  VTune(TM) Amplifier XE contsructs the following table using the client data
++ *
++ *   Code subrange  Line number
++ *      0-1             2
++ *      1-12            4
++ *      12-15           2
++ *      15-18           1
++ *      18-21           30
++ * @endcode
+  */
+-
+ typedef struct _LineNumberInfo
+ {
+-    unsigned int        Offset;                 /* x86 Offset from the begining of the method*/
+-    unsigned int        LineNumber;             /* source line number from the begining of
+-                                                 * the source file
+-                                                 */
++    unsigned int Offset;     /**< Offset from the begining of the code region. */
++    unsigned int LineNumber; /**< Matching source line number offset (from beginning of source file). */
+ 
+ } *pLineNumberInfo, LineNumberInfo;
+ 
++/**
++ *  Description of JIT-compiled method.
++ */
+ typedef struct _iJIT_Method_Load
+ {
+-    unsigned int        method_id;              /* unique method ID - can be any unique value,
+-                                                 * (except 0 - 999)
+-                                                 */
+-    char*               method_name;            /* method name (can be with or without
+-                                                 * the class and signature, in any case
+-                                                 * the class name will be added to it)
+-                                                 */
+-    void*               method_load_address;    /* virtual address of that method
+-                                                 * - This determines the method range for the
+-                                                 * iJVM_EVENT_TYPE_ENTER/LEAVE_METHOD_ADDR
+-                                                 * events
+-                                                 */
+-    unsigned int        method_size;            /* Size in memory - Must be exact */
+-    unsigned int        line_number_size;       /* Line Table size in number of entries
+-                                                 * - Zero if none
+-                                                 */
+-    pLineNumberInfo     line_number_table;      /* Pointer to the begining of the line numbers
+-                                                 * info array
+-                                                 */
+-    unsigned int        class_id;               /* unique class ID */
+-    char*               class_file_name;        /* class file name */
+-    char*               source_file_name;       /* source file name */
+-    void*               user_data;              /* bits supplied by the user for saving in
+-                                                 * the JIT file
+-                                                 */
+-    unsigned int        user_data_size;         /* the size of the user data buffer */
+-    iJDEnvironmentType  env;                    /* NOTE: no need to fill this field,
+-                                                 * it's filled by VTune
+-                                                 */
++    unsigned int method_id; /**< Unique method ID.
++                             *  Method ID may not be smaller than 999.
++                             *  Either you use the API function
++                             *  iJIT_GetNewMethodID to get a valid and unique
++                             *  method ID, or you take care of ID uniqueness
++                             *  and correct range by yourself.\n
++                             *  You must use the same method ID for all code
++                             *  regions of the same method, otherwise different
++                             *  method IDs mean different methods. */
++
++    char* method_name; /** The name of the method. It can be optionally
++                        *  prefixed with its class name and appended with
++                        *  its complete signature. Can't be  NULL. */
++
++    void* method_load_address; /** The start virtual address of the method code
++                                *  region. If NULL that data provided with
++                                *  event are not accepted. */
++
++    unsigned int method_size; /** The code size of the method in memory.
++                               *  If 0, then data provided with the event are not
++                               *  accepted. */
++
++    unsigned int line_number_size; /** The number of entries in the line number
++                                    *  table.0 if none. */
++
++    pLineNumberInfo line_number_table; /** Pointer to the line numbers info
++                                        *  array. Can be NULL if
++                                        *  line_number_size is 0. See
++                                        *  LineNumberInfo Structure for a
++                                        *  description of a single entry in
++                                        *  the line number info array */
++
++    unsigned int class_id; /** This field is obsolete. */
++
++    char* class_file_name; /** Class name. Can be NULL.*/
++
++    char* source_file_name; /** Source file name. Can be NULL.*/
++
++    void* user_data; /** This field is obsolete. */
++
++    unsigned int user_data_size; /** This field is obsolete. */
++
++    iJDEnvironmentType  env; /** This field is obsolete. */
++
+ } *piJIT_Method_Load, iJIT_Method_Load;
+ 
+-/* API Functions */
++/**
++ * Description of inline JIT-compiled method.
++ */
++typedef struct _iJIT_Method_Inline_Load
++{
++    unsigned int method_id; /**< Unique method ID.
++                             *  Method ID may not be smaller than 999.
++                             *  Either you use the API function
++                             *  iJIT_GetNewMethodID to get a valid and unique
++                             *  method ID, or you take care of ID uniqueness
++                             *  and correct range by yourself. */
++
++    unsigned int parent_method_id; /** Unique immediate parent's method ID.
++                                    *  Method ID may not be smaller than 999.
++                                    *  Either you use the API function
++                                    *  iJIT_GetNewMethodID to get a valid and unique
++                                    *  method ID, or you take care of ID uniqueness
++                                    *  and correct range by yourself. */
++
++    char* method_name; /** The name of the method. It can be optionally
++                        *  prefixed with its class name and appended with
++                        *  its complete signature. Can't be  NULL. */
++
++    void* method_load_address;  /** The virtual address on which the method
++                                  * is inlined. If NULL, then data provided with
++                                  * the event are not accepted. */
++
++    unsigned int method_size; /** The code size of the method in memory.
++                               *  If 0 that data provided with event are not
++                               *  accepted. */
++
++    unsigned int line_number_size; /** The number of entries in the line number
++                                    *  table. 0 if none. */
++
++    pLineNumberInfo line_number_table; /** Pointer to the line numbers info
++                                        *  array. Can be NULL if
++                                        *  line_number_size is 0. See
++                                        *  LineNumberInfo Structure for a
++                                        *  description of a single entry in
++                                        *  the line number info array */
++
++    char* class_file_name; /** Class name. Can be NULL.*/
++
++    char* source_file_name; /** Source file name. Can be NULL.*/
++
++} *piJIT_Method_Inline_Load, iJIT_Method_Inline_Load;
++
++/** @cond exclude_from_documentation */
+ #ifdef __cplusplus
+ extern "C" {
+-#endif
++#endif /* __cplusplus */
+ 
+ #ifndef CDECL
+ #  if defined WIN32 || defined _WIN32
+@@ -199,25 +419,59 @@ extern "C" {
+ #endif /* CDECL */
+ 
+ #define JITAPI CDECL
++/** @endcond */
++
++/**
++ * @brief Generates a new unique method ID.
++ *
++ * You must use this API to obtain unique and valid method IDs for methods or
++ * traces reported to the agent if you don't have you own mechanism to generate
++ * unique method IDs.
++ *
++ * @return a new unique method ID. When out of unique method IDs, this API
++ * returns 0, which is not an accepted value.
++ */
++unsigned int JITAPI iJIT_GetNewMethodID(void);
+ 
+-/* called when the settings are changed with new settings */
+-typedef void (*iJIT_ModeChangedEx)(void *UserData, iJIT_ModeFlags Flags);
++/**
++ * @brief Returns the current mode of the agent.
++ *
++ * @return iJIT_SAMPLING_ON, indicating that agent is running, or
++ * iJIT_NOTHING_RUNNING if no agent is running.
++ */
++iJIT_IsProfilingActiveFlags JITAPI iJIT_IsProfilingActive(void);
+ 
++/**
++ * @brief Reports infomation about JIT-compiled code to the agent.
++ *
++ * The reported information is used to attribute samples obtained from any
++ * Intel(R) VTune(TM) Amplifier collector. This API needs to be called
++ * after JIT compilation and before the first entry into the JIT compiled
++ * code.
++ *
++ * @param[in] event_type - type of the data sent to the agent
++ * @param[in] EventSpecificData - pointer to event-specific data
++ *
++ * @returns 1 on success, otherwise 0.
++ */
+ int JITAPI iJIT_NotifyEvent(iJIT_JVM_EVENT event_type, void *EventSpecificData);
+ 
+-/* The new mode call back routine */
+-void JITAPI iJIT_RegisterCallbackEx(void *userdata, iJIT_ModeChangedEx NewModeCallBackFuncEx);
+-
+-iJIT_IsProfilingActiveFlags JITAPI iJIT_IsProfilingActive(void);
+-
++/** @cond exclude_from_documentation */
++/*
++ * Do not use these legacy APIs, which are here for backward compatibility
++ * with Intel(R) VTune(TM) Performance Analyzer.
++ */
++typedef void (*iJIT_ModeChangedEx)(void *UserData, iJIT_ModeFlags Flags);
++void JITAPI iJIT_RegisterCallbackEx(void *userdata,
++                                    iJIT_ModeChangedEx NewModeCallBackFuncEx);
+ void JITAPI FinalizeThread(void);
+-
+ void JITAPI FinalizeProcess(void);
+ 
+-unsigned int JITAPI iJIT_GetNewMethodID(void);
+-
+ #ifdef __cplusplus
+ }
+-#endif
++#endif /* __cplusplus */
++/** @endcond */
++
++/** @} jitapi group */
+ 
+ #endif /* __JITPROFILING_H__ */
+diff --git a/vm/compiler/codegen/x86/CodegenInterface.cpp b/vm/compiler/codegen/x86/CodegenInterface.cpp
+index 0e76ef0..dfc8052 100644
+--- a/vm/compiler/codegen/x86/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/CodegenInterface.cpp
+@@ -34,6 +34,80 @@
+ #include <cutils/properties.h>
+ #endif
+ 
++#if !defined(VTUNE_DALVIK)
++/* Handy function for VTune updates of PredictedChainingCells */
++static void updateCodeCache(PredictedChainingCell& dst, const PredictedChainingCell& src)
++{
++    dst = src;
++}
++
++/* Handy function for VTune updates of ints */
++static void updateCodeCache(int &dst, int src)
++{
++    dst = src;
++}
++
++/* Send updated code cache content to VTune */
++static void SendUpdateToVTune(void * address, unsigned size, unsigned method_id = 0)
++{
++    (void) address; (void) size; (void) unsigned method_id;
++}
++
++#else
++
++#include "compiler/JitProfiling.h"
++
++/* Send updated code cache content to VTune */
++static void SendUpdateToVTune(void * address, unsigned size, unsigned method_id = 0)
++{
++    if (gDvmJit.vtuneInfo == kVTuneInfoDisabled || gDvmJit.vtuneVersion < 279867) {
++        return;
++    }
++
++    iJIT_Method_Load jitMethod = {0};
++    jitMethod.method_id = method_id;
++    jitMethod.method_load_address = address;
++    jitMethod.method_size = size;
++
++    // Send the trace update event to the VTune analyzer
++    int res = iJIT_NotifyEvent(iJVM_EVENT_TYPE_METHOD_UPDATE, (void*)&jitMethod);
++    if (gDvmJit.printMe == true) {
++        if (res != 0) {
++            if (jitMethod.method_id == 0) {
++                ALOGD("JIT API: a trace update with address=%p size=%u was not written.",
++                        jitMethod.method_load_address, jitMethod.method_size);
++            } else {
++                ALOGD("JIT API: a trace update with method_id=%u address=%p size=%u was written successfully.",
++                        jitMethod.method_id, jitMethod.method_load_address, jitMethod.method_size);
++            }
++        } else {
++            ALOGD("JIT API: failed to write a trace update with method_id=%u address=%p size=%u.",
++                    jitMethod.method_id, jitMethod.method_load_address, jitMethod.method_size);
++        }
++    }
++}
++
++/* Handy function for VTune updates of changed PredictedChainingCells */
++static void updateCodeCache(PredictedChainingCell& dst, const PredictedChainingCell& src)
++{
++    bool isDiff = dst.branch != src.branch || dst.branch2 != src.branch2;
++    dst = src;
++    if (isDiff == true) {
++        SendUpdateToVTune(&dst, sizeof(PredictedChainingCell));
++    }
++}
++
++/* Handy function for VTune updates of changed ints */
++static void updateCodeCache(int &dst, int src)
++{
++    bool isDiff = dst != src;
++    dst = src;
++    if (isDiff == true) {
++        SendUpdateToVTune(&dst, sizeof(int));
++    }
++}
++#endif // !defined(VTUNE_DALVIK)
++
+ /* JIT opcode filtering */
+ bool jitOpcodeTable[kNumPackedOpcodes];
+ Opcode jitNotSupportedOpcode[] = {
+@@ -342,7 +416,8 @@ void dvmCompilerPatchInlineCache(void)
+         }
+ 
+         /* Patch the chaining cell */
+-        *cellAddr = *cellContent;
++        updateCodeCache(*cellAddr, *cellContent);
++
+         minAddr = (cellAddr < minAddr) ? cellAddr : minAddr;
+         maxAddr = (cellAddr > maxAddr) ? cellAddr : maxAddr;
+     }
+@@ -543,6 +618,11 @@ static bool inlineCachePatchEnqueue(PredictedChainingCell *cellAddr,
+         UNPROTECT_CODE_CACHE(cellAddr, sizeof(*cellAddr));
+ 
+         cellAddr->method = newContent->method;
++
++        /* remember if the branch address has changed, other fields do not matter.
++         * If changed then send new values to VTune a bit later */
++        bool isBranchUpdated = cellAddr->branch != newContent->branch || cellAddr->branch2 != newContent->branch2;
++
+         cellAddr->branch = newContent->branch;
+         cellAddr->branch2 = newContent->branch2;
+ 
+@@ -554,6 +634,9 @@ static bool inlineCachePatchEnqueue(PredictedChainingCell *cellAddr,
+             (volatile int32_t *)(void*) &cellAddr->clazz);
+         //cacheflush((intptr_t) cellAddr, (intptr_t) (cellAddr+1), 0);
+         UPDATE_CODE_CACHE_PATCHES();
++        if (isBranchUpdated == true) {
++            SendUpdateToVTune(cellAddr, sizeof(*cellAddr));
++        }
+ 
+         PROTECT_CODE_CACHE(cellAddr, sizeof(*cellAddr));
+ 
+@@ -771,7 +854,7 @@ struct __attribute__ ((packed)) BackwardBranchChainingCellContents
+         int * addressOfJumpOperand = reinterpret_cast<int *> (contents->codePtr);
+ 
+         //This does the actual patching with the offset we calculated
+-        *(addressOfJumpOperand) = relativeOffset;
++        updateCodeCache(*addressOfJumpOperand, relativeOffset);
+ 
+         //We return size of our chaining cell
+         return sizeof(*contents);
+@@ -885,7 +968,7 @@ u4* dvmJitUnchain(void* codeAddr)
+                     patchAddr = (u1 *)(*(int *)((char*)pChainCells + OFFSET_OF_PATCHADDR));
+                     relativeNCG = (pChainCells - patchAddr) - BYTES_OF_32BITS;
+                     if (patchAddr)
+-                       *(int*)patchAddr = relativeNCG;
++                        updateCodeCache(*(int*)patchAddr, relativeNCG);
+                     break;
+                 case kChainingCellHot:
+                     COMPILER_TRACE_CHAINING(
+@@ -896,10 +979,9 @@ u4* dvmJitUnchain(void* codeAddr)
+                     if (patchAddr) {
+                         if (ismove_flag) {
+                             relativeNCG = (pChainCells - patchAddr) - BYTES_OF_32BITS;
+-                            *(int*)patchAddr = relativeNCG;
+-                        }
+-                        else
+-                            *(int*)patchAddr = (int)pChainCells;
++                            updateCodeCache(*(int*)patchAddr, relativeNCG);
++                        } else
++                            updateCodeCache(*(int*)patchAddr, (int)pChainCells);
+                     }
+                     break;
+                 case kChainingCellInvokeSingleton:
+@@ -908,7 +990,7 @@ u4* dvmJitUnchain(void* codeAddr)
+                     elemSize = BYTES_OF_SINGLETON_CHAINING;
+                     patchAddr = (u1 *)(*(int *)((char*)pChainCells + OFFSET_OF_PATCHADDR));
+                     if (patchAddr)
+-                        *(int*)patchAddr = (int)pChainCells;
++                        updateCodeCache(*(int*)patchAddr, (int)pChainCells);
+                     break;
+                 case kChainingCellBackwardBranch:
+                     COMPILER_TRACE_CHAINING(
+@@ -2340,13 +2422,17 @@ void* dvmJitChain(void* tgtAddr, u4* branchAddr)
+     if ((gDvmJit.pProfTable != NULL) && (gDvm.sumThreadSuspendCount == 0) &&
+         (gDvmJit.codeCacheFull == false)) {
+ 
++        UNPROTECT_CODE_CACHE(branchAddr, sizeof(int));
+         gDvmJit.translationChains++;
++        UPDATE_CODE_CACHE_PATCHES();
+ 
+         relOffset = (int) tgtAddr - (int)branchAddr - 4; // 32bit offset
+-        *(int*)branchAddr = relOffset;
++
++        updateCodeCache(*(int*)branchAddr, relOffset);
+ 
+         gDvmJit.hasNewChain = true;
+ 
++        PROTECT_CODE_CACHE(branchAddr, sizeof(int));
+         COMPILER_TRACE_CHAINING(
+             ALOGI("Jit Runtime: chaining 0x%x to %p with relOffset %x",
+                   (int) branchAddr, tgtAddr, relOffset));
+@@ -2364,12 +2450,15 @@ void* dvmJitChain_staticAddr(void* tgtAddr, u4* branchAddr)
+     if ((gDvmJit.pProfTable != NULL) && (gDvm.sumThreadSuspendCount == 0) &&
+         (gDvmJit.codeCacheFull == false)) {
+ 
++        UNPROTECT_CODE_CACHE(branchAddr, sizeof(int));
+         gDvmJit.translationChains++;
++        UPDATE_CODE_CACHE_PATCHES();
+ 
+-        *(int*)branchAddr = (int)tgtAddr;
++        updateCodeCache(*(int*)branchAddr, (int)tgtAddr);
+ 
+         gDvmJit.hasNewChain = true;
+ 
++        PROTECT_CODE_CACHE(branchAddr, sizeof(int));
+         COMPILER_TRACE_CHAINING(
+             ALOGI("Jit Runtime: chaining 0x%x to %p\n",
+                  (int) branchAddr, tgtAddr));
+diff --git a/vm/compiler/codegen/x86/Lower.cpp b/vm/compiler/codegen/x86/Lower.cpp
+index 2de13d4..6dec068 100644
+--- a/vm/compiler/codegen/x86/Lower.cpp
++++ b/vm/compiler/codegen/x86/Lower.cpp
+@@ -1140,10 +1140,14 @@ void sendLabelInfoToVTune(int startStreamPtr, int endStreamPtr, const char* labe
+     jitMethod.method_load_address = (void *)startStreamPtr;
+     jitMethod.method_size = endStreamPtr-startStreamPtr;
+     int res = iJIT_NotifyEvent(iJVM_EVENT_TYPE_METHOD_LOAD_FINISHED, (void*)&jitMethod);
+-    if (res) {
+-        ALOGI("JIT API: a trace of %s method was written successfully address: %p size: %d.\n", labelName, jitMethod.method_load_address, jitMethod.method_size);
+-    } else {
+-        ALOGI("JIT API: failed to write a trace of %s method address: %p size: %d.\n", labelName, jitMethod.method_load_address, jitMethod.method_size);
++    if (gDvmJit.printMe == true) {
++        if (res != 0) {
++            ALOGD("JIT API: a trace of %s method was written successfully address: id=%u, address=%p, size=%d."
++                    , labelName, jitMethod.method_id, jitMethod.method_load_address, jitMethod.method_size);
++        } else {
++            ALOGD("JIT API: failed to write a trace of %s method address: id=%u, address=%p, size=%d."
++                    , labelName, jitMethod.method_id, jitMethod.method_load_address, jitMethod.method_size);
++        }
+     }
+ }
+ #endif
+-- 
+1.7.4.1
+

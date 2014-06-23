@@ -1,0 +1,365 @@
+From db2ec4c832306c175b9004c01fb91b7e22e40f48 Mon Sep 17 00:00:00 2001
+From: Vladimir Kostyukov <vladimir.kostyukov@intel.com>
+Date: Wed, 10 Jul 2013 16:58:34 +0700
+Subject: Dalvik: A labeled version of optimized division by constant
+
+BZ: 121979
+
+An optimization of division by constant doesn't insert proper
+labels for 'div' operation after code generation. And because
+of 'return' from the middle of 'common_div_rem_int' function,
+default labels are not inserted. This patch adds missed labels.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I909f72e6299a820dce59434cf2b0331f19067cf2
+Orig-MCG-Change-Id: I92597c7deef18cf38b5a3e3ec4b33fbf29cde0e3
+Signed-off-by: Vladimir Kostyukov <vladimir.kostyukov@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/codegen/x86/BytecodeVisitor.cpp |   21 ++-
+ vm/compiler/codegen/x86/LowerAlu.cpp        |  268 +++++++++++++--------------
+ 2 files changed, 144 insertions(+), 145 deletions(-)
+
+diff --git a/vm/compiler/codegen/x86/BytecodeVisitor.cpp b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+index db84857..e59b091 100644
+--- a/vm/compiler/codegen/x86/BytecodeVisitor.cpp
++++ b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+@@ -5410,11 +5410,9 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+         //If we have a constant, we can use a multiplication approach instead.
+         //However, we currently do not handle case of -1 constant so we take the divide path.
+         //It also does not make sense to optimize division by zero.
+-        if (isConst == VR_IS_CONSTANT && tmpvalue != -1 && tmpvalue != 0)
++        if (isConst == VR_IS_CONSTANT && tmpvalue != -1)
+         {
+-            int magic, shift;
+-            calculateMagicAndShift(tmpvalue, &magic, &shift);
+-            if (tmpvalue == 1) {
++            if (tmpvalue == 0 || tmpvalue == 1) {
+                 infoArray[0].regNum = 2;
+                 infoArray[0].refCount = 2;
+                 infoArray[0].physicalType = LowOpndRegType_gp;
+@@ -5422,8 +5420,19 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+                 infoArray[1].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
+                 infoArray[1].shareWithVR = false;
+                 infoArray[1].refCount = 2;
+-                return 2;
++                infoArray[2].regNum = PhysicalReg_EDX;
++                infoArray[2].refCount = 1;
++                infoArray[2].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++                if (tmpvalue == 1 && (inst_op == OP_REM_INT || inst_op == OP_REM_INT_2ADDR)) {
++                    infoArray[2].refCount++;
++                } else if (tmpvalue == 1) {
++                    infoArray[1].refCount++;
++                }
++                return 3;
+             } else {
++                int magic, shift;
++                calculateMagicAndShift(tmpvalue, &magic, &shift);
++
+                 infoArray[0].regNum = 2;
+                 infoArray[0].physicalType = LowOpndRegType_gp;
+                 infoArray[1].regNum = PhysicalReg_EAX;
+@@ -5436,7 +5445,7 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+                 if (inst_op == OP_REM_INT || inst_op == OP_REM_INT_2ADDR) {
+                     infoArray[0].refCount = 8;
+                     infoArray[1].refCount = 7;
+-                    infoArray[2].refCount = 8;
++                    infoArray[2].refCount = 9;
+                     infoArray[3].refCount = 3;
+                     if ((tmpvalue > 0 && magic < 0) || (tmpvalue < 0 && magic > 0)) {
+                         infoArray[3].refCount++;
+diff --git a/vm/compiler/codegen/x86/LowerAlu.cpp b/vm/compiler/codegen/x86/LowerAlu.cpp
+index fa3e313..8678217 100644
+--- a/vm/compiler/codegen/x86/LowerAlu.cpp
++++ b/vm/compiler/codegen/x86/LowerAlu.cpp
+@@ -839,145 +839,138 @@ int common_div_rem_int(bool isRem, int vA, int v1, int v2) {
+     // Handle the case where the divisor is a constant at compile time
+     int divisor[2];
+     int isConst = isVirtualRegConstant(v2, LowOpndRegType_gp, divisor, false);
+-    if (isConst > 0 && divisor[0] != 0) {
+-        int magic;
+-        int shift;
+-        calculateMagicAndShift(divisor[0], &magic, &shift);
+-        switch(divisor[0]) {
+-            case 1:
+-                if(isRem == false) {
+-                    set_virtual_reg(vA, OpndSize_32, PhysicalReg_EAX, true);
+-                }else {
+-                    set_VR_to_imm(vA, OpndSize_32, 0);
+-                }
+-                return 0;
+-            case -1:
+-                // We could potentially do better but for now we just use the original generic code generation
+-                break;
+-            default:
+-                // According to H.S.Warren's Hacker's Delight Chapter 10 and
+-                // T,Grablund, P.L.Montogomery's Division by invariant integers using multiplication
+-                // For a integer divided by a constant,
+-                // we can always find a magic number M and a shift S. Thus,
+-                // For d >= 2,
+-                //     int(n/d) = floor(n/d) = floor(M*n/2^S), while n > 0
+-                //     int(n/d) = ceil(n/d) = floor(M*n/2^S) +1, while n < 0.
+-                // For d <= -2,
+-                //     int(n/d) = ceil(n/d) = floor(M*n/2^S) +1 , while n > 0
+-                //     int(n/d) = floor(n/d) = floor(M*n/2^S), while n < 0.
+-                // We implement this algorithm in the following way:
+-                // 1. multiply magic number m and numerator n, get the higher 32bit result in EDX
+-                // 2. if divisor > 0 and magic < 0, add numerator to EDX
+-                //    if divisor < 0 and magic > 0, sub numerator to EDX
+-                // 3. if S !=0, SAR S bits for EDX
+-                // 4. add 1 to EDX if EDX < 0
+-                // 5. Thus, EDX is the quotient
+-
+-                // mov %eax, %tmp1
+-                // mov magic, %tmp2
+-                // imul %tmp2
+-                move_reg_to_reg(OpndSize_32, PhysicalReg_EAX, true, 1, false);
+-                move_imm_to_reg(OpndSize_32, magic, 2, false);
++    // For now we just use the generic code generation for division by -1
++    if (isConst > 0 && divisor[0] != -1) {
++        if (divisor[0] == 0) {
++            // Division by zero: we don't need to generate the code at all.
++            transferToState(2);
++            return 0;
++        } else if (divisor[0] != 1) { // There is nothing to do with division by 1
++            int magic;
++            int shift;
++            calculateMagicAndShift(divisor[0], &magic, &shift);
++
++            // According to H.S.Warren's Hacker's Delight Chapter 10 and
++            // T,Grablund, P.L.Montogomery's Division by invariant integers using multiplication
++            // For a integer divided by a constant,
++            // we can always find a magic number M and a shift S. Thus,
++            // For d >= 2,
++            //     int(n/d) = floor(n/d) = floor(M*n/2^S), while n > 0
++            //     int(n/d) = ceil(n/d) = floor(M*n/2^S) +1, while n < 0.
++            // For d <= -2,
++            //     int(n/d) = ceil(n/d) = floor(M*n/2^S) +1 , while n > 0
++            //     int(n/d) = floor(n/d) = floor(M*n/2^S), while n < 0.
++            // We implement this algorithm in the following way:
++            // 1. multiply magic number m and numerator n, get the higher 32bit result in EDX
++            // 2. if divisor > 0 and magic < 0, add numerator to EDX
++            //    if divisor < 0 and magic > 0, sub numerator to EDX
++            // 3. if S !=0, SAR S bits for EDX
++            // 4. add 1 to EDX if EDX < 0
++            // 5. Thus, EDX is the quotient
++
++            // mov %eax, %tmp1
++            // mov magic, %tmp2
++            // imul %tmp2
++
++            move_reg_to_reg(OpndSize_32, PhysicalReg_EAX, true, 1, false);
++            move_imm_to_reg(OpndSize_32, magic, 2, false);
++            alu_unary_reg(OpndSize_32, imul_opc, 2, false);
++            // v2>0 && M<0
++            if (divisor[0] > 0 && magic < 0){
++                alu_binary_reg_reg(OpndSize_32, add_opc, 1, false, PhysicalReg_EDX, true);
++            }else if (divisor[0] < 0 && magic > 0){
++            // v2<0 && M>0
++                alu_binary_reg_reg(OpndSize_32, sub_opc, 1, false, PhysicalReg_EDX, true);
++            }
++            // sarl shift, %edx
++            if (shift != 0)
++                alu_binary_imm_reg(OpndSize_32, sar_opc, shift, PhysicalReg_EDX, true);
++            // mov %edx, %tmp2
++            // shrl 31, %edx
++            // add %tmp2, %edx
++            move_reg_to_reg(OpndSize_32, PhysicalReg_EDX, true, 2, false);
++            alu_binary_imm_reg(OpndSize_32, shr_opc, 31, PhysicalReg_EDX, true);
++            alu_binary_reg_reg(OpndSize_32, add_opc, 2, false, PhysicalReg_EDX, true);
++
++            if (isRem == true) {
++                 //mov %edx, %eax
++                 //mov v2, %tmp2
++                 //imul %tmp2
++                 //sub %eax, %tmp1
++                 //mov %tmp1, edx
++                move_reg_to_reg(OpndSize_32, PhysicalReg_EDX, true, PhysicalReg_EAX, true);
++                move_imm_to_reg(OpndSize_32, divisor[0], 2, false);
+                 alu_unary_reg(OpndSize_32, imul_opc, 2, false);
+-                // v2>0 && M<0
+-                if (divisor[0] > 0 && magic < 0){
+-                    alu_binary_reg_reg(OpndSize_32, add_opc, 1, false, PhysicalReg_EDX, true);
+-                }else if (divisor[0] < 0 && magic > 0){
+-                // v2<0 && M>0
+-                    alu_binary_reg_reg(OpndSize_32, sub_opc, 1, false, PhysicalReg_EDX, true);
+-                }
+-                // sarl shift, %edx
+-                if (shift != 0)
+-                    alu_binary_imm_reg(OpndSize_32, sar_opc, shift, PhysicalReg_EDX, true);
+-                // mov %edx, %tmp2
+-                // shrl 31, %edx
+-                // add %tmp2, %edx
+-                move_reg_to_reg(OpndSize_32, PhysicalReg_EDX, true, 2, false);
+-                alu_binary_imm_reg(OpndSize_32, shr_opc, 31, PhysicalReg_EDX, true);
+-                alu_binary_reg_reg(OpndSize_32, add_opc, 2, false, PhysicalReg_EDX, true);
+-
+-                if (isRem == false){
+-                    set_virtual_reg(vA, OpndSize_32, PhysicalReg_EDX, true);
+-                }else {
+-                     //mov %edx, %eax
+-                     //mov v2, %tmp2
+-                     //imul %tmp2
+-                     //sub %eax, %tmp1
+-                     //mov %tmp1, vA
+-                    move_reg_to_reg(OpndSize_32, PhysicalReg_EDX, true, PhysicalReg_EAX, true);
+-                    move_imm_to_reg(OpndSize_32, divisor[0], 2, false);
+-                    alu_unary_reg(OpndSize_32, imul_opc, 2, false);
+-                    alu_binary_reg_reg(OpndSize_32, sub_opc, PhysicalReg_EAX, true, 1, false);
+-                    set_virtual_reg(vA, OpndSize_32, 1, false);
+-                }
+-                return 0;
++                alu_binary_reg_reg(OpndSize_32, sub_opc, PhysicalReg_EAX, true, 1, false);
++                move_reg_to_reg(OpndSize_32, 1, false, PhysicalReg_EDX, true);
++            }
+         }
+-    }
+-
+-    //Find out Numerator | Denominator
+-    move_reg_to_reg(OpndSize_32, PhysicalReg_EAX, true, 3, false);
+-    alu_binary_reg_reg(OpndSize_32, or_opc, 2, false, 3, false);
+-
+-    //If both arguments are less than 8-bits (and positive), do 8-bit divide
+-    test_imm_reg(OpndSize_32, 0xFFFFFF00, 3, false);
+-
+-    rememberState(3);
+-    conditional_jump(Condition_Z, ".common_div_rem_int_8", true);
+-
+-    //If both arguments are less than 16-bits (and positive), do 16-bit divide
+-    test_imm_reg(OpndSize_32, 0xFFFF0000, 3, false);
+-    conditional_jump(Condition_Z, ".common_div_rem_int_16", true);
+-
+-    //Handle special cases:
+-    //0x80000000 / -1 should result in a quotient of 0x80000000
+-    //and a remainder of 0.
+-    //Check for -1:
+-    compare_imm_reg(OpndSize_32, -1, 2, false);
+-    rememberState(4);
+-    conditional_jump(Condition_NE, ".common_div_rem_int_32", true);
+-    //Check for 0x80000000 (MinInt)
+-    compare_imm_reg(OpndSize_32, 0x80000000, PhysicalReg_EAX, true);
+-    //Special case, no division is needed.
+-    //We set the quotient to 0x800000000 (EAX is already that),
+-    //and remainder to 0
+-    transferToState(2);
+-    conditional_jump(Condition_E, ".common_div_rem_int_divdone", true);
+-
+-
+-    goToState(4);
+-    if (insertLabel(".common_div_rem_int_32", true) == -1) //merge point
+-        return -1;
+-    convert_integer(OpndSize_32, OpndSize_64); //cdq
+-    //idiv: dividend in edx:eax; quotient in eax; remainder in edx
+-    alu_unary_reg(OpndSize_32, idiv_opc, 2, false);
+-    transferToState(2);
+-    unconditional_jump(".common_div_rem_int_divdone", true);
++    } else { //It is a general case. Both divisor and numerator are variables.
++ 
++        //Find out Numerator | Denominator
++        move_reg_to_reg(OpndSize_32, PhysicalReg_EAX, true, 3, false);
++        alu_binary_reg_reg(OpndSize_32, or_opc, 2, false, 3, false);
++
++        //If both arguments are less than 8-bits (and positive), do 8-bit divide
++        test_imm_reg(OpndSize_32, 0xFFFFFF00, 3, false);
++
++        rememberState(3);
++        conditional_jump(Condition_Z, ".common_div_rem_int_8", true);
++
++        //If both arguments are less than 16-bits (and positive), do 16-bit divide
++        test_imm_reg(OpndSize_32, 0xFFFF0000, 3, false);
++        conditional_jump(Condition_Z, ".common_div_rem_int_16", true);
++
++        //Handle special cases:
++        //0x80000000 / -1 should result in a quotient of 0x80000000
++        //and a remainder of 0.
++        //Check for -1:
++        compare_imm_reg(OpndSize_32, -1, 2, false);
++        rememberState(4);
++        conditional_jump(Condition_NE, ".common_div_rem_int_32", true);
++        //Check for 0x80000000 (MinInt)
++        compare_imm_reg(OpndSize_32, 0x80000000, PhysicalReg_EAX, true);
++        //Special case, no division is needed.
++        //We set the quotient to 0x800000000 (EAX is already that),
++        //and remainder to 0
++        transferToState(2);
++        conditional_jump(Condition_E, ".common_div_rem_int_divdone", true);
+ 
+-    //Do 8-bit unsigned divide:
+-    //div: dividend in ax; quotient in al; remainder in ah
+-    //We are forced to use a hard-coded register, since the register allocator
+-    //can allocate a register not capable of 8-bit operation, like ESI,
+-    //which will cause undefined behaviour.
+-    goToState(3);
+-    if (insertLabel(".common_div_rem_int_8", true) == -1)
+-        return -1;
+-    move_reg_to_reg(OpndSize_32, 2, false, 4, false);
+-    alu_unary_reg(OpndSize_8, div_opc, 4, false);
+-    if (isRem) {
+-        move_reg_to_reg(OpndSize_32, PhysicalReg_EAX, true, PhysicalReg_EDX, true);
+-        alu_binary_imm_reg(OpndSize_32, shr_opc, 8, PhysicalReg_EDX, true);
+-    } else
+-        alu_binary_imm_reg(OpndSize_32, and_opc, 0x000000FF, PhysicalReg_EAX, true);
+-    transferToState(2);
+-    unconditional_jump(".common_div_rem_int_divdone", true);
+ 
+-    //Do 16-bit divide:
+-    //div: dividend in dx:ax; quotient in ax; remainder in dx
+-    goToState(3);
+-    if (insertLabel(".common_div_rem_int_16", true) == -1)
+-        return -1;
+-    alu_unary_reg(OpndSize_16, div_opc, 2, false);
++        goToState(4);
++        if (insertLabel(".common_div_rem_int_32", true) == -1) //merge point
++            return -1;
++        convert_integer(OpndSize_32, OpndSize_64); //cdq
++        //idiv: dividend in edx:eax; quotient in eax; remainder in edx
++        alu_unary_reg(OpndSize_32, idiv_opc, 2, false);
++        transferToState(2);
++        unconditional_jump(".common_div_rem_int_divdone", true);
++
++        //Do 8-bit unsigned divide:
++        //div: dividend in ax; quotient in al; remainder in ah
++        //We are forced to use a hard-coded register, since the register allocator
++        //can allocate a register not capable of 8-bit operation, like ESI,
++        //which will cause undefined behaviour.
++        goToState(3);
++        if (insertLabel(".common_div_rem_int_8", true) == -1)
++            return -1;
++        move_reg_to_reg(OpndSize_32, 2, false, 4, false);
++        alu_unary_reg(OpndSize_8, div_opc, 4, false);
++        if (isRem) {
++            move_reg_to_reg(OpndSize_32, PhysicalReg_EAX, true, PhysicalReg_EDX, true);
++            alu_binary_imm_reg(OpndSize_32, shr_opc, 8, PhysicalReg_EDX, true);
++        } else
++            alu_binary_imm_reg(OpndSize_32, and_opc, 0x000000FF, PhysicalReg_EAX, true);
++        transferToState(2);
++        unconditional_jump(".common_div_rem_int_divdone", true);
+ 
++        //Do 16-bit divide:
++        //div: dividend in dx:ax; quotient in ax; remainder in dx
++        goToState(3);
++        if (insertLabel(".common_div_rem_int_16", true) == -1)
++            return -1;
++        alu_unary_reg(OpndSize_16, div_opc, 2, false);
++    }
+ 
+     transferToState(2);
+     if (insertLabel(".common_div_rem_int_divdone", true) == -1)
+@@ -987,9 +980,6 @@ int common_div_rem_int(bool isRem, int vA, int v1, int v2) {
+     else //divide: quotient in %eax
+         set_virtual_reg(vA, OpndSize_32, PhysicalReg_EAX, true);
+ 
+-    if (insertLabel(".common_div_rem_int_okay", true) == -1)
+-        return -1;
+-
+     return 0;
+ }
+ #undef P_GPR_1
+-- 
+1.7.4.1
+

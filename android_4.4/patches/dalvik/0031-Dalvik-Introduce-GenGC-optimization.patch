@@ -1,0 +1,1210 @@
+From df28e7017d6db19afec157efa027f7afa6648936 Mon Sep 17 00:00:00 2001
+From: yhe19 <yunan.he@intel.com>
+Date: Mon, 10 Dec 2012 02:03:05 +0800
+Subject: Dalvik: Introduce GenGC optimization
+
+BZ: 47554
+
+We found Dalvik Garbage Collection (GC) design has an area to improve.
+We developed a patch to address the issue. The patch can improve the
+object-intensive apps' performance, and keep the non-object-intensive
+apps' performance un-impacted.
+
+Problem: Android application has a heap area (called Zygote heap) that
+holds many long-live objects, and Dalvik GC needs to scan this area every
+time a collection happens. The problem is, Dalvik GC does not always sweep
+this area. So the scanning of this area is almost redundant operation.
+The scanning time is a waste - it prolongs the collection pause time,
+hence also degrades apps' performance and response.
+
+Our solution: We introduce the idea of Generational GC to Dalvik that we
+do not scan this area every time a collection happens. Instead,
+we only keep the pointer references pointing from this area to outside.
+So we can save the scanning time of this area.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-GC; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, proprietary
+
+Change-Id: I74bd38fa0d178cb96eb873588a0c364f29276061
+Orig-MCG-Change-Id: I74bb59bc71891f8aa03eb985d57b39b0c23c24ee
+Signed-off-by: yhe19 <yunan.he@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ Android.mk              |   11 +++
+ vm/Dvm.mk               |    5 +
+ vm/Globals.h            |    5 +
+ vm/Init.cpp             |   13 +++
+ vm/alloc/CardTable.cpp  |   31 +++++++
+ vm/alloc/CardTable.h    |   13 +++
+ vm/alloc/Heap.cpp       |   90 +++++++++++++++++++++-
+ vm/alloc/Heap.h         |    7 ++
+ vm/alloc/HeapBitmap.cpp |   31 +++++++
+ vm/alloc/HeapBitmap.h   |    6 ++
+ vm/alloc/HeapInternal.h |   22 +++++
+ vm/alloc/HeapSource.cpp |  111 +++++++++++++++++++++++++-
+ vm/alloc/HeapSource.h   |   27 ++++++
+ vm/alloc/MarkSweep.cpp  |   61 ++++++++++++++-
+ vm/alloc/MarkSweep.h    |    8 ++-
+ vm/alloc/RegionGC.cpp   |  202 +++++++++++++++++++++++++++++++++++++++++++++++
+ vm/alloc/RegionGC.h     |   75 +++++++++++++++++
+ 17 files changed, 713 insertions(+), 5 deletions(-)
+ create mode 100644 vm/alloc/RegionGC.cpp
+ create mode 100644 vm/alloc/RegionGC.h
+
+diff --git a/Android.mk b/Android.mk
+index 5fbc399..bcfe065 100644
+--- a/Android.mk
++++ b/Android.mk
+@@ -36,6 +36,17 @@ ifeq ($(WITH_JIT),)
+   endif
+ endif
+ 
++# Region GC is an optimization in DalvikVM GC to reduce the GC pause time
++# and increase the application performance.
++WITH_REGION_GC := $(strip $(WITH_REGION_GC))
++ifeq ($(WITH_REGION_GC),)
++  ifeq ($(TARGET_ARCH),x86)
++    WITH_REGION_GC := true
++  else
++    WITH_REGION_GC := false
++  endif
++endif
++
+ subdirs := $(addprefix $(LOCAL_PATH)/,$(addsuffix /Android.mk, \
+ 		libdex \
+ 		vm \
+diff --git a/vm/Dvm.mk b/vm/Dvm.mk
+index a7cedc2..03e6ae6 100644
+--- a/vm/Dvm.mk
++++ b/vm/Dvm.mk
+@@ -204,6 +204,11 @@ LOCAL_SRC_FILES := \
+ 	test/TestHash.cpp \
+ 	test/TestIndirectRefTable.cpp
+ 
++ifeq ($(WITH_REGION_GC), true)
++  LOCAL_CFLAGS += -DWITH_REGION_GC
++  LOCAL_SRC_FILES += alloc/RegionGC.cpp
++endif
++
+ # TODO: this is the wrong test, but what's the right one?
+ ifneq ($(filter arm mips,$(dvm_arch)),)
+   LOCAL_SRC_FILES += os/android.cpp
+diff --git a/vm/Globals.h b/vm/Globals.h
+index cb15d8c..2e69821 100644
+--- a/vm/Globals.h
++++ b/vm/Globals.h
+@@ -733,6 +733,11 @@ struct DvmGlobals {
+     VerifierStats verifierStats;
+ #endif
+ 
++#ifdef WITH_REGION_GC
++    /* Region GC support. */
++    bool        enableRegionGC;
++#endif
++
+     /* String pointed here will be deposited on the stack frame of dvmAbort */
+     const char *lastMessage;
+ };
+diff --git a/vm/Init.cpp b/vm/Init.cpp
+index 56e48cc..f0407e7 100644
+--- a/vm/Init.cpp
++++ b/vm/Init.cpp
+@@ -1236,6 +1236,11 @@ static int processOptions(int argc, const char* const argv[],
+         } else if (strcmp(argv[i], "-Xprofile:dualclock") == 0) {
+             gDvm.profilerClockSource = kProfilerClockSourceDual;
+ 
++#ifdef WITH_REGION_GC
++        } else if (strcmp(argv[i], "-XnoRegionGC") == 0) {
++            gDvm.enableRegionGC = false;
++
++#endif
+         } else {
+             if (!ignoreUnrecognized) {
+                 dvmFprintf(stderr, "Unrecognized option '%s'\n", argv[i]);
+@@ -1342,6 +1347,14 @@ static void setCommandLineDefaults()
+      * Default profiler configuration.
+      */
+     gDvm.profilerClockSource = kProfilerClockSourceDual;
++
++#ifdef WITH_REGION_GC
++    /*
++     * Region GC is enabled by default.
++     * Use -XnoRegionGC to disable Region GC.
++     */
++    gDvm.enableRegionGC = true;
++#endif
+ }
+ 
+ 
+diff --git a/vm/alloc/CardTable.cpp b/vm/alloc/CardTable.cpp
+index 87143dc..b4b4cd1 100644
+--- a/vm/alloc/CardTable.cpp
++++ b/vm/alloc/CardTable.cpp
+@@ -72,6 +72,20 @@ bool dvmCardTableStartup(size_t heapMaximumSize, size_t growthLimit)
+     gcHeap->cardTableBase = (u1*)allocBase;
+     gcHeap->cardTableLength = growthLimit / GC_CARD_SIZE;
+     gcHeap->cardTableMaxLength = length;
++
++#ifdef WITH_REGION_GC
++    /* Begin of the shadow card table initialization. */
++    void *shadowCardTableAllocBase = dvmAllocRegion(length + 0x100, PROT_READ | PROT_WRITE,
++                            "dalvik-shadow-card-table");
++    if(shadowCardTableAllocBase ==  NULL) {
++        munmap(gcHeap->cardTableBase, gcHeap->cardTableLength);
++        return false;
++    }
++    gcHeap->shadowCardTableBase = (u1*)shadowCardTableAllocBase;
++    gcHeap->shadowCardTableLength = length;
++    /* End of the shadow card table initialization. */
++#endif
++
+     biasedBase = (u1 *)((uintptr_t)allocBase -
+                        ((uintptr_t)heapBase >> GC_CARD_SHIFT));
+     offset = GC_CARD_DIRTY - ((uintptr_t)biasedBase & 0xff);
+@@ -90,7 +104,24 @@ void dvmCardTableShutdown()
+ {
+     gDvm.biasedCardTableBase = NULL;
+     munmap(gDvm.gcHeap->cardTableBase, gDvm.gcHeap->cardTableLength);
++#ifdef WITH_REGION_GC
++    munmap(gDvm.gcHeap->shadowCardTableBase, gDvm.gcHeap->shadowCardTableLength);
++#endif
++}
++
++#ifdef WITH_REGION_GC
++void dvmClearCardTablePartial(const void *base, unsigned int length){
++    assert(gDvm.gcHeap->cardTableBase != NULL);
++    u1 *biasedBase = gDvm.biasedCardTableBase;
++    u1 *start = biasedBase + ((uintptr_t)base >> GC_CARD_SHIFT);
++    memset(start, GC_CARD_CLEAN, length/GC_CARD_SIZE);
++}
++
++void dvmClearShadowCardTable(void){
++    assert(gDvm.gcHeap->cardTableBase != NULL);
++    memset(gDvm.gcHeap->shadowCardTableBase, GC_CARD_CLEAN, gDvm.gcHeap->shadowCardTableLength);
+ }
++#endif
+ 
+ void dvmClearCardTable()
+ {
+diff --git a/vm/alloc/CardTable.h b/vm/alloc/CardTable.h
+index 43b0563..f810002 100644
+--- a/vm/alloc/CardTable.h
++++ b/vm/alloc/CardTable.h
+@@ -44,6 +44,19 @@ void dvmCardTableShutdown(void);
+  */
+ void dvmClearCardTable(void);
+ 
++#ifdef WITH_REGION_GC
++/*
++ * Clears the relevent bytes in the card table for the memory region
++ * in managed heap from "base" to "base + length".
++ */
++void dvmClearCardTablePartial(const void *base, unsigned int length);
++
++/*
++ * Resets all of the bytes in the shadow card table to clean.
++ */
++void dvmClearShadowCardTable(void);
++#endif
++
+ /*
+  * Returns the address of the relevent byte in the card table, given
+  * an address on the heap.
+diff --git a/vm/alloc/Heap.cpp b/vm/alloc/Heap.cpp
+index 2de20ef..5ec7650 100644
+--- a/vm/alloc/Heap.cpp
++++ b/vm/alloc/Heap.cpp
+@@ -27,6 +27,7 @@
+ #include "alloc/DdmHeap.h"
+ #include "alloc/HeapSource.h"
+ #include "alloc/MarkSweep.h"
++#include "alloc/CardTable.h"
+ #include "os/os.h"
+ 
+ #include <sys/mman.h>
+@@ -38,7 +39,12 @@
+ #include <cutils/trace.h>
+ 
+ static const GcSpec kGcForMallocSpec = {
++#ifdef WITH_REGION_GC
++    false,  /* isPartial */
++    true, /* isRegional */
++#else
+     true,  /* isPartial */
++#endif
+     false,  /* isConcurrent */
+     true,  /* doPreserve */
+     "GC_FOR_ALLOC"
+@@ -48,6 +54,9 @@ const GcSpec *GC_FOR_MALLOC = &kGcForMallocSpec;
+ 
+ static const GcSpec kGcConcurrentSpec  = {
+     true,  /* isPartial */
++#ifdef WITH_REGION_GC
++    false, /* isRegional */
++#endif
+     true,  /* isConcurrent */
+     true,  /* doPreserve */
+     "GC_CONCURRENT"
+@@ -57,6 +66,9 @@ const GcSpec *GC_CONCURRENT = &kGcConcurrentSpec;
+ 
+ static const GcSpec kGcExplicitSpec = {
+     false,  /* isPartial */
++#ifdef WITH_REGION_GC
++    false, /* isRegional */
++#endif
+     true,  /* isConcurrent */
+     true,  /* doPreserve */
+     "GC_EXPLICIT"
+@@ -66,6 +78,9 @@ const GcSpec *GC_EXPLICIT = &kGcExplicitSpec;
+ 
+ static const GcSpec kGcBeforeOomSpec = {
+     false,  /* isPartial */
++#ifdef WITH_REGION_GC
++    true, /* isRegional */
++#endif
+     false,  /* isConcurrent */
+     false,  /* doPreserve */
+     "GC_BEFORE_OOM"
+@@ -428,6 +443,37 @@ static void verifyRootsAndHeap()
+     dvmVerifyRoots();
+     dvmVerifyBitmap(dvmHeapSourceGetLiveBits());
+ }
++/*
++ * Prepare Card Table. Without WITH_REGION_GC enabled, GC clears
++ * the card table when concurrent GC triggered. With Region GC enabled,
++ * different GC introduces different operation on the card table.
++ */
++static void dvmPrepareCardTables(const GcSpec* spec)
++{
++#ifdef WITH_REGION_GC
++     if (spec->isConcurrent) {
++         /* Prepare the card tables before the concurrent GC. */
++         regionGcBackupCardTable();
++         dvmClearCardTable();
++     } else if (spec->isRegional) {
++         /* Prepare the card tables for regional GC*/
++         regionGcPrepareCardTable();
++     }
++#else
++     if (spec->isConcurrent) {
++         dvmClearCardTable();
++     }
++#endif
++}
++
++#ifdef WITH_REGION_GC
++/* Check the runtime properties. */
++static void dvmGcCheckProperty()
++{
++    /* Check the reuntime properties for the Regional GC. */
++    regionGcCheckProperty();
++}
++#endif
+ 
+ /*
+  * Initiate garbage collection.
+@@ -481,6 +527,19 @@ void dvmCollectGarbageInternal(const GcSpec* spec)
+     ATRACE_BEGIN("GC: Threads Suspended"); // Suspend A
+     dvmSuspendAllThreads(SUSPEND_FOR_GC);
+ 
++
++#ifdef WITH_REGION_GC
++    /* Disable the cross heap pointer check at the begining of GC*/
++    dvmSetEnableCrossHeapPointerCheck(false);
++
++    /* Check properties. Only check for the Regional GC now.*/
++    dvmGcCheckProperty();
++    if (spec->isRegional) {
++        /*Decide GC mode for the Regional GC.*/
++        regionGcDecideGcMode();
++    }
++#endif
++
+     /*
+      * If we are not marking concurrently raise the priority of the
+      * thread performing the garbage collection.
+@@ -497,7 +556,11 @@ void dvmCollectGarbageInternal(const GcSpec* spec)
+ 
+     /* Set up the marking context.
+      */
++#ifdef WITH_REGION_GC
++    if (!dvmHeapBeginMarkStep(spec->isPartial || spec->isRegional)) {
++#else
+     if (!dvmHeapBeginMarkStep(spec->isPartial)) {
++#endif
+         ATRACE_END(); // Suspend A
+         ATRACE_END(); // Top-level GC
+         LOGE_HEAP("dvmHeapBeginMarkStep failed; aborting");
+@@ -517,13 +580,13 @@ void dvmCollectGarbageInternal(const GcSpec* spec)
+     assert(gcHeap->finalizerReferences == NULL);
+     assert(gcHeap->phantomReferences == NULL);
+     assert(gcHeap->clearedReferences == NULL);
++    dvmPrepareCardTables(spec);
+ 
+     if (spec->isConcurrent) {
+         /*
+          * Resume threads while tracing from the roots.  We unlock the
+          * heap to allow mutator threads to allocate from free space.
+          */
+-        dvmClearCardTable();
+         dvmUnlockHeap();
+         dvmResumeAllThreads(SUSPEND_FOR_GC);
+         ATRACE_END(); // Suspend A
+@@ -535,7 +598,11 @@ void dvmCollectGarbageInternal(const GcSpec* spec)
+      * objects will also be marked.
+      */
+     LOGD_HEAP("Recursing...");
++#ifdef WITH_REGION_GC
++    dvmHeapScanMarkedObjects(spec->isRegional);
++#else
+     dvmHeapScanMarkedObjects();
++#endif
+ 
+     if (spec->isConcurrent) {
+         /*
+@@ -565,6 +632,22 @@ void dvmCollectGarbageInternal(const GcSpec* spec)
+         dvmHeapReScanMarkedObjects();
+     }
+ 
++#ifdef WITH_REGION_GC
++    if (spec->isRegional && regionGcNeedClearPhase()){
++        /*
++         * Region GC minor collection bypasses zygote heap scanning.
++         * To keep correctness, it needs to scan the objects in dirty
++         * cards of zygote heap since those objects may contain pointers
++         * to active heap.
++         * Steps:
++         * 1. Clear card table of active heap. Only keep the card table of zygote heap
++         * 2. Scan the heap again from the objects in dirty card table.
++         */
++        dvmClearCardTablePartial(dvmGetActiveHeapBase(), dvmGetActiveHeapSize());
++        dvmHeapReScanMarkedObjects();
++    }
++#endif
++
+     /*
+      * All strongly-reachable objects have now been marked.  Process
+      * weakly-reachable objects discovered while tracing.
+@@ -609,8 +692,13 @@ void dvmCollectGarbageInternal(const GcSpec* spec)
+         ATRACE_END(); // Suspend B
+         dirtyEnd = dvmGetRelativeTimeMsec();
+     }
++#ifdef WITH_REGION_GC
++    dvmHeapSweepUnmarkedObjects(spec->isPartial ||  spec->isRegional, spec->isConcurrent,
++                                &numObjectsFreed, &numBytesFreed);
++#else
+     dvmHeapSweepUnmarkedObjects(spec->isPartial, spec->isConcurrent,
+                                 &numObjectsFreed, &numBytesFreed);
++#endif
+     LOGD_HEAP("Cleaning up...");
+     dvmHeapFinishMarkStep();
+     if (spec->isConcurrent) {
+diff --git a/vm/alloc/Heap.h b/vm/alloc/Heap.h
+index 19e48cd..c8bd021 100644
+--- a/vm/alloc/Heap.h
++++ b/vm/alloc/Heap.h
+@@ -22,6 +22,13 @@
+ struct GcSpec {
+   /* If true, only the application heap is threatened. */
+   bool isPartial;
++#ifdef WITH_REGION_GC
++  /* If true, the regional GC "may" be triggered. Regional GC will decide
++   * whether or not to start Regional GC and which type of Regional GC
++   * (minor or major)will be triggered dynamically. Please check RegionGC.c.
++   */
++  bool isRegional;
++#endif
+   /* If true, the trace is run concurrently with the mutator. */
+   bool isConcurrent;
+   /* Toggles for the soft reference clearing policy. */
+diff --git a/vm/alloc/HeapBitmap.cpp b/vm/alloc/HeapBitmap.cpp
+index d6a737b..6162ff8 100644
+--- a/vm/alloc/HeapBitmap.cpp
++++ b/vm/alloc/HeapBitmap.cpp
+@@ -116,6 +116,8 @@ void dvmHeapBitmapWalk(const HeapBitmap *bitmap, BitmapCallback *callback,
+     }
+ }
+ 
++
++#ifdef WITH_REGION_GC
+ /*
+  * Similar to dvmHeapBitmapWalk but the callback routine is permitted
+  * to change the bitmap bits and max during traversal.  Used by the
+@@ -129,6 +131,33 @@ void dvmHeapBitmapWalk(const HeapBitmap *bitmap, BitmapCallback *callback,
+  * visited.
+  */
+ void dvmHeapBitmapScanWalk(HeapBitmap *bitmap,
++                           uintptr_t base, uintptr_t max,
++                           BitmapScanCallback *callback, void *arg)
++{
++    assert(bitmap != NULL);
++    assert(bitmap->bits != NULL);
++    assert(callback != NULL);
++    uintptr_t end = HB_OFFSET_TO_INDEX(max - bitmap->base);
++    uintptr_t start = HB_OFFSET_TO_INDEX(base - bitmap->base);
++    for (uintptr_t i = start; i <= end; ++i) {
++        unsigned long word = bitmap->bits[i];
++        if (UNLIKELY(word != 0)) {
++            unsigned long highBit = 1 << (HB_BITS_PER_WORD - 1);
++            uintptr_t ptrBase = HB_INDEX_TO_OFFSET(i) + bitmap->base;
++            void *finger = (void *)(HB_INDEX_TO_OFFSET(i + 1) + bitmap->base);
++            while (word != 0) {
++                const int shift = CLZ(word);
++                Object *addr = (Object *)(ptrBase + shift * HB_OBJECT_ALIGNMENT);
++                (*callback)(addr, finger, arg);
++                word &= ~(highBit >> shift);
++            }
++            end = HB_OFFSET_TO_INDEX(bitmap->max - bitmap->base);
++        }
++
++    }
++}
++#else
++void dvmHeapBitmapScanWalk(HeapBitmap *bitmap,
+                            BitmapScanCallback *callback, void *arg)
+ {
+     assert(bitmap != NULL);
+@@ -153,6 +182,8 @@ void dvmHeapBitmapScanWalk(HeapBitmap *bitmap,
+     }
+ }
+ 
++#endif
++
+ /*
+  * Walk through the bitmaps in increasing address order, and find the
+  * object pointers that correspond to garbage objects.  Call
+diff --git a/vm/alloc/HeapBitmap.h b/vm/alloc/HeapBitmap.h
+index 9f2a0a1..9385686 100644
+--- a/vm/alloc/HeapBitmap.h
++++ b/vm/alloc/HeapBitmap.h
+@@ -112,8 +112,14 @@ void dvmHeapBitmapWalk(const HeapBitmap *bitmap,
+  * Like dvmHeapBitmapWalk but takes a callback function with a finger
+  * address.
+  */
++#ifdef WITH_REGION_GC
+ void dvmHeapBitmapScanWalk(HeapBitmap *bitmap,
++                           uintptr_t base, uintptr_t max,
+                            BitmapScanCallback *callback, void *arg);
++#else
++void dvmHeapBitmapScanWalk(HeapBitmap *bitmap,
++                           BitmapScanCallback *callback, void *arg);
++#endif
+ 
+ /*
+  * Walk through the bitmaps in increasing address order, and find the
+diff --git a/vm/alloc/HeapInternal.h b/vm/alloc/HeapInternal.h
+index 576bf7d..a29fb20 100644
+--- a/vm/alloc/HeapInternal.h
++++ b/vm/alloc/HeapInternal.h
+@@ -23,6 +23,12 @@
+ 
+ struct HeapSource;
+ 
++#ifdef WITH_REGION_GC
++#include "RegionGC.h"
++#endif
++
++typedef struct HeapSource HeapSource;
++
+ struct GcHeap {
+     HeapSource *heapSource;
+ 
+@@ -50,6 +56,18 @@ struct GcHeap {
+     size_t cardTableLength;
+     size_t cardTableMaxLength;
+     size_t cardTableOffset;
++#ifdef WITH_REGION_GC
++    /*
++     * The shadow card tale is simliar to the card table. It's used in
++     * Region GC. Region GC minor collection needs to backup the
++     * dirty cards from the card table into the shadow card table before
++     * cleaning the card table.
++     * TODO: we do not need the extra memory to backup the dirty cards.
++     * Using the free bits in the card table can achieve the same goal.
++     */
++    u1*             shadowCardTableBase;
++    size_t          shadowCardTableLength;
++#endif
+ 
+     /* Is the GC running?  Used to avoid recursive calls to GC.
+      */
+@@ -63,6 +81,10 @@ struct GcHeap {
+     int ddmHpsgWhat;
+     int ddmNhsgWhen;
+     int ddmNhsgWhat;
++#ifdef WITH_REGION_GC
++    RegionGC        *regionGC;
++#endif
++
+ };
+ 
+ bool dvmLockHeap(void);
+diff --git a/vm/alloc/HeapSource.cpp b/vm/alloc/HeapSource.cpp
+index 82c2b9e..318696e 100644
+--- a/vm/alloc/HeapSource.cpp
++++ b/vm/alloc/HeapSource.cpp
+@@ -154,6 +154,12 @@ struct HeapSource {
+      */
+     size_t numHeaps;
+ 
++#ifdef WITH_REGION_GC
++    /* Set true when GC allocates more than one heap.
++     */
++    bool multiHeapsEnabled;
++#endif
++
+     /* True if zygote mode was active when the HeapSource was created.
+      */
+     bool sawZygote;
+@@ -199,6 +205,8 @@ struct HeapSource {
+ 
+ #define hs2heap(hs_) (&((hs_)->heaps[0]))
+ 
++static HeapSource *gHs = NULL;
++
+ /*
+  * Returns true iff a soft limit is in effect for the active heap.
+  */
+@@ -267,6 +275,41 @@ static Heap *ptr2heap(const HeapSource *hs, const void *ptr)
+     return NULL;
+ }
+ 
++#ifdef WITH_REGION_GC
++/*
++ * Returns the heap num that <ptr> could have come from, or -1
++ * if it could not have come from any heap.
++ */
++static inline size_t
++ptr2heapNum(const HeapSource *hs, const void *ptr)
++{
++    const size_t numHeaps = hs->numHeaps;
++    size_t i;
++
++    if (ptr != NULL) {
++        for (i = 0; i < numHeaps; i++) {
++            const Heap *const heap = &hs->heaps[i];
++
++            if ((const char *)ptr >= heap->base && (const char *)ptr < heap->limit) {
++                return i;
++            }
++        }
++    }
++    return -1;
++}
++
++/*
++ * Check cross heap pointer. If pointer is from zygote heap to active heap, it records the pointer
++ * by marking the dirty cards for the object contains this pointer.
++ * It's used in Region GC major collection currently.
++ */
++void hsCheckPointer2AppHeap(Object *from, Object *to){
++    if(ptr2heapNum(gHs, (void *)from) !=0 && ptr2heapNum(gHs, (void *)to) == 0){
++        dvmMarkCard(from);
++    }
++}
++#endif
++
+ /*
+  * Functions to update heapSource->bytesAllocated when an object
+  * is allocated or freed.  mspace_usable_size() will give
+@@ -305,7 +348,6 @@ static void countFree(Heap *heap, const void *ptr, size_t *numBytes)
+     *numBytes += delta;
+ }
+ 
+-static HeapSource *gHs = NULL;
+ 
+ static mspace createMspace(void* begin, size_t morecoreStart, size_t startingSize)
+ {
+@@ -664,6 +706,21 @@ GcHeap* dvmHeapSourceStartup(size_t startSize, size_t maximumSize,
+       hs->minFree = hs->maxFree;
+     }
+ 
++#ifdef WITH_REGION_GC
++    hs->multiHeapsEnabled = false;
++
++    RegionGC *regionGC;
++    regionGC = (RegionGC *)mspace_malloc(msp, sizeof(*regionGC));
++    if(regionGC == NULL) {
++        LOGE_HEAP("Can't allocate heap source\n");
++        goto fail;
++    }
++    memset(regionGC, 0, sizeof(*regionGC));
++    regionGcInitialization(regionGC);
++    regionGC->gcHeap = gcHeap;
++    gcHeap->regionGC = regionGC;
++#endif
++
+     if (!addInitialHeap(hs, msp, growthLimit)) {
+         LOGE_HEAP("Can't add initial heap");
+         goto fail;
+@@ -723,7 +780,14 @@ bool dvmHeapSourceStartupBeforeFork()
+          */
+         ALOGV("Splitting out new zygote heap");
+         gDvm.newZygoteHeapAllocated = true;
+-        return addNewHeap(hs);
++        bool ret = addNewHeap(hs);
++#ifdef WITH_REGION_GC
++        setMultiHeapsEnabled(true);
++        if(gDvm.enableRegionGC) {
++            regionGcResetCardTables(NULL);
++        }
++#endif
++        return ret;
+     }
+     return true;
+ }
+@@ -1602,3 +1666,46 @@ void dvmHeapSourceRegisterNativeFree(int bytes)
+     } while (android_atomic_cas(expected_size, new_size,
+                                 &gHs->nativeBytesAllocated));
+ }
++
++#ifdef WITH_REGION_GC
++/*
++ * Set true when GC has more than one heap.
++ */
++void setMultiHeapsEnabled(bool status)
++{
++    gHs->multiHeapsEnabled = status;
++}
++
++bool isMultiHeapsEnabled()
++{
++    return gHs->multiHeapsEnabled;
++}
++
++/* Get active heap size. */
++size_t
++dvmGetActiveHeapSize()
++{
++    return gHs->heaps[0].maximumSize;
++}
++
++/* Get active heap base. */
++char *
++dvmGetActiveHeapBase()
++{
++    return gHs->heaps[0].base;
++}
++
++/* Get zygote heap size.  */
++size_t
++dvmGetZygoteHeapSize()
++{
++    return gHs->heaps[1].maximumSize;
++}
++
++/* Get zygote heap base. */
++char *
++dvmGetZygoteHeapBase()
++{
++    return gHs->heaps[1].base;
++}
++#endif //WITH_REGION_GC
+diff --git a/vm/alloc/HeapSource.h b/vm/alloc/HeapSource.h
+index 42fccb2..a03ac5b 100644
+--- a/vm/alloc/HeapSource.h
++++ b/vm/alloc/HeapSource.h
+@@ -210,4 +210,31 @@ void dvmHeapSourceRegisterNativeAllocation(int bytes);
+  */
+ void dvmHeapSourceRegisterNativeFree(int bytes);
+ 
++#ifdef WITH_REGION_GC
++/*
++ * Set true when GC has more than one heap.
++ */
++void setMultiHeapsEnabled(bool status);
++bool isMultiHeapsEnabled();
++
++/* Get active heap size. */
++size_t dvmGetActiveHeapSize();
++
++/* Get active heap base. */
++char* dvmGetActiveHeapBase();
++
++/* Get zygote heap size.  */
++size_t dvmGetZygoteHeapSize();
++
++/* Get zygote heap base.  */
++char* dvmGetZygoteHeapBase();
++
++/*
++ * Check cross heap pointer. If pointer is from zygote heap to
++ * active heap, it records the pointer by marking the dirty cards
++ * for the object contains this pointer.
++ * It's used in Region GC major collection currently.
++ */
++void hsCheckPointer2AppHeap(Object *from, Object *to);
++#endif //WITH_REGION_GC
+ #endif  // DALVIK_HEAP_SOURCE_H_
+diff --git a/vm/alloc/MarkSweep.cpp b/vm/alloc/MarkSweep.cpp
+index 2781a7c..8cc062a 100644
+--- a/vm/alloc/MarkSweep.cpp
++++ b/vm/alloc/MarkSweep.cpp
+@@ -211,6 +211,26 @@ void dvmHeapReMarkRootSet()
+     dvmVisitRoots(rootReMarkObjectVisitor, ctx);
+ }
+ 
++#ifdef WITH_REGION_GC
++bool enableCrossHeapPointerCheck = false;
++
++void dvmSetEnableCrossHeapPointerCheck(bool status)
++{
++    enableCrossHeapPointerCheck = status;
++}
++
++static inline void
++_checkCrossHeapPointer(Object *from, Object *to){
++    if(enableCrossHeapPointerCheck){
++        hsCheckPointer2AppHeap(from, to);
++    }
++}
++
++#define checkCrossHeapPointer _checkCrossHeapPointer
++#else
++#define checkCrossHeapPointer(...) ((void)0)
++#endif
++
+ /*
+  * Scans instance fields.
+  */
+@@ -225,6 +245,7 @@ static void scanFields(const Object *obj, GcMarkContext *ctx)
+             size_t rshift = CLZ(refOffsets);
+             size_t offset = CLASS_OFFSET_FROM_CLZ(rshift);
+             Object *ref = dvmGetFieldObject(obj, offset);
++            checkCrossHeapPointer((Object *)obj, ref);
+             markObject(ref, ctx);
+             refOffsets &= ~(CLASS_HIGH_BIT >> rshift);
+         }
+@@ -236,6 +257,7 @@ static void scanFields(const Object *obj, GcMarkContext *ctx)
+             for (int i = 0; i < clazz->ifieldRefCount; ++i, ++field) {
+                 void *addr = BYTE_OFFSET(obj, field->byteOffset);
+                 Object *ref = ((JValue *)addr)->l;
++                checkCrossHeapPointer((Object *)obj, ref);
+                 markObject(ref, ctx);
+             }
+         }
+@@ -253,6 +275,7 @@ static void scanStaticFields(const ClassObject *clazz, GcMarkContext *ctx)
+         char ch = clazz->sfields[i].signature[0];
+         if (ch == '[' || ch == 'L') {
+             Object *obj = clazz->sfields[i].value.l;
++            checkCrossHeapPointer((Object *)clazz, obj);
+             markObject(obj, ctx);
+         }
+     }
+@@ -266,7 +289,9 @@ static void scanInterfaces(const ClassObject *clazz, GcMarkContext *ctx)
+     assert(clazz != NULL);
+     assert(ctx != NULL);
+     for (int i = 0; i < clazz->interfaceCount; ++i) {
+-        markObject((const Object *)clazz->interfaces[i], ctx);
++        Object *interface = (Object *)clazz->interfaces[i];
++        checkCrossHeapPointer((Object *)clazz, interface);
++        markObject(interface, ctx);
+     }
+ }
+ 
+@@ -279,15 +304,19 @@ static void scanClassObject(const Object *obj, GcMarkContext *ctx)
+     assert(obj != NULL);
+     assert(dvmIsClassObject(obj));
+     assert(ctx != NULL);
++    checkCrossHeapPointer((Object *)obj, (Object *)obj->clazz);
+     markObject((const Object *)obj->clazz, ctx);
+     const ClassObject *asClass = (const ClassObject *)obj;
+     if (IS_CLASS_FLAG_SET(asClass, CLASS_ISARRAY)) {
++        checkCrossHeapPointer((Object *)asClass, (Object *)asClass->elementClass);
+         markObject((const Object *)asClass->elementClass, ctx);
+     }
+     /* Do super and the interfaces contain Objects and not dex idx values? */
+     if (asClass->status > CLASS_IDX) {
++        checkCrossHeapPointer((Object *)asClass, (Object *)asClass->super);
+         markObject((const Object *)asClass->super, ctx);
+     }
++    checkCrossHeapPointer((Object *)asClass, asClass->classLoader);
+     markObject((const Object *)asClass->classLoader, ctx);
+     scanFields(obj, ctx);
+     scanStaticFields(asClass, ctx);
+@@ -305,11 +334,13 @@ static void scanArrayObject(const Object *obj, GcMarkContext *ctx)
+     assert(obj != NULL);
+     assert(obj->clazz != NULL);
+     assert(ctx != NULL);
++    checkCrossHeapPointer((Object *)obj, (Object *)obj->clazz);
+     markObject((const Object *)obj->clazz, ctx);
+     if (IS_CLASS_FLAG_SET(obj->clazz, CLASS_ISOBJECTARRAY)) {
+         const ArrayObject *array = (const ArrayObject *)obj;
+         const Object **contents = (const Object **)(void *)array->contents;
+         for (size_t i = 0; i < array->length; ++i) {
++            checkCrossHeapPointer((Object *)obj, (Object *)contents[i]);
+             markObject(contents[i], ctx);
+         }
+     }
+@@ -440,6 +471,7 @@ static void scanDataObject(const Object *obj, GcMarkContext *ctx)
+     assert(obj != NULL);
+     assert(obj->clazz != NULL);
+     assert(ctx != NULL);
++    checkCrossHeapPointer((Object *)obj, (Object *)obj->clazz);
+     markObject((const Object *)obj->clazz, ctx);
+     scanFields(obj, ctx);
+     if (IS_CLASS_FLAG_SET(obj->clazz, CLASS_ISREFERENCE)) {
+@@ -593,16 +625,43 @@ static void scanBitmapCallback(Object *obj, void *finger, void *arg)
+  * reachable objects.  When this returns, the entire set of
+  * live objects will be marked and the mark stack will be empty.
+  */
++#ifdef WITH_REGION_GC
++void dvmHeapScanMarkedObjects(bool isRegional)
++#else
+ void dvmHeapScanMarkedObjects(void)
++#endif
+ {
+     GcMarkContext *ctx = &gDvm.gcHeap->markContext;
+ 
+     assert(ctx->finger == NULL);
+ 
++#ifdef WITH_REGION_GC
++    /* In Region GC minor collection, GC only scans the active heap.
++     * Other GC mode will scan the whole heaps.
++     */
++    uintptr_t base[HEAP_SOURCE_MAX_HEAP_COUNT];
++    uintptr_t max[HEAP_SOURCE_MAX_HEAP_COUNT];
++
++    uintptr_t basePtr, endPtr;
++
++    if(isRegional && regionGcIsPartialMark()){
++        /* Prepare the make bitmap for the active heap in minor collection. */
++        size_t numHeaps = dvmHeapSourceGetNumHeaps();
++        dvmHeapSourceGetRegions(base, max, numHeaps);
++        basePtr = base[0];
++        endPtr = max[0];
++    } else {
++        basePtr = ctx->bitmap->base;
++        endPtr = ctx->bitmap->max;
++    }
++
++    dvmHeapBitmapScanWalk(ctx->bitmap, basePtr, endPtr, scanBitmapCallback, ctx);
++#else
+     /* The bitmaps currently have bits set for the root set.
+      * Walk across the bitmaps and scan each object.
+      */
+     dvmHeapBitmapScanWalk(ctx->bitmap, scanBitmapCallback, ctx);
++#endif
+ 
+     ctx->finger = (void *)ULONG_MAX;
+ 
+diff --git a/vm/alloc/MarkSweep.h b/vm/alloc/MarkSweep.h
+index b14333a..edb464a 100644
+--- a/vm/alloc/MarkSweep.h
++++ b/vm/alloc/MarkSweep.h
+@@ -49,7 +49,11 @@ struct GcMarkContext {
+ bool dvmHeapBeginMarkStep(bool isPartial);
+ void dvmHeapMarkRootSet(void);
+ void dvmHeapReMarkRootSet(void);
++#ifdef WITH_REGION_GC
++void dvmHeapScanMarkedObjects(bool isRegional);
++#else
+ void dvmHeapScanMarkedObjects(void);
++#endif
+ void dvmHeapReScanMarkedObjects(void);
+ void dvmHeapProcessReferences(Object **softReferences, bool clearSoftRefs,
+                               Object **weakReferences,
+@@ -60,5 +64,7 @@ void dvmHeapSweepSystemWeaks(void);
+ void dvmHeapSweepUnmarkedObjects(bool isPartial, bool isConcurrent,
+                                  size_t *numObjects, size_t *numBytes);
+ void dvmEnqueueClearedReferences(Object **references);
+-
++#ifdef WITH_REGION_GC
++void dvmSetEnableCrossHeapPointerCheck(bool status);
++#endif //WITH_REGION_GC
+ #endif  // DALVIK_ALLOC_MARK_SWEEP_H_
+diff --git a/vm/alloc/RegionGC.cpp b/vm/alloc/RegionGC.cpp
+new file mode 100644
+index 0000000..1d2267a
+--- /dev/null
++++ b/vm/alloc/RegionGC.cpp
+@@ -0,0 +1,202 @@
++/*
++ * Copyright (C) 2010-2011 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#include "Dalvik.h"
++#include "alloc/RegionGC.h"
++#include "alloc/CardTable.h"
++#include "alloc/HeapInternal.h"
++
++#ifdef HAVE_ANDROID_OS
++#include <cutils/properties.h>
++#endif
++
++#ifdef WITH_REGION_GC
++
++/* The default dirty card ratio threshold. */
++#define DIRTY_CARD_RATIO_THRESHOLD 0.4f
++
++static RegionGC *gRegionGC = NULL;
++
++void regionGcInitialization(RegionGC *regionGC)
++{
++    gRegionGC = regionGC;
++
++    regionGC->regionGcType = REGION_GC_NULL;
++    regionGC->forceMajor = false;
++    regionGC->dirtyRatioThreshold = DIRTY_CARD_RATIO_THRESHOLD;
++    regionGC->startRegionGC = false;
++    regionGC->dirtyRatioZygoteHeap = 0;
++}
++
++/* Start major collection when:
++ * 1. dirty cards percentage in zygote heap is larger than the threshold.
++ * 2. forceMajor is set to true.
++ */
++static bool needStartMajor()
++{
++    return gRegionGC->dirtyRatioZygoteHeap > gRegionGC->dirtyRatioThreshold
++           || gRegionGC->forceMajor;
++}
++
++void regionGcCheckProperty()
++{
++    RegionGC *regionGC = gRegionGC;
++    /* If GC only has one heap or Region GC is disabled in command line,
++     * Region GC will not be triggered.
++     */
++    if(isMultiHeapsEnabled() && gDvm.enableRegionGC) {
++#ifdef HAVE_ANDROID_OS
++        /* Check the runtime option to enable and disable Region GC. */
++        char propBuf[256];
++        property_get("dalvik.vm.region-gc", propBuf, "");
++        if(!strcmp(propBuf, "off")) {
++            regionGC->startRegionGC = false;
++        } else if(!strcmp(propBuf, "on")) {
++            if( regionGC->startRegionGC == false){
++                regionGC->forceMajor = true;
++            } else {
++                regionGC->forceMajor = false;
++            }
++            regionGC->startRegionGC = true;
++        } else {
++            regionGC->startRegionGC = true;
++        }
++
++        /* Check the runtime option to set the dirty threshold to trigger
++         * major collection.
++         */
++        memset(propBuf, 0, 256);
++        property_get("dalvik.vm.region-gc-dirty-threshold", propBuf, "-1.0");
++        float dirty_threshold = atof(propBuf);
++        if(dirty_threshold > 0 && dirty_threshold < 1) {
++            regionGC->dirtyRatioThreshold = dirty_threshold;
++        }
++#else
++        regionGC->startRegionGC = true;
++#endif
++    }
++}
++
++void regionGcDecideGcMode()
++{
++    RegionGC *regionGC = gRegionGC;
++
++    if(regionGC->startRegionGC) {
++         if(!needStartMajor()) {
++             /* Start minor collection. */
++             regionGC->regionGcType = REGION_GC_MINOR;
++         } else {
++             /* Start major collection. */
++             regionGC->regionGcType = REGION_GC_MAJOR;
++             dvmSetEnableCrossHeapPointerCheck(true);
++         }
++    } else {
++         regionGC->regionGcType = REGION_GC_NULL;
++    }
++}
++
++void regionGcResetCardTables(RegionGC *regionGC)
++{
++    dvmClearShadowCardTable();
++    dvmClearCardTable();
++}
++
++/* Merge the shadow card table and the card table. The results will be
++ * stored back to the shadow card table and the card table.
++ */
++void regionGcMergeCardTables(RegionGC *regionGC)
++{
++    size_t numCard = 0;
++    size_t numDirtyCard = 0;
++
++    GcHeap *gcHeap = regionGC->gcHeap;
++    u1 *cardAddr = &(gcHeap->cardTableBase[0]);
++    u1 *shadowCardAddr = &(gcHeap->shadowCardTableBase[0]);
++
++    size_t footprint = dvmGetZygoteHeapSize();
++    u1 *limitCard = dvmCardFromAddr((u1 *)dvmHeapSourceGetBase() + footprint);
++
++    for( ; cardAddr != limitCard; ++cardAddr, ++shadowCardAddr) {
++        *shadowCardAddr = *cardAddr = *cardAddr | *shadowCardAddr;
++        if(*shadowCardAddr != GC_CARD_CLEAN) numDirtyCard ++;
++        numCard ++;
++    }
++    regionGC->dirtyRatioZygoteHeap = (float)numDirtyCard / numCard;
++}
++
++/* Merge the shadow card table and the card table. The results will be
++ * stored back to the shadow card table.
++ */
++void regionGcBackupCardTable()
++{
++    RegionGC *regionGC = gRegionGC;
++
++    if(regionGC->startRegionGC) {
++
++        size_t numCard = 0;
++        size_t numDirtyCard = 0;
++
++        GcHeap *gcHeap = regionGC->gcHeap;
++        u1 *cardAddr = &(gcHeap->cardTableBase[0]);
++        u1 *shadowCardAddr = &(gcHeap->shadowCardTableBase[0]);
++
++        size_t footprint = dvmGetZygoteHeapSize();
++        u1 *limitCard = dvmCardFromAddr((u1 *)dvmHeapSourceGetBase() + footprint);
++
++        for( ; cardAddr != limitCard; ++cardAddr, ++shadowCardAddr) {
++            *shadowCardAddr = *cardAddr | *shadowCardAddr;
++            if(*shadowCardAddr != GC_CARD_CLEAN) numDirtyCard ++;
++            numCard ++;
++        }
++        regionGC->dirtyRatioZygoteHeap = (float)numDirtyCard / numCard;
++    }
++}
++
++/* Prepare card tables for regional GC. */
++void regionGcPrepareCardTable()
++{
++    if(gRegionGC->regionGcType == REGION_GC_MAJOR) {
++        /* Major collection: clear both the card table and shadow card table.  */
++        regionGcResetCardTables(gRegionGC);
++    } else if(gRegionGC->regionGcType == REGION_GC_MINOR) {
++        /* Minor collection: merge the card table and shadow card table and store
++         * the results to both. Clear bits in  the card table for the active heap.
++         */
++        regionGcMergeCardTables(gRegionGC);
++        dvmClearCardTablePartial(dvmGetActiveHeapBase(), dvmGetActiveHeapSize());
++    }
++}
++
++bool regionGcIsMinorGc()
++{
++    if(gRegionGC->startRegionGC && gRegionGC->regionGcType == REGION_GC_MINOR) {
++        return true;
++    } else {
++        return false;
++    }
++}
++
++/* Only needs clear phase to rescan the dirty objects for minor collection. */
++bool regionGcNeedClearPhase()
++{
++    return regionGcIsMinorGc();
++}
++
++/* Only starts partial makr to scan the active heap in minor collection. */
++bool regionGcIsPartialMark()
++{
++    return regionGcIsMinorGc();
++}
++#endif
+diff --git a/vm/alloc/RegionGC.h b/vm/alloc/RegionGC.h
+new file mode 100644
+index 0000000..b50054d
+--- /dev/null
++++ b/vm/alloc/RegionGC.h
+@@ -0,0 +1,75 @@
++/*
++ * Copyright (C) 2010-2011 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef _DALVIK_ALLOC_REGIONGC
++#define _DALVIK_ALLOC_REGIONGC
++
++#include "alloc/Heap.h"
++
++/* 1. REGION_GC_NULL: The default value. Region GC is not enabled yet.
++ * 2. REGION_GC_MINOR:Minor collection in Region GC only scan and
++ *    sweep active heap.
++ * 3. REGION_GC_MAJOR: Major collection in Region GC scan both active heap
++ *    and zygote heap. It's triggered for reduce the floating garbage
++ *    introduced by Region GC minor collection.
++ */
++enum REGION_GC_TYPE { REGION_GC_NULL, REGION_GC_MINOR, REGION_GC_MAJOR };
++
++struct RegionGC{
++    GcHeap *gcHeap;
++
++    /* When GC starts region GC in this collection cycle, the value
++     * is set to true.
++     */
++    bool startRegionGC;
++    REGION_GC_TYPE regionGcType;
++    /* Set to true to force major collection.
++     */
++    bool forceMajor;
++    /* The percentage of dirty cards in the zygote heap.
++     */
++    float dirtyRatioZygoteHeap;
++    /* The budget of dirty cards in the zygote heap. If GC exceeds this
++     * budget, a major collection is triggered to collect the floating
++     * garbage.
++     */
++    float dirtyRatioThreshold;
++};
++
++/* Region GC intialization. */
++void regionGcInitialization(RegionGC *regionGC);
++
++/* Decide the GC mode. */
++void regionGcDecideGcMode();
++
++/* Clear both the card table and the shadow card table. */
++void regionGcResetCardTables(RegionGC *regionGC);
++
++/* Prepare Card Tables for regional GC. */
++void regionGcPrepareCardTable();
++
++/* Merge the shadow card table and the card table.*/
++void regionGcBackupCardTable();
++
++/* Decide if the regional GC need a final phase to rescan the dirty objects. */
++bool regionGcNeedClearPhase();
++
++/* Decide if the regional GC only needs partial mark. */
++bool regionGcIsPartialMark();
++
++/* Check properties for the Regional GC. */
++void regionGcCheckProperty();
++#endif //_DALVIK_ALLOC_REGIONGC
+-- 
+1.7.4.1
+

@@ -1,0 +1,1461 @@
+From b439217a84105a5ea61068a727e3cb4d51ba6272 Mon Sep 17 00:00:00 2001
+From: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Date: Tue, 9 Apr 2013 17:45:04 -0700
+Subject: Dalvik: Sink Accumulations from Inner Loops
+
+BZ: 92858
+
+Adds pass to sink accumulations from inner loops. Whenever an accumulation is
+found which matches the increment of the IV, the final IV to increment in
+loop exit. In order to do this safely regardless of iteration, a decrement is
+done using IV in loop preheader.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I12bf08ed14f7b4ed2739283610ddd7a2a2e80b51
+Orig-MCG-Change-Id: Iddbf4edd71465c0f98daa64944b5ff5d97081feb
+Signed-off-by: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Signed-off-by: Udayan Banerji <udayan.banerji@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/Dvm.mk                           |    5 +-
+ vm/compiler/AccumulationSinking.cpp |  806 +++++++++++++++++++++++++++++++++++
+ vm/compiler/AccumulationSinking.h   |   32 ++
+ vm/compiler/CompilerIR.h            |    5 +-
+ vm/compiler/Expression.h            |    6 +-
+ vm/compiler/Frontend.cpp            |   82 ----
+ vm/compiler/IntermediateRep.cpp     |   55 ++-
+ vm/compiler/LoopInformation.cpp     |  107 +++++
+ vm/compiler/LoopInformation.h       |   22 +
+ vm/compiler/LoopOpt.cpp             |   97 +++++
+ vm/compiler/LoopOpt.h               |   16 +
+ vm/compiler/RegisterizationME.cpp   |    9 +
+ 12 files changed, 1140 insertions(+), 102 deletions(-)
+ create mode 100644 vm/compiler/AccumulationSinking.cpp
+ create mode 100644 vm/compiler/AccumulationSinking.h
+
+diff --git a/vm/Dvm.mk b/vm/Dvm.mk
+index bde8d50..a91e785 100644
+--- a/vm/Dvm.mk
++++ b/vm/Dvm.mk
+@@ -364,10 +364,11 @@ ifeq ($(dvm_arch),x86)
+               compiler/LoopInformation.cpp \
+               compiler/SSAWalkData.cpp \
+               compiler/RegisterizationME.cpp \
+-              compiler/Expression.cpp
++              compiler/Expression.cpp \
++              compiler/AccumulationSinking.cpp
+        # need apache harmony x86 encoder/decoder
+        LOCAL_C_INCLUDES += \
+-	      dalvik/vm/compiler/codegen/x86/libenc
++              dalvik/vm/compiler/codegen/x86/libenc
+ 
+        LOCAL_SRC_FILES += \
+               compiler/codegen/x86/libenc/enc_base.cpp \
+diff --git a/vm/compiler/AccumulationSinking.cpp b/vm/compiler/AccumulationSinking.cpp
+new file mode 100644
+index 0000000..fcfad1c
+--- /dev/null
++++ b/vm/compiler/AccumulationSinking.cpp
+@@ -0,0 +1,806 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "AccumulationSinking.h"
++#include "CompilerIR.h"
++#include "Dalvik.h"
++#include "Dataflow.h"
++#include "Expression.h"
++#include "LoopInformation.h"
++#include "LoopOpt.h"
++
++#include <algorithm>
++
++/**
++ * @brief Choose an IV for the pass: it must be able to count the iterations
++ * @param info the LoopInformation
++ * @param increment Holds the chosen IV increment value (updated by the function)
++ * @return the chosen IV for the pass, or -1 if not found
++ */
++static int chooseIV (CompilationUnit *cUnit, LoopInformation *info, int &increment)
++{
++    //Get the IV list
++    GrowableList& ivList = info->getInductionVariableList ();
++
++    //Go through the induction variable list
++    GrowableListIterator iterator;
++    dvmGrowableListIteratorInit(&ivList, &iterator);
++
++    while (true)
++    {
++        InductionVariableInfo *infoIV = (InductionVariableInfo *) (dvmGrowableListIteratorNext(&iterator));
++
++        //Bail at the end
++        if (infoIV == 0)
++        {
++            break;
++        }
++
++        //Is it a simple induction variable?
++        if (infoIV->m == 1 && infoIV->basicSSAReg == infoIV->ssaReg)
++        {
++            //Is the increment 1?
++            //TODO Add support for negative and positive constants.
++            if (infoIV->inc == 1)
++            {
++                //Get the ssa register for this induction
++                int ssaReg = infoIV->ssaReg;
++
++                //Get the increment
++                increment = infoIV->inc;
++
++                //Return the register side
++                return dvmExtractSSARegister (cUnit, ssaReg);
++            }
++        }
++    }
++
++    //Did not find a simple induction variable
++    return -1;
++}
++
++/**
++ * @brief Find the definition of the phi node that is in the loop
++ * @param cUnit the CompilationUnit
++ * @param info the LoopInformation
++ * @param phi the Phi node
++ * @return find the last definition in the loop for that virtual register
++ */
++static MIR *findLastDefinition (CompilationUnit *cUnit, LoopInformation *info, MIR *phi)
++{
++    //Get the SSA structure
++    SSARepresentation *ssa = phi->ssaRep;
++
++    //We should have only two uses for the phi node
++    if (ssa->numUses != 2)
++    {
++        return 0;
++    }
++
++    //In theory, we could assume the second use is the one that we want but let's be paranoid
++    unsigned int firstUse = ssa->uses[0];
++    unsigned int secondUse = ssa->uses[1];
++
++    //Get the subscripts
++    unsigned int subScript1 = dvmExtractSSASubscript (cUnit, firstUse);
++    unsigned int subScript2 = dvmExtractSSASubscript (cUnit, secondUse);
++
++    //Get the defWhere list
++    MIR **defWhere = ssa->defWhere;
++
++    //Paranoid
++    assert (defWhere != 0);
++
++    //Use the highest of the two
++    MIR *mir = (subScript1 < subScript2) ? defWhere[1] : defWhere[0];
++
++    //Return it
++    return mir;
++}
++
++/**
++ * @brief Helper function for filtering, it follows the definitions and accumulates them in the vector and map provided as arguments
++ * @param cUnit the CompilationUnit
++ * @param info the LoopInformation
++ * @param vr the considered virtual register
++ * @param accumulatorCalculation the calculation of the vr accumulator
++ * @param accumulatorMap the map containing every MIR used for the calculation of the vr accumulator
++ */
++static void fillAccumulatorMapHelper (CompilationUnit *cUnit, LoopInformation *info, MIR *current,
++                                      std::vector<MIR *> &accumulatorCalculation, std::map<MIR *, bool> &accumulatorMap)
++{
++    //First job is to check if current is in the accumulator map
++    if (accumulatorMap.find (current) != accumulatorMap.end ())
++    {
++        //Then bail, we've handled it before
++        return;
++    }
++
++    //Otherwise add it there
++    accumulatorMap[current] = true;
++
++    //Next, add it to the calculation as well
++    accumulatorCalculation.push_back (current);
++
++    //Get its SSA representation
++    SSARepresentation *ssa = current->ssaRep;
++
++    //Now go through it's defWhere and recursively call with them
++    int max = ssa->numUses;
++    for (int i = 0; i < max; i++)
++    {
++        MIR *defined = ssa->defWhere[i];
++
++        if (defined != 0)
++        {
++            //Get its BasicBlock
++            BasicBlock *bb = defined->bb;
++
++            //If in the loop, call recursively
++            if (info->isBasicBlockInLoop (bb) == true)
++            {
++                fillAccumulatorMapHelper (cUnit, info, defined, accumulatorCalculation, accumulatorMap);
++            }
++        }
++    }
++}
++
++/**
++ * @brief Filter the VRs to only consider inter-iteration interIteration, non IV registers, and not used for another calculation
++ * @param cUnit the CompilationUnit
++ * @param info the LoopInformation
++ * @param vr the considered virtual register
++ * @param accumulatorCalculation the calculation of the vr accumulator
++ * @param accumulatorMap the map containing every MIR used for the calculation of the vr accumulator
++ * @return whether or not the VR is a potential accumulator
++ */
++static bool fillAccumulatorMap (CompilationUnit *cUnit, LoopInformation *info, unsigned int vr,
++                                std::vector<MIR *> &accumulatorCalculation, std::map<MIR *, bool> &accumulatorMap)
++{
++    //First job is to find the related PHI MIR for the loop
++    MIR *phi = info->getPhiInstruction (cUnit, vr);
++
++    //Paranoid
++    if (phi == 0)
++    {
++        return false;
++    }
++
++    //Find the real last definition we care about
++    MIR *lastDef = findLastDefinition (cUnit, info, phi);
++
++    //Paranoid: if we didn't find it, bail
++    if (lastDef == 0)
++    {
++        return false;
++    }
++
++    //Add the Phi node to the map to not add it to the calculation
++    accumulatorMap[phi] = true;
++
++    //Now recurse to add all calculations related to the accumulator calculation
++    fillAccumulatorMapHelper (cUnit, info, lastDef, accumulatorCalculation, accumulatorMap);
++
++    //Report success
++    return true;
++}
++
++
++/**
++ * @brief Filter the VRs to only consider inter-iteration interIteration, non IV registers, and not used for another calculation
++ * @param cUnit the CompilationUnit
++ * @param info the LoopInformation
++ * @param accumulatorList the calculation of the accumulators to be considered by the pass
++ */
++static void filterVRs (CompilationUnit *cUnit, LoopInformation *info, std::vector<std::vector<MIR*> > &accumulatorList)
++{
++    //Get the loop interIteration
++    BitVector *interIterationVariables = info->getInterIterationVariables ();
++
++    //If we don't have any, we are done
++    if (interIterationVariables == 0)
++    {
++        return;
++    }
++
++    //Have a map for the filtered
++    std::vector<unsigned int> vrElements;
++
++    //First step: find the VRs that are not IV but are inter-iteration interIteration
++
++    //Go through each variable
++    BitVectorIterator bvIterator;
++
++    dvmBitVectorIteratorInit (interIterationVariables, &bvIterator);
++    while (true) {
++        int vr = dvmBitVectorIteratorNext(&bvIterator);
++
++        //If done, bail
++        if (vr == -1)
++        {
++            break;
++        }
++
++        //Is that register an induction variable?
++        if (info->isAnInductionVariable (cUnit, vr) == false)
++        {
++            //Add it now
++            vrElements.push_back (vr);
++        }
++    }
++
++    //Step two: check if these are accumulators, there is no use for any other variable
++    //   - We are going to fill a vector of MIR vectors
++    //      - In the end it will contain, for each accumulator, the MIRs that create it
++    //      - We also fill a map to say which MIR goes to which accumulator for filtering
++    //      - Finally, we check if any other MIR in the loop uses the accumulator or any subscript of it
++    for (std::vector<unsigned int>::const_iterator it = vrElements.begin (); it != vrElements.end (); it++)
++    {
++        //Get the VR
++        unsigned int vr = *it;
++
++        //Get a local vector of MIR instructions for the accumulator
++        std::vector<MIR *> accumulatorCalculation;
++        //Get a local map for the MIRs being used
++        std::map<MIR *, bool> accumulatorMap;
++
++        //Fill the map if it is an accumulation
++        bool res = fillAccumulatorMap (cUnit, info, vr, accumulatorCalculation, accumulatorMap);
++
++        //If we succeeded, reverse the list first before adding it
++        if (res == true)
++        {
++            std::reverse (accumulatorCalculation.begin (), accumulatorCalculation.end ());
++
++            accumulatorList.push_back (accumulatorCalculation);
++        }
++    }
++}
++
++/**
++ * @brief Check if the calculation of the accumulator is only for the accumulator
++ * @param cUnit the CompilationUnit
++ * @param info the LoopInformation
++ * @param accumulatorList the list of instructions
++ * @param accumulatorMap the map of instructions
++ * @return whether this is an accepted accumulator calculation
++ */
++static bool checkUsage (const MIR *mir)
++{
++    //If no mir, everything is fine
++    if (mir == 0)
++    {
++        return true;
++    }
++
++    //Get the SSA representation
++    SSARepresentation *ssa = mir->ssaRep;
++
++    //Paranoid
++    assert (ssa != 0 && ssa->usedNext != 0);
++
++    //Go through the usedNext of the defines
++    int max = ssa->numDefs;
++    SUsedChain **chains = ssa->usedNext;
++
++    for (int i = 0; i < max; i++)
++    {
++        SUsedChain *chain = chains[i];
++
++        //Basically, we fail if the chain has a next
++        if (chain != 0 && chain->nextUse != 0)
++        {
++            return false;
++        }
++    }
++
++    //Report success
++    return true;
++}
++
++/**
++ * @brief Builds expressions for lists of MIRs.
++ * @param cUnit
++ * @param info
++ * @param vrList
++ * @param ivExpressions Expressions are written to this list. There is a 1:1
++ * mapping between entries and vrList and expressions in this list.
++ */
++static void buildExpressions(CompilationUnit *cUnit, LoopInformation *info,
++                                const std::vector<std::vector<MIR *> > &vrList,
++                                std::vector<Expression *> &ivExpressions)
++{
++    //Try to construct an expression tree for a list of candidate MIRs. Thus,
++    //we iterate through the list which contains lists of MIRs
++    std::vector<std::vector<MIR *> >::const_iterator listIter;
++
++    //Go through the VR list
++    for (listIter = vrList.begin(); listIter != vrList.end(); listIter++)
++    {
++        //Get reference to the list of MIRs
++        const std::vector<MIR *> & listOfMIRs = *listIter;
++
++        //Build expression trees for the list of MIRs
++        std::map<MIR *, Expression *> mirToExpression = Expression::mirsToExpressions(listOfMIRs);
++
++        //We only care about expression tree of last MIR in our list
++        MIR * lastMIR = listOfMIRs.back();
++
++        //Do we have an expression tree for our last MIR?
++        std::map<MIR *, Expression *>::const_iterator mirIter;
++        mirIter = mirToExpression.find(lastMIR);
++
++        //If we did not find it, then let's just insert an empty expression
++        if (mirIter == mirToExpression.end())
++        {
++            ivExpressions.push_back(0);
++        }
++        //Else we save the expression we found
++        else
++        {
++            Expression * found = mirIter->second;
++            ivExpressions.push_back(found);
++        }
++    }
++}
++
++static bool findDanglingConstantsHelper(Expression * expression,
++        BytecodeExpression * & expressionRef,
++        const int & inductionVariableIncrement)
++{
++    if (expression == 0)
++    {
++        return false;
++    }
++
++    //If we do not have a bytecode expression, we cannot find a linear
++    //transformation expression.
++    if (expression->isBytecodeExpression() == false)
++    {
++        return false;
++    }
++
++    //If we get to this point, we know that we have a bytecode expression.
++    BytecodeExpression * bytecodeExpr =
++            static_cast<BytecodeExpression *>(expression);
++
++    const MIR * expressionMir = bytecodeExpr->getMir();
++
++    //If check usage returns false, let's be conservative and not accept it.
++    if (checkUsage(expressionMir) == false)
++    {
++        return false;
++    }
++
++    //If we don't have a linear transformation, we eagerly return false
++    //TODO Sub can also be supported, but we need to count the number of
++    //levels and also figure out if it is the rhs or lhs operand.
++    if (bytecodeExpr->getExpressionKind() != ExpKind_Add)
++    {
++        return false;
++    }
++
++    //Linear transformation expressions are always binary
++    BinaryExpression * binaryExpr =
++            static_cast<BinaryExpression *>(bytecodeExpr);
++
++    //It is easiest if we look for constants on the right of the tree.
++    //If we want to also consider lhs, then we need to keep track which
++    //of the subtrees gave us the constant we wanted.
++    Expression * rhsChild = binaryExpr->getRhs();
++
++    //Paranoid, but should never happen because expressions guarantee
++    //non-null children.
++    if (rhsChild == 0)
++    {
++        return false;
++    }
++
++    bool foundConstant = false;
++
++    //Now we can check if we found linear transformation using a constant.
++    //TODO A better approach here would be to check if expression evaluates to
++    //a constant value. Also since our IV is an int, we want to make sure
++    //that what we find is also an integer linear transformation.
++    if (rhsChild->isConstant() == true
++            && bytecodeExpr->getExpressionType() == ExpType_Int)
++    {
++        //Cast is safe because we know it is a constant
++        ConstantExpression * constant = static_cast<ConstantExpression *>(rhsChild);
++
++        //Interpret its value as an integer since we are using it in
++        //an expression whose result will be an integer.
++        int value = constant->getValue<int>();
++
++        //Now compare its value with what we are looking for
++        foundConstant = (value == inductionVariableIncrement);
++
++        expressionRef = bytecodeExpr;
++    }
++    else
++    {
++        foundConstant = findDanglingConstantsHelper(rhsChild, expressionRef,
++                inductionVariableIncrement);
++    }
++
++    return foundConstant;
++}
++
++/**
++ * @brief Find dangling constants we can sink
++ * @param info the LoopInformation
++ * @param vrExpressions the expressions for the virtual registers in the vrList (updated by the function)
++ * @param chosenIV the IV used to count the loop iterations
++ * @param increment the increment value on the chosen IV
++ * @param toRemove the vector of MIR instructions to remove (updated by the function)
++ * @param toSink the vector of MIR instructions to sink (updated by the function)
++ * @param toHoist the vector of MRI instructions to hoist (updated by the function)
++ */
++static void findDanglingConstants(LoopInformation *info,
++        std::vector<Expression *> &vrExpressions, unsigned int chosenIV,
++        const int & increment, std::vector<MIR *> &toRemove,
++        std::vector<MIR *> &toSink, std::vector<MIR *> &toHoist)
++{
++    std::vector<Expression *>::const_iterator exprIter;
++
++    bool foundDanglingConstant = false;
++
++    //Iterate through the expression candidates
++    for (exprIter = vrExpressions.begin(); exprIter != vrExpressions.end();
++            exprIter++)
++    {
++        Expression * expression = *exprIter;
++
++        //The expression for this MIR could be null. Continue
++        if (expression == 0)
++        {
++            continue;
++        }
++
++        //All of the expressions we are looking through must be representative
++        //of dalvik bytecodes. Thus if the current one we are looking at is not,
++        //then we can just skip it.
++        if (expression->isBytecodeExpression() == false)
++        {
++            continue;
++        }
++
++        BytecodeExpression * bytecodeExpr =
++                static_cast<BytecodeExpression *>(expression);
++
++        MIR * bytecodeExprMir = bytecodeExpr->getMir();
++
++        //If it is a bytecode expression, it must have a MIR associated
++        assert (bytecodeExprMir != 0);
++
++        BytecodeExpression * expressionToRemove = 0;
++
++        foundDanglingConstant = findDanglingConstantsHelper(expression,
++                expressionToRemove, increment);
++
++        if (foundDanglingConstant == true && expressionToRemove != 0)
++        {
++            //Get the MIR to remove
++            MIR * mirToRemove = expressionToRemove->getMir();
++
++            //All bytecode expressions must have a MIR
++            assert (mirToRemove != 0);
++
++            //Depending on the IV increment, we must decide which kind of
++            //expression we need to generate for the sink and which kind
++            //for the hoist.
++            ExpressionKind sinkExpKind =
++                    increment >= 0 ? ExpKind_Add : ExpKind_Sub;
++            ExpressionKind hoistExpKind =
++                    sinkExpKind == ExpKind_Sub ? ExpKind_Add : ExpKind_Sub;
++
++            //For the new expression we create, we want it to be the same type
++            //as the one as we are removing.
++            ExpressionType newMirExpType = expressionToRemove->getExpressionType();
++
++            //We are sinking and hoisting operations on the VR that receives result
++            //that is at top of expression tree.
++            int resultVR = bytecodeExprMir->dalvikInsn.vA;
++
++            //Create MIR to use for sinking
++            MIR * mirToSink = BytecodeExpression::createMir(sinkExpKind,
++                    newMirExpType, resultVR, resultVR, chosenIV);
++
++            //Create MIR to use for hoisting
++            MIR * mirToHoist = BytecodeExpression::createMir(hoistExpKind,
++                    newMirExpType, resultVR, resultVR, chosenIV);
++
++            //Now save all MIRs in the output lists
++            toSink.push_back(mirToSink);
++            toHoist.push_back(mirToHoist);
++            toRemove.push_back(mirToRemove);
++        }
++    }
++}
++
++/**
++ * @brief Removes the MIRs in list from their corresponding Basic Block.
++ * @details Note it does not ensure to fix uses of the VRs defined.
++ * If we tag v6 = v5 + 1 for removal, it does not ensure that users v6 use
++ * v5 instead.
++ * @param toRemove list of MIRs to remove
++ */
++static void removeAccumulations(const std::vector<MIR *> & toRemove)
++{
++    std::vector<MIR *>::const_iterator mirIter;
++
++    for (mirIter = toRemove.begin (); mirIter != toRemove.end (); mirIter++)
++    {
++        MIR * mir = (*mirIter);
++
++        //Check if the destVR is different from source
++        //This assumes that LHS of expression is a VR
++        unsigned int vA = mir->dalvikInsn.vA;
++        unsigned int vB = mir->dalvikInsn.vB;
++
++        //If different, we need to do some work
++        if (vA != vB)
++        {
++            dvmCompilerRewriteMirDef (mir, vA, vB);
++        }
++
++        dvmCompilerRemoveMIR (mir->bb, mir);
++    }
++}
++
++/**
++ * @brief Add instructions to the BasicBlock
++ * @param bb the BasicBlock
++ * @param toAdd a vector of Instructions to add to bb
++ */
++static void addInstructionsToBasicBlock (BasicBlock *bb, const std::vector<MIR *> &toAdd)
++{
++    //If it is nil, we don't do anything
++    if (bb == 0)
++    {
++        return;
++    }
++
++    //Add a copy of each MIR
++    for (std::vector<MIR *>::const_iterator it = toAdd.begin (); it != toAdd.end (); it++)
++    {
++        MIR *newMIR = dvmCompilerCopyMIR (*it);
++
++        dvmCompilerAppendMIR (bb, newMIR);
++    }
++}
++
++/**
++ * @brief Add instructions to the BasicBlock in a BitVector
++ * @param basicBlocks a BitVector containing the BasicBlocks
++ * @param toAdd a vector of Instructions to add to bb
++ */
++static void addInstructionsToBasicBlocks (CompilationUnit *cUnit, BitVector *basicBlocks, const std::vector<MIR *> &toAdd)
++{
++    //Iterate on the exit blocks
++    BitVectorIterator bvIterator;
++    dvmBitVectorIteratorInit (basicBlocks, &bvIterator);
++
++    while (true)
++    {
++        //Get the block index
++        int blockIdx = dvmBitVectorIteratorNext (&bvIterator);
++
++        //If we are done
++        if (blockIdx == -1)
++        {
++            break;
++        }
++
++        BasicBlock *bb = (BasicBlock *) dvmGrowableListGetElement(&cUnit->blockList, blockIdx);
++
++        //Now add to the basic block
++        addInstructionsToBasicBlock (bb, toAdd);
++    }
++}
++
++/**
++ * @brief Sink the accumulations
++ * @param cUnit the CompilationUnit
++ * @param info the LoopInformation
++ * @param toSink the vector of new expressions to sink
++ */
++static void sinkAccumulations (CompilationUnit *cUnit, LoopInformation *info, const std::vector<MIR *> &toSink)
++{
++    //We need to sink to the exit loops and the backward chaining cell
++
++    //First, handle the exit loops
++    BitVector *bv = const_cast<BitVector *> (info->getExitLoops ());
++
++    //Add the instructions to the basic blocks defined by the vector
++    addInstructionsToBasicBlocks (cUnit, bv, toSink);
++
++    //Now get the backward chaining cells
++    bv = const_cast<BitVector *> (info->getBackwardBranches ());
++
++    //Add the instructions to the basic blocks defined by the vector
++    addInstructionsToBasicBlocks (cUnit, bv, toSink);
++}
++
++/**
++ * @brief Handle a loop for the sinking of an accumulation
++ * @param cUnit the CompilationUnit
++ * @param info the LoopInformation
++ */
++static void handleLoop (CompilationUnit *cUnit, LoopInformation *info)
++{
++    //Step 1: Choose an IV: we want an IV that can count the iterations
++    int increment;
++    int chosenIV = chooseIV (cUnit, info, increment);
++
++    //If we didn't find one, bail
++    if (chosenIV < 0)
++    {
++        return;
++    }
++
++    //Step 2: Filter out the virtual registers: we only want PHI nodes that aren't IVs and are not used except for their own calculation
++    std::vector<std::vector<MIR *> > accumulatorList;
++    filterVRs (cUnit, info, accumulatorList);
++
++    //Step 3: Build the expression tree for the chosen VRs
++    std::vector<Expression *> ivExpressions;
++    buildExpressions (cUnit, info, accumulatorList, ivExpressions);
++
++    //Step 4: Find the dangling constants (any constant accumulation we can sink)
++    std::vector<MIR *> toRemove;
++    std::vector<MIR *> toSink;
++    std::vector<MIR *> toHoist;
++    findDanglingConstants (info, ivExpressions, chosenIV, increment, toRemove,
++            toSink, toHoist);
++
++    //Step 5: Sink the accumulation
++    sinkAccumulations (cUnit, info, toSink);
++
++    //Step 6: Hoist the initial value decrementation
++    addInstructionsToBasicBlock (info->getPreHeader (), toHoist);
++
++    //Step 7: Remove MIRs no longer needed
++    removeAccumulations (toRemove);
++}
++
++/**
++ * @brief Wrapper around registerizing the loop, it handles loop nests as well
++ * @param cUnit the CompilationUnit
++ * @param info the LoopInformation
++ */
++static void sinkAccumulation (CompilationUnit *cUnit, LoopInformation *info)
++{
++    //If info is 0, there is nothing to do
++    if (info == 0)
++    {
++        return;
++    }
++
++    //Search in the children if anybody includes them
++    unsigned int nbr = info->getNestedNbr ();
++
++    //Is it the inner loop ?
++    if (nbr == 0)
++    {
++        //Actually perform the pass on the loop
++        handleLoop (cUnit, info);
++    }
++    else
++    {
++        //Go through each child and recursively call
++        for (unsigned int i = 0; i < nbr; i++)
++        {
++            LoopInformation *inner = info->getNested (i);
++
++            //Paranoid
++            assert (inner != 0);
++
++            sinkAccumulation (cUnit, inner);
++        }
++    }
++}
++
++static bool compilerSinkAccumulationsGateHelper(const CompilationUnit *cUnit, LoopInformation *info)
++{
++    //Info should be non null here
++    if (info == 0)
++    {
++        return false;
++    }
++
++    //We are only interested in the innermost loops
++    unsigned int nbr = info->getNestedNbr ();
++
++    if (nbr == 0)
++    {
++        //We don't want loops with multiple exit blocks
++        if (dvmCountSetBits (info->getExitLoops ()) > 1)
++        {
++            return false;
++        }
++
++        //We also don't want multiple backward blocks
++        if (dvmCountSetBits (info->getBackwardBranches ()) > 1)
++        {
++            return false;
++        }
++
++        //Reject if we can throw an exception in our code
++        if (info->canThrow(cUnit) == true)
++        {
++            return false;
++        }
++
++        //We also don't want invokes in the loop
++        if (info->hasInvoke(cUnit) == true)
++        {
++            return false;
++        }
++    }
++    else
++    {
++        //Go through each child and recursively call
++        for (unsigned int i = 0; i < nbr; i++)
++        {
++            LoopInformation *inner = info->getNested (i);
++
++            //Paranoid
++            assert (inner != 0);
++
++            bool success = compilerSinkAccumulationsGateHelper (cUnit, inner);
++            if (success == false)
++            {
++                return false;
++            }
++        }
++    }
++
++    //All good!
++    return true;
++}
++
++bool dvmCompilerSinkAccumulationsGate(const CompilationUnit *cUnit, const Pass *curPass)
++{
++    //First, make sure we are in the new loop detection system
++    if ( dvmCompilerTraceIsLoopNewSystem(cUnit, curPass) == false )
++    {
++        return false;
++    }
++
++    LoopInformation *info = cUnit->loopInformation;
++
++    if (info == 0)
++    {
++        return false;
++    }
++
++    //Find the innermost loop and test it
++    return compilerSinkAccumulationsGateHelper(cUnit, info);
++}
++
++void dvmCompilerAccumulationSinking (CompilationUnit *cUnit, Pass *currentPass)
++{
++    //Now let's go through the loop information
++    LoopInformation *info = cUnit->loopInformation;
++
++    //Now try to sink accumulations
++    sinkAccumulation (cUnit, info);
++
++    //Unused argument
++    (void) currentPass;
++}
++
+diff --git a/vm/compiler/AccumulationSinking.h b/vm/compiler/AccumulationSinking.h
+new file mode 100644
+index 0000000..77bd5ca
+--- /dev/null
++++ b/vm/compiler/AccumulationSinking.h
+@@ -0,0 +1,32 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef DALVIK_VM_ACCUMULATIONSINKING_H_
++#define DALVIK_VM_ACCUMULATIONSINKING_H_
++
++//Forward declarations
++struct BasicBlock;
++struct CompilationUnit;
++class Pass;
++
++/**
++ * @brief Perform accumulation sinking optimization
++ * @param cUnit the CompilationUnit
++ * @param pass the current Pass
++ */
++void dvmCompilerAccumulationSinking (CompilationUnit *cUnit, Pass *pass);
++
++#endif
+diff --git a/vm/compiler/CompilerIR.h b/vm/compiler/CompilerIR.h
+index 09d0fe4..00022b2 100644
+--- a/vm/compiler/CompilerIR.h
++++ b/vm/compiler/CompilerIR.h
+@@ -454,12 +454,15 @@ bool dvmCompilerRemoveMIR (BasicBlock *bb, MIR *mir);
+ /* Insert a BasicBlock between a parent and child */
+ bool dvmCompilerInsertBasicBlockBetween (BasicBlock *newBlock, BasicBlock *parent, BasicBlock *child);
+ 
+-/* Insert a BasicBlock between a parent and child */
++/* Copy a BasicBlock */
+ BasicBlock *dvmCompilerCopyBasicBlock (CompilationUnit *cUnit, const BasicBlock *old, bool addIt = true);
+ 
+ /* Update the predecessor information of old and new BB */
+ void dvmCompilerUpdatePredecessors(BasicBlock *parent, BasicBlock *oldChild, BasicBlock *newChild);
+ 
++/* Copy a MIR */
++MIR *dvmCompilerCopyMIR (MIR *orig);
++
+ /* Debug Utilities */
+ void dvmCompilerDumpCompilationUnit(CompilationUnit *cUnit);
+ 
+diff --git a/vm/compiler/Expression.h b/vm/compiler/Expression.h
+index b3520f8..b230b51 100644
+--- a/vm/compiler/Expression.h
++++ b/vm/compiler/Expression.h
+@@ -767,9 +767,13 @@ public:
+     template<typename desired_type>
+     desired_type getValue (void)
+     {
++        //We need to break strict aliasing rules so we quiet down compiler
++        //by using char* first.
++        char *ptr = reinterpret_cast<char *> (&value);
++
+         //Since the backing store is 64-bit integer, we need to
+         //reinterpret to desired type.
+-        return *reinterpret_cast<desired_type *> (&value);
++        return *reinterpret_cast<desired_type *> (ptr);
+     }
+ 
+     /**
+diff --git a/vm/compiler/Frontend.cpp b/vm/compiler/Frontend.cpp
+index fc9bb4b..bf2bdce 100644
+--- a/vm/compiler/Frontend.cpp
++++ b/vm/compiler/Frontend.cpp
+@@ -1828,89 +1828,7 @@ static bool compileLoop(CompilationUnit *cUnit, unsigned int startOffset,
+     }
+ 
+ #if defined(ARCH_IA32)
+-    //Now consider nested loops or not
+-    //First check if we have the information for it
+-    {
+-        LoopInformation *loopInfo = cUnit->loopInformation;
+-
+-        if (loopInfo != 0)
+-        {
+-            //If it is nested and option says no, bail
+-            if (gDvmJit.nestedLoops == false)
+-            {
+-                if (loopInfo->getNestedNbr () != 0)
+-                {
+-                    goto bail;
+-                }
+-
+-                //Ok second possibility to reject is if we only want simple loops
+-                if (gDvmJit.branchLoops == false)
+-                {
+-                    //Now check if we have only one backward branch: to only enable "simple" loops
+-                    const BitVector *backwards = loopInfo->getBackwardBranches ();
+-
+-                    if (backwards == 0)
+-                    {
+-                        goto bail;
+-                    }
+-
+-                    if (dvmCountSetBits (backwards) != 1)
+-                    {
+-                        goto bail;
+-                    }
+ 
+-                    //Finally, get the basic block for the backward branch
+-                    int backwardIdx = dvmHighestBitSet (backwards);
+-
+-                    if (backwardIdx < 0)
+-                    {
+-                        goto bail;
+-                    }
+-
+-                    BasicBlock *backward = (BasicBlock *) dvmGrowableListGetElement (&cUnit->blockList, backwardIdx);
+-
+-                    //If nil or no domination loopInformation, bail
+-                    if (backward == 0 || backward->dominators == 0)
+-                    {
+-                        goto bail;
+-                    }
+-
+-                    //Now go through each BB and see if it dominates backward
+-                    BitVector *blocks = const_cast<BitVector*> (loopInfo->getBasicBlocks ());
+-
+-                    BitVectorIterator bvIterator;
+-
+-                    dvmBitVectorIteratorInit(blocks, &bvIterator);
+-                    while (true) {
+-                        int blockIdx = dvmBitVectorIteratorNext(&bvIterator);
+-                        //If done, bail
+-                        if (blockIdx == -1)
+-                        {
+-                            break;
+-                        }
+-
+-                        BasicBlock *bb = (BasicBlock *) dvmGrowableListGetElement(&cUnit->blockList, blockIdx);
+-
+-                        if (bb == 0)
+-                        {
+-                            break;
+-                        }
+-
+-                        if (bb == backward)
+-                        {
+-                            continue;
+-                        }
+-
+-                        //We bail if it doesn't dominate
+-                        if (dvmIsBitSet (backward->dominators, bb->id) == 0)
+-                        {
+-                            goto bail;
+-                        }
+-                    }
+-                }
+-            }
+-        }
+-    }
+ 
+     //Before lowering, print out the compilation unit
+     if (cUnit->printMe == true)
+diff --git a/vm/compiler/IntermediateRep.cpp b/vm/compiler/IntermediateRep.cpp
+index 082952a..38c4d5c 100644
+--- a/vm/compiler/IntermediateRep.cpp
++++ b/vm/compiler/IntermediateRep.cpp
+@@ -264,45 +264,68 @@ bool dvmCompilerInsertBasicBlockBetween (BasicBlock *newBlock, BasicBlock *paren
+     return true;
+ }
+ 
++/**
++ * @brief Copy a BasicBlock
++ * @param cUnit the CompilationUnit
++ */
+ BasicBlock *dvmCompilerCopyBasicBlock (CompilationUnit *cUnit, const BasicBlock *old, bool addIt)
+ {
+-    BasicBlock *res = dvmCompilerNewBB (old->blockType, cUnit->numBlocks++);
++    BasicBlock *resultBB = dvmCompilerNewBB (old->blockType, cUnit->numBlocks++);
+ 
+     //We don't do a superficial copy here because it would lead to a lot of things
+     //To clean up. Let us do it by hand instead
+ 
+     //Copy in taken and fallthrough
+-    res->fallThrough = old->fallThrough;
+-    res->taken = old->taken;
++    resultBB->fallThrough = old->fallThrough;
++    resultBB->taken = old->taken;
+ 
+     //Copy offset, method
+-    res->startOffset = old->startOffset;
+-    res->containingMethod = old->containingMethod;
++    resultBB->startOffset = old->startOffset;
++    resultBB->containingMethod = old->containingMethod;
+ 
+     //Now copy instructions
+     for (MIR *mir = old->firstMIRInsn; mir != 0; mir = mir->next)
+     {
+-        MIR *copy = static_cast<MIR *> (dvmCompilerNew (sizeof (*copy), true));
+-
+-        //Superficial copy because it's easier in this case
+-        *copy = *mir;
++        //Get a copy first
++        MIR *copy = dvmCompilerCopyMIR (mir);
+ 
+-        //Now remove prev, next, and ssaRep
+-        copy->next = 0;
+-        copy->prev = 0;
+-        copy->ssaRep = 0;
++        //Update the parent of the MIR
++        copy->bb = resultBB;
+ 
+         //Append it
+-        dvmCompilerAppendMIR (res, copy);
++        dvmCompilerAppendMIR (resultBB, copy);
+     }
+ 
+     //Do we insert it to the cUnit list?
+     if (addIt == true)
+     {
+-        dvmInsertGrowableList (&cUnit->blockList, (intptr_t) res);
++        dvmInsertGrowableList (&cUnit->blockList, (intptr_t) resultBB);
+     }
+ 
+-    return res;
++    return resultBB;
++}
++
++/**
++ * @brief Copy a MIR instruction
++ * @param orig the original MIR we wish to copy
++ * @return the copy of the MIR, without a next, prev, ssa representation or a BasicBlock
++ */
++MIR *dvmCompilerCopyMIR (MIR *orig)
++{
++    MIR *copy = static_cast<MIR *> (dvmCompilerNew (sizeof (*copy), true));
++
++    //Superficial copy because it's easier in this case
++    *copy = *orig;
++
++    //Now remove prev, next, and ssaRep
++    copy->next = 0;
++    copy->prev = 0;
++    copy->ssaRep = 0;
++
++    //No bb for this copy
++    copy->bb = 0;
++
++    return copy;
+ }
+ 
+ /**
+diff --git a/vm/compiler/LoopInformation.cpp b/vm/compiler/LoopInformation.cpp
+index b701e64..fc6e40b 100644
+--- a/vm/compiler/LoopInformation.cpp
++++ b/vm/compiler/LoopInformation.cpp
+@@ -768,3 +768,110 @@ bool LoopInformation::isInvariant (unsigned int ssa)
+ 
+     return dvmIsBitSet (variants, ssa) == false;
+ }
++
++bool LoopInformation::isBasicBlockInLoop (const BasicBlock *bb) const
++{
++    //If we don't have any basic blocks or if bb is nil, return false
++    if (basicBlocks == 0 || bb == 0)
++    {
++        return false;
++    }
++
++    //Otherwise check the bit
++    return dvmIsBitSet (basicBlocks, bb->id);
++}
++
++bool LoopInformation::canThrow (const CompilationUnit *cUnit) const
++{
++    //Get the BasicBlock vector for this loop
++    BitVector *blocks = const_cast<BitVector *> (getBasicBlocks ());
++
++    //Iterate through them
++    BitVectorIterator bvIterator;
++
++    dvmBitVectorIteratorInit (blocks, &bvIterator);
++    while (true)
++    {
++        //Get block index
++        int blockIdx = dvmBitVectorIteratorNext (&bvIterator);
++
++        //If done, bail
++        if (blockIdx == -1)
++        {
++            break;
++        }
++
++        BasicBlock *bb = (BasicBlock*) (dvmGrowableListGetElement(&cUnit->blockList, blockIdx));
++
++        //Paranoid
++        if (bb == 0)
++        {
++            break;
++        }
++
++        //Go through its instructions
++        for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++        {
++            //Get dalvik instruction
++            DecodedInstruction &insn = mir->dalvikInsn;
++
++            int flags = dexGetFlagsFromOpcode (insn.opcode);
++
++            if ( (flags & kInstrCanThrow) != 0)
++            {
++                return true;
++            }
++        }
++    }
++
++    //It is fine, no instructions can throw
++    return false;
++}
++
++
++bool LoopInformation::hasInvoke (const CompilationUnit *cUnit) const
++{
++    //Get the BasicBlock vector for this loop
++    BitVector *blocks = const_cast<BitVector *> (getBasicBlocks ());
++
++    //Iterate through them
++    BitVectorIterator bvIterator;
++
++    dvmBitVectorIteratorInit (blocks, &bvIterator);
++    while (true)
++    {
++        //Get block index
++        int blockIdx = dvmBitVectorIteratorNext (&bvIterator);
++
++        //If done, bail
++        if (blockIdx == -1)
++        {
++            break;
++        }
++
++        BasicBlock *bb = (BasicBlock*) (dvmGrowableListGetElement(&cUnit->blockList, blockIdx));
++
++        //Paranoid
++        if (bb == 0)
++        {
++            break;
++        }
++
++        //Go through its instructions
++        for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++        {
++            //Get dalvik instruction
++            DecodedInstruction &insn = mir->dalvikInsn;
++
++            int flags = dexGetFlagsFromOpcode (insn.opcode);
++
++            if ( (flags & kInstrInvoke) != 0)
++            {
++                return true;
++            }
++        }
++    }
++
++    //It is fine, no invoke instructions seen
++    return false;
++}
+diff --git a/vm/compiler/LoopInformation.h b/vm/compiler/LoopInformation.h
+index 211d8be..96876d4 100644
+--- a/vm/compiler/LoopInformation.h
++++ b/vm/compiler/LoopInformation.h
+@@ -294,6 +294,28 @@ class LoopInformation
+           * @return whether or not it is an invariant for the loop
+           */
+          bool isInvariant (unsigned int ssa);
++
++         /**
++          * @brief Is the BasicBlock in the loop?
++          * @param bb the BasicBlock
++          * @return whether the BasicBlock is in the loop, if bb is 0, returns false
++          */
++         bool isBasicBlockInLoop (const BasicBlock *bb) const;
++
++         /**
++          * @brief Can the loop throw an exception?
++          * @param cUnit the CompilationUnit
++          * @return whether the loop can throw an exception or not
++          */
++         bool canThrow (const CompilationUnit *cUnit) const;
++
++         /**
++          * @brief Does the loop have an invoke in it?
++          * @param cUnit the CompilationUnit
++          * @return whether the loop has an invoke bytecode
++          */
++         bool hasInvoke (const CompilationUnit *cUnit) const;
++
+ };
+ 
+ /**
+diff --git a/vm/compiler/LoopOpt.cpp b/vm/compiler/LoopOpt.cpp
+index a5b20ec..1d88885 100644
+--- a/vm/compiler/LoopOpt.cpp
++++ b/vm/compiler/LoopOpt.cpp
+@@ -14,6 +14,7 @@
+ * limitations under the License.
+ */
+ 
++#include "AccumulationSinking.h"
+ #include "BBOptimization.h"
+ #include "Checks.h"
+ #include "Dalvik.h"
+@@ -49,6 +50,9 @@ START_PASSES
+     //This loop formation is used when the new loop filtering is active
+     NEW_PASS ("Form Loop", kAllNodes, 0, dvmCompilerTraceIsLoopNewSystem,
+                 0, dvmCompilerTestLoop, dvmCompilerFormLoop, 0, kOptimizationBasicBlockChange),
++    //Check if the formed loops are like we want right now (nested or not, branches or not)
++    NEW_PASS ("Reject Loops", kAllNodes, 0, dvmCompilerCheckLoops,
++                            0, 0, 0, 0, 0),
+     //This loop formation is used when the old loop filtering is active
+     NEW_PASS ("Old Loop Formation", kAllNodes, 0, dvmCompilerTraceIsLoopOldSystem,
+                 dvmCompilerFormOldLoop, 0, 0, 0, kOptimizationBasicBlockChange),
+@@ -66,6 +70,8 @@ START_PASSES
+               0, 0, dvmCompilerMemoryAliasing, 0, 0),
+     NEW_PASS ("Variant", kAllNodes, 0, dvmCompilerVerySimpleLoopGate,
+               0, 0, dvmCompilerVariant, 0, 0),
++    NEW_PASS ("Accumulation Sinking", kAllNodes, 0, dvmCompilerSinkAccumulationsGate,
++            0, dvmCompilerAccumulationSinking, 0, 0, kOptimizationBasicBlockChange),
+     //This should be after the last optimization that changes instruction sequence or BB logic
+     //Note: reorder is safe and should be after
+     //We do registerization for all traces to provide spill information to the BE
+@@ -340,3 +346,94 @@ void dvmCompilerPrintIgnorePasses (void)
+         }
+     }
+ }
++
++bool dvmCompilerCheckLoops (const CompilationUnit *cUnit, const Pass *curPass)
++{
++    LoopInformation *loopInfo = cUnit->loopInformation;
++
++    if (loopInfo != 0)
++    {
++        //If it is nested and option says no, bail
++        if (gDvmJit.nestedLoops == false)
++        {
++            if (loopInfo->getNestedNbr () != 0)
++            {
++                const_cast<CompilationUnit *>(cUnit)->quitLoopMode = true;
++                return false;
++            }
++
++            //Ok second possibility to reject is if we only want simple loops
++            if (gDvmJit.branchLoops == false)
++            {
++                //Now check if we have only one backward branch: to only enable "simple" loops
++                const BitVector *backwards = loopInfo->getBackwardBranches ();
++
++                if (backwards == 0)
++                {
++                    const_cast<CompilationUnit *>(cUnit)->quitLoopMode = true;
++                    return false;
++                }
++
++                if (dvmCountSetBits (backwards) != 1)
++                {
++                    const_cast<CompilationUnit *>(cUnit)->quitLoopMode = true;
++                    return false;
++                }
++
++                //Finally, get the basic block for the backward branch
++                int backwardIdx = dvmHighestBitSet (backwards);
++
++                if (backwardIdx < 0)
++                {
++                    const_cast<CompilationUnit *>(cUnit)->quitLoopMode = true;
++                    return false;
++                }
++
++                BasicBlock *backward = (BasicBlock *) dvmGrowableListGetElement (&cUnit->blockList, backwardIdx);
++
++                //If nil or no domination loopInformation, bail
++                if (backward == 0 || backward->dominators == 0)
++                {
++                    const_cast<CompilationUnit *>(cUnit)->quitLoopMode = true;
++                    return false;
++                }
++
++                //Now go through each BB and see if it dominates backward
++                BitVector *blocks = const_cast<BitVector*> (loopInfo->getBasicBlocks ());
++
++                BitVectorIterator bvIterator;
++
++                dvmBitVectorIteratorInit(blocks, &bvIterator);
++                while (true) {
++                    int blockIdx = dvmBitVectorIteratorNext(&bvIterator);
++                    //If done, bail
++                    if (blockIdx == -1)
++                    {
++                        break;
++                    }
++
++                    BasicBlock *bb = (BasicBlock *) dvmGrowableListGetElement(&cUnit->blockList, blockIdx);
++
++                    if (bb == 0)
++                    {
++                        break;
++                    }
++
++                    if (bb == backward)
++                    {
++                        continue;
++                    }
++
++                    //We bail if it doesn't dominate
++                    if (dvmIsBitSet (backward->dominators, bb->id) == 0)
++                    {
++                        const_cast<CompilationUnit *>(cUnit)->quitLoopMode = true;
++                        return false;
++                    }
++                }
++            }
++        }
++    }
++
++    return true;
++}
+diff --git a/vm/compiler/LoopOpt.h b/vm/compiler/LoopOpt.h
+index debd6f7..45ecf0a 100644
+--- a/vm/compiler/LoopOpt.h
++++ b/vm/compiler/LoopOpt.h
+@@ -70,4 +70,20 @@ void dvmCompilerPrintPassNames (void);
+  * @brief Print the pass names we are going to ignore
+  */
+ void dvmCompilerPrintIgnorePasses (void);
++
++/**
++ * @brief Verify that the loop is capable of having the accumulations sunk
++ * @param cUnit the CompilationUnit
++ * @param curPass the Pass
++ * @return whether the sink accumulation sinking
++ */
++bool dvmCompilerSinkAccumulationsGate (const CompilationUnit *cUnit, const Pass *curPass);
++
++/**
++ * @brief Check if the loops are formed the way we want (nested / branches on / off)
++ * @param cUnit the CompilationUnit
++ * @param curPass the Pass
++ * @return Whether to continue as a loop or bail
++ */
++bool dvmCompilerCheckLoops ( const CompilationUnit *cUnit, const Pass *curPass);
+ #endif
+diff --git a/vm/compiler/RegisterizationME.cpp b/vm/compiler/RegisterizationME.cpp
+index 645cf40..54793c3 100644
+--- a/vm/compiler/RegisterizationME.cpp
++++ b/vm/compiler/RegisterizationME.cpp
+@@ -380,6 +380,9 @@ static void registerizeLoop (CompilationUnit *cUnit, const LoopInformation *info
+ 
+     BasicBlock *preHeader = info->getPreHeader ();
+ 
++    //Paranoid
++    assert (preHeader != 0);
++
+     //Select which registers should get registerized
+     selectRegisters (cUnit, info, registers);
+ 
+@@ -425,6 +428,12 @@ static void registerizeLoop (CompilationUnit *cUnit, const LoopInformation *info
+     //Call the helper function to set the writebacks for each BasicBlock
+     handleWriteBackRequests (cUnit, basicBlocks);
+ 
++    //Paranoid
++    assert (preHeader->requestWriteBack != 0);
++
++    //Clear the writebacks for the loop preheader
++    dvmClearAllBits (preHeader->requestWriteBack);
++
+     //Handle the backward chaining cells of the loop
+     const BitVector *backwards = info->getBackwardBranches ();
+ 
+-- 
+1.7.4.1
+

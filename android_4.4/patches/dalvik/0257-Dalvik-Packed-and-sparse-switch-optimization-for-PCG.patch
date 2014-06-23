@@ -1,0 +1,1400 @@
+From 0416e526f93d0f02fade062dec1c5944beef9ea3 Mon Sep 17 00:00:00 2001
+From: Tim Hartley <timothy.d.hartley@intel.com>
+Date: Tue, 2 Jul 2013 17:00:49 +0000
+Subject: Dalvik: Packed and sparse switch optimization for PCG GL
+
+BZ: 123320
+
+This patch includes optimized support for the packed-switch
+and sparse-switch bytecodes in the PCG GL. It gives a 3%
+performance improvement to AndEBench on Saltbay when using
+PCG compiled for atom_sse4.2.
+
+vm/compiler/codegen/CompilerCodegen.h
+ - Added macro constants for chaining cell sizes.
+vm/compiler/codegen/x86/lightcg/CodegenErrors.cpp/h
+ - Added PCG codegen-specific errors.
+vm/compiler/codegen/x86/lightcg/NcgHelper.h
+ - Need C linkage for switch lookup functions used in PCG GL.
+vm/compiler/codegen/x86/pcg/Analysis.cpp
+ - Add SPARSE_SWITCH to dvmCompilerPcgNewRegisterizeVRAnalysis.
+vm/compiler/codegen/x86/pcg/BasicBlockPCG.h
+- Add switchTableSymbol to BasicBlockPCG.
+vm/compiler/codegen/x86/pcg/ChainingCellException.cpp
+ - CHANGED SIZES OF CHAINING CELLS.
+ - Add isSwitch flag to normal and singleton chaining cells.
+ - Initiate cross reference for switch normal chaining cells and
+    switch table (which is not created yet when laying down the
+    chaining cells).
+ - Change callback in hot chaining cells to always call
+    dvmJitToInterpTraceSelect.
+ - Add function to return the preceding BasicBlock containing a
+    switch MIR.
+ - Removed a few exit (-1), and propagated the errors upwards.
+ - Added dvmCompilerPcgEmitSwitchTables, which finalizes the
+    normal chaining cell cross-reference and lays down the
+    pointers to the chaining cells. The switch table will get
+    patched at runtime as part of the chaining/unchaining
+    procedure.
+vm/compiler/codegen/x86/pcg/ChainingCellException.h
+ - Added a few includes.
+ - Added a prototype for added function.
+ - Altered the prototype/doxygen for altered functions.
+vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
+ - Added case for OP_SPARSE_SWITCH.
+ - Added initialization for cross-reference of switch table entries
+    and chaining cells.
+vm/compiler/codegen/x86/pcg/LowerOther.cpp
+ - Changed dvmCompilerPcgTranslatePackedSwitch to handle small cases
+    where the # of switch cases <= MAX_CHAINED_SWITCH_CASES, and big
+    switches where # of cases > MAX_CHAINED_SWITCH_CASES.
+ - Added dvmCompilerPcgTranslateSparseSwitch, similarly.
+vm/compiler/codegen/x86/pcg/LowerOther.h
+ - Added prototype for dvmCompilerPcgTranslateSparseSwitch.
+vm/compiler/codegen/x86/pcg/PcgInterface.cpp
+ - Propagated some errors upwards, and calling function to
+   print them to log, and cancel JIT trace compilation.
+vm/compiler/codegen/x86/pcg/Utility.cpp
+ - Removed one exit (-1), propagated upwards.
+ - Added memory disambiguation for switch dereferences.
+ - Added OP_SPARSE_SWITCH to dvmCompilerPcgSupportTrace.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Ib443128ae4c396990041033462822c45fb866888
+Orig-MCG-Change-Id: I2690c1810a63a580e26fab55d49ef3189619d738
+Signed-off-by: Tim Hartley <timothy.d.hartley@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Reviewed-on: http://android.intel.com:8080/123667
+Reviewed-by: Popov, Ivan G <ivan.g.popov@intel.com>
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/codegen/CompilerCodegen.h              |    9 +-
+ vm/compiler/codegen/x86/lightcg/CodegenErrors.cpp  |   53 ++--
+ vm/compiler/codegen/x86/lightcg/CodegenErrors.h    |    6 +
+ vm/compiler/codegen/x86/lightcg/NcgHelper.h        |    4 +-
+ vm/compiler/codegen/x86/pcg/Analysis.cpp           |    1 +
+ vm/compiler/codegen/x86/pcg/BasicBlockPCG.h        |    6 +
+ .../codegen/x86/pcg/ChainingCellException.cpp      |  343 +++++++++++++++-----
+ .../codegen/x86/pcg/ChainingCellException.h        |   24 ++-
+ vm/compiler/codegen/x86/pcg/CodeGeneration.cpp     |   57 +++-
+ vm/compiler/codegen/x86/pcg/DataStructures.h       |   14 +
+ vm/compiler/codegen/x86/pcg/LowerOther.cpp         |  256 ++++++++++++++-
+ vm/compiler/codegen/x86/pcg/LowerOther.h           |   14 +-
+ vm/compiler/codegen/x86/pcg/PcgInterface.cpp       |   17 +-
+ vm/compiler/codegen/x86/pcg/Utility.cpp            |   13 +-
+ 14 files changed, 669 insertions(+), 148 deletions(-)
+
+diff --git a/vm/compiler/codegen/CompilerCodegen.h b/vm/compiler/codegen/CompilerCodegen.h
+index d5df9b9..889d42b 100644
+--- a/vm/compiler/codegen/CompilerCodegen.h
++++ b/vm/compiler/codegen/CompilerCodegen.h
+@@ -20,7 +20,14 @@
+ #include "compiler/CompilerIR.h"
+ 
+ /* Maximal number of switch cases to have inline chains */
+-#define MAX_CHAINED_SWITCH_CASES 64
++#define MAX_CHAINED_SWITCH_CASES    64
++
++/* Size of various inlined chaining cell structures, in bytes */
++#define BACKWARD_BRANCH_CC_SIZE     29
++#define SINGLETON_CC_SIZE           17
++#define PREDICTED_CC_SIZE           20
++#define HOT_CC_SIZE                 17
++#define NORMAL_CC_SIZE              17
+ 
+ /* Work unit is architecture dependent */
+ bool dvmCompilerDoWork(CompilerWorkOrder *work);
+diff --git a/vm/compiler/codegen/x86/lightcg/CodegenErrors.cpp b/vm/compiler/codegen/x86/lightcg/CodegenErrors.cpp
+index 0f82fbc..1d62643 100644
+--- a/vm/compiler/codegen/x86/lightcg/CodegenErrors.cpp
++++ b/vm/compiler/codegen/x86/lightcg/CodegenErrors.cpp
+@@ -56,31 +56,34 @@ struct ErrorInformation
+  * JitCompilationErrors
+  */
+ START_ERRORS
+-    NEW_ERROR (kJitErrorMaxVR,                "Exceeded maximum allowed VRs in a basic block.",               false, false),
+-    NEW_ERROR (kJitErrorShortJumpOffset,      "Jump offset greater than 8-bits.",                              true, false),
+-    NEW_ERROR (kJitErrorUnsupportedBytecode,  "Trace contains bytecode with no implementation.",              false, false),
+-    NEW_ERROR (kJitErrorUnresolvedField,      "Trace contains SGET / SPUT bytecode with unresolved field.",   false, false),
+-    NEW_ERROR (kJitErrorInvalidBBId,          "Cannot find BasicBlock_O1 corresponding to a BasicBlock.",     false, false),
+-    NEW_ERROR (kJitErrorCodeCacheFull,        "Jit code cache is full.",                                       true, false),
+-    NEW_ERROR (kJitErrorRegAllocFailed,       "Failure in register allocator or register tables.",            false, false),
+-    NEW_ERROR (kJitErrorMallocFailed,         "Malloc failure during trace compilation.",                      false, true),
+-    NEW_ERROR (kJitErrorMaxXferPoints,        "Exceeded maximum number of transfer points per BB.",           false, false),
+-    NEW_ERROR (kJitErrorMaxDestRegPerSource,  "Exceeded number of destination regs for a source reg.",        false, false),
+-    NEW_ERROR (kJitErrorStateTransfer,        "Problem with state transfer in JIT.",                          false, false),
+-    NEW_ERROR (kJitErrorTraceFormation,       "Problem with trace formation.",                                false, false),
+-    NEW_ERROR (kJitErrorNullBoundCheckFailed, "Problem while performing null or bound check.",                false, false),
+-    NEW_ERROR (kJitErrorMergeLiveRange,       "Problem while merging live ranges (mergeLiveRange).",          false, false),
+-    NEW_ERROR (kJitErrorGlobalData,           "Global data not defined.",                                     false, false),
+-    NEW_ERROR (kJitErrorInsScheduling,        "Problem during instruction scheduling.",                       false, false),
+-    NEW_ERROR (kJitErrorBERegisterization,    "Issue registerizing the trace in the backend.",                 true, false),
+-    NEW_ERROR (kJitErrorSpill,                "The trace provoked a spill.",                                   true, false),
+-    NEW_ERROR (kJitErrorBBCannotBeHandled,    "The backend decided it cannot safely handle the Basic Block.", false, false),
+-    NEW_ERROR (kJitErrorConstInitFail,        "Patching of Double/Long constants failed.",                     true, false),
+-    NEW_ERROR (kJitErrorChainingCell,         "An issue was encountered while generating chaining cell.",     false, false),
+-    NEW_ERROR (kJitErrorInvalidOperandSize,   "Invalid Operand Size was encountered.",                        false, false),
+-    NEW_ERROR (kJitErrorPlugin,               "Problem with the plugin system.",                              false, false),
+-    NEW_ERROR (kJitErrorConstantFolding,      "Constant folding failed due to unhandled case.",               false, false),
+-    NEW_ERROR (kJitErrorCodegen,              "Undefined issues in trace formation.",                         false, false),
++    NEW_ERROR (kJitErrorMaxVR,                          "Exceeded maximum allowed VRs in a basic block.",               false, false),
++    NEW_ERROR (kJitErrorShortJumpOffset,                "Jump offset greater than 8-bits.",                              true, false),
++    NEW_ERROR (kJitErrorUnsupportedBytecode,            "Trace contains bytecode with no implementation.",              false, false),
++    NEW_ERROR (kJitErrorUnresolvedField,                "Trace contains SGET / SPUT bytecode with unresolved field.",   false, false),
++    NEW_ERROR (kJitErrorInvalidBBId,                    "Cannot find BasicBlock_O1 corresponding to a BasicBlock.",     false, false),
++    NEW_ERROR (kJitErrorCodeCacheFull,                  "Jit code cache is full.",                                       true, false),
++    NEW_ERROR (kJitErrorRegAllocFailed,                 "Failure in register allocator or register tables.",            false, false),
++    NEW_ERROR (kJitErrorMallocFailed,                   "Malloc failure during trace compilation.",                      false, true),
++    NEW_ERROR (kJitErrorMaxXferPoints,                  "Exceeded maximum number of transfer points per BB.",           false, false),
++    NEW_ERROR (kJitErrorMaxDestRegPerSource,            "Exceeded number of destination regs for a source reg.",        false, false),
++    NEW_ERROR (kJitErrorStateTransfer,                  "Problem with state transfer in JIT.",                          false, false),
++    NEW_ERROR (kJitErrorTraceFormation,                 "Problem with trace formation.",                                false, false),
++    NEW_ERROR (kJitErrorNullBoundCheckFailed,           "Problem while performing null or bound check.",                false, false),
++    NEW_ERROR (kJitErrorMergeLiveRange,                 "Problem while merging live ranges (mergeLiveRange).",          false, false),
++    NEW_ERROR (kJitErrorGlobalData,                     "Global data not defined.",                                     false, false),
++    NEW_ERROR (kJitErrorInsScheduling,                  "Problem during instruction scheduling.",                       false, false),
++    NEW_ERROR (kJitErrorBERegisterization,              "Issue registerizing the trace in the backend.",                 true, false),
++    NEW_ERROR (kJitErrorSpill,                          "The trace provoked a spill.",                                   true, false),
++    NEW_ERROR (kJitErrorBBCannotBeHandled,              "The backend decided it cannot safely handle the Basic Block.", false, false),
++    NEW_ERROR (kJitErrorConstInitFail,                  "Patching of Double/Long constants failed.",                     true, false),
++    NEW_ERROR (kJitErrorChainingCell,                   "An issue was encountered while generating chaining cell.",     false, false),
++    NEW_ERROR (kJitErrorInvalidOperandSize,             "Invalid Operand Size was encountered.",                        false, false),
++    NEW_ERROR (kJitErrorPlugin,                         "Problem with the plugin system.",                              false, false),
++    NEW_ERROR (kJitErrorConstantFolding,                "Constant folding failed due to unhandled case.",               false, false),
++    NEW_ERROR (kJitErrorCodegen,                        "Undefined issues in trace formation.",                         false, false),
++    NEW_ERROR (kJitErrorPcgUnknownChainingBlockType,    "Unknown chaining block type seen in PCG GL.",                  false, false),
++    NEW_ERROR (kJitErrorPcgUnsupportedCallDataType,     "Unsupported call data type in PCG GL.",                        false, false),
++    NEW_ERROR (kJitErrorPcgUnexpectedDataType,          "Unexpected data type seen in PCG GL.",                         false, false),
+ END_ERRORS
+ 
+ 
+diff --git a/vm/compiler/codegen/x86/lightcg/CodegenErrors.h b/vm/compiler/codegen/x86/lightcg/CodegenErrors.h
+index 4301da0..95231c6 100644
+--- a/vm/compiler/codegen/x86/lightcg/CodegenErrors.h
++++ b/vm/compiler/codegen/x86/lightcg/CodegenErrors.h
+@@ -89,6 +89,12 @@ enum JitCompilationErrors {
+     kJitErrorPlugin,
+     /** @brief Unhandled case during constant folding */
+     kJitErrorConstantFolding,
++    /** @brief Unknown chaining block type seen in PCG GL */
++    kJitErrorPcgUnknownChainingBlockType,
++    /** @brief Unexpected data type seen in PCG GL */
++    kJitErrorPcgUnexpectedDataType,
++    /** @brief Unsupported call data type in PCG GL */
++    kJitErrorPcgUnsupportedCallDataType,
+ 
+     /* ----- Add more errors above ---------------------------
+      * ----- Don't add new errors beyond this point ----------
+diff --git a/vm/compiler/codegen/x86/lightcg/NcgHelper.h b/vm/compiler/codegen/x86/lightcg/NcgHelper.h
+index 3cd56ea..b39befc 100644
+--- a/vm/compiler/codegen/x86/lightcg/NcgHelper.h
++++ b/vm/compiler/codegen/x86/lightcg/NcgHelper.h
+@@ -23,10 +23,10 @@ s4 dvmNcgHandleSparseSwitch(const s4*, u2, s4);
+ extern "C" s4 dvmJitHandlePackedSwitch(const s4*, s4, u2, s4);
+ 
+ /** @brief return a target address stored in switch table based on index value*/
+-s4 dvmJitHandleSparseSwitch(const s4*, const s4*, u2, s4);
++extern "C" s4 dvmJitHandleSparseSwitch(const s4*, const s4*, u2, s4);
+ 
+ /** @brief return the index if keys[index] == testval */
+-s4 dvmJitLookUpBigSparseSwitch(const s4*, u2, s4);
++extern "C" s4 dvmJitLookUpBigSparseSwitch(const s4*, u2, s4);
+ 
+ extern "C" void dvmNcgInvokeInterpreter(int pc); //interpreter to execute at pc
+ extern "C" void dvmNcgInvokeNcg(int pc);
+diff --git a/vm/compiler/codegen/x86/pcg/Analysis.cpp b/vm/compiler/codegen/x86/pcg/Analysis.cpp
+index ee31822..bac6416 100644
+--- a/vm/compiler/codegen/x86/pcg/Analysis.cpp
++++ b/vm/compiler/codegen/x86/pcg/Analysis.cpp
+@@ -775,6 +775,7 @@ bool dvmCompilerPcgNewRegisterizeVRAnalysis (CompilationUnitPCG *cUnit)
+ 
+                 case OP_CHECK_CAST:
+                 case OP_PACKED_SWITCH:
++                case OP_SPARSE_SWITCH:
+                     //Paranoid
+                     assert (ssaRep->numUses > 0);
+ 
+diff --git a/vm/compiler/codegen/x86/pcg/BasicBlockPCG.h b/vm/compiler/codegen/x86/pcg/BasicBlockPCG.h
+index a22b12c..a7d0c4b 100644
+--- a/vm/compiler/codegen/x86/pcg/BasicBlockPCG.h
++++ b/vm/compiler/codegen/x86/pcg/BasicBlockPCG.h
+@@ -50,6 +50,12 @@ struct BasicBlockPCG: public BasicBlock
+          */
+         CGSymbol writebackTargetSymbol;
+ 
++        /**
++         * @brief A CGSymbol for the switch table.
++         * @details This is a CGSymbol representing the location of the switch table entries, which are used to chain switch statements.
++         */
++        CGSymbol switchTableSymbol;
++
+         /** @brief Has this block been bound?  This information is needed to determine whether we can query for the block address */
+         bool blockBound;
+ 
+diff --git a/vm/compiler/codegen/x86/pcg/ChainingCellException.cpp b/vm/compiler/codegen/x86/pcg/ChainingCellException.cpp
+index 00a0c4a..71e1fc4 100644
+--- a/vm/compiler/codegen/x86/pcg/ChainingCellException.cpp
++++ b/vm/compiler/codegen/x86/pcg/ChainingCellException.cpp
+@@ -72,11 +72,10 @@ static uint8_t* dvmCompilerPcgEmitSingletonChainingCell (CompilationUnitPCG *cUn
+ {
+     const uint8_t *cellBegin = currCachePtr;
+ 
+-    //TODO Normalize CC layout by making a class that defines the CC's structure
+-    const size_t cChainingCellSize = 13;
+-
+-    if (freeSpace < cChainingCellSize)
++    // Make sure we don't overflow the code cache
++    if (freeSpace < SINGLETON_CC_SIZE)
+     {
++        SET_JIT_ERROR(kJitErrorCodeCacheFull);
+         return 0;
+     }
+ 
+@@ -121,12 +120,18 @@ static uint8_t* dvmCompilerPcgEmitSingletonChainingCell (CompilationUnitPCG *cUn
+     }
+     currCachePtr += 4;
+ 
+-    if ( (size_t) (currCachePtr - cellBegin) != cChainingCellSize)
++    // Since singleton chaining cells are handled liked hot chaining cells
++    // we need to lay down the isMove flag here, too, to match the format
++    * ( (unsigned int*)currCachePtr) = 0;
++    if (cUnit->checkDebugMask (DebugMaskBytecode) == true)
+     {
+-        ALOGE ("\n+++ PCG ERROR +++ Singleton chaining cell size inconsistency");
+-        //TODO: use the error framework
+-        exit (-1);
++        ALOGI ("    isMove: 0x%08x\n", * ( (int *)currCachePtr));
+     }
++    currCachePtr += 4;
++
++    // Since the assert doesn't always compile, avoid the 'unused' warning
++    (void)cellBegin;
++    assert( (size_t) (currCachePtr - cellBegin) == SINGLETON_CC_SIZE);
+ 
+     return currCachePtr;
+ }
+@@ -155,11 +160,10 @@ static uint8_t* dvmCompilerPcgEmitPredictedChainingCell (CompilationUnitPCG *cUn
+ {
+     const uint8_t *cellBegin = currCachePtr;
+ 
+-    //TODO Normalize CC layout by making a class that defines the CC's structure
+-    const size_t cChainingCellSize = 20;
+-
+-    if (freeSpace < cChainingCellSize)
++    // Make sure we don't overflow the code cache
++    if (freeSpace < PREDICTED_CC_SIZE)
+     {
++        SET_JIT_ERROR(kJitErrorCodeCacheFull);
+         return 0;
+     }
+ 
+@@ -189,11 +193,9 @@ static uint8_t* dvmCompilerPcgEmitPredictedChainingCell (CompilationUnitPCG *cUn
+                 intStream[4]);
+     }
+ 
+-    if ( (size_t) (currCachePtr - cellBegin) != cChainingCellSize)
+-    {
+-        ALOGE ("\n+++ PCG ERROR +++ Predicted chaining cell size inconsistency");
+-        exit (-1);
+-    }
++    // Since the assert doesn't always compile, avoid the 'unused' warning
++    (void)cellBegin;
++    assert( (size_t) (currCachePtr - cellBegin) == PREDICTED_CC_SIZE);
+ 
+     return currCachePtr;
+ }
+@@ -218,10 +220,8 @@ static uint8_t* dvmCompilerPcgEmitHotChainingCell (CompilationUnitPCG *cUnit,
+ {
+     const uint8_t *cellBegin = currCachePtr;
+ 
+-    //TODO Normalize CC layout by making a class that defines the CC's structure
+-    const size_t cChainingCellSize = 17;
+-
+-    if (freeSpace < cChainingCellSize)
++    // Make sure we don't overflow the code cache
++    if (freeSpace < HOT_CC_SIZE)
+     {
+         return 0;
+     }
+@@ -235,37 +235,21 @@ static uint8_t* dvmCompilerPcgEmitHotChainingCell (CompilationUnitPCG *cUnit,
+     // block should land here, so bind the symbol to this address.
+     dvmCompilerPcgBindSymbolAddress (blockSymbol, currCachePtr);
+ 
++    // Get the relocation object for references to this cell
+     SRelocation relocation = cUnit->findRelocation (blockSymbol);
+-    int isRelative = 0;
+ 
+-    // Now lay down the call instruction.  The call instruction differs
+-    // depending on whether the reference is absolute or PC-relative.
++    // Now lay down the call instruction.
+     *currCachePtr++ = 0xe8;
+-    if (relocation.relocationType == CGRelocationTypePC32)
+-    {
+-        //Get symbol to the dvmJitToInterpNormal callback
+-        CGSymbol callback = singletonPtr<PersistentInfo> ()->getCallBack ("dvmJitToInterpNormal");
+-        void * callbackAddress = dvmCompilerPcgGetSymbolAddress (callback);
+ 
+-        * ( (int32_t*)currCachePtr) = (int32_t)callbackAddress - ( (int32_t)currCachePtr + 4);
+-        isRelative = 1;
+-        if (cUnit->checkDebugMask (DebugMaskBytecode) == true)
+-        {
+-            ALOGI ("    call dvmJitToInterpNormal: 0xe8 0x%08x\n", * ( (int32_t*)currCachePtr));
+-        }
+-    }
+-    else
+-    {
+-        //Get symbol to the dvmJitToInterpNormal callback
+-        CGSymbol callback = singletonPtr<PersistentInfo> ()->getCallBack ("dvmJitToInterpTraceSelect");
+-        void * callbackAddress = dvmCompilerPcgGetSymbolAddress (callback);
++    //Get symbol to the dvmJitToInterpTraceSelect callback
++    CGSymbol callback = singletonPtr<PersistentInfo> ()->getCallBack ("dvmJitToInterpTraceSelect");
++    void * callbackAddress = dvmCompilerPcgGetSymbolAddress (callback);
+ 
+-        * ( (int32_t*)currCachePtr) = (int32_t)callbackAddress - ( (int32_t)currCachePtr + 4);
++    * ( (int32_t*)currCachePtr) = (int32_t)callbackAddress - ( (int32_t)currCachePtr + 4);
+ 
+-        if (cUnit->checkDebugMask (DebugMaskBytecode) == true)
+-        {
+-            ALOGI ("    call dvmJitToInterpTraceSelect: 0xe8 0x%08x\n", * ( (int32_t*)currCachePtr));
+-        }
++    if (cUnit->checkDebugMask (DebugMaskBytecode) == true)
++    {
++        ALOGI ("    call dvmJitToInterpTraceSelect: 0xe8 0x%08x\n", * ( (int32_t*)currCachePtr));
+     }
+     currCachePtr += 4;
+ 
+@@ -287,20 +271,57 @@ static uint8_t* dvmCompilerPcgEmitHotChainingCell (CompilationUnitPCG *cUnit,
+ 
+     // Finally, lay out a flag to signal whether the reference is absolute or
+     // PC-relative.
++    int isRelative = 0;
++
++    if (relocation.relocationType == CGRelocationTypePC32)
++    {
++        isRelative = 1;
++    }
++
+     * ( (int *)currCachePtr) = isRelative;
+     if (cUnit->checkDebugMask (DebugMaskBytecode) == true)
+     {
+-        ALOGI ("    flag: 0x%08x\n", * ( (int *)currCachePtr));
++        ALOGI ("    isMove: 0x%08x\n", * ( (int *)currCachePtr));
+     }
+     currCachePtr += 4;
+ 
+-    if ( (size_t) (currCachePtr - cellBegin) != cChainingCellSize)
++    // Since the assert doesn't always compile, avoid the 'unused' warning
++    (void)cellBegin;
++    assert( (size_t) (currCachePtr - cellBegin) == HOT_CC_SIZE);
++
++    return currCachePtr;
++}
++
++/**
++ * @brief Return the predecessor BB of switch-associated chaining cells
++ * @param cUnit the CompilationUnitPCG
++ * @param normalChainingCellBB the chaining cell which might be switch-associated
++ * @return the pointer to the switch BB or 0 if the CC is not switch-associated
++ * @details: Certain normal chaining cells are associated with switch statements, and they require slightly different processing from normal chaining cells that end traces. In particular, the patch address in the CC must point to the switch table, rather than into the compiled instruction stream.
++ */
++static BasicBlockPCG * getPredecessorSwitchBasicBlock(
++    CompilationUnitPCG *cUnit,
++    BasicBlockPCG * normalChainingCellBB)
++{
++    BitVectorIterator bvIterator;
++    dvmBitVectorIteratorInit (normalChainingCellBB->predecessors, &bvIterator);
++
++    // Get the precedessor BB for the chainingcell BB
++    BasicBlockPCG *predBB = reinterpret_cast<BasicBlockPCG *> (
++        dvmCompilerGetNextBasicBlockViaBitVector (bvIterator, cUnit->blockList));
++
++    // Return the predBB only if it contains a switch instruction
++    if (predBB != 0 && predBB->blockType == kDalvikByteCode &&
++        predBB->lastMIRInsn != 0)
+     {
+-        ALOGE ("\n+++ PCG ERROR +++ Hot chaining cell size inconsistency");
+-        exit (-1);
++        if(predBB->lastMIRInsn->dalvikInsn.opcode == OP_PACKED_SWITCH ||
++           predBB->lastMIRInsn->dalvikInsn.opcode == OP_SPARSE_SWITCH)
++        {
++            return predBB;
++        }
+     }
+ 
+-    return currCachePtr;
++    return 0;
+ }
+ 
+ /**
+@@ -308,25 +329,30 @@ static uint8_t* dvmCompilerPcgEmitHotChainingCell (CompilationUnitPCG *cUnit,
+  * @param cUnit the CompilationUnitPCG
+  * @param startAddr the start address for the code generation
+  * @param bytecodeTargetAddr the bytecode address
+- * @param blockSymbol the symbol for a given basic block
++ * @param bb the chaining cell's basicblock in the CFG
+  * @param currCachePtr the current cache pointer
+  * @param freeSpace amount of free space available
++ * @param switchChainingCellEntries A list of the chaining cell block/relocation pairs
+  * @return the pointer to the next byte after the chaining cell, 0 if a problem arose
++ * @details Normal chaining cells are completely finalized at emission time. Switch-associated chaining cells cannot be finalized, because they require the switch table to be laid down. Thus, we use the relocation system to patch the chaining cell's relocation address to be the switch table's entry corresponding to this chaining cell.
+  */
+-static uint8_t* dvmCompilerPcgEmitNormalChainingCell (CompilationUnitPCG *cUnit,
+-                                           const uint8_t *startAddr,
+-                                           const void *bytecodeTargetAddr,
+-                                           CGSymbol blockSymbol,
+-                                           uint8_t *currCachePtr,
+-                                           size_t freeSpace)
++static uint8_t* dvmCompilerPcgEmitNormalChainingCell (
++    CompilationUnitPCG *cUnit,
++    const uint8_t *startAddr,
++    const void *bytecodeTargetAddr,
++    BasicBlockPCG * bb,
++    uint8_t *currCachePtr,
++    size_t freeSpace,
++    std::list<SwitchTableCCXRef> *
++         switchChainingCellEntries)
+ {
++    CGSymbol blockSymbol = bb->chainingCellSymbol;
+     const uint8_t *cellBegin = currCachePtr;
+ 
+-    //TODO Normalize CC layout by making a class that defines the CC's structure
+-    const size_t cChainingCellSize = 13;
+-
+-    if (freeSpace < cChainingCellSize)
++    // Make sure we don't overflow the code cache
++    if (freeSpace < NORMAL_CC_SIZE)
+     {
++        SET_JIT_ERROR(kJitErrorCodeCacheFull);
+         return 0;
+     }
+ 
+@@ -369,21 +395,79 @@ static uint8_t* dvmCompilerPcgEmitNormalChainingCell (CompilationUnitPCG *cUnit,
+     }
+     currCachePtr += 4;
+ 
+-    // Finally, lay down the address in the code where this chaining cell is referenced.
+-    const SRelocation &relocation = cUnit->findRelocation (blockSymbol);
+-    * ( (const uint8_t**)currCachePtr) = startAddr + relocation.codeOffset;
++    BasicBlockPCG * switchBB = getPredecessorSwitchBasicBlock(cUnit, bb);
++    if (switchBB != 0)
++    {
++        // This chaining cell is associated with a switch statement
++        SRelocation * relocation =
++            static_cast <SRelocation *>
++            (dvmCompilerNew(sizeof(SRelocation), false));
++
++        // First we need to create a symbol for the switch table entry
++        // so that we can refer to it now
++        std::string switchBBName;
++        dvmCompilerPcgGetBlockName (switchBB, switchBBName);
++
++        char buffer[1024];
++        snprintf(buffer, sizeof(buffer), "%s_switch_%d",
++            switchBBName.c_str(),
++            switchChainingCellEntries->size());
++
++        std::string switchEntryName(buffer);
++        CGSymbol switchEntrySymbol =
++            dvmCompilerPcgCreateSymbol(switchEntryName, 0, true);
++
++        // Now that we have a symbol, we can create a relocation tracker for it
++        const SClientSymbolInfo *clientSymbolInfo =
++            singletonPtr<PersistentInfo> ()->getSymbolInfo (switchEntrySymbol);
++        relocation->targetSymbol = clientSymbolInfo;
++        relocation->addend = (int32_t)0;
++        relocation->codeOffset = (uint32_t)currCachePtr - (uint32_t)startAddr;
++        relocation->relocationType = CGRelocationType32;
++
++        // That should be sufficient to accomplish the write to this location,
++        // once the switch table entry symbol gets associated with an address,
++        // so make sure we store it in the list
++        SwitchTableCCXRef xref = { relocation, bb };
++        switchChainingCellEntries->push_back(xref);
++
++        // Just put something in the cell, so we don't print anything wrong
++        // in debug mode
++        * ( (const uint8_t**)currCachePtr) = 0;
++    }
++    else
++    {
++        // Lay down the address in the code where this chaining cell is
++        // referenced.
++        const SRelocation &relocation = cUnit->findRelocation (blockSymbol);
++        * ( (const uint8_t**)currCachePtr) = startAddr + relocation.codeOffset;
++    }
++
+     if (cUnit->checkDebugMask (DebugMaskBytecode) == true)
+     {
+         ALOGI ("    codePtr: 0x%p\n", * ( (const uint8_t**)currCachePtr));
+     }
+     currCachePtr += 4;
+ 
+-    if ( (size_t) (currCachePtr - cellBegin) != cChainingCellSize)
++    // Finally, lay down the isSwitch flag (because switch cells need to cause
++    // absolute targets to be patched, not relative targets
++    int isSwitch = 0;
++    if (switchBB != 0)
+     {
+-        ALOGE ("\n+++ PCG ERROR +++ Normal chaining cell size inconsistency");
+-        exit (-1);
++        isSwitch = 1;
+     }
+ 
++    * ( (int*)currCachePtr) = isSwitch;
++    if (cUnit->checkDebugMask (DebugMaskBytecode) == true)
++    {
++        ALOGI ("    isSwitch: 0x%d\n", * ( (const int*)currCachePtr));
++    }
++    currCachePtr += 4;
++
++    // Since the assert doesn't always compile, avoid the 'unused' warning
++    (void)cellBegin;
++    assert( (size_t) (currCachePtr - cellBegin) == NORMAL_CC_SIZE);
++
+     return currCachePtr;
+ }
+ 
+@@ -402,11 +486,10 @@ static uint8_t* dvmCompilerPcgEmitBackwardBranchChainingCell (CompilationUnitPCG
+ {
+     const uint8_t *cellBegin = currCachePtr;
+ 
+-    //TODO Normalize CC layout by making a class that defines the CC's structure
+-    const size_t cChainingCellSize = 25;
+-
+-    if (freeSpace < cChainingCellSize)
++    // Make sure we don't overflow the code cache
++    if (freeSpace < BACKWARD_BRANCH_CC_SIZE)
+     {
++        SET_JIT_ERROR(kJitErrorCodeCacheFull);
+         return 0;
+     }
+ 
+@@ -462,6 +545,15 @@ static uint8_t* dvmCompilerPcgEmitBackwardBranchChainingCell (CompilationUnitPCG
+     }
+     currCachePtr += 4;
+ 
++    // Since backward branch need to match the format of the other CCs,
++    // we need to lay down the isMove flag here, too
++    * ( (unsigned int*)currCachePtr) = 0;
++    if (cUnit->checkDebugMask (DebugMaskBytecode) == true)
++    {
++        ALOGI ("    isMove: 0x%08x\n", * ( (int *)currCachePtr));
++    }
++    currCachePtr += 4;
++
+     // Lay down the code address of the loop header.
+     int64_t loopHeaderOffset;
+ 
+@@ -521,11 +613,9 @@ static uint8_t* dvmCompilerPcgEmitBackwardBranchChainingCell (CompilationUnitPCG
+     }
+     currCachePtr += 4;
+ 
+-    if ( (size_t) (currCachePtr - cellBegin) != cChainingCellSize)
+-    {
+-        ALOGE ("\n+++ PCG ERROR +++ Backward chaining cell size inconsistency");
+-        exit (-1);
+-    }
++    // Since the assert doesn't always compile, avoid the 'unused' warning
++    (void)cellBegin;
++    assert ( (size_t) (currCachePtr - cellBegin) == BACKWARD_BRANCH_CC_SIZE);
+ 
+     return currCachePtr;
+ }
+@@ -901,6 +991,9 @@ void dvmCompilerPcgGenerateSpeculativeNullChecks (CompilationUnitPCG *cUnit)
+             CGAddr addr = CGCreateAddr (cUnit->getVMPtr (), CGInstInvalid, 0, CGSymbolInvalid, virtualReg * 4);
+ 
+             size = dvmCompilerPcgGetOpcodeAndSizeForDtype (dtype, &opcode);
++            if (IS_ANY_JIT_ERROR_SET() == true) {
++                return;
++            }
+ 
+             void *handle = dvmCompilerPcgGetVRHandle (virtualReg, size);
+             CGInst load = CGCreateNewInst (opcode, "m", addr, size, handle);
+@@ -928,7 +1021,8 @@ void dvmCompilerPcgGenerateSpeculativeNullChecks (CompilationUnitPCG *cUnit)
+ uint8_t *dvmCompilerPcgEmitChainingCells (CompilationUnitPCG *cUnit,
+         uint8_t *startAddr,
+         uint8_t *cachePtr,
+-        size_t freeSpace)
++        size_t freeSpace,
++        std::list<SwitchTableCCXRef> * switchChainingCellEntries)
+ {
+     u4 padding, i;
+     uint8_t *firstChainCellAddr;
+@@ -949,7 +1043,7 @@ uint8_t *dvmCompilerPcgEmitChainingCells (CompilationUnitPCG *cUnit,
+ 
+         for (unsigned int j = 0; j < chainingListByType[i].numUsed; j++)
+         {
+-            uint8_t *newCachePtr;
++            uint8_t *newCachePtr = 0;
+             int blockId = blockIdList[j];
+             BasicBlockPCG *chainingBlock = (BasicBlockPCG *) (dvmGrowableListGetElement (&cUnit->blockList, blockId));
+ 
+@@ -965,9 +1059,10 @@ uint8_t *dvmCompilerPcgEmitChainingCells (CompilationUnitPCG *cUnit,
+                             cUnit,
+                             startAddr,
+                             cUnit->method->insns + chainingBlock->startOffset,
+-                            chainingBlock->chainingCellSymbol,
++                            chainingBlock,
+                             cachePtr,
+-                            freeSpace);
++                            freeSpace,
++                            switchChainingCellEntries);
+                     break;
+ 
+                 case kChainingCellBackwardBranch:
+@@ -1010,12 +1105,15 @@ uint8_t *dvmCompilerPcgEmitChainingCells (CompilationUnitPCG *cUnit,
+ 
+                 default:
+                     ALOGE ("\n+++ PCG ERROR +++ Unknown chaining block type seen : %d.", (int)chainingBlock->blockType);
+-                    exit (-1);
++                    SET_JIT_ERROR(kJitErrorPcgUnknownChainingBlockType);
++                    assert(0);
++                    return 0;
+             }
+ 
+             if (newCachePtr == false)
+             {
+                 // The code cache is full.  Return 0 to indicate this.
++                SET_JIT_ERROR(kJitErrorCodeCacheFull);
+                 return 0;
+             }
+             freeSpace -= (newCachePtr - cachePtr);
+@@ -1066,3 +1164,84 @@ uint8_t *dvmCompilerPcgEmitChainingCells (CompilationUnitPCG *cUnit,
+ 
+     return cachePtr + sizeof (pcgChainCellCounts);
+ }
++
++uint8_t* dvmCompilerPcgEmitSwitchTables(CompilationUnitPCG *cUnit,
++        uint8_t *currCachePtr,
++        size_t freeSpace,
++        std::list<SwitchTableCCXRef> * switchChainingCellEntries)
++{
++    uint32_t * shiftedCachePtr = (uint32_t*)align ((char*)currCachePtr, 4);
++    uint32_t num_shift_bytes = (uint32_t)shiftedCachePtr - (uint32_t)currCachePtr;
++    uint32_t a = num_shift_bytes + switchChainingCellEntries->size() * 4;
++
++    // Make sure we have enough room in the code cache for the switch table
++    if (freeSpace < a) {
++        SET_JIT_ERROR(kJitErrorCodeCacheFull);
++        return 0;
++    }
++
++    // Trying to make this method-safe, i.e. by not limiting it strictly
++    // to only one switch table
++    GrowableListIterator iterator;
++    dvmGrowableListIteratorInit(&cUnit->blockList,
++                                &iterator);
++
++    while (true)
++    {
++        BasicBlockPCG *bb = (BasicBlockPCG *) dvmGrowableListIteratorNext(&iterator);
++
++        if (bb == 0)
++        {
++             break;
++        }
++
++        // Skip all basic blocks that don't have switch statements
++        if (bb->lastMIRInsn == 0 || bb->switchTableSymbol == CGSymbolInvalid)
++        {
++            continue;
++        }
++
++        if ((bb->lastMIRInsn->dalvikInsn.opcode == OP_PACKED_SWITCH ||
++            bb->lastMIRInsn->dalvikInsn.opcode == OP_SPARSE_SWITCH) == false)
++        {
++            continue;
++        }
++
++        // Need four-byte alignment, to ensure safe patching
++        currCachePtr = (uint8_t *) align ((char*)currCachePtr, 4);
++
++        // So that the compiled switch instruction has a pointer to the switch
++        // table, we need to bind the symbol to the code cache address
++        dvmCompilerPcgBindSymbolAddress (
++            bb->switchTableSymbol, currCachePtr);
++
++        // To set up the switch table, all we need to do is go through
++        // switchChainingCellEntries and add the cache pointer to the
++        // relocation, then add it to the relocation tracking system
++        std::list<SwitchTableCCXRef>::iterator it;
++        for (it = switchChainingCellEntries->begin();
++             it != switchChainingCellEntries->end(); it++)
++        {
++            SRelocation *switchTableEntryRelocation = it->relocation;
++            BasicBlockPCG *chainingCellBlock = it->chainingCellBB;
++
++            // Now that we know where the symbol should live, bind it, and add the
++            // finalized relocation to the tracking system
++            dvmCompilerPcgBindSymbolAddress (
++                switchTableEntryRelocation->targetSymbol->cgSymbol,
++                currCachePtr);
++            cUnit->addRelocation(*switchTableEntryRelocation);
++
++            // And since the chaining cell locations have already been bound,
++            // find that address, and put it here in the switch table entry
++            * ( (const uint8_t**)currCachePtr) =
++                (const uint8_t*)
++                dvmCompilerPcgGetSymbolAddress
++                (chainingCellBlock->chainingCellSymbol);
++            currCachePtr += 4;
++        }
++    }
++
++    switchChainingCellEntries->clear();
++    return currCachePtr;
++}
+diff --git a/vm/compiler/codegen/x86/pcg/ChainingCellException.h b/vm/compiler/codegen/x86/pcg/ChainingCellException.h
+index a7147be..10a16d2 100644
+--- a/vm/compiler/codegen/x86/pcg/ChainingCellException.h
++++ b/vm/compiler/codegen/x86/pcg/ChainingCellException.h
+@@ -18,7 +18,11 @@
+ #define H_CHAININGCELLEXCEPTION
+ 
+ #include "Common.h"
++#include "CompilerIR.h"
++#include "DataStructures.h"
+ #include "libpcg.h"
++#include <string>
++#include <list>
+ 
+ //Forward Definitions
+ struct BasicBlockPCG;
+@@ -75,17 +79,35 @@ void dvmCompilerPcgGenerateRangeCheck (CompilationUnitPCG *cUnit, CGInst base, C
+  */
+ void dvmCompilerPcgGenerateSimpleNullCheck (CompilationUnitPCG *cUnit, CGInst inst);
+ 
++
+ /**
+  * @brief Emit the chaining cells
+  * @param cUnit the CompilationUnitPCG
+  * @param start_addr is the routine start address
+  * @param cache_ptr is a pointer to the next available byte in the code cache.
+  * @param freeSpace free space still available
++ * @param switchChainingCellEntries a list of pairs of relocations and their chaining cells, to perform the cross-reference of the switch table entries and the chaining cells
+  * @return This routine returns the next available byte in the code cache, or 0 if there isn't enough available space to lay down the chaining cells
+  */
+-uint8_t *dvmCompilerPcgEmitChainingCells (CompilationUnitPCG *cUnit, uint8_t *start_addr, uint8_t *cache_ptr, size_t freeSpace);
++uint8_t *dvmCompilerPcgEmitChainingCells (CompilationUnitPCG *cUnit,
++        uint8_t *start_addr,
++        uint8_t *cache_ptr,
++        size_t freeSpace,
++        std::list<SwitchTableCCXRef> * switchChainingCellEntries);
+ 
+ /**
++ * @brief Emit the switch tables
++ * @param cUnit the CompilationUnitPCG
++ * @param currCachePtr is a pointer to the next available byte in the code cache.
++ * @param freeSpace free space still available
++ * @param switchChainingCellEntries a list of pairs of relocations and their chaining cells, to perform the cross-reference of the switch table entries and the chaining cells
++ * @return This routine returns the next available byte in the code cache, or 0 if there isn't enough available space to lay down the chaining cells
++ */
++uint8_t* dvmCompilerPcgEmitSwitchTables(CompilationUnitPCG *cUnit,
++        uint8_t *currCachePtr,
++        size_t freeSpace,
++        std::list<SwitchTableCCXRef> * switchChainingCellEntries);
++/**
+  * @brief Generate the predicted chaining cell
+  * @param cUnit the CompilationUnitPCG
+  * @param bb the BasicBlockPCG
+diff --git a/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp b/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
+index 13e17a3..c7c6fbd 100644
+--- a/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
++++ b/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
+@@ -35,6 +35,7 @@
+ #include "PersistentInfo.h"
+ #include "Singleton.h"
+ #include "Utility.h"
++#include <list>
+ 
+ /**
+  * @brief Translate an MIR instruction
+@@ -675,6 +676,10 @@ static bool dvmCompilerPcgTranslateInsn (CompilationUnitPCG *cUnit, MIR *mir)
+             dvmCompilerPcgTranslatePackedSwitch (cUnit, mir);
+             break;
+ 
++        case OP_SPARSE_SWITCH:
++            dvmCompilerPcgTranslateSparseSwitch (cUnit, mir);
++            break;
++
+         case OP_RETURN:
+         case OP_RETURN_OBJECT:
+         case OP_RETURN_WIDE:
+@@ -748,7 +753,12 @@ static bool dvmCompilerPcgTranslateInsn (CompilationUnitPCG *cUnit, MIR *mir)
+                     dexGetOpcodeName (dalvikOpCode), dalvikOpCode);
+             LOGE ("Jit (PCG): unsupported MIR opcode");
+             assert (0);
+-            exit (-1);
++            SET_JIT_ERROR(kJitErrorUnsupportedBytecode);
++    }
++
++    if (IS_ANY_JIT_ERROR_SET() == true)
++    {
++        return false;
+     }
+ 
+     return success;
+@@ -1189,6 +1199,11 @@ bool dvmCompilerPcgGenerateIlForTrace (CompilationUnitPCG *cUnit, JitTranslation
+     dvmCompilerPcgGenerateEntryIl (cUnit);
+     dvmCompilerPcgGenerateSpeculativeNullChecks (cUnit);
+ 
++    if (IS_ANY_JIT_ERROR_SET() == true)
++    {
++        return false;
++    }
++
+     if (dvmCompilerPcgTranslateCUnit (cUnit, info) == false)
+     {
+         return false;
+@@ -1213,9 +1228,10 @@ void dvmCompilerPcgEmitCode (CompilationUnitPCG *cUnit, JitTranslationInfo* info
+     // Allocate space for the chaining information.
+     if (freeSpace < cExtraBytesForChaining)
+     {
+-        gDvmJit.codeCacheFull = true;
++        SET_JIT_ERROR(kJitErrorCodeCacheFull);
+         return;
+     }
++
+     currCachePtr += cExtraBytesForChaining;
+     freeSpace -= cExtraBytesForChaining;
+ 
+@@ -1224,8 +1240,9 @@ void dvmCompilerPcgEmitCode (CompilationUnitPCG *cUnit, JitTranslationInfo* info
+     // the only reason CGGetBinaryCode should fail is due to insufficient
+     // space in the code cache.
+     if (CGGetBinaryCode (currCachePtr, freeSpace, 0x80000000, &startAddr, &endAddr, &requiredAlign) == false)
++
+     {
+-        gDvmJit.codeCacheFull = true;
++        SET_JIT_ERROR(kJitErrorCodeCacheFull);
+         return;
+     }
+ 
+@@ -1233,10 +1250,27 @@ void dvmCompilerPcgEmitCode (CompilationUnitPCG *cUnit, JitTranslationInfo* info
+ 
+     cUnit->bindBlockSymbolAddresses (startAddr);
+ 
+-    currCachePtr = dvmCompilerPcgEmitChainingCells (cUnit, startAddr, endAddr + 1, freeSpace);
+-    if (currCachePtr == false)
++    // There are two sets of cross references that we need to save
++    // The first is from the chaining cells to the switch table entries
++    // The second is from the switch table to the beginning of the chaining
++    // cells; this is easy, we have the symbols to those blocks already saved.
++    // The first is harder, because it's a forward reference. Hence, we
++    // create a relocation object for each normal chaining cell so that
++    // the chaining cell can be updated when we know where the corresponding
++    // switch table entry is laid down
++    std::list<SwitchTableCCXRef> switchChainingCellEntries;
++    currCachePtr = dvmCompilerPcgEmitChainingCells (cUnit, startAddr, endAddr + 1, freeSpace, &switchChainingCellEntries);
++
++    if (IS_ANY_JIT_ERROR_SET() == true)
++    {
++        return;
++    }
++
++    freeSpace -= currCachePtr - (endAddr + 1);
++    currCachePtr = dvmCompilerPcgEmitSwitchTables(cUnit, currCachePtr, freeSpace, &switchChainingCellEntries);
++
++    if (IS_ANY_JIT_ERROR_SET() == true)
+     {
+-        gDvmJit.codeCacheFull = true;
+         return;
+     }
+ 
+@@ -1271,10 +1305,13 @@ void dvmCompilerPcgEmitCode (CompilationUnitPCG *cUnit, JitTranslationInfo* info
+                 cacheStartPtr, stream);
+     }
+ 
+-    ALOGD("-------- PCG: Emit trace for [%s%s@%#x] binary code starts at %p (cache start %p)",
+-            cUnit->method->clazz->descriptor, cUnit->method->name,
+-            cUnit->traceDesc->trace[0].info.frag.startOffset,
+-            cUnit->baseAddr, gDvmJit.codeCache);
++    if (cUnit->checkDebugMask (DebugMaskDisasm) == true)
++    {
++        ALOGD("-------- PCG: Emit trace for [%s%s@%#x] binary code starts at %p (cache start %p)",
++                cUnit->method->clazz->descriptor, cUnit->method->name,
++                cUnit->traceDesc->trace[0].info.frag.startOffset,
++                cUnit->baseAddr, gDvmJit.codeCache);
++    }
+ }
+ 
+ void *dvmCompilerPcgCreateHookFunction (void)
+diff --git a/vm/compiler/codegen/x86/pcg/DataStructures.h b/vm/compiler/codegen/x86/pcg/DataStructures.h
+index 375e136..d3c69af 100644
+--- a/vm/compiler/codegen/x86/pcg/DataStructures.h
++++ b/vm/compiler/codegen/x86/pcg/DataStructures.h
+@@ -18,6 +18,7 @@
+ #define H_DATASTRUCTURES
+ 
+ #include "libpcg.h"
++#include <list>
+ 
+ /**
+  * @class pcgDtype
+@@ -76,4 +77,17 @@ typedef struct sRelocation
+     CGRelocationType relocationType;         /**< @brief The type of relocation  (absolute vs. PC-relative) */
+ } SRelocation;
+ 
++
++// forward declaration
++struct BasicBlockPCG;
++
++/**
++ * @class SwitchTableCCXRef
++ * @brief SwitchTableCCXRef provides information for how to map a switch table entry to its chaining cell
++ */
++struct SwitchTableCCXRef {
++    SRelocation * relocation;           /**< @brief A ptr to a relocation to keep track of the chaining cell / switch table entry x-ref */
++    BasicBlockPCG * chainingCellBB;     /**< @brief A ptr to the chaining cell this relocation is associated with */
++};
++
+ #endif
+diff --git a/vm/compiler/codegen/x86/pcg/LowerOther.cpp b/vm/compiler/codegen/x86/pcg/LowerOther.cpp
+index b8cc74d..b0365f3 100644
+--- a/vm/compiler/codegen/x86/pcg/LowerOther.cpp
++++ b/vm/compiler/codegen/x86/pcg/LowerOther.cpp
+@@ -25,6 +25,7 @@
+ #include "PersistentInfo.h"
+ #include "Singleton.h"
+ #include "Utility.h"
++#include "Labels.h"
+ 
+ CGInst dvmCompilerPcgGenerateVMPtrMov (CompilationUnitPCG *cUnit)
+ {
+@@ -315,19 +316,102 @@ void dvmCompilerPcgTranslateNewInstance (CompilationUnitPCG *cUnit, MIR *mir)
+     dvmCompilerPcgSetVirtualReg (cUnit, ssaRep->defs[0], "mov", 4, callResult);
+ }
+ 
++/**
++ * @brief Create a jump instruction by using the switch table
++ * @param cUnit the CompilationUnitPCG
++ * @param pSwTblInst A CGInst referring to the packed switch table address
++ * @param tableIndexInst A CGInst referring to the table index load/calculation
++ */
++static void dvmCompilerPcgCreateJumpToPackedSwitchEntry (
++    CompilationUnitPCG * cUnit,
++    CGInst pSwTblInst,
++    CGInst tableIndexInst)
++{
++    // Create the jumpTargetAddr, which is the indexed entry
++    // in the switch table
++    CGAddr jumpTargetAddr = CGCreateAddr (pSwTblInst, tableIndexInst,
++        sizeof(void*), CGSymbolInvalid, 0);
++    CGInst jumpTarget = CGCreateNewInst ("mov", "m", jumpTargetAddr,
++        sizeof(void*), (void*)1);
++
++    // Create an indirect jump to the chaining cell or the
++    // chained address (in eax)
++    CGInst parmEdi = dvmCompilerPcgGenerateVMPtrMov (cUnit);
++    CGInst parmEbp = dvmCompilerPcgGenerateFramePtrMov (cUnit);
++    CGInst parms[3] = {parmEdi, parmEbp, CGInstInvalid};
++    dvmCompilerPcgCreateJsr (CGSymbolInvalid, parms, jumpTarget);
++}
++
++/**
++ * @brief Punt back to the interpreter, because the switch has too many cases to chain
++ * @param cUnit the CompilationUnitPCG
++ * @param entries The actual data entries in the dex file for the switch
++ * @param tableIndexInst A CGInst referring to the table index load/calculation
++ */
++static void dvmCompilerPcgCreateSwitchPunt (
++    CompilationUnitPCG * cUnit,
++    const s4* entries,
++    CGInst tableIndexInst)
++{
++    // Need to compute the correct rPC and call dvmJitToInterpNoChain
++    CGInst entriesInst = CGCreateNewInst ("mov", "i", entries);
++    CGAddr entriesAddr = CGCreateAddr (entriesInst, tableIndexInst,
++        sizeof(size_t), CGSymbolInvalid, 0);
++    CGInst entryInst = CGCreateNewInst ("mov", "m",
++        entriesAddr, sizeof(size_t), (void*)1);
++    CGInst shiftedEntryInst = CGCreateNewInst ("imul", "ri", entryInst, 2);
++
++    // Add the calculated offset to the rPC and jump to the interpreter
++    CGInst rPCInst = CGCreateNewInst ("mov", "i", rPC);
++    CGInst newRPCInst = CGCreateNewInst ("add", "rr",
++        rPCInst, shiftedEntryInst);
++    CGInst rPCInEaxInst = CGCreateNewInst ("mov", "r", newRPCInst);
++    CGSetRreg (rPCInEaxInst, "eax");
++
++    CGInst parmEdi = dvmCompilerPcgGenerateVMPtrMov (cUnit);
++    CGInst parmEbp = dvmCompilerPcgGenerateFramePtrMov (cUnit);
++    CGInst noChainParms[4] = {parmEdi, parmEbp, rPCInEaxInst, CGInstInvalid};
++
++    //Get symbol to the dvmJitToInterpNoChain callback
++    CGSymbol callback = singletonPtr<PersistentInfo> ()->getCallBack ("dvmJitToInterpNoChain");
++
++    //Paranoid
++    assert (callback != 0);
++
++    dvmCompilerPcgCreateJsr (callback, noChainParms);
++}
++
+ void dvmCompilerPcgTranslatePackedSwitch (CompilationUnitPCG *cUnit, MIR *mir)
+ {
++    BasicBlockPCG *bb = static_cast<BasicBlockPCG *> (mir->bb);
++
++    // Each switch instruction needs a switch table, so create a
++    // symbol we can use to refer to the switch table (which
++    // will be created later)
++    std::string blockName;
++    dvmCompilerPcgGetBlockName (bb, blockName);
++    std::string switchTableName = blockName + "_switch";
++    bb->switchTableSymbol = dvmCompilerPcgCreateSymbol (switchTableName, 0, false);
++
++    //Paranoid
++    assert (bb != 0);
++
+     u4 tmp = mir->dalvikInsn.vB;
+     u2* switchData = const_cast<u2 *> (rPC) + (s4)tmp;
+ 
+-    if (*switchData++ != kPackedSwitchSignature)
++    if (*switchData != kPackedSwitchSignature)
+     {
+         // should have been caught by verifier
+         dvmThrowInternalError ("bad packed switch magic");
+         return;
+     }
+ 
+-    u2 tSize = *switchData++;
++    // Advance the pointer
++    switchData++;
++
++    u2 tSize = *switchData;
++    // Advance the pointer
++    switchData++;
+     assert (tSize > 0);
+     s4 firstKey = * ( (s4*)switchData);
+     switchData += 2;
+@@ -336,28 +420,166 @@ void dvmCompilerPcgTranslatePackedSwitch (CompilationUnitPCG *cUnit, MIR *mir)
+ 
+     //Get the SSARepresentation
+     SSARepresentation *ssaRep = mir->ssaRep;
+-
+     assert (ssaRep != 0);
+ 
+     CGInst A = dvmCompilerPcgGetVirtualReg (cUnit, ssaRep->uses[0], "mov", 4);
+-    CGInst entriesInst = CGCreateNewInst ("mov", "i", (int32_t)entries);
++    CGInst pSwTblInst = CGCreateNewInst ("movltc", "n", bb->switchTableSymbol);
+     CGInst firstKeyInst = CGCreateNewInst ("mov", "i", firstKey);
+     CGInst tsizeInst = CGCreateNewInst ("mov", "i", (int32_t)tSize);
+-    CGInst callRes =  dvmCompilerPcgGenerateX86Call (cUnit, "dvmJitHandlePackedSwitch", INTreg, 4,
+-            INTreg, entriesInst,
+-            INTreg, firstKeyInst,
+-            INTreg, tsizeInst,
+-            INTreg, A);
+-    CGInst targetPC = CGCreateNewInst ("add", "ri", callRes, (int32_t)rPC);
+-    CGInst parmEdi = dvmCompilerPcgGenerateVMPtrMov (cUnit);
+-    CGInst parmEbp = dvmCompilerPcgGenerateFramePtrMov (cUnit);
+-    CGInst parms[4] = {targetPC, parmEdi, parmEbp, CGInstInvalid};
++    CGInst zero = CGCreateNewInst ("mov", "i", 0);
+ 
+-    //Get callback to dvmJitToInterpNoChain
+-    CGSymbol callback = singletonPtr<PersistentInfo> ()->getCallBack ("dvmJitToInterpNoChain");
++    // The table index is A - firstKeyValue
++    CGInst tableIndexInst = CGCreateNewInst ("sub", "rr", A, firstKeyInst);
++
++    CGLabel switchDefault = CGCreateLabel ();
++    CGLabel switchNoChain = CGLabelInvalid;
++    CGCreateNewInst ("cjcc", "rcrbp", tableIndexInst, "sge", tsizeInst,
++        switchDefault, 0);
++    CGCreateNewInst ("cjcc", "rcrbp", tableIndexInst, "slt", zero,
++        switchDefault, 0);
++
++    if (tSize > MAX_CHAINED_SWITCH_CASES) {
++        // The big switch case handles MAX_CHAINED_SWITCH_CASES
++        // cases of the switch data, and the default case
++        switchNoChain = CGCreateLabel ();
+ 
+-    //Create JSR
+-    dvmCompilerPcgCreateJsr (callback, parms, CGInstInvalid);
++        CGCreateNewInst ("cjcc", "rcrbp", tableIndexInst, "sge",
++            CGCreateNewInst ("mov", "i", MAX_CHAINED_SWITCH_CASES),
++            switchNoChain, 0);
++    }
++
++    // The fallthrough path is when the index is in the switch table
++    // so simply use the switch table to generate the jumpTarget
++    dvmCompilerPcgCreateJumpToPackedSwitchEntry (cUnit, pSwTblInst,
++        tableIndexInst);
++
++    // Now we handle the default case
++    CGBindLabel (switchDefault);
++    int maxChains = MIN(tSize, MAX_CHAINED_SWITCH_CASES);
++    CGInst maxChainsInst = CGCreateNewInst ("mov", "i", maxChains);
++
++    dvmCompilerPcgCreateJumpToPackedSwitchEntry (cUnit, pSwTblInst,
++        maxChainsInst);
++
++    if (tSize > MAX_CHAINED_SWITCH_CASES)
++    {
++        // Now we handle the punt to interpreter case
++        CGBindLabel (switchNoChain);
++
++        dvmCompilerPcgCreateSwitchPunt (cUnit, entries, tableIndexInst);
++    }
++}
++
++void dvmCompilerPcgTranslateSparseSwitch (CompilationUnitPCG *cUnit, MIR *mir)
++{
++    BasicBlockPCG *bb = static_cast<BasicBlockPCG *> (mir->bb);
++
++    // Each switch instruction needs a switch table, so create a
++    // symbol we can use to refer to the switch table (which
++    // will be created later)
++    std::string blockName;
++    dvmCompilerPcgGetBlockName (bb, blockName);
++    char buffer[1024];
++    snprintf(buffer, sizeof(buffer), "%s_switch",
++        blockName.c_str());
++    std::string switchTableName(buffer);
++    bb->switchTableSymbol = dvmCompilerPcgCreateSymbol (switchTableName, 0, false);
++
++    //Paranoid
++    assert (bb != 0);
++
++    u4 tmp = mir->dalvikInsn.vB;
++    u2* switchData = const_cast<u2 *> (rPC) + (s4)tmp;
++
++    if (*switchData != kSparseSwitchSignature)
++    {
++        // should have been caught by verifier
++        dvmThrowInternalError ("bad sparse switch magic");
++        return;
++    }
++
++    // Advance the pointer
++    switchData++;
++
++    u2 tSize = *switchData;
++    // Advance the pointer
++    switchData++;
++    assert (tSize > 0);
++    const s4* keys = (const s4*) switchData;
++    const s4* entries = keys + tSize;
++    assert(((u4)keys & 0x3) == 0);
++    assert((((u4) ((s4*) switchData + tSize)) & 0x3) == 0);
++
++    //Get the SSARepresentation
++    SSARepresentation *ssaRep = mir->ssaRep;
++    assert (ssaRep != 0);
++
++    CGInst A = dvmCompilerPcgGetVirtualReg (cUnit, ssaRep->uses[0], "mov", 4);
++    CGInst pSwTblInst = CGCreateNewInst ("movltc", "n", bb->switchTableSymbol);
++    CGInst keysInst = CGCreateNewInst ("mov", "i", keys);
++    CGInst tsizeInst = CGCreateNewInst ("mov", "i", (int32_t)tSize);
++
++    // normal switch case
++    if (tSize <= MAX_CHAINED_SWITCH_CASES) {
++        // The normal switch case just calls the function
++        // dvmJitHandleSparseSwitch with the switch key and the pointer
++        // to the switch table at the end of the trace.
++
++        // jumpTarget will be either the start of the
++        // chaining cell or the chained address
++        CGInst jumpTarget = dvmCompilerPcgGenerateX86Call (cUnit, "dvmJitHandleSparseSwitch", INTreg, 4,
++                INTreg, pSwTblInst,
++                INTreg, keysInst,
++                INTreg, tsizeInst,
++                INTreg, A);
++
++        CGInst parmEdi = dvmCompilerPcgGenerateVMPtrMov (cUnit);
++        CGInst parmEbp = dvmCompilerPcgGenerateFramePtrMov (cUnit);
++        CGInst parms[4] = {jumpTarget, parmEdi, parmEbp, CGInstInvalid};
++
++        // Create an indirect jump to the chaining cell or the
++        // chained address (in eax)
++        dvmCompilerPcgCreateJsr (CGSymbolInvalid, parms, jumpTarget);
++
++    } else {
++
++        // The big switch case handles MAX_CHAINED_SWITCH_CASES
++        // cases of the switch data, and the default case
++
++        // tableIndexInst will be the index in the full switch table (in the
++        // dex file) which matches the switch key
++        CGInst tableIndexInst = dvmCompilerPcgGenerateX86Call (cUnit,
++                "dvmJitLookUpBigSparseSwitch", INTreg, 3,
++                INTreg, keysInst,
++                INTreg, tsizeInst,
++                INTreg, A);
++
++        CGLabel switchDefault = CGCreateLabel ();
++        CGLabel switchNoChain = CGCreateLabel ();
++        CGCreateNewInst ("cjcc", "rcrbp", tableIndexInst, "sge", tsizeInst,
++            switchDefault, 0);
++        CGCreateNewInst ("cjcc", "rcrbp", tableIndexInst, "sge",
++            CGCreateNewInst ("mov", "i", MAX_CHAINED_SWITCH_CASES),
++            switchNoChain, 0);
++
++        // The fallthrough path is when the index is in the switch table
++        // so simply index the switch table and jump to that address
++        dvmCompilerPcgCreateJumpToPackedSwitchEntry (cUnit, pSwTblInst,
++            tableIndexInst);
++
++        // Now we handle the default case
++        CGBindLabel (switchDefault);
++        int maxChains = MIN(tSize, MAX_CHAINED_SWITCH_CASES);
++        CGInst maxChainsInst = CGCreateNewInst ("mov", "i", maxChains);
++
++        dvmCompilerPcgCreateJumpToPackedSwitchEntry (cUnit, pSwTblInst,
++            maxChainsInst);
++
++        // Now we handle the punt to interpreter case
++        CGBindLabel (switchNoChain);
++
++        dvmCompilerPcgCreateSwitchPunt (cUnit, entries, tableIndexInst);
++    }
+ }
+ 
+ void dvmCompilerPcgAddVRInterfaceCode (CompilationUnitPCG *cUnit)
+diff --git a/vm/compiler/codegen/x86/pcg/LowerOther.h b/vm/compiler/codegen/x86/pcg/LowerOther.h
+index 78cfe8f..a1cb070 100644
+--- a/vm/compiler/codegen/x86/pcg/LowerOther.h
++++ b/vm/compiler/codegen/x86/pcg/LowerOther.h
+@@ -63,33 +63,39 @@ void dvmCompilerPcgTranslateMarkCardNotNull (const CompilationUnitPCG *cUnit, CG
+ 
+ /**
+  * @brief Translate the instanceOf bytecode
+- * @param cUnit the CompilationUnit
++ * @param cUnit the CompilationUnitPCG
+  * @param mir the MIR instruction
+  */
+ void dvmCompilerPcgTranslateInstanceOf (CompilationUnitPCG *cUnit, MIR *mir);
+ 
+ /**
+  * @brief Translate the check cast bytecode
+- * @param cUnit the CompilationUnit
++ * @param cUnit the CompilationUnitPCG
+  * @param mir the MIR instruction
+  */
+ void dvmCompilerPcgTranslateCheckCast (CompilationUnitPCG *cUnit, MIR *mir);
+ 
+ /**
+  * @brief Translate the new instance bytecode
+- * @param cUnit the CompilationUnit
++ * @param cUnit the CompilationUnitPCG
+  * @param mir the MIR instruction
+  */
+ void dvmCompilerPcgTranslateNewInstance (CompilationUnitPCG *cUnit, MIR *mir);
+ 
+ /**
+  * @brief Translate the packed switch bytecode
+- * @param cUnit the CompilationUnit
++ * @param cUnit the CompilationUnitPCG
+  * @param mir the MIR instruction
+  */
+ void dvmCompilerPcgTranslatePackedSwitch (CompilationUnitPCG *cUnit, MIR *mir);
+ 
+ /**
++ * @brief Translate the sparse switch bytecode
++ * @param cUnit the CompilationUnitPCG
++ * @param mir the MIR instruction
++ */
++void dvmCompilerPcgTranslateSparseSwitch (CompilationUnitPCG *cUnit, MIR *mir);
++/**
+  * @brief Add the VR interface code
+  * @param cUnit the CompilationUnitPCG
+  */
+diff --git a/vm/compiler/codegen/x86/pcg/PcgInterface.cpp b/vm/compiler/codegen/x86/pcg/PcgInterface.cpp
+index a877dd1..e39e272 100644
+--- a/vm/compiler/codegen/x86/pcg/PcgInterface.cpp
++++ b/vm/compiler/codegen/x86/pcg/PcgInterface.cpp
+@@ -74,12 +74,12 @@ void pcgDvmCompilerMIR2LIR (CompilationUnit *cUnitME, JitTranslationInfo* info)
+     // caller that an error occured during compilation.  We will set it to a
+     // valid value after successfull compilation.
+     cUnitME->baseAddr = 0;
++    info->codeAddress = 0;
+ 
+     if (cUnitME->printMe == true) {
+         cUnit.setDebugLevel (DebugMaskDisasm);
+     }
+ 
+-
+     if (cUnit.checkDebugMask (DebugMaskTrace) == true)
+     {
+         CGSetTraceOutputFile (stdout);
+@@ -87,6 +87,9 @@ void pcgDvmCompilerMIR2LIR (CompilationUnit *cUnitME, JitTranslationInfo* info)
+ 
+     CGCreateRoutine (&cUnit);
+ 
++    // clear any previous JIT errors
++    CLEAR_ALL_JIT_ERRORS();
++
+     //If analysis succeeds continue
+     if (dvmCompilerPcgNewRegisterizeVRAnalysis (&cUnit) == true)
+     {
+@@ -102,6 +105,18 @@ void pcgDvmCompilerMIR2LIR (CompilationUnit *cUnitME, JitTranslationInfo* info)
+         {
+             CGCompileRoutine (&cUnit);
+             dvmCompilerPcgEmitCode (&cUnit, info);
++
++            if (IS_JIT_ERROR_SET(kJitErrorCodeCacheFull) == true)
++            {
++                gDvmJit.codeCacheFull = true;
++            }
++
++            if (IS_ANY_JIT_ERROR_SET())
++            {
++                // We call this to print errors set down in EmitCode,
++                // true means we won't retry
++                dvmCanFixErrorsAndRetry(&cUnit, true);
++            }
+         }
+     }
+ 
+diff --git a/vm/compiler/codegen/x86/pcg/Utility.cpp b/vm/compiler/codegen/x86/pcg/Utility.cpp
+index e5440cf..c3b7c9e 100644
+--- a/vm/compiler/codegen/x86/pcg/Utility.cpp
++++ b/vm/compiler/codegen/x86/pcg/Utility.cpp
+@@ -16,6 +16,7 @@
+ 
+ #include "BasicBlockPCG.h"
+ #include "CodeGeneration.h"
++#include "CodegenErrors.h"
+ #include "CompilationUnitPCG.h"
+ #include "Dataflow.h"
+ #include "Labels.h"
+@@ -52,9 +53,11 @@ static const char *getCallOpcodeAndRreg (pcgDtype dtype, const char **rregPtr)
+     }
+ 
+     // We can add support for FP results, but they aren't currently needed, so just give an error here.
+-    //TODO remove this exit -1
+-    ALOGI ("PCG Error: Unsupported call dtype");
+-    exit (-1);
++    ALOGE ("PCG Error: Unsupported call dtype");
++    assert(0);
++    SET_JIT_ERROR(kJitErrorPcgUnsupportedCallDataType);
++    *rregPtr = "";
++    return "";
+ }
+ 
+ int32_t dvmCompilerPcgGetOpcodeAndSizeForDtype (pcgDtype dtype, const char **opcPtr)
+@@ -88,7 +91,8 @@ int32_t dvmCompilerPcgGetOpcodeAndSizeForDtype (pcgDtype dtype, const char **opc
+             ALOGE ("\n+++ PCG ERROR +++ Unexpected data type seen : %d.",
+                   dtype);
+             assert (0);
+-            exit (-1);
++            SET_JIT_ERROR(kJitErrorPcgUnexpectedDataType);
++            return -1;
+     }
+ 
+     *opcPtr = pcgOpcode;
+@@ -470,7 +474,6 @@ bool dvmCompilerPcgSupportTrace (CompilationUnit *cUnit)
+                     }
+                     break;
+ 
+-                case OP_SPARSE_SWITCH:
+                 case OP_INVOKE_VIRTUAL:
+                 case OP_INVOKE_SUPER:
+                 case OP_INVOKE_VIRTUAL_RANGE:
+-- 
+1.7.4.1
+

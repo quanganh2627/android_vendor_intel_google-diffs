@@ -1,0 +1,150 @@
+From 753093907a6d365e7da450e33043ffe2c5e4f59e Mon Sep 17 00:00:00 2001
+From: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Date: Thu, 4 Apr 2013 11:48:13 -0700
+Subject: Dalvik: Fix registerization satisfyBBAssociations
+
+BZ: 97467
+
+Registerization can make mistakes when satisfying child BB association.
+This can happen when satisfying the in memory VRs of child. Whenever a
+child believes a VR is in memory, the parent must ensure that is the
+case. Sometimes registerization can skip satisfying this if the VR
+is not part of the write back requests.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I3883869b5ca04736c902ee58cfdcdd4c8cd86cb7
+Orig-MCG-Change-Id: I4f280da950c30d5f69a13d0eadd26af5b9a23edf
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/codegen/x86/LowerJump.cpp         |    7 ++--
+ vm/compiler/codegen/x86/RegisterizationBE.cpp |   40 +++++++++++++++++--------
+ vm/compiler/codegen/x86/RegisterizationBE.h   |    5 ++-
+ 3 files changed, 35 insertions(+), 17 deletions(-)
+
+diff --git a/vm/compiler/codegen/x86/LowerJump.cpp b/vm/compiler/codegen/x86/LowerJump.cpp
+index 4985c9c..1f22f9a 100644
+--- a/vm/compiler/codegen/x86/LowerJump.cpp
++++ b/vm/compiler/codegen/x86/LowerJump.cpp
+@@ -1254,9 +1254,10 @@ int common_if(s4 tmp, ConditionCode cc_next, ConditionCode cc) {
+             return -1;
+         }
+ 
+-        //Now we want to satisfy the associations of the loop entry
+-        if (AssociationTable::satisfyBBAssociations (backward,
+-                loopEntry) == false)
++        //Now we want to satisfy the associations of the loop entry.
++        //We also inform satisfyBBAssociations that this is a backward branch.
++        if (AssociationTable::satisfyBBAssociations (backward, loopEntry,
++                true) == false)
+         {
+             return -1;
+         }
+diff --git a/vm/compiler/codegen/x86/RegisterizationBE.cpp b/vm/compiler/codegen/x86/RegisterizationBE.cpp
+index 2ba1cb7..c017492 100644
+--- a/vm/compiler/codegen/x86/RegisterizationBE.cpp
++++ b/vm/compiler/codegen/x86/RegisterizationBE.cpp
+@@ -427,11 +427,15 @@ static void initAssociationHelperTables (AssociationTable &associationsToUse,
+  * @param childUsedReg what registers are being used at entry for the child
+  * @param currentVRs the current Virtual Registers used by the parent at the end of code generation
+  * @param childVRs the child's Virtual Register usage at entrance of code generation
++ * @param trySkipWriteBack This enables an optimization where the write backs are only handled
++ * if VR is in the BB's write back requests. This can be useful when spilling to memory for loop
++ * entry but loop never reads the written value.
+  */
+ static void spillVRToMemory (const BasicBlock_O1 *parent,
+                              const std::set<PhysicalReg> &childUsedReg,
+                              const std::set<int> &currentVRs,
+-                             const std::set<int> &childVRs) {
++                             const std::set<int> &childVRs,
++                             bool trySkipWriteBack) {
+     std::set<int> setOperationResult;
+ 
+     // Do we have any VRs that are currently in physical registers
+@@ -443,21 +447,26 @@ static void spillVRToMemory (const BasicBlock_O1 *parent,
+ 
+     //Spill anything that is in this difference set
+     for (std::set<int>::const_iterator setOpIter = setOperationResult.begin();
+-            setOpIter != setOperationResult.end(); setOpIter++) {
+-        // TODO This spilling should reuse some common code for spilling just VRs
+-
++            setOpIter != setOperationResult.end(); setOpIter++)
++    {
+         int VR = *setOpIter;
+ 
+-        // So we spill if parent requested it for spill or if child plans on reusing
+-        // the physical register.
+-        for (int entry = 0; entry < num_compile_entries; entry++) {
++        for (int entry = 0; entry < num_compile_entries; entry++)
++        {
++            // We want to skip the write back if the optimization is enabled, if parent
++            // did not request it for spill, and if the child does not plan on reusing it
++            bool skipWriteBack = trySkipWriteBack
++                    && (dvmIsBitSet(parent->requestWriteBack, VR) == false)
++                    && (childUsedReg.find(
++                            static_cast<PhysicalReg>(compileTable[entry].physicalReg))
++                            == childUsedReg.end());
++
++            // Handle the write back
+             if (isVirtualReg(compileTable[entry].physicalType)
+                     && compileTable[entry].physicalReg != PhysicalReg_Null
+                     && compileTable[entry].regNum == VR
+-                    && (dvmIsBitSet(parent->requestWriteBack, VR)
+-                            || childUsedReg.find(
+-                                    static_cast<PhysicalReg>(compileTable[entry].physicalReg))
+-                                    != childUsedReg.end())) {
++                    && skipWriteBack == false)
++            {
+                 DEBUG_ASSOCIATION_MERGE(ALOGD("Spilling v%d back to memory because "
+                         "child does not expect it in a physical register", VR));
+                 spillLogicalReg(entry, true);
+@@ -832,7 +841,9 @@ static bool moveToChildPhysical (AssociationTable &associationsToUse,
+     return true;
+ }
+ 
+-bool AssociationTable::satisfyBBAssociations(BasicBlock_O1 * parent, BasicBlock_O1 * child) {
++bool AssociationTable::satisfyBBAssociations (BasicBlock_O1 * parent,
++        BasicBlock_O1 * child, bool isBackward)
++{
+     // To get here, it must be the case that this child's associations have
+     // already been finalized
+     assert (child->associationTable.hasBeenFinalized() == true);
+@@ -858,7 +869,10 @@ bool AssociationTable::satisfyBBAssociations(BasicBlock_O1 * parent, BasicBlock_
+     associationsToUse.findUsedRegisters(childUsedReg);
+ 
+     //Handle VR difference to spill anything the child wants: frees registers
+-    spillVRToMemory (parent, childUsedReg, currentVRs, childVRs);
++    //For backward branches, we want to try skipping anything that is not a
++    //phi node.
++    spillVRToMemory (parent, childUsedReg, currentVRs, childVRs,
++            isBackward == true);
+ 
+     //Third step: find scratch registers
+     std::set<PhysicalReg> scratchRegs;
+diff --git a/vm/compiler/codegen/x86/RegisterizationBE.h b/vm/compiler/codegen/x86/RegisterizationBE.h
+index 46efdb1..8c161a2 100644
+--- a/vm/compiler/codegen/x86/RegisterizationBE.h
++++ b/vm/compiler/codegen/x86/RegisterizationBE.h
+@@ -219,10 +219,13 @@ public:
+      * to the association table state of child.
+      * @param parent Parent basic block.
+      * @param child Child basic block.
++     * @param isBackward Used to denote whether we are satisfying associations
++     * of loop entry. If yes, then we only write back phi nodes.
+      * @return Returns whether the state of parent successfully matches state of
+      * child.
+      */
+-    static bool satisfyBBAssociations(BasicBlock_O1 * parent, BasicBlock_O1 * child);
++    static bool satisfyBBAssociations (BasicBlock_O1 * parent,
++            BasicBlock_O1 * child, bool isBackward = false);
+ 
+     /**
+      * @brief Spills virtual registers marked for spilling by the middle end.
+-- 
+1.7.4.1
+

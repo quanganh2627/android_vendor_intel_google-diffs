@@ -1,0 +1,1359 @@
+From eaaa1b4a2b467d67aeb1f179cc4cba7dc3fcd26a Mon Sep 17 00:00:00 2001
+From: Tim Hartley <timothy.d.hartley@intel.com>
+Date: Tue, 3 Dec 2013 10:57:14 -0800
+Subject: Dalvik: newer style jitverbose logging for PCG
+
+BZ: 144660
+This patch brings the PCG JIT back-end up to date with
+the better jitverbose printing to the logcat. It refactors
+the PCG GL's switch table cross-reference system.
+
+Change-Id: I47c7440679f34f00fb68b57e9ce41eb1eb4c0cb5
+Category: device enablement
+Domain: AOSP.Dalvik-Other
+Origin: internal
+Upstream-Candidate: no, need rework
+Signed-off-by: Tim Hartley <timothy.d.hartley@intel.com>
+---
+ vm/Dvm.mk                                          |    3 +-
+ vm/Globals.h                                       |    5 +
+ vm/compiler/CompilerIR.h                           |    5 +
+ vm/compiler/Frontend.cpp                           |    8 +
+ vm/compiler/JitVerbose.cpp                         |  277 +++++++++++++++++++
+ vm/compiler/JitVerbose.h                           |   52 ++++
+ .../codegen/x86/lightcg/CodegenInterface.cpp       |  290 +++-----------------
+ vm/compiler/codegen/x86/lightcg/Lower.h            |    3 -
+ .../codegen/x86/pcg/ChainingCellException.cpp      |   60 +++--
+ .../codegen/x86/pcg/ChainingCellException.h        |   10 +-
+ vm/compiler/codegen/x86/pcg/CodeGeneration.cpp     |   17 +-
+ vm/compiler/codegen/x86/pcg/CompilationUnitPCG.cpp |   21 ++
+ vm/compiler/codegen/x86/pcg/CompilationUnitPCG.h   |   33 +++
+ vm/compiler/codegen/x86/pcg/UtilityPCG.cpp         |   71 +++++
+ vm/compiler/codegen/x86/pcg/UtilityPCG.h           |    7 +
+ 15 files changed, 572 insertions(+), 290 deletions(-)
+ create mode 100644 vm/compiler/JitVerbose.cpp
+ create mode 100644 vm/compiler/JitVerbose.h
+
+diff --git a/vm/Dvm.mk b/vm/Dvm.mk
+index d476c5f..99c57e6 100644
+--- a/vm/Dvm.mk
++++ b/vm/Dvm.mk
+@@ -387,7 +387,8 @@ ifeq ($(dvm_arch),x86)
+               compiler/Expression.cpp \
+               compiler/AccumulationSinking.cpp \
+               compiler/SinkCastOpt.cpp \
+-              compiler/Vectorization.cpp
++              compiler/Vectorization.cpp \
++              compiler/JitVerbose.cpp
+ 
+        LOCAL_C_INCLUDES += \
+               dalvik/vm/compiler \
+diff --git a/vm/Globals.h b/vm/Globals.h
+index fe7be10..c6a9f8e 100644
+--- a/vm/Globals.h
++++ b/vm/Globals.h
+@@ -831,6 +831,8 @@ enum VTuneInfo {
+ #define VTUNE_VERSION_DEFAULT 279866
+ #endif
+ 
++struct ChainCellCounts;
++
+ /**
+  * @class sPassFramework
+  * @brief The Pass framework's entry point
+@@ -875,6 +877,9 @@ typedef struct sJitFramework
+ 
+     /** @brief What is maximum number of scratch registers allowed? */
+     unsigned int (*scratchRegAvail) (void);
++
++    /** @brief Function to dump verbose trace information to logcat */
++    void (*printTrace) (CompilationUnit *cUnit, ChainCellCounts &chainCellCounts, int wide_const_count, u2* pCCOffsetSection);
+ }SJitFramework;
+ 
+ /*
+diff --git a/vm/compiler/CompilerIR.h b/vm/compiler/CompilerIR.h
+index c7ea72d..3769094 100644
+--- a/vm/compiler/CompilerIR.h
++++ b/vm/compiler/CompilerIR.h
+@@ -629,6 +629,11 @@ typedef struct CompilationUnit {
+      * are updated.
+      */
+     std::map<int, int> *degeneratePhiMap;
++
++    /**
++     * @brief Keeps track of code blocks, to facilitate jit verbose printing
++     */
++    std::vector<std::pair<BBType, char*> >  *code_block_table;
+ }CompilationUnit;
+ 
+ #if defined(WITH_SELF_VERIFICATION)
+diff --git a/vm/compiler/Frontend.cpp b/vm/compiler/Frontend.cpp
+index 4a4010d..7b78d27 100644
+--- a/vm/compiler/Frontend.cpp
++++ b/vm/compiler/Frontend.cpp
+@@ -1816,6 +1816,10 @@ bool dvmCompileMethod(const Method *method, JitTranslationInfo *info)
+     std::map<int, int> degeneratePhiMap;
+     cUnit.degeneratePhiMap = &degeneratePhiMap;
+ 
++    //Set up the jit verbose infrastructure
++    std::vector<std::pair<BBType, char*> > code_block_table;
++    cUnit.code_block_table = &code_block_table;
++
+     /* Initialize the block list */
+     dvmInitGrowableList(&cUnit.blockList, 4);
+ 
+@@ -2411,6 +2415,10 @@ bool dvmCompileTrace(JitTraceDescription *desc, int numMaxInsts,
+     std::map<int, int> degeneratePhiMap;
+     cUnit.degeneratePhiMap = &degeneratePhiMap;
+ 
++    //Set up the jit verbose infrastructure
++    std::vector<std::pair<BBType, char*> > code_block_table;
++    cUnit.code_block_table = &code_block_table;
++
+ #if defined(WITH_JIT_TUNING)
+     /* Locate the entry to store compilation statistics for this method */
+     methodStats = dvmCompilerAnalyzeMethodBody(desc->method, false);
+diff --git a/vm/compiler/JitVerbose.cpp b/vm/compiler/JitVerbose.cpp
+new file mode 100644
+index 0000000..a672236
+--- /dev/null
++++ b/vm/compiler/JitVerbose.cpp
+@@ -0,0 +1,277 @@
++/*
++* Copyright (C) 2013 Intel Corporation
++*
++* Licensed under the Apache License, Version 2.0 (the "License");
++* you may not use this file except in compliance with the License.
++* You may obtain a copy of the License at
++*
++*      http://www.apache.org/licenses/LICENSE-2.0
++*
++* Unless required by applicable law or agreed to in writing, software
++* distributed under the License is distributed on an "AS IS" BASIS,
++* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++* See the License for the specific language governing permissions and
++* limitations under the License.
++*/
++
++#include <vector>
++#include <map>
++#include <set>
++
++#include "Dalvik.h"
++#include "Compiler.h"
++#include "CompilerIR.h"
++#include "Dataflow.h"
++#include "PassDriver.h"
++#include "Utility.h"
++#include "enc_wrapper.h"
++
++#define PRINT_BUFFER_LEN 1024
++
++void dvmCompilerPrintEmittedCodeBlock (unsigned char *startAddr,
++                                       unsigned char *endAddr)
++{
++    char strbuf[PRINT_BUFFER_LEN];
++    unsigned char *addr;
++    unsigned char *next_addr;
++
++    static const unsigned char nops[10][9] = {
++        { 0, },                                                     // 0, this line is dummy and not used in the loop below
++        { 0x90, },                                                  // 1-byte NOP
++        { 0x66, 0x90, },                                            // 2
++        { 0x0F, 0x1F, 0x00, },                                      // 3
++        { 0x0F, 0x1F, 0x40, 0x00, },                                // 4
++        { 0x0F, 0x1F, 0x44, 0x00, 0x00, },                          // 5
++        { 0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00, },                    // 6
++        { 0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00, },              // 7
++        { 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00, },        // 8
++        { 0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00 },   // 9-byte NOP
++    };
++    int nopSize;
++    int pos;
++
++    if (gDvmJit.printBinary == true)
++    {
++        // print binary in bytes
++        int n = 0;
++        for (addr = startAddr; addr < endAddr; addr++)
++        {
++            n += snprintf (&strbuf[n], PRINT_BUFFER_LEN-n, "0x%x, ", *addr);
++            if (n > PRINT_BUFFER_LEN - 10)
++            {
++                ALOGD ("## %s", strbuf);
++                n = 0;
++            }
++        }
++        if (n > 0)
++        {
++            ALOGD ("## %s", strbuf);
++        }
++    }
++
++    // print disassembled instructions
++    addr = startAddr;
++    while (addr < endAddr)
++    {
++        next_addr = reinterpret_cast<unsigned char *>
++            (decoder_disassemble_instr(reinterpret_cast<char *>(addr),
++                                       strbuf, PRINT_BUFFER_LEN));
++        if (addr != next_addr)
++        {
++            ALOGD ("**  %p: %s", addr, strbuf);
++        }
++        else
++        {
++            for (nopSize = 1; nopSize < 10; nopSize++)
++            {
++                for (pos = 0; pos < nopSize; pos++)
++                {
++                    if (addr[pos] != nops[nopSize][pos])
++                    {
++                        break;
++                    }
++                }
++                if (pos == nopSize)
++                {
++                    ALOGD ("**  %p: NOP (%d byte)", addr, nopSize);
++                    next_addr += nopSize;
++                    break;
++                }
++            }
++            if (nopSize == 10)
++            {
++                ALOGD ("** unable to decode binary at %p", addr);
++                break;
++            }
++        }
++        addr = next_addr;
++    }
++}
++
++/**
++ * @brief Print the content of chaining cell block in code cache to LOG.
++ * @param startAddr - starting address of the chaining cell block in code cache
++ * @param blockType - chaining cell block type
++ */
++void printChainingCellBlocks (char *startAddr, BBType blockType)
++{
++    unsigned int *ui_ptr;
++
++    if (startAddr == 0 || blockType >= kChainingCellGap)
++    {
++        return;
++    }
++
++    // Chaining cell block starts with a 5B "call rel32" at [startAddr, ui_ptr).
++    ui_ptr = (unsigned int *) ((unsigned char *)(startAddr+5));
++
++    switch (blockType)
++    {
++        case kChainingCellNormal:
++            ALOGD ("** // Normal Chaining Cell");
++            dvmCompilerPrintEmittedCodeBlock ((unsigned char *) startAddr, (unsigned char *) ui_ptr);
++            ALOGD ("**  %p: %#x \t// next bytecode PC", (void*)ui_ptr, *ui_ptr);
++            ui_ptr++;
++            ALOGD ("**  %p: %#x \t// code address to be patched", (void*)ui_ptr, *ui_ptr);
++            ui_ptr++;
++            ALOGD ("**  %p: %d \t// isSwitch flag", (void*)ui_ptr, *ui_ptr);
++            break;
++
++        case kChainingCellInvokeSingleton:
++            ALOGD ("** // InvokeSingleton Chaining Cell");
++            dvmCompilerPrintEmittedCodeBlock ((unsigned char *) startAddr, (unsigned char *) ui_ptr);
++            ALOGD ("**  %p: %#x \t// next bytecode PC", (void*)ui_ptr, *ui_ptr);
++            ui_ptr++;
++            ALOGD ("**  %p: %#x \t// code address to be patched", (void*)ui_ptr, *ui_ptr);
++            ui_ptr++;
++            break;
++
++        case kChainingCellHot:
++            ALOGD ("** // Hot Chaining Cell");
++            dvmCompilerPrintEmittedCodeBlock ((unsigned char *) startAddr, (unsigned char *) ui_ptr);
++            ALOGD ("**  %p: %#x \t// next bytecode PC", (void*)ui_ptr, *ui_ptr);
++            ui_ptr++;
++            ALOGD ("**  %p: %#x \t// code address to be patched", (void*)ui_ptr, *ui_ptr);
++            ui_ptr++;
++            ALOGD ("**  %p: %d   \t// above needs an IP-relative offset", (void*)ui_ptr, *ui_ptr);
++            break;
++
++        case kChainingCellBackwardBranch:
++            ALOGD ("** // BackwardBranch Chaining Cell");
++            dvmCompilerPrintEmittedCodeBlock ((unsigned char *) startAddr, (unsigned char *) ui_ptr);
++            ALOGD ("**  %p: %#x \t// next bytecode PC", (void*)ui_ptr, *ui_ptr);
++            ui_ptr++;
++            ALOGD ("**  %p: %#x \t// code address to be patched", (void*)ui_ptr, *ui_ptr);
++            ui_ptr++;
++            ALOGD ("**  %p: %#x \t// address of loop header block", (void*)ui_ptr, *ui_ptr);
++            ui_ptr++;
++            ALOGD ("**  %p: %#x \t// address of VR write-back block", (void*)ui_ptr, *ui_ptr);
++            ui_ptr++;
++            ALOGD ("**  %p: %#x \t// address of loop pre-header block", (void*)ui_ptr, *ui_ptr);
++            break;
++
++        case kChainingCellInvokePredicted:
++            ui_ptr = (unsigned int *) startAddr;
++            ALOGD ("** // InvokePredicted Chaining Cell: %p",
++                  (void*) startAddr);
++            ALOGD ("**  %p: %#x \t// to be patched", (void*)ui_ptr, *ui_ptr);
++            ui_ptr++;
++            ALOGD ("**  %p: %#x \t// to be patched", (void*)ui_ptr, *ui_ptr);
++            ui_ptr++;
++            ALOGD ("**  %p: %#x \t// class", (void*)ui_ptr, *ui_ptr);
++            ui_ptr++;
++            ALOGD ("**  %p: %#x \t// method", (void*)ui_ptr, *ui_ptr);
++            ui_ptr++;
++            ALOGD ("**  %p: %#x \t// staged class", (void*)ui_ptr, *ui_ptr);
++            break;
++
++        default:
++            ALOGD ("printChainingCellBlocks: Unknown chaining cell type %u!",
++                  blockType);
++            break;      // Not yet supported! Do nothing.
++    }
++}
++
++char *dvmCompilerPrintTrace (CompilationUnit *cUnit)
++{
++    std::vector<std::pair<BBType, char*> > &code_block_table = *cUnit->code_block_table;
++    char *code_ptr, *next_code_ptr;
++    BBType blk_type;
++    int k;
++    int max = code_block_table.size () - 1;
++
++    ALOGD ("-------- Emit trace for [%s%s@%#x] binary code starts at %p (cache start %p)",
++          cUnit->method->clazz->descriptor, cUnit->method->name,
++          cUnit->traceDesc->trace[0].info.frag.startOffset,
++          cUnit->baseAddr, gDvmJit.codeCache);
++    ALOGD ("** %s%s@%#x:", cUnit->method->clazz->descriptor,
++          cUnit->method->name, cUnit->traceDesc->trace[0].info.frag.startOffset);
++
++    code_ptr = 0;
++    next_code_ptr = 0;
++    for (k = 0; k < max; k++)
++    {
++        blk_type = code_block_table[k].first;
++        code_ptr = code_block_table[k].second;
++        next_code_ptr = code_block_table[k+1].second;
++
++        switch (blk_type)
++        {
++        case kExceptionHandling:
++            if (code_ptr < next_code_ptr)
++            {
++                ALOGD ("** // exception handling VR restores");
++                // print like a normal code block
++                dvmCompilerPrintEmittedCodeBlock ((unsigned char *) code_ptr,
++                                      (unsigned char *) next_code_ptr);
++            }
++            break;
++
++        case kDalvikByteCode:
++        case kFromInterpreter:
++            if (code_ptr < next_code_ptr)
++            {
++                dvmCompilerPrintEmittedCodeBlock ((unsigned char *) code_ptr,
++                                      (unsigned char *) next_code_ptr);
++            }
++            break;
++
++        case kChainingCellNormal:
++        case kChainingCellHot:
++        case kChainingCellInvokeSingleton:
++        case kChainingCellInvokePredicted:
++        case kChainingCellBackwardBranch:
++            printChainingCellBlocks (code_ptr, blk_type);
++            break;
++
++        default:          // no print for other block types
++            break;
++        }
++    }
++
++    return next_code_ptr;
++}
++
++char *dvmCompilerPrintChainingCellCounts (char *chainingCellCountAddr, ChainCellCounts &chainCellCounts)
++{
++    char * next_code_ptr = chainingCellCountAddr;
++    // print the chaining cell count section
++    uint32_t padding = (4 - ( (u4)next_code_ptr % 4)) % 4;
++    next_code_ptr = reinterpret_cast<char*>(reinterpret_cast<unsigned int>(next_code_ptr + padding));
++    ALOGD ("** // chaining cell counts section (4B aligned)");
++    for (int i = 0; i < kChainingCellGap; i++)
++    {
++        ALOGD ("**  %p: %u", (void*) next_code_ptr, chainCellCounts.u.count[i]);
++        next_code_ptr += sizeof(chainCellCounts.u.count[i]);
++    }
++    return next_code_ptr;
++}
++
++void dvmCompilerPrintChainingCellOffsetHeader (u2 *pCCOffsetSection)
++{
++    // print the chaining cell offset header content
++    ALOGD ("** // Patched (offset to chaining cell counts)@%p = %#x",
++          (void*)pCCOffsetSection, *pCCOffsetSection);
++    ALOGD ("** // Patched (offset to chaining cell blocks)@%p = %#x",
++          (void*)&pCCOffsetSection[1], pCCOffsetSection[1]);
++}
+diff --git a/vm/compiler/JitVerbose.h b/vm/compiler/JitVerbose.h
+new file mode 100644
+index 0000000..5b6a5b3
+--- /dev/null
++++ b/vm/compiler/JitVerbose.h
+@@ -0,0 +1,52 @@
++/*
++* Copyright (C) 2013 Intel Corporation
++*
++* Licensed under the Apache License, Version 2.0 (the "License");
++* you may not use this file except in compliance with the License.
++* You may obtain a copy of the License at
++*
++*      http://www.apache.org/licenses/LICENSE-2.0
++*
++* Unless required by applicable law or agreed to in writing, software
++* distributed under the License is distributed on an "AS IS" BASIS,
++* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++* See the License for the specific language governing permissions and
++* limitations under the License.
++*/
++
++#ifndef DALVIK_VM_JITVERBOSE_H_
++#define DALVIK_VM_JITVERBOSE_H_
++
++//Forward declarations
++struct CompilationUnit;
++struct ChainCellCounts;
++
++/* @brief Print the code block in code cache in the range of [startAddr, endAddr) in readable format.
++ * @param startAddr the start address of the emitted code block
++ * @param endAddr the end address of the emitted code block
++ */
++void dvmCompilerPrintEmittedCodeBlock (unsigned char *startAddr,
++                                       unsigned char *endAddr);
++
++/**
++ * @brief Print the contents of the code blocks and chaining cells to the LOG
++ * @param cUnit pointer to the CompilationUnit
++ * @return the trace cache pointer if code was printed, or 0 otherwise
++ */
++char *dvmCompilerPrintTrace (CompilationUnit *cUnit);
++
++/**
++ * @brief Print the chaining cell counts for a trace to logcat
++ * @param chainingCellCountAddr a pointer to the beginning of the chaining cell counts in the emitted code
++ * @param chainCellCounts reference to the ChainCellCounts table
++ * @return the trace cache pointer if code was printed, or 0 otherwise
++ */
++char *dvmCompilerPrintChainingCellCounts (char *chainingCellCountAddr, ChainCellCounts &chainCellCounts);
++
++/**
++ * @brief Print the chaining cell offset header content
++ * @param pCCOffsetSection - pointer to the chaining cell offset header
++ */
++void dvmCompilerPrintChainingCellOffsetHeader (u2 *pCCOffsetSection);
++
++#endif
+diff --git a/vm/compiler/codegen/x86/lightcg/CodegenInterface.cpp b/vm/compiler/codegen/x86/lightcg/CodegenInterface.cpp
+index c7ffb14..c6d3065 100644
+--- a/vm/compiler/codegen/x86/lightcg/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/lightcg/CodegenInterface.cpp
+@@ -31,6 +31,7 @@
+ #include "Scheduler.h"
+ #include "Profile.h"
+ #include "X86Common.h"
++#include "JitVerbose.h"
+ 
+ #ifdef HAVE_ANDROID_OS
+ #include <cutils/properties.h>
+@@ -1550,266 +1551,61 @@ bool handleExtendedMIR (CompilationUnit *cUnit, BasicBlock_O1 *bb, MIR *mir)
+     return result;
+ }
+ 
+-#define PRINT_BUFFER_LEN 1024
+-/* Print the code block in code cache in the range of [startAddr, endAddr)
+- * in readable format.
+- */
+-void printEmittedCodeBlock(unsigned char *startAddr, unsigned char *endAddr)
+-{
+-    char strbuf[PRINT_BUFFER_LEN];
+-    unsigned char *addr;
+-    unsigned char *next_addr;
+-    int n;
+-
+-    static const unsigned char nops[10][9] = {
+-        { 0, },                                                     // 0, this line is dummy and not used in the loop below
+-        { 0x90, },                                                  // 1-byte NOP
+-        { 0x66, 0x90, },                                            // 2
+-        { 0x0F, 0x1F, 0x00, },                                      // 3
+-        { 0x0F, 0x1F, 0x40, 0x00, },                                // 4
+-        { 0x0F, 0x1F, 0x44, 0x00, 0x00, },                          // 5
+-        { 0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00, },                    // 6
+-        { 0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00, },              // 7
+-        { 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00, },        // 8
+-        { 0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00 },   // 9-byte NOP
+-    };
+-    int nopSize;
+-    int pos;
+-
+-    if (gDvmJit.printBinary) {
+-        // print binary in bytes
+-        n = 0;
+-        for (addr = startAddr; addr < endAddr; addr++) {
+-            n += snprintf(&strbuf[n], PRINT_BUFFER_LEN-n, "0x%x, ", *addr);
+-            if (n > PRINT_BUFFER_LEN - 10) {
+-                ALOGD("## %s", strbuf);
+-                n = 0;
+-            }
+-        }
+-        if (n > 0)
+-            ALOGD("## %s", strbuf);
+-    }
+-
+-    // print disassembled instructions
+-    addr = startAddr;
+-    while (addr < endAddr) {
+-        next_addr = reinterpret_cast<unsigned char*>
+-            (decoder_disassemble_instr(reinterpret_cast<char*>(addr),
+-                                       strbuf, PRINT_BUFFER_LEN));
+-        if (addr != next_addr) {
+-            ALOGD("**  %p: %s", addr, strbuf);
+-        } else {
+-            for (nopSize = 1; nopSize < 10; nopSize++) {
+-                for (pos = 0; pos < nopSize; pos++) {
+-                    if (addr[pos] != nops[nopSize][pos])
+-                        break;
+-                }
+-                if (pos == nopSize) {
+-                    ALOGD("**  %p: NOP (%d byte)", addr, nopSize);
+-                    next_addr += nopSize;
+-                    break;
+-                }
+-            }
+-            if (nopSize == 10) {
+-                ALOGD("** unable to decode binary at %p", addr);
+-                break;
+-            }
+-        }
+-        addr = next_addr;
+-    }
+-}
+-
+-/**
+- * @brief Print the content of chaining cell block in code cache to LOG.
+- * @param startAddr - starting address of the chaining cell block in code cache
+- * @param blockType - chaining cell block type
+- */
+-static void printChainingCellBlocks(char *startAddr, BBType blockType)
+-{
+-    unsigned int *ui_ptr;
+-
+-    if (startAddr == 0 || blockType >= kChainingCellGap) {
+-        return;
+-    }
+-
+-    // Chaining cell block starts with a 5B "call rel32" at [startAddr, ui_ptr).
+-    ui_ptr = (unsigned int *) ((unsigned char *)(startAddr+5));
+-
+-    switch (blockType) {
+-        case kChainingCellNormal:
+-            ALOGD("** // Normal Chaining Cell");
+-            printEmittedCodeBlock((unsigned char *) startAddr, (unsigned char *) ui_ptr);
+-            ALOGD("**  %p: %#x \t// next bytecode PC", (void*)ui_ptr, *ui_ptr);
+-            ui_ptr++;
+-            ALOGD("**  %p: %#x \t// code address to be patched", (void*)ui_ptr, *ui_ptr);
+-            ui_ptr++;
+-            ALOGD("**  %p: %d \t// isSwitch flag", (void*)ui_ptr, *ui_ptr);
+-            break;
+-
+-        case kChainingCellInvokeSingleton:
+-            ALOGD("** // InvokeSingleton Chaining Cell");
+-            printEmittedCodeBlock((unsigned char *) startAddr, (unsigned char *) ui_ptr);
+-            ALOGD("**  %p: %#x \t// next bytecode PC", (void*)ui_ptr, *ui_ptr);
+-            ui_ptr++;
+-            ALOGD("**  %p: %#x \t// code address to be patched", (void*)ui_ptr, *ui_ptr);
+-            ui_ptr++;
+-            break;
+-
+-        case kChainingCellHot:
+-            ALOGD("** // Hot Chaining Cell");
+-            printEmittedCodeBlock((unsigned char *) startAddr, (unsigned char *) ui_ptr);
+-            ALOGD("**  %p: %#x \t// next bytecode PC", (void*)ui_ptr, *ui_ptr);
+-            ui_ptr++;
+-            ALOGD("**  %p: %#x \t// code address to be patched", (void*)ui_ptr, *ui_ptr);
+-            ui_ptr++;
+-            ALOGD("**  %p: %d   \t// above needs an IP-relative offset", (void*)ui_ptr, *ui_ptr);
+-            break;
+-
+-        case kChainingCellBackwardBranch:
+-            ALOGD("** // BackwardBranch Chaining Cell");
+-            printEmittedCodeBlock((unsigned char *) startAddr, (unsigned char *) ui_ptr);
+-            ALOGD("**  %p: %#x \t// next bytecode PC", (void*)ui_ptr, *ui_ptr);
+-            ui_ptr++;
+-            ALOGD("**  %p: %#x \t// code address to be patched", (void*)ui_ptr, *ui_ptr);
+-            ui_ptr++;
+-            ALOGD("**  %p: %#x \t// address of loop header block", (void*)ui_ptr, *ui_ptr);
+-            ui_ptr++;
+-            ALOGD("**  %p: %#x \t// address of VR write-back block", (void*)ui_ptr, *ui_ptr);
+-            ui_ptr++;
+-            ALOGD("**  %p: %#x \t// address of loop pre-header block", (void*)ui_ptr, *ui_ptr);
+-            break;
+-
+-        case kChainingCellInvokePredicted:
+-            ui_ptr = (unsigned int *) startAddr;
+-            ALOGD("** // InvokePredicted Chaining Cell: %p",
+-                  (void*) startAddr);
+-            ALOGD("**  %p: %#x \t// to be patched", (void*)ui_ptr, *ui_ptr);
+-            ui_ptr++;
+-            ALOGD("**  %p: %#x \t// to be patched", (void*)ui_ptr, *ui_ptr);
+-            ui_ptr++;
+-            ALOGD("**  %p: %#x \t// class", (void*)ui_ptr, *ui_ptr);
+-            ui_ptr++;
+-            ALOGD("**  %p: %#x \t// method", (void*)ui_ptr, *ui_ptr);
+-            ui_ptr++;
+-            ALOGD("**  %p: %#x \t// rechain count", (void*)ui_ptr, *ui_ptr);
+-            break;
+-
+-        default:
+-            ALOGD("printChainingCellBlocks: Unknown chaining cell type %u!",
+-                  blockType);
+-            break;      // Not yet supported! Do nothing.
+-    }
+-}
+-
+ /**
+- * @brief Print the content of the content of a trace to LOG.
+- * @param cUnit - pointer to the CompilationUnit
+- * @param code_block_table - reference to the code block table for code/data section addresses
++ * @brief Print the content of a trace to LOG.
++ * @param basicCompilationUnit - pointer to the CompilationUnit
+  * @param chainCellCounts - reference to the ChainCellCounts table
+  * @param wide_const_count - number of long/double constants in the constant section
+  * @param pCCOffsetSection - pointer to the chaining cell offset header
+  */
+-typedef std::pair<BBType, char*> CodeBlockElem;
+-static void printTrace(CompilationUnit_O1 *cUnit, std::vector<CodeBlockElem> &code_block_table,
+-                       ChainCellCounts &chainCellCounts, int wide_const_count, u2* pCCOffsetSection)
++void dvmCompilerLcgPrintTrace (CompilationUnit *basicCompilationUnit, ChainCellCounts &chainCellCounts, int wide_const_count, u2* pCCOffsetSection)
+ {
+-    char *code_ptr, *next_code_ptr = 0;
+-    BBType blk_type;
+-    int k;
+-    int max = code_block_table.size () - 1;
+-
+-    ALOGD("-------- Emit trace for [%s%s@%#x] binary code starts at %p (cache start %p)",
+-          cUnit->method->clazz->descriptor, cUnit->method->name,
+-          cUnit->traceDesc->trace[0].info.frag.startOffset,
+-          cUnit->baseAddr, gDvmJit.codeCache);
+-    ALOGD("** %s%s@%#x:", cUnit->method->clazz->descriptor,
+-          cUnit->method->name, cUnit->traceDesc->trace[0].info.frag.startOffset);
+-
+-    code_ptr = NULL;
+-    next_code_ptr = NULL;
+-    for (k = 0; k < max; k++) {
+-        blk_type = code_block_table[k].first;
+-        code_ptr = code_block_table[k].second;
+-        next_code_ptr = code_block_table[k+1].second;
+-
+-        switch (blk_type) {
+-        case kExceptionHandling:
+-            if (code_ptr < next_code_ptr) {
+-                ALOGD("** // exception handling VR restores");
+-                // print like a normal code block
+-                printEmittedCodeBlock((unsigned char *) code_ptr,
+-                                      (unsigned char *) next_code_ptr);
+-            }
+-            break;
++    CompilationUnit_O1 *cUnit = static_cast<CompilationUnit_O1 *> (basicCompilationUnit);
++    char *next_code_ptr = 0;
+ 
+-        case kDalvikByteCode:
+-        case kFromInterpreter:
+-            if (code_ptr < next_code_ptr) {
+-                printEmittedCodeBlock((unsigned char *) code_ptr,
+-                                      (unsigned char *) next_code_ptr);
+-            }
+-            break;
++    next_code_ptr = dvmCompilerPrintTrace (cUnit);
+ 
+-        case kChainingCellNormal:
+-        case kChainingCellHot:
+-        case kChainingCellInvokeSingleton:
+-        case kChainingCellInvokePredicted:
+-        case kChainingCellBackwardBranch:
+-            printChainingCellBlocks(code_ptr, blk_type);
+-            break;
+-
+-        default:          // no print for other block types
+-            break;
+-        }
+-    }
+-
+-    if (next_code_ptr == NULL) {
++    if (next_code_ptr == 0)
++    {
+         // simply return if there is no entry in code block
+         return;
+     }
+ 
+     // print switch table section if any
+-    if ((cUnit->getSwitchInfo() != 0) && (cUnit->getSwitchInfo()->tSize > 0)) {
+-
++    if ((cUnit->getSwitchInfo () != 0) && (cUnit->getSwitchInfo ()->tSize > 0))
++    {
+         // 4 byte aligned
+         next_code_ptr = reinterpret_cast<char*>((reinterpret_cast<unsigned int>(next_code_ptr) + 3) & ~0x3);
+-        ALOGD("** // Switch Table section (4B aligned)");
++        ALOGD ("** // Switch Table section (4B aligned)");
+         unsigned int *stPtr = (unsigned int *)next_code_ptr;
+-        for (int i = 0; i < MIN(cUnit->getSwitchInfo()->tSize, MAX_CHAINED_SWITCH_CASES) + 1; i ++) {
+-            ALOGD("**  %p: %#x", (void*) stPtr, *stPtr);
+-            stPtr ++;
++        int switchTableSize = MIN (cUnit->getSwitchInfo ()->tSize, MAX_CHAINED_SWITCH_CASES) + 1;
++        for (int i = 0; i < switchTableSize; i++)
++        {
++            ALOGD ("**  %p: %#x", (void*) stPtr, *stPtr);
++            stPtr++;
+         }
+         next_code_ptr = (char*)stPtr;
+     }
+ 
+-    // next_code_ptr should hold the pre-padded address of the chaining cell count section
+-    // print the chaining cell count section
+-    next_code_ptr = reinterpret_cast<char*>((reinterpret_cast<unsigned int>(next_code_ptr) + 3) & ~0x3);
+-    ALOGD("** // chaining cell counts section (4B aligned)");
+-    for (k=0; k< kChainingCellGap; k++) {
+-        ALOGD("**  %p: %u", (void*) next_code_ptr, chainCellCounts.u.count[k]);
+-        next_code_ptr += sizeof(chainCellCounts.u.count[k]);
+-    }
++    next_code_ptr = dvmCompilerPrintChainingCellCounts (next_code_ptr, chainCellCounts);
+ 
+     // print the long/double constant section if any
+-    if (wide_const_count > 0) {
++    if (wide_const_count > 0)
++    {
+         long long *llptr;
+         double *dblptr;
+-        ALOGD("** // long/double constant section (16B aligned)");
++        ALOGD ("** // long/double constant section (16B aligned)");
+         next_code_ptr = reinterpret_cast<char*>((reinterpret_cast<unsigned int>(next_code_ptr) + 0xF) & ~0xF);
+         llptr = (long long *) next_code_ptr;
+-        for (k=0; k<wide_const_count; k++) {
++        for (int i = 0; i < wide_const_count; i++)
++        {
+             dblptr = (double *) llptr;
+-            ALOGD("**  %p: %lld (%g)", llptr, *llptr, *dblptr);
++            ALOGD ("**  %p: %lld (%g)", llptr, *llptr, *dblptr);
+             llptr++;        // increases pointer by 8B
+         }
+     }
+ 
+-    // print the chaining cell offset header content
+-    ALOGD("** // Patched (offset to chaining cell counts)@%p = %#x",
+-          (void*)pCCOffsetSection, *pCCOffsetSection);
+-    ALOGD("** // Patched (offset to chaining cell blocks)@%p = %#x",
+-          (void*)&pCCOffsetSection[1], pCCOffsetSection[1]);
++    dvmCompilerPrintChainingCellOffsetHeader (pCCOffsetSection);
+ }
+ 
+ /**
+@@ -2085,8 +1881,6 @@ void dvmCompilerLCGMIR2LIR (CompilationUnit *cUnitME, JitTranslationInfo *info)
+     BasicBlock *nextFallThrough = 0;
+     // Define the code_block_table for tracking various type of code blocks
+     //  for printing.
+-    // CodeBlockElem has a block type and the starting address of the block.
+-    std::vector<CodeBlockElem> code_block_table;
+     char *print_stream_ptr = 0; // current block stream pointer
+ 
+     dump_x86_inst = cUnit->printMe;
+@@ -2280,8 +2074,8 @@ void dvmCompilerLCGMIR2LIR (CompilationUnit *cUnitME, JitTranslationInfo *info)
+ 
+     if (cUnit->printMe) {
+         // record all assmebly code before chaining cells as a block
+-        CodeBlockElem code_blk_elem(kDalvikByteCode, streamMethodStart);
+-        code_block_table.push_back(code_blk_elem);
++        std::pair<BBType, char*> code_blk_elem(kDalvikByteCode, streamMethodStart);
++        cUnit->code_block_table->push_back(code_blk_elem);
+         print_stream_ptr = stream;
+     }
+ 
+@@ -2313,8 +2107,8 @@ void dvmCompilerLCGMIR2LIR (CompilationUnit *cUnitME, JitTranslationInfo *info)
+         if (cUnit->printMe && print_stream_ptr < stream) {
+             // If there is any code before the chaining cell block and the
+             // last recorded block, make it a separate code block.
+-            CodeBlockElem code_blk_elem(kDalvikByteCode, print_stream_ptr);
+-            code_block_table.push_back(code_blk_elem);
++            std::pair<BBType, char*> code_blk_elem(kDalvikByteCode, print_stream_ptr);
++            cUnit->code_block_table->push_back(code_blk_elem);
+             print_stream_ptr = stream;
+         }
+ 
+@@ -2367,7 +2161,7 @@ void dvmCompilerLCGMIR2LIR (CompilationUnit *cUnitME, JitTranslationInfo *info)
+                     ALOGI("JIT_INFO: Bad blocktype %d", chainingBlock->blockType);
+                     SET_JIT_ERROR(kJitErrorTraceFormation);
+                     endOfTrace (cUnit);
+-                    code_block_table.clear();
++                    cUnit->code_block_table->clear();
+                     return;
+             }
+ 
+@@ -2380,8 +2174,8 @@ void dvmCompilerLCGMIR2LIR (CompilationUnit *cUnitME, JitTranslationInfo *info)
+ 
+             if (cUnit->printMe) {
+                 // record the chaining cell block
+-                CodeBlockElem code_blk_elem(chainingBlock->blockType, print_stream_ptr);
+-                code_block_table.push_back(code_blk_elem);
++                std::pair<BBType, char*> code_blk_elem(chainingBlock->blockType, print_stream_ptr);
++                cUnit->code_block_table->push_back(code_blk_elem);
+                 print_stream_ptr = stream;
+             }
+ 
+@@ -2391,7 +2185,7 @@ void dvmCompilerLCGMIR2LIR (CompilationUnit *cUnitME, JitTranslationInfo *info)
+                 gDvmJit.codeCacheFull = true;
+                 endOfTrace (cUnit);
+                 PROTECT_CODE_CACHE(stream, unprotected_code_cache_bytes);
+-                code_block_table.clear();
++                cUnit->code_block_table->clear();
+                 return;
+             }
+         }
+@@ -2412,8 +2206,8 @@ void dvmCompilerLCGMIR2LIR (CompilationUnit *cUnitME, JitTranslationInfo *info)
+ 
+     if (cUnit->printMe) {
+         // record exception VR restores as block type kExceptionHandling
+-        CodeBlockElem code_blk_elem(kExceptionHandling, print_stream_ptr);
+-        code_block_table.push_back(code_blk_elem);
++        std::pair<BBType, char*> code_blk_elem(kExceptionHandling, print_stream_ptr);
++        cUnit->code_block_table->push_back(code_blk_elem);
+         print_stream_ptr = stream;
+     }
+ 
+@@ -2423,7 +2217,7 @@ void dvmCompilerLCGMIR2LIR (CompilationUnit *cUnitME, JitTranslationInfo *info)
+         ALOGI("JIT_INFO: Code cache full after endOfTrace (trace uses %uB)", (stream - streamStart));
+         SET_JIT_ERROR_MANUAL (cUnit, kJitErrorCodeCacheFull);
+         PROTECT_CODE_CACHE(stream, unprotected_code_cache_bytes);
+-        code_block_table.clear();
++        cUnit->code_block_table->clear();
+         return;
+     }
+ 
+@@ -2442,7 +2236,7 @@ void dvmCompilerLCGMIR2LIR (CompilationUnit *cUnitME, JitTranslationInfo *info)
+             gDvmJit.codeCacheFull = true;
+             endOfTrace(cUnit);
+             PROTECT_CODE_CACHE(stream, unprotected_code_cache_bytes);
+-            code_block_table.clear();
++            cUnit->code_block_table->clear();
+             return;
+         }
+         createSwitchTable(cUnit);
+@@ -2466,7 +2260,7 @@ void dvmCompilerLCGMIR2LIR (CompilationUnit *cUnitME, JitTranslationInfo *info)
+         SET_JIT_ERROR_MANUAL (cUnit, kJitErrorCodeCacheFull);
+         gDvmJit.codeCacheFull = true;
+         PROTECT_CODE_CACHE(stream, unprotected_code_cache_bytes);
+-        code_block_table.clear();
++        cUnit->code_block_table->clear();
+         return;
+     }
+ 
+@@ -2546,14 +2340,14 @@ void dvmCompilerLCGMIR2LIR (CompilationUnit *cUnitME, JitTranslationInfo *info)
+         // Push an kExitBlock block as an end marker of the trace.
+         // The chaining cell count and the long/double constants are
+         //  emit after the end marker.
+-        CodeBlockElem code_blk_elem(kExitBlock, print_stream_ptr);
+-        code_block_table.push_back(code_blk_elem);
+-        printTrace(cUnit, code_block_table, chainCellCounts, patchCount, pOffset);
++        std::pair<BBType, char*> code_blk_elem(kExitBlock, print_stream_ptr);
++        cUnit->code_block_table->push_back(code_blk_elem);
++        dvmCompilerLcgPrintTrace(cUnit, chainCellCounts, patchCount, pOffset);
+     }
+     if (cUnit->getSwitchInfo() != 0) {
+         cUnit->getSwitchInfo()->switchNormalCCList.clear();
+     }
+-    code_block_table.clear();
++    cUnit->code_block_table->clear();
+     ALOGV("JIT CODE after trace %p to %p size %x START %p", streamMethodStart,
+           (char *) gDvmJit.codeCache + gDvmJit.codeCacheByteUsed,
+           cUnit->totalSize, gDvmJit.codeCache);
+diff --git a/vm/compiler/codegen/x86/lightcg/Lower.h b/vm/compiler/codegen/x86/lightcg/Lower.h
+index 039b3a6..6bdc33b 100644
+--- a/vm/compiler/codegen/x86/lightcg/Lower.h
++++ b/vm/compiler/codegen/x86/lightcg/Lower.h
+@@ -1535,9 +1535,6 @@ CompilationErrorHandler *dvmCompilerLCGNewCompilationErrorHandler (void);
+ void pushCallerSavedRegs(void);
+ void popCallerSavedRegs(void);
+ 
+-//Print the emitted code
+-void printEmittedCodeBlock(unsigned char *startAddr, unsigned char *endAddr);
+-
+ /**
+  * @brief Applies the shuffle operation (PSHUF)
+  * @param srcReg The 128-bit register containing the src value
+diff --git a/vm/compiler/codegen/x86/pcg/ChainingCellException.cpp b/vm/compiler/codegen/x86/pcg/ChainingCellException.cpp
+index ba9f276..1613a6a 100644
+--- a/vm/compiler/codegen/x86/pcg/ChainingCellException.cpp
++++ b/vm/compiler/codegen/x86/pcg/ChainingCellException.cpp
+@@ -350,7 +350,6 @@ static BasicBlockPCG * getPredecessorSwitchBasicBlock(
+  * @param bb the chaining cell's basicblock in the CFG
+  * @param currCachePtr the current cache pointer
+  * @param freeSpace amount of free space available
+- * @param switchChainingCellEntries A list of the chaining cell block/relocation pairs
+  * @return the pointer to the next byte after the chaining cell, 0 if a problem arose
+  * @details Normal chaining cells are completely finalized at emission time. Switch-associated chaining cells cannot be finalized, because they require the switch table to be laid down. Thus, we use the relocation system to patch the chaining cell's relocation address to be the switch table's entry corresponding to this chaining cell.
+  */
+@@ -360,9 +359,7 @@ static uint8_t* dvmCompilerPcgEmitNormalChainingCell (
+     const void *bytecodeTargetAddr,
+     BasicBlockPCG * bb,
+     uint8_t *currCachePtr,
+-    size_t freeSpace,
+-    std::list<SwitchTableCCXRef> *
+-         switchChainingCellEntries)
++    size_t freeSpace)
+ {
+     CGSymbol blockSymbol = bb->chainingCellSymbol;
+     const uint8_t *cellBegin = currCachePtr;
+@@ -433,7 +430,7 @@ static uint8_t* dvmCompilerPcgEmitNormalChainingCell (
+         char buffer[1024];
+         snprintf(buffer, sizeof(buffer), "%s_switch_%d",
+             switchBBName.c_str(),
+-            switchChainingCellEntries->size());
++            cUnit->getNumberOfSwitchTableEntries ());
+ 
+         std::string switchEntryName(buffer);
+         CGSymbol switchEntrySymbol =
+@@ -447,8 +444,7 @@ static uint8_t* dvmCompilerPcgEmitNormalChainingCell (
+         // That should be sufficient to accomplish the write to this location,
+         // once the switch table entry symbol gets associated with an address,
+         // so make sure we store it in the list
+-        SwitchTableCCXRef xref = { swRelocation, bb };
+-        switchChainingCellEntries->push_back(xref);
++        cUnit->addSwitchTableEntry (swRelocation, bb);
+ 
+         // Just put something in the cell, so we don't print anything wrong
+         // in debug mode
+@@ -878,18 +874,17 @@ void dvmCompilerPcgGenerateSpeculativeNullChecks (CompilationUnitPCG *cUnit)
+ }
+ 
+ uint8_t *dvmCompilerPcgEmitChainingCells (CompilationUnitPCG *cUnit,
++        ChainCellCounts *pcgChainCellCounts,
+         uint8_t *startAddr,
+         uint8_t *cachePtr,
+-        size_t freeSpace,
+-        std::list<SwitchTableCCXRef> * switchChainingCellEntries)
++        size_t freeSpace)
+ {
+     u4 padding, i;
+     uint8_t *firstChainCellAddr;
+ 
+     firstChainCellAddr = cachePtr;
+ 
+-    ChainCellCounts pcgChainCellCounts;
+-    memset (&pcgChainCellCounts, 0, sizeof (pcgChainCellCounts));
++    memset (pcgChainCellCounts, 0, sizeof (ChainCellCounts));
+ 
+     GrowableList *chainingListByType = cUnit->getChainingList ();
+ 
+@@ -898,7 +893,7 @@ uint8_t *dvmCompilerPcgEmitChainingCells (CompilationUnitPCG *cUnit,
+     {
+         int *blockIdList = (int *)chainingListByType[i].elemList;
+         cUnit->numChainingCells[i] = chainingListByType[i].numUsed;
+-        pcgChainCellCounts.u.count[i] = cUnit->numChainingCells[i];
++        pcgChainCellCounts->u.count[i] = cUnit->numChainingCells[i];
+ 
+         for (unsigned int j = 0; j < chainingListByType[i].numUsed; j++)
+         {
+@@ -920,8 +915,7 @@ uint8_t *dvmCompilerPcgEmitChainingCells (CompilationUnitPCG *cUnit,
+                             cUnit->method->insns + chainingBlock->startOffset,
+                             chainingBlock,
+                             cachePtr,
+-                            freeSpace,
+-                            switchChainingCellEntries);
++                            freeSpace);
+                     break;
+ 
+                 case kChainingCellBackwardBranch:
+@@ -983,27 +977,41 @@ uint8_t *dvmCompilerPcgEmitChainingCells (CompilationUnitPCG *cUnit,
+                 {
+                     ALOGI ("JIT_INFO: PCG: Translation for block %d skipped due to no-reference from code", blockId);
+                 }
+-                pcgChainCellCounts.u.count[i]--;
++                pcgChainCellCounts->u.count[i]--;
+             }
+             else
+             {
++                if (cUnit->printMe == true)
++                {
++                    // record the chaining cell block
++                    std::pair<BBType, char*> code_blk_elem(chainingBlock->blockType, (char *)cachePtr);
++                    cUnit->code_block_table->push_back(code_blk_elem);
++                }
++
+                 freeSpace -= (newCachePtr - cachePtr);
+                 cachePtr = newCachePtr;
+             }
+         }
+     }
+ 
++    if (cUnit->checkDebugMask (DebugMaskDisasm) == true)
++    {
++        // Setting up the end of the trace (the mem constants and chain cell counts are separate)
++        std::pair<BBType, char*> code_blk_elem(kExitBlock, (char *)cachePtr);
++        cUnit->code_block_table->push_back(code_blk_elem);
++    }
++
+     // Dump section for chaining cell counts, make sure it is 4-byte aligned
+     padding = (4 - ( (u4)cachePtr % 4)) % 4;
+ 
+     // make sure there is enough space for the chaining cell counts and
+     // padding.  Return 0 if not.
+-    if (freeSpace < padding + sizeof (pcgChainCellCounts))
++    if (freeSpace < padding + sizeof (ChainCellCounts))
+     {
+         cUnit->errorHandler->setError (kJitErrorCodeCacheFull);
+         return 0;
+     }
+-    freeSpace -= padding + sizeof (pcgChainCellCounts);
++    freeSpace -= padding + sizeof (ChainCellCounts);
+     cachePtr += padding;
+ 
+     // Install the chaining information.  There are two u2 values that
+@@ -1024,28 +1032,27 @@ uint8_t *dvmCompilerPcgEmitChainingCells (CompilationUnitPCG *cUnit,
+                 * ( (u2*)startAddr - 1));
+     }
+ 
+-    memcpy (cachePtr, &pcgChainCellCounts, sizeof (pcgChainCellCounts));
++    memcpy (cachePtr, pcgChainCellCounts, sizeof (ChainCellCounts));
+     if (cUnit->checkDebugMask (DebugMaskBytecode) == true)
+     {
+         ALOGI ("Chaining cell counts contents @0x%p\n   ", cachePtr);
+-        for (i = 0; i < sizeof (pcgChainCellCounts); i++)
++        for (i = 0; i < sizeof (ChainCellCounts); i++)
+         {
+             ALOGI (" 0x%02x", cachePtr[i]);
+         }
+         ALOGI ("\n");
+     }
+ 
+-    return cachePtr + sizeof (pcgChainCellCounts);
++    return cachePtr + sizeof (ChainCellCounts);
+ }
+ 
+ uint8_t* dvmCompilerPcgEmitSwitchTables(CompilationUnitPCG *cUnit,
+         uint8_t *currCachePtr,
+-        size_t freeSpace,
+-        std::list<SwitchTableCCXRef> * switchChainingCellEntries)
++        size_t freeSpace)
+ {
+     uint32_t * shiftedCachePtr = (uint32_t*)align ((char*)currCachePtr, 4);
+     uint32_t num_shift_bytes = (uint32_t)shiftedCachePtr - (uint32_t)currCachePtr;
+-    uint32_t a = num_shift_bytes + switchChainingCellEntries->size() * 4;
++    uint32_t a = num_shift_bytes + cUnit->getNumberOfSwitchTableEntries () * 4;
+ 
+     // Make sure we have enough room in the code cache for the switch table
+     if (freeSpace < a) {
+@@ -1090,9 +1097,9 @@ uint8_t* dvmCompilerPcgEmitSwitchTables(CompilationUnitPCG *cUnit,
+         // To set up the switch table, all we need to do is go through
+         // switchChainingCellEntries and add the cache pointer to the
+         // relocation, then add it to the relocation tracking system
+-        std::list<SwitchTableCCXRef>::iterator it;
+-        for (it = switchChainingCellEntries->begin();
+-             it != switchChainingCellEntries->end(); it++)
++        SwitchTableEntryIterator it;
++        for (it = cUnit->switchTableBegin ();
++             it != cUnit->switchTableEnd (); it++)
+         {
+             CRelocation *switchTableEntryRelocation = it->relocation;
+             BasicBlockPCG *chainingCellBlock = it->chainingCellBB;
+@@ -1110,6 +1117,5 @@ uint8_t* dvmCompilerPcgEmitSwitchTables(CompilationUnitPCG *cUnit,
+         }
+     }
+ 
+-    switchChainingCellEntries->clear();
+     return currCachePtr;
+ }
+diff --git a/vm/compiler/codegen/x86/pcg/ChainingCellException.h b/vm/compiler/codegen/x86/pcg/ChainingCellException.h
+index e167507..e6b7cad 100644
+--- a/vm/compiler/codegen/x86/pcg/ChainingCellException.h
++++ b/vm/compiler/codegen/x86/pcg/ChainingCellException.h
+@@ -83,30 +83,28 @@ void dvmCompilerPcgGenerateSimpleNullCheck (CompilationUnitPCG *cUnit, CGInst in
+ /**
+  * @brief Emit the chaining cells
+  * @param cUnit the CompilationUnitPCG
++ * @param pcgChainCellCounts the ChainCellCounts
+  * @param start_addr is the routine start address
+  * @param cache_ptr is a pointer to the next available byte in the code cache.
+  * @param freeSpace free space still available
+- * @param switchChainingCellEntries a list of pairs of relocations and their chaining cells, to perform the cross-reference of the switch table entries and the chaining cells
+  * @return This routine returns the next available byte in the code cache, or 0 if there isn't enough available space to lay down the chaining cells
+  */
+ uint8_t *dvmCompilerPcgEmitChainingCells (CompilationUnitPCG *cUnit,
++        ChainCellCounts *pcgChainCellCounts,
+         uint8_t *start_addr,
+         uint8_t *cache_ptr,
+-        size_t freeSpace,
+-        std::list<SwitchTableCCXRef> * switchChainingCellEntries);
++        size_t freeSpace);
+ 
+ /**
+  * @brief Emit the switch tables
+  * @param cUnit the CompilationUnitPCG
+  * @param currCachePtr is a pointer to the next available byte in the code cache.
+  * @param freeSpace free space still available
+- * @param switchChainingCellEntries a list of pairs of relocations and their chaining cells, to perform the cross-reference of the switch table entries and the chaining cells
+  * @return This routine returns the next available byte in the code cache, or 0 if there isn't enough available space to lay down the chaining cells
+  */
+ uint8_t* dvmCompilerPcgEmitSwitchTables(CompilationUnitPCG *cUnit,
+         uint8_t *currCachePtr,
+-        size_t freeSpace,
+-        std::list<SwitchTableCCXRef> * switchChainingCellEntries);
++        size_t freeSpace);
+ 
+ /**
+  * @brief Generate a speculative null checks
+diff --git a/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp b/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
+index c69eec7..0a25ef4 100644
+--- a/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
++++ b/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
+@@ -1513,6 +1513,13 @@ void dvmCompilerPcgEmitCode (CompilationUnitPCG *cUnit, JitTranslationInfo* info
+         return;
+     }
+ 
++    if (cUnit->printMe == true)
++    {
++        // record all assmebly code before chaining cells as a block
++        std::pair<BBType, char*> code_blk_elem(kDalvikByteCode, (char*)startAddr);
++        cUnit->code_block_table->push_back(code_blk_elem);
++    }
++
+     freeSpace -= (endAddr + 1) - currCachePtr;
+ 
+     cUnit->bindBlockSymbolAddresses (startAddr);
+@@ -1525,8 +1532,8 @@ void dvmCompilerPcgEmitCode (CompilationUnitPCG *cUnit, JitTranslationInfo* info
+     // create a relocation object for each normal chaining cell so that
+     // the chaining cell can be updated when we know where the corresponding
+     // switch table entry is laid down
+-    std::list<SwitchTableCCXRef> switchChainingCellEntries;
+-    currCachePtr = dvmCompilerPcgEmitChainingCells (cUnit, startAddr, endAddr + 1, freeSpace, &switchChainingCellEntries);
++    ChainCellCounts pcgChainCellCounts;
++    currCachePtr = dvmCompilerPcgEmitChainingCells (cUnit, &pcgChainCellCounts, startAddr, endAddr + 1, freeSpace);
+ 
+     if (cUnit->errorHandler->isAnyErrorSet () == true)
+     {
+@@ -1537,7 +1544,7 @@ void dvmCompilerPcgEmitCode (CompilationUnitPCG *cUnit, JitTranslationInfo* info
+ 
+     uint8_t *oldCachePtr = currCachePtr;
+ 
+-    currCachePtr = dvmCompilerPcgEmitSwitchTables(cUnit, currCachePtr, freeSpace, &switchChainingCellEntries);
++    currCachePtr = dvmCompilerPcgEmitSwitchTables(cUnit, currCachePtr, freeSpace);
+ 
+     freeSpace -= currCachePtr - oldCachePtr;
+ 
+@@ -1571,7 +1578,7 @@ void dvmCompilerPcgEmitCode (CompilationUnitPCG *cUnit, JitTranslationInfo* info
+     {
+         ALOGI ("Disassembly for trace %d\n", cUnit->getTraceID ());
+         ALOGI ("=========================\n");
+-        printEmittedCodeBlock (startAddr, endAddr + 1);
++        dvmCompilerPcgPrintTrace (cUnit, pcgChainCellCounts, (u2*)(startAddr - cExtraBytesForChaining));
+     }
+ 
+     // TODO (DLK): stream needs to be updated here for the time being, because
+@@ -1585,7 +1592,7 @@ void dvmCompilerPcgEmitCode (CompilationUnitPCG *cUnit, JitTranslationInfo* info
+                 cacheStartPtr, stream);
+     }
+ 
+-    if (cUnit->printMe == true)
++    if (cUnit->checkDebugMask (DebugMaskDisasm) == true)
+     {
+         ALOGD("-------- PCG: Emit trace for [%s%s@%#x] binary code starts at %p (cache start %p)",
+                 cUnit->method->clazz->descriptor, cUnit->method->name,
+diff --git a/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.cpp b/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.cpp
+index 37c8bc7..2a8a156 100644
+--- a/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.cpp
++++ b/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.cpp
+@@ -525,3 +525,24 @@ MemConstIterator CompilationUnitPCG::memConstEnd(void)
+ {
+     return memconsts.end();
+ }
++
++unsigned int CompilationUnitPCG::getNumberOfSwitchTableEntries (void)
++{
++    return this->switchChainingCellEntries.size();
++}
++
++void CompilationUnitPCG::addSwitchTableEntry (CRelocation *relocation, BasicBlockPCG *chainingCellBB)
++{
++    SwitchTableCCXRef xref = { relocation, chainingCellBB };
++    this->switchChainingCellEntries.push_back(xref);
++}
++
++SwitchTableEntryIterator CompilationUnitPCG::switchTableBegin(void)
++{
++    return this->switchChainingCellEntries.begin();
++}
++
++SwitchTableEntryIterator CompilationUnitPCG::switchTableEnd(void)
++{
++    return this->switchChainingCellEntries.end();
++}
+diff --git a/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.h b/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.h
+index e367534..9ab8591 100644
+--- a/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.h
++++ b/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.h
+@@ -80,6 +80,11 @@ enum OptimizationMasks
+ typedef std::map<MemConstType, CGSymbol>::iterator MemConstIterator;
+ 
+ /**
++ * @brief Iterator for switch table entries, for external use.
++ */
++typedef std::list<SwitchTableCCXRef>::iterator SwitchTableEntryIterator;
++
++/**
+  * @class CompilationUnitPCG
+  * @param the CompilationUnitPCG, extension of CompilationUnit
+  */
+@@ -152,6 +157,8 @@ class CompilationUnitPCG: public CompilationUnit
+         /** @brief set of constants to dump into memory */
+         std::map<MemConstType, CGSymbol> memconsts;
+ 
++        /** @brief A list to keep track of switch chaining cell entries */
++        std::list<SwitchTableCCXRef> switchChainingCellEntries;
+     public:
+         /**
+          * @brief Constructor
+@@ -430,6 +437,32 @@ class CompilationUnitPCG: public CompilationUnit
+          * @return End of memconsts map.
+          */
+         MemConstIterator memConstEnd(void);
++
++        /**
++         * @brief Return the number of switch table entries
++         * @return The number of switch table entries
++         */
++        unsigned int getNumberOfSwitchTableEntries (void);
++
++        /**
++         * @brief Add a switch table cross-reference to be placed into the switch table
++         * @param relocation A ptr to a relocation to keep track of the chaining cell / switch table entry x-ref
++         * @param chainingCellBB a ptr to the chaining cell this relocation is associated with
++         */
++        void addSwitchTableEntry (CRelocation *relocation, BasicBlockPCG *chainingCellBB);
++
++        /**
++         * @brief Return beginning of switchtableentry list.
++         * @return Beginning of switchtableentry list.
++         */
++        SwitchTableEntryIterator switchTableBegin(void);
++
++        /**
++         * @brief Return end of switchtableentry list.
++         * @return End of switchtableentry list.
++         */
++        SwitchTableEntryIterator switchTableEnd(void);
++
+ };
+ 
+ #endif
+diff --git a/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp b/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp
+index a1952a2..8454681 100644
+--- a/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp
++++ b/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp
+@@ -28,6 +28,8 @@
+ #include "UtilityPCG.h"
+ #include "BitVector.h"
+ #include "Utility.h"
++#include "JitVerbose.h"
++#include "Lower.h"
+ 
+ /**
+  * @brief Get a call and register from a type
+@@ -945,3 +947,72 @@ CGSymbol CGGetMemConstSymbolFromClient(uint8_t *value, size_t length, uint32_t a
+ 
+     return CGSymbolInvalid;
+ }
++
++void dvmCompilerPcgPrintTrace (CompilationUnit *basicCompilationUnit, ChainCellCounts &chainCellCounts, u2* pCCOffsetSection)
++{
++    CompilationUnitPCG * cUnit = static_cast<CompilationUnitPCG*> (basicCompilationUnit);
++    char *next_code_ptr = 0;
++
++    next_code_ptr = dvmCompilerPrintTrace (cUnit);
++
++    if (next_code_ptr == 0)
++    {
++        // simply return if there is no entry in code block
++        return;
++    }
++
++    if (cUnit->getNumberOfSwitchTableEntries () > 0)
++    {
++        // 4 byte aligned
++        next_code_ptr = reinterpret_cast<char*>((reinterpret_cast<unsigned int>(next_code_ptr) + 3) & ~0x3);
++        ALOGD ("** // Switch Table section (4B aligned)");
++        unsigned int *stPtr = (unsigned int *)next_code_ptr;
++        int switchTableSize = MIN (cUnit->getNumberOfSwitchTableEntries (), MAX_CHAINED_SWITCH_CASES) + 1;
++        for (int i = 0; i < switchTableSize; i++)
++        {
++            ALOGD ("**  %p: %#x", (void*) stPtr, *stPtr);
++            stPtr++;
++        }
++        next_code_ptr = (char*)stPtr;
++    }
++
++    dvmCompilerPrintChainingCellCounts (next_code_ptr, chainCellCounts);
++
++    // print the long/double constant section if any
++    if (cUnit->memConstBegin () != cUnit->memConstEnd ())
++    {
++        ALOGD ("** // PCG constant section");
++    }
++
++    for (MemConstIterator it = cUnit->memConstBegin ();
++         it != cUnit->memConstEnd (); ++it)
++    {
++        uint8_t *alignedCachePtr = (uint8_t*)align ((char*)next_code_ptr, it->first.align);
++        uint16_t *shortPtr;
++        uint32_t *intPtr;
++        uint64_t *longPtr;
++        switch (it->first.length)
++        {
++            case 1:
++                ALOGD ("**  %p: %x", alignedCachePtr, *alignedCachePtr);
++                break;
++            case 2:
++                shortPtr = (uint16_t*) alignedCachePtr;
++                ALOGD ("**  %p: %x", shortPtr, *shortPtr);
++                break;
++            case 4:
++                intPtr = (uint32_t*) alignedCachePtr;
++                ALOGD ("**  %p: %x", intPtr, *intPtr);
++                break;
++            case 8:
++                longPtr = (uint64_t*) alignedCachePtr;
++                ALOGD ("**  %p: %llx", longPtr, *longPtr);
++                break;
++            default:
++                ALOGD ("Couldn't decode value at %p.", alignedCachePtr);
++        }
++        next_code_ptr = (char *)(alignedCachePtr + it->first.length);
++    }
++
++    dvmCompilerPrintChainingCellOffsetHeader (pCCOffsetSection);
++}
+diff --git a/vm/compiler/codegen/x86/pcg/UtilityPCG.h b/vm/compiler/codegen/x86/pcg/UtilityPCG.h
+index 2150abe..570fd5a 100644
+--- a/vm/compiler/codegen/x86/pcg/UtilityPCG.h
++++ b/vm/compiler/codegen/x86/pcg/UtilityPCG.h
+@@ -234,4 +234,11 @@ int dvmCompilerPcgGetVROffsetRelativeToVMPtr (CompilationUnitPCG *cUnit, int vR)
+  */
+ CGSymbol pcgDvmClientGetMemConstSymbol(CompilationUnitPCG *cUnit, uint8_t *value, size_t length, uint32_t align);
+ 
++/**
++ * @brief Print the content of a trace to LOG.
++ * @param basicCompilationUnit - pointer to the CompilationUnit
++ * @param chainCellCounts - reference to the ChainCellCounts table
++ * @param pCCOffsetSection - pointer to the chaining cell offset header
++ */
++void dvmCompilerPcgPrintTrace (CompilationUnit *basicCompilationUnit, ChainCellCounts &chainCellCounts, u2* pCCOffsetSection);
+ #endif
+-- 
+1.7.4.1
+

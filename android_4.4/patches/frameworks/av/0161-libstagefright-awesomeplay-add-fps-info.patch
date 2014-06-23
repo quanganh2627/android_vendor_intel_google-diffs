@@ -1,0 +1,193 @@
+From 8adef017a3b0533486a8df4864b7766dfe504d59 Mon Sep 17 00:00:00 2001
+From: pingxshi <pingxshi@intel.com>
+Date: Thu, 18 Oct 2012 11:25:26 +0800
+Subject: libstagefright: awesomeplay add fps info
+
+BZ: 56392
+
+fix FPS value can't be rendered after the video playback completed.
+
+Category: aosp improvement
+Domain: local playback
+Origin: internal
+Upstream-Candidate: no
+
+Change-Id: Idbd69c65fd75065c77ea3c163876bd16b56e48ee
+Orig-Change-Id: I00434a261050960cf84d1944adbd7fe07fc95f8d
+Signed-off-by: Tianmi Chen <tianmi.chen@intel.com>
+---
+ media/libstagefright/AwesomePlayer.cpp |  102 ++++++++++++++++++++++++++++++--
+ 1 files changed, 97 insertions(+), 5 deletions(-)
+
+diff --git a/media/libstagefright/AwesomePlayer.cpp b/media/libstagefright/AwesomePlayer.cpp
+index 2dd4e34..b270825 100644
+--- a/media/libstagefright/AwesomePlayer.cpp
++++ b/media/libstagefright/AwesomePlayer.cpp
+@@ -17,6 +17,11 @@
+ #undef DEBUG_HDCP
+ 
+ //#define LOG_NDEBUG 0
++#define DUMP_DECODE_INFO
++#ifdef DUMP_DECODE_INFO
++#define LOG_NIDEBUG 0
++#endif
++
+ #define LOG_TAG "AwesomePlayer"
+ #define ATRACE_TAG ATRACE_TAG_VIDEO
+ #include <utils/Log.h>
+@@ -77,6 +82,37 @@ static const size_t kHighWaterMarkBytes = 200000;
+ // is destroyed to allow the audio DSP to power down.
+ static int64_t kOffloadPauseMaxUs = 60000000ll;
+ 
++#ifdef DUMP_DECODE_INFO
++/*
++* Using __thread storage class for Frame counters to make
++* them Thread-local in order to enable instrumentation of
++* multiple simultaneous video playbacks.
++*/
++static __thread int tl_dropFrameCount = 0;
++static __thread int tl_emptyFrameCount = 0;
++static __thread int tl_renderFrameCount =0;
++static __thread int tl_decodeFrameCount = 0;
++static __thread unsigned long tl_startbackStart = 0;
++static __thread unsigned long tl_startbackEnd = 0;
++
++// property for printing the decode info
++// LOG_LEVEL_0: default not print
++// LOG_LEVEL_1: print base info
++// LOG_LEVEL_2: print each render frame @system time
++#define LOG_LEVEL_0 0
++#define LOG_LEVEL_1 1
++#define LOG_LEVEL_2 2
++static unsigned long g_log_level = 0;
++
++#define log_decode_print(level, format, ...) \
++    if (g_log_level >= level) { \
++        LOGI(format, __VA_ARGS__); \
++    } \
++    else { \
++        void(0); \
++    }
++
++#endif
+ 
+ struct AwesomeEvent : public TimedEventQueue::Event {
+     AwesomeEvent(
+@@ -242,6 +278,12 @@ AwesomePlayer::AwesomePlayer()
+     mAudioTearDownEventPending = false;
+ 
+     reset();
++#ifdef DUMP_DECODE_INFO
++    char property[PROPERTY_VALUE_MAX];
++    if (property_get("debug.dump.log", property, NULL) > 0) {
++        g_log_level = atoi(property);
++    }
++#endif
+ }
+ 
+ AwesomePlayer::~AwesomePlayer() {
+@@ -1356,6 +1398,35 @@ status_t AwesomePlayer::pause_l(bool at_eos) {
+                 Playback::PAUSE, 0);
+     }
+ 
++#ifdef DUMP_DECODE_INFO
++    {
++        if (g_log_level >= LOG_LEVEL_1) {
++            struct timeval tv;
++            gettimeofday(&tv, NULL);
++            tl_startbackEnd = tv.tv_sec * 1000 + tv.tv_usec / 1000 ;
++
++            float playbackDuration = (float)(tl_startbackEnd - tl_startbackStart) / 1000.0f;
++            float decode_FPS = (float) (tl_decodeFrameCount - 1)/ playbackDuration;
++            float render_FPS = (float) (tl_renderFrameCount - 1) / playbackDuration;
++
++            LOGI("  ************ AwesomePlayer decoding performance ****************\n");
++            LOGI(" Video source URI= %s", mUri.string());
++            LOGI("decodeFrameCount = %lu, renderFrameCount=%lu, dropFrameCount=%lu, emptyFrameCount=%lu",
++                   tl_decodeFrameCount,tl_renderFrameCount, tl_dropFrameCount,tl_emptyFrameCount);
++
++            LOGI("playbackDuration=%f, render_FPS=%f \n", playbackDuration, render_FPS);
++            LOGI("  ***************      End       ********************\n");
++
++            tl_startbackStart = 0;
++            tl_startbackEnd = 0;
++            tl_decodeFrameCount = 0;
++            tl_renderFrameCount = 0;
++            tl_dropFrameCount = 0;
++            tl_emptyFrameCount = 0;
++        }
++    }
++#endif
++
+     uint32_t params = IMediaPlayerService::kBatteryDataTrackDecoder;
+     if ((mAudioSource != NULL) && (mAudioSource != mAudioTrack)) {
+         params |= IMediaPlayerService::kBatteryDataTrackAudio;
+@@ -1989,7 +2060,11 @@ void AwesomePlayer::onVideoEvent() {
+         for (;;) {
+             status_t err = mVideoSource->read(&mVideoBuffer, &options);
+             options.clearSeekTo();
+-
++#ifdef DUMP_DECODE_INFO
++            if(g_log_level >= LOG_LEVEL_1 && err == OK ) {
++                 ++tl_decodeFrameCount;
++            }
++#endif
+             if (err != OK) {
+                 CHECK(mVideoBuffer == NULL);
+                 if (err == -EWOULDBLOCK) {
+@@ -2034,6 +2109,9 @@ void AwesomePlayer::onVideoEvent() {
+             if (mVideoBuffer->range_length() == 0) {
+                 // Some decoders, notably the PV AVC software decoder
+                 // return spurious empty buffers that we just want to ignore.
++#ifdef DUMP_DECODE_INFO
++                log_decode_print(LOG_LEVEL_1,"get the %dth empty buffer", tl_emptyFrameCount++);
++#endif
+ 
+                 mVideoBuffer->release();
+                 mVideoBuffer = NULL;
+@@ -2283,9 +2361,11 @@ void AwesomePlayer::onVideoEvent() {
+             if (mWVMExtractor == NULL) {
+                 ALOGI("we're much too late (%.2f secs), video skipping ahead",
+                      latenessUs / 1E6);
+-
+-                mVideoBuffer->release();
+-                mVideoBuffer = NULL;
++#ifdef DUMP_DECODE_INFO
++            log_decode_print(LOG_LEVEL_1,"Time out, drop the %dth buffer", tl_dropFrameCount++);
++#endif
++            mVideoBuffer->release();
++            mVideoBuffer = NULL;
+ 
+                 mSeeking = SEEK_VIDEO_ONLY;
+                 mSeekTimeUs = mediaTimeUs;
+@@ -2314,7 +2394,9 @@ void AwesomePlayer::onVideoEvent() {
+                 ALOGV("we're late by %lld us (%.2f secs) dropping "
+                      "one after %d frames",
+                      latenessUs, latenessUs / 1E6, mSinceLastDropped);
+-
++#ifdef DUMP_DECODE_INFO
++                log_decode_print(LOG_LEVEL_1,"Time out, drop the %dth buffer", tl_dropFrameCount++);
++#endif
+                 mSinceLastDropped = 0;
+                 mVideoBuffer->release();
+                 mVideoBuffer = NULL;
+@@ -2358,6 +2440,16 @@ void AwesomePlayer::onVideoEvent() {
+         if (mFlags & PLAYING) {
+             notifyIfMediaStarted_l();
+         }
++#ifdef DUMP_DECODE_INFO
++        if (g_log_level >= LOG_LEVEL_1) {
++            tl_renderFrameCount++;
++            if(0 == tl_startbackStart) {
++                struct timeval tv;
++                gettimeofday(&tv,NULL);
++                tl_startbackStart = tv.tv_sec * 1000 + tv.tv_usec/1000;
++            }
++        }
++#endif
+     }
+ 
+     mVideoBuffer->release();
+-- 
+1.7.4.1
+

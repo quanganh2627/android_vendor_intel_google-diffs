@@ -1,0 +1,132 @@
+From 07713c3a0908851d705e01a53229f0278506993b Mon Sep 17 00:00:00 2001
+From: Yang Chang <yang.chang@intel.com>
+Date: Thu, 30 May 2013 10:18:16 +0800
+Subject: Dalvik: User threads may keep running after GC is supposed to suspend all
+
+BZ: 96430
+
+dvmLockThreadList may change a thread's state from THREAD_VMWAIT to THREAD_RUNNING
+without checking if there is any suspension request. This could lead to user threads
+executing even after GC is supposed to suspend all of them. A check is added before
+the state transition. However, the current fullSuspendCheck can't be used for this
+purpose because of potential deadlocks. A revised fullSuspendCheck takes this special
+case into consider.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: yes
+
+Change-Id: I281b946129ad6dc7d39bfa5bbde2b9df5d6dabda
+Orig-MCG-Change-Id: Ie5cbcf08fbe418fea7ccddb9ef5ce1d1cc11be4d
+Signed-off-by: Yang Chang <yang.chang@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/Thread.cpp |   34 +++++++++++++++++++++++++++++-----
+ vm/Thread.h   |    4 +++-
+ 2 files changed, 32 insertions(+), 6 deletions(-)
+
+diff --git a/vm/Thread.cpp b/vm/Thread.cpp
+index 1ebfca7..d580b19 100644
+--- a/vm/Thread.cpp
++++ b/vm/Thread.cpp
+@@ -390,8 +390,9 @@ void dvmLockThreadList(Thread* self)
+ 
+     dvmLockMutex(&gDvm.threadListLock);
+ 
+-    if (self != NULL)
+-        self->status = oldStatus;
++    if (self != NULL) {
++        dvmChangeStatus(self, oldStatus, true);
++    }
+ }
+ 
+ /*
+@@ -2842,7 +2843,7 @@ void dvmWaitForSuspend(Thread* thread)
+  *
+  * Returns "true" if we suspended ourselves.
+  */
+-static bool fullSuspendCheck(Thread* self)
++static bool fullSuspendCheck(Thread* self, bool releaseThreadListLock = false)
+ {
+     assert(self != NULL);
+     assert(self->suspendCount >= 0);
+@@ -2866,8 +2867,29 @@ static bool fullSuspendCheck(Thread* self)
+              * and re-acquiring the lock provides the memory barriers we
+              * need for correct behavior on SMP.
+              */
++
++            /*
++             * threadListLock has to be released in this function before
++             * thread self is suspended otherwise there will be a deadlock.
++             * When thread self is resumed, there might be a deadlock since
++             * threadSuspendCountLock gets locked before threadListLock (see
++             * Global.h for the correct order). We use dvmTryLockThreadList to
++             * solve this problem
++             */
++            if(releaseThreadListLock == true) {
++                dvmUnlockThreadList();
++            }
+             dvmWaitCond(&gDvm.threadSuspendCountCond,
+                     &gDvm.threadSuspendCountLock);
++            if(releaseThreadListLock == true && dvmTryLockThreadList() == false) {
++               /*
++                * If dvmTryLockThreadList failed, we have to release the locks already
++                * acquired and then try again in proper order
++                */
++               unlockThreadSuspendCount();
++               dvmLockMutex(&gDvm.threadListLock);
++               lockThreadSuspendCount();
++            }
+         }
+         ATRACE_END();
+         assert(self->suspendCount == 0 && self->dbgSuspendCount == 0);
+@@ -2899,10 +2921,12 @@ bool dvmCheckSuspendPending(Thread* self)
+  * Update our status.
+  *
+  * The "self" argument, which may be NULL, is accepted as an optimization.
++ * The releaseThreadLock is false by default. It is true only when this is
++ * called from dvmLockThreadList.
+  *
+  * Returns the old status.
+  */
+-ThreadStatus dvmChangeStatus(Thread* self, ThreadStatus newStatus)
++ThreadStatus dvmChangeStatus(Thread* self, ThreadStatus newStatus, bool releaseThreadLock)
+ {
+     ThreadStatus oldStatus;
+ 
+@@ -2971,7 +2995,7 @@ ThreadStatus dvmChangeStatus(Thread* self, ThreadStatus newStatus)
+         volatile int32_t* addr = reinterpret_cast<volatile int32_t*>(raw);
+         android_atomic_acquire_store(newStatus, addr);
+         if (self->suspendCount != 0) {
+-            fullSuspendCheck(self);
++            fullSuspendCheck(self, releaseThreadLock);
+         }
+     } else {
+         /*
+diff --git a/vm/Thread.h b/vm/Thread.h
+index d7a6143..a1826f2 100644
+--- a/vm/Thread.h
++++ b/vm/Thread.h
+@@ -404,6 +404,8 @@ INLINE bool dvmCheckSuspendQuick(Thread* self) {
+ /*
+  * Used when changing thread state.  Threads may only change their own.
+  * The "self" argument, which may be NULL, is accepted as an optimization.
++ * The releaseThreadLock is false by default. It is true only when this is
++ * called from dvmLockThreadList.
+  *
+  * If you're calling this before waiting on a resource (e.g. THREAD_WAIT
+  * or THREAD_MONITOR), do so in the same function as the wait -- this records
+@@ -413,7 +415,7 @@ INLINE bool dvmCheckSuspendQuick(Thread* self) {
+  *
+  * Returns the old status.
+  */
+-ThreadStatus dvmChangeStatus(Thread* self, ThreadStatus newStatus);
++ThreadStatus dvmChangeStatus(Thread* self, ThreadStatus newStatus, bool releaseThreadListLock = false);
+ 
+ /*
+  * Initialize a mutex.
+-- 
+1.7.4.1
+

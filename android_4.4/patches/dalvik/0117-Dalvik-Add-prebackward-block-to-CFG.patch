@@ -1,0 +1,1439 @@
+From 2cedf1ed7fb572e1239b1cda1091f7b523430661 Mon Sep 17 00:00:00 2001
+From: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Date: Tue, 2 Apr 2013 12:37:54 -0700
+Subject: Dalvik: Add prebackward block to CFG
+
+BZ: 96834
+
+This patch adds a block for every backward branch chaining cell that
+is an immediate dominator of the chaining cell. The newly inserted
+basic blocks take the write back requests and MIRs from the backward
+branch chaining cells. This is done in order to help the backend which
+cannot handle chaining cells like normal bytecode blocks.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Ia2a4a3c2068d663afee66d5e4813c7c296d1008a
+Orig-MCG-Change-Id: I34bb3d5098dde871f6c3af21416f20b4a8ca1f5c
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/BBOptimization.cpp                |   16 +-
+ vm/compiler/BBOptimization.h                  |   12 +
+ vm/compiler/CompilerIR.h                      |   10 +
+ vm/compiler/IntermediateRep.cpp               |   12 +
+ vm/compiler/Loop.cpp                          |  289 ++++++++++++++++
+ vm/compiler/LoopInformation.cpp               |    1 -
+ vm/compiler/LoopInformation.h                 |    2 +-
+ vm/compiler/LoopOpt.cpp                       |    2 +
+ vm/compiler/Utility.cpp                       |    4 +
+ vm/compiler/codegen/x86/AnalysisO1.cpp        |    4 +-
+ vm/compiler/codegen/x86/CodegenErrors.cpp     |    3 +-
+ vm/compiler/codegen/x86/CodegenErrors.h       |    2 +
+ vm/compiler/codegen/x86/CodegenInterface.cpp  |  434 ++++++++++++++++---------
+ vm/compiler/codegen/x86/Lower.h               |    4 +-
+ vm/compiler/codegen/x86/LowerHelper.cpp       |   31 ++-
+ vm/compiler/codegen/x86/LowerJump.cpp         |  168 ++++------
+ vm/compiler/codegen/x86/RegisterizationBE.cpp |    9 +-
+ 17 files changed, 724 insertions(+), 279 deletions(-)
+
+diff --git a/vm/compiler/BBOptimization.cpp b/vm/compiler/BBOptimization.cpp
+index 0f01c86..a4f4d45 100644
+--- a/vm/compiler/BBOptimization.cpp
++++ b/vm/compiler/BBOptimization.cpp
+@@ -136,17 +136,17 @@ bool dvmCompilerMergeBasicBlocks (CompilationUnit *cUnit, BasicBlock *bb)
+  * @brief Handle the insertion of the pre-loop header
+  * @param cUnit the CompilationUnit
+  * @param newBlock the new block to be added
+- * @param bb the current backward chaining cell
++ * @param backward the current backward chaining cell
+  * @return whether we succeeded or not
+  */
+-static bool handlePreLoopInsertion (CompilationUnit *cUnit, BasicBlock *newBlock, BasicBlock *bb)
++static bool handlePreLoopInsertion (CompilationUnit *cUnit, BasicBlock *newBlock, BasicBlock *backward)
+ {
+     bool res = false;
+ 
+     BitVectorIterator bvIterator;
+ 
+     //Get its fall through
+-    bb = bb->fallThrough;
++    BasicBlock *bb = backward->fallThrough;
+ 
+     //Paranoid
+     if (bb == 0)
+@@ -212,17 +212,17 @@ static bool handlePreLoopInsertion (CompilationUnit *cUnit, BasicBlock *newBlock
+  * @brief Insert the pre-loop header
+  * @param cUnit the CompilationUnit
+  * @param info the LoopInformation for the loop
+- * @param bb the current backward branch
++ * @param backward the current backward branch
+  */
+-static void insertPreLoopHeader (CompilationUnit *cUnit, LoopInformation *info, BasicBlock *bb)
++static void insertPreLoopHeader (CompilationUnit *cUnit, LoopInformation *info, BasicBlock *backward)
+ {
+     //Now, we have a little bit of work: we want to create a preheader
+     //Don't define its ID or add it yet, we might not use it
+     BasicBlock *preHeader = dvmCompilerNewBB(kDalvikByteCode, 0);
+-    preHeader->startOffset = bb->startOffset;
++    preHeader->startOffset = backward->startOffset;
+ 
+     //Set the links correctly
+-    bool res = handlePreLoopInsertion (cUnit, preHeader, bb);
++    bool res = handlePreLoopInsertion (cUnit, preHeader, backward);
+ 
+     if (res == true)
+     {
+@@ -240,7 +240,7 @@ static void insertPreLoopHeader (CompilationUnit *cUnit, LoopInformation *info,
+     {
+         //This should never happen
+         ALOGD ("Warning: Loop does not have a header: %s%s, for %x",
+-                        cUnit->method->clazz->descriptor, cUnit->method->name, bb->startOffset);
++                        cUnit->method->clazz->descriptor, cUnit->method->name, backward->startOffset);
+         cUnit->quitLoopMode = true;
+ 
+         //In the assert world, we'd prefer this never happens
+diff --git a/vm/compiler/BBOptimization.h b/vm/compiler/BBOptimization.h
+index af288c1..2e89089 100644
+--- a/vm/compiler/BBOptimization.h
++++ b/vm/compiler/BBOptimization.h
+@@ -31,6 +31,18 @@ class Pass;
+ bool dvmCompilerMergeBasicBlocks (CompilationUnit *cUnit, BasicBlock *bb);
+ 
+ /**
++ * @brief Inserts a basic block before Backward Chaining Cell.
++ * @details The newly inserted basic blocks takes the write back requests and
++ * MIRs from chaining cell in order to help backend which cannot handle
++ * Backward Chaining Cell like a bytecode block. It also ensures that the
++ * newly inserted block is the taken branch, so if the backward was fallthrough
++ * it flips the condition.
++ * @param cUnit the CompilationUnit
++ * @param currentPass the Pass
++ */
++void dvmCompilerInsertPreBackward (CompilationUnit *cUnit, Pass *currentPass);
++
++/**
+  * @brief Form the loop by inserting pre/post blocks and backward branches for loops
+  * @param cUnit the CompilationUnit
+  * @param bb the BasicBlock
+diff --git a/vm/compiler/CompilerIR.h b/vm/compiler/CompilerIR.h
+index a7ff4a4..50967b9 100644
+--- a/vm/compiler/CompilerIR.h
++++ b/vm/compiler/CompilerIR.h
+@@ -69,6 +69,7 @@ typedef enum BBType {
+     kPCReconstruction,
+     kExceptionHandling,
+     kCatchEntry,
++    kPreBackwardBlock,
+ } BBType;
+ 
+ typedef enum JitMode {
+@@ -357,6 +358,15 @@ typedef struct CompilationUnit {
+ BasicBlock *dvmCompilerNewBB(BBType blockType, int blockId);
+ 
+ /**
++ * @brief Allocates a new basic block and adds it to the compilation unit.
++ * @details Automatically generates an id for the BB
++ * @param cUnit Compilation Unit
++ * @param blockType Type of block we want to create
++ * @return Returns the newly created BB
++ */
++BasicBlock *dvmCompilerNewBBinCunit (CompilationUnit *cUnit, BBType blockType);
++
++/**
+  * @brief Used for allocating a new MIR.
+  * @return Returns the newly created MIR.
+  */
+diff --git a/vm/compiler/IntermediateRep.cpp b/vm/compiler/IntermediateRep.cpp
+index 659f729..b0922db 100644
+--- a/vm/compiler/IntermediateRep.cpp
++++ b/vm/compiler/IntermediateRep.cpp
+@@ -38,6 +38,18 @@ BasicBlock *dvmCompilerNewBB(BBType blockType, int blockId)
+     return bb;
+ }
+ 
++/* Allocate a new basic block and add it to the compilation unit */
++BasicBlock *dvmCompilerNewBBinCunit (CompilationUnit *cUnit, BBType blockType)
++{
++    // Create a new BB and assign it an id
++    BasicBlock *newBlock = dvmCompilerNewBB (blockType, cUnit->numBlocks++);
++
++    // Once created, add it to the cUnit
++    dvmInsertGrowableList (&(cUnit->blockList), (intptr_t) newBlock);
++
++    return newBlock;
++}
++
+ /* Allocate a new MIR */
+ MIR *dvmCompilerNewMIR (void)
+ {
+diff --git a/vm/compiler/Loop.cpp b/vm/compiler/Loop.cpp
+index 9b03dd7..7f438d8 100644
+--- a/vm/compiler/Loop.cpp
++++ b/vm/compiler/Loop.cpp
+@@ -1623,3 +1623,292 @@ void dvmCompilerLoopMarkOffNonHeaderBlocks (CompilationUnit *cUnit)
+ 
+     //Domination is done later so no need here
+ }
++
++/**
++ * @brief Used to flip the condition of an "if" bytecode
++ * @param opcode Dalvik opcode to negate
++ * @param negatedOpcode Updated by function to contain negated
++ * opcode. Only valid if function returns true.
++ * @return Returns true if successfully negated.
++ */
++static bool negateOpcode(Opcode opcode, Opcode & negatedOpcode)
++{
++    //Eagerly assume we will succeed
++    bool success = true;
++
++    switch (opcode) {
++        /* reg/reg cmp */
++        case OP_IF_EQ:
++            negatedOpcode = OP_IF_NE;
++            break;
++        case OP_IF_NE:
++            negatedOpcode = OP_IF_EQ;
++            break;
++        case OP_IF_LT:
++            negatedOpcode = OP_IF_GE;
++            break;
++        case OP_IF_GE:
++            negatedOpcode = OP_IF_LT;
++            break;
++        case OP_IF_GT:
++            negatedOpcode = OP_IF_LE;
++            break;
++        case OP_IF_LE:
++            negatedOpcode = OP_IF_GT;
++            break;
++        /* reg/zero cmp */
++        case OP_IF_EQZ:
++            negatedOpcode = OP_IF_NEZ;
++            break;
++        case OP_IF_NEZ:
++            negatedOpcode = OP_IF_EQZ;
++            break;
++        case OP_IF_LTZ:
++            negatedOpcode = OP_IF_GEZ;
++            break;
++        case OP_IF_GEZ:
++            negatedOpcode = OP_IF_LTZ;
++            break;
++        case OP_IF_GTZ:
++            negatedOpcode = OP_IF_LEZ;
++            break;
++        case OP_IF_LEZ:
++            negatedOpcode = OP_IF_GTZ;
++            break;
++        default:
++            success = false;
++            break;
++    }
++
++    return success;
++}
++
++/**
++ * @brief Looks through backward's predecessors and inserts a new block in
++ * between. It also ensures that new block is the taken branch and flips
++ * condition in bytecode if needed.
++ * @details Creates a new block and copies relevant information from backward.
++ * @param cUnit the Compilation Unit
++ * @param backward the backward branch chaining cell
++ */
++static void insertBlockBeforeBackwardHelper (CompilationUnit *cUnit,
++        BasicBlock *backward)
++{
++    //Checking preconditions
++    assert(backward != 0);
++
++    BitVector *predecessors = backward->predecessors;
++
++    //Paranoid
++    if (predecessors == 0)
++    {
++        return;
++    }
++
++    //Initialize iterator
++    BitVectorIterator bvIterator;
++    dvmBitVectorIteratorInit (predecessors, &bvIterator);
++
++    //Ok, there is currently no way a backward branch can have more than one predecessor
++    //Something went terribly wrong if it did, so get out
++    if (dvmCountSetBits (predecessors) != 1)
++    {
++        cUnit->quitLoopMode = true;
++        return;
++    }
++
++    while (true)
++    {
++        //Get the block index
++        int blockIdx = dvmBitVectorIteratorNext (&bvIterator);
++
++        //Break if we are done
++        if (blockIdx == -1)
++        {
++            break;
++        }
++
++        //Get the predecessor block
++        BasicBlock *predecessor =
++                reinterpret_cast<BasicBlock *> (dvmGrowableListGetElement (
++                        &cUnit->blockList, blockIdx));
++
++        //Paranoid
++        if (predecessor == 0)
++        {
++            continue;
++        }
++
++        //Create a preBackward block
++        BasicBlock *preBackward = dvmCompilerNewBBinCunit (cUnit,
++                kPreBackwardBlock);
++
++        //Paranoid
++        assert(preBackward != 0);
++
++        //Now we copy the relevant parts
++        preBackward->startOffset = backward->startOffset;
++        preBackward->firstMIRInsn = backward->firstMIRInsn;
++        preBackward->lastMIRInsn = backward->lastMIRInsn;
++        preBackward->containingMethod = backward->containingMethod;
++
++        //We also need to make a copy of the write back requests
++        preBackward->requestWriteBack = dvmCompilerAllocBitVector (1, true);
++        dvmCopyBitVector (preBackward->requestWriteBack,
++                backward->requestWriteBack);
++
++        //We want the new block to be the taken branch.
++        //So if backward used to be the fallthrough, make it the taken.
++        if(predecessor->fallThrough == backward)
++        {
++            MIR *ifMir = predecessor->lastMIRInsn;
++
++            //It is unexpected if we have a null MIR, but just continue
++            if (ifMir == 0)
++            {
++                continue;
++            }
++
++            //Paranoid, we should have an if at the end
++            assert(ifMir != 0 && ifMir->dalvikInsn.opcode >= OP_IF_EQ
++                    && ifMir->dalvikInsn.opcode <= OP_IF_LEZ);
++
++            Opcode negated;
++
++            bool canNegate = negateOpcode (ifMir->dalvikInsn.opcode, negated);
++
++            //If we can negate the bytecode condition, then we can swap
++            //the children
++            if (canNegate == true)
++            {
++                //Update opcode
++                ifMir->dalvikInsn.opcode = negated;
++
++                //Set the fallthrough to be the old taken
++                predecessor->fallThrough = predecessor->taken;
++
++                //Make the backward be the new taken
++                predecessor->taken = backward;
++            }
++        }
++
++        //Insert the preBackward block between predecessor and backward CC
++        bool res = dvmCompilerInsertBasicBlockBetween (preBackward, predecessor,
++                backward);
++
++        //If we failed inserting, that's not good but let's keep going
++        if (res == false)
++        {
++            continue;
++        }
++
++        //Clear fields from backward
++        backward->firstMIRInsn = 0;
++        backward->lastMIRInsn = 0;
++
++        //Update parent of the MIRs
++        for (MIR *mir = preBackward->firstMIRInsn; mir != 0; mir = mir->next)
++        {
++            mir->bb = preBackward;
++        }
++    }
++}
++
++/**
++ * @brief Finds all of the backward branch chaining cells and then inserts
++ * a block before each of them.
++ * @param cUnit the Compilation Unit
++ * @param info the information of Loop we are looking at
++ */
++static void insertBlockBeforeBackward (CompilationUnit *cUnit,
++        const LoopInformation *info)
++{
++    //We want to look through all of the backward chaining cells
++    const BitVector *backwards = info->getBackwardBranches ();
++
++    //Const cast due to incompatibility here
++    BitVector *tmp = const_cast<BitVector *> (backwards);
++
++    //Initialize iterator
++    BitVectorIterator bvIterator;
++    dvmBitVectorIteratorInit (tmp, &bvIterator);
++
++    while (true)
++    {
++        //Get the block index
++        int blockIdx = dvmBitVectorIteratorNext (&bvIterator);
++
++        //Break if we are done
++        if (blockIdx == -1)
++        {
++            break;
++        }
++
++        //Get the backward block
++        BasicBlock *backward =
++                reinterpret_cast<BasicBlock *> (dvmGrowableListGetElement (
++                        &cUnit->blockList, blockIdx));
++
++        //Paranoid
++        if (backward == 0)
++        {
++            continue;
++        }
++
++        insertBlockBeforeBackwardHelper (cUnit, backward);
++    }
++}
++
++/**
++ * @brief Walks through all of the nested loops to insert prebackward blocks.
++ * @param cUnit the Compilation Unit
++ * @param info the information of Loop we are looking at
++ */
++static void insertPreBackwardWalker (CompilationUnit *cUnit, const LoopInformation *info)
++{
++    //If info is 0, there is nothing to do
++    if (info == 0)
++    {
++        return;
++    }
++
++    //Actually do the work
++    insertBlockBeforeBackward (cUnit, info);
++
++    //Search in the children if anybody includes them
++    unsigned int nestedNum = info->getNestedNbr ();
++
++    for (unsigned int i = 0; i < nestedNum; i++)
++    {
++        //Get the inner loop
++        LoopInformation *inner = info->getNested (i);
++
++        //Paranoid
++        assert(inner != 0);
++
++        insertPreBackwardWalker (cUnit, inner);
++    }
++}
++
++/**
++ * @brief Inserts a basic block before Backward Chaining Cell.
++ * @details The newly inserted basic blocks takes the write back requests and
++ * MIRs from chaining cell in order to help backend which cannot handle
++ * Backward Chaining Cell like a bytecode block. It also ensures that the
++ * newly inserted block is the taken branch, so if the backward was fallthrough
++ * it flips the condition.
++ * @param cUnit the CompilationUnit
++ * @param currentPass the Pass
++ */
++void dvmCompilerInsertPreBackward (CompilationUnit *cUnit, Pass *currentPass)
++{
++    //Now let's go through the loop information
++    LoopInformation *info = cUnit->loopInformation;
++
++    //Call helper so we can insert prebackward block for all backward
++    //chaining cells
++    insertPreBackwardWalker (cUnit, info);
++
++    //Unused argument
++    (void) currentPass;
++}
+diff --git a/vm/compiler/LoopInformation.cpp b/vm/compiler/LoopInformation.cpp
+index 501ba99..0f53fb8 100644
+--- a/vm/compiler/LoopInformation.cpp
++++ b/vm/compiler/LoopInformation.cpp
+@@ -41,7 +41,6 @@ void LoopInformation::init (const Method *method)
+     backward = 0;
+     entry = 0;
+     preHeader = 0;
+-    backward = 0;
+     postExitLoop = 0;
+ 
+     if (method != 0)
+diff --git a/vm/compiler/LoopInformation.h b/vm/compiler/LoopInformation.h
+index a899a92..1bab8d8 100644
+--- a/vm/compiler/LoopInformation.h
++++ b/vm/compiler/LoopInformation.h
+@@ -49,7 +49,7 @@ class LoopInformation
+         /** @brief Preheader of the loop */
+         BasicBlock *preHeader;
+ 
+-        /** @brief Backward Chaining Cell of the loop */
++        /** @brief Backward Chaining Cells of the loop */
+         BitVector *backward;
+ 
+         /** @brief Post loop basic block */
+diff --git a/vm/compiler/LoopOpt.cpp b/vm/compiler/LoopOpt.cpp
+index 131034f..24d78a4 100644
+--- a/vm/compiler/LoopOpt.cpp
++++ b/vm/compiler/LoopOpt.cpp
+@@ -62,6 +62,8 @@ START_PASSES
+                 0, dvmCompilerRegisterize, 0, 0, 0),
+     NEW_PASS ("Merge Blocks", kAllNodes, 0, 0,
+                 0, 0, dvmCompilerMergeBasicBlocks, 0, kOptimizationBasicBlockChange),
++    NEW_PASS ("Insert Prebackward Block", kAllNodes, 0, 0,
++                    0, dvmCompilerInsertPreBackward, 0, 0, kOptimizationBasicBlockChange),
+     NEW_PASS ("Reorder Blocks", kBreadthFirstTraversal, 0, dvmCompilerTraceIsLoop,
+                 dvmCompilerReorder, 0, 0, 0, kOptimizationBasicBlockChange),
+ 
+diff --git a/vm/compiler/Utility.cpp b/vm/compiler/Utility.cpp
+index 94d4dd6..c92928b 100644
+--- a/vm/compiler/Utility.cpp
++++ b/vm/compiler/Utility.cpp
+@@ -310,6 +310,7 @@ void dvmCompilerDumpCompilationUnit(CompilationUnit *cUnit)
+         "PC Reconstruction",
+         "Exception Handling",
+         "Catch Entry",
++        "PreBackward Block"
+     };
+ 
+     ALOGD("Compiling %s %s", cUnit->method->clazz->descriptor,
+@@ -558,6 +559,9 @@ void dvmGetBlockName(BasicBlock *bb, char *name)
+          case kExceptionHandling:
+             snprintf(name, BLOCK_NAME_LEN, "exception%04x", bb->id);
+             break;
++         case kPreBackwardBlock:
++             snprintf(name, BLOCK_NAME_LEN, "prebackward%04x", bb->id);
++             break;
+          default:
+             snprintf(name, BLOCK_NAME_LEN, "??");
+             break;
+diff --git a/vm/compiler/codegen/x86/AnalysisO1.cpp b/vm/compiler/codegen/x86/AnalysisO1.cpp
+index 9c8d569..d32d55c 100644
+--- a/vm/compiler/codegen/x86/AnalysisO1.cpp
++++ b/vm/compiler/codegen/x86/AnalysisO1.cpp
+@@ -889,8 +889,10 @@ int preprocessingBB(CompilationUnit *cUnit, BasicBlock* bb) {
+ 
+     // If BB does not have any bytecode we do not need to collect
+     // any information about it
+-    if (bb->blockType != kDalvikByteCode && bb->firstMIRInsn == NULL)
++    if (bb->firstMIRInsn == NULL)
++    {
+         return 0;
++    }
+ 
+     int retCode = collectInfoOfBasicBlock(currentMethod, currentBB);
+     if (retCode < 0) {
+diff --git a/vm/compiler/codegen/x86/CodegenErrors.cpp b/vm/compiler/codegen/x86/CodegenErrors.cpp
+index e21ab2b..97cd9c8 100644
+--- a/vm/compiler/codegen/x86/CodegenErrors.cpp
++++ b/vm/compiler/codegen/x86/CodegenErrors.cpp
+@@ -41,7 +41,8 @@ static const char* jitErrorMessages[kJitErrorMaxDefined] = {
+     "Issue registerizing the trace in the backend",
+     "The trace provoked a spill",
+     "The backend decided it cannot safely handle the Basic Block",
+-    "Patching of Double/Long constants failed"
++    "Patching of Double/Long constants failed",
++    "An issue was encountered while generating chaining cell",
+     //Add error messages here when adding error codes
+ };
+ 
+diff --git a/vm/compiler/codegen/x86/CodegenErrors.h b/vm/compiler/codegen/x86/CodegenErrors.h
+index e4f23d0..da326b9 100644
+--- a/vm/compiler/codegen/x86/CodegenErrors.h
++++ b/vm/compiler/codegen/x86/CodegenErrors.h
+@@ -81,6 +81,8 @@ enum JitCompilationErrors {
+     kJitErrorBBCannotBeHandled,
+     /** @brief Errors while performing double/long constant initialization */
+     kJitErrorConstInitFail,
++    /** @brief Error while generating chaining cell */
++    kJitErrorChainingCell,
+ 
+     /* ----- Add more errors above ---------------------------*/
+     /* ----- Don't add new errors beyond this point ----------*/
+diff --git a/vm/compiler/codegen/x86/CodegenInterface.cpp b/vm/compiler/codegen/x86/CodegenInterface.cpp
+index 71f36b5..135c7e9 100644
+--- a/vm/compiler/codegen/x86/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/CodegenInterface.cpp
+@@ -491,13 +491,13 @@ void unconditional_jump_rel32(void * target) {
+ 
+ // works whether instructions for target basic block are generated or not
+ LowOp* jumpToBasicBlock(char* instAddr, int targetId,
+-        bool targetIsChainingCell) {
++        bool immediateNeedsAligned) {
+     stream = instAddr;
+     bool unknown;
+     OpndSize size;
+     if(gDvmJit.scheduling) {
+         // If target is chaining cell, we must align the immediate
+-        unconditional_jump_block(targetId, targetIsChainingCell);
++        unconditional_jump_block(targetId, immediateNeedsAligned);
+     } else {
+         int relativeNCG = getRelativeNCG(targetId, JmpCall_uncond, &unknown, &size);
+         unconditional_jump_int(relativeNCG, size);
+@@ -506,13 +506,13 @@ LowOp* jumpToBasicBlock(char* instAddr, int targetId,
+ }
+ 
+ LowOp* condJumpToBasicBlock(char* instAddr, ConditionCode cc, int targetId,
+-        bool targetIsChainingCell) {
++        bool immediateNeedsAligned) {
+     stream = instAddr;
+     bool unknown;
+     OpndSize size;
+     if(gDvmJit.scheduling) {
+         // If target is chaining cell, we must align the immediate
+-        conditional_jump_block(cc, targetId, targetIsChainingCell);
++        conditional_jump_block(cc, targetId, immediateNeedsAligned);
+     } else {
+         int relativeNCG = getRelativeNCG(targetId, JmpCall_cond, &unknown, &size);
+         conditional_jump_int(cc, relativeNCG, size);
+@@ -725,13 +725,63 @@ done:
+     return method;
+ }
+ 
++/**
++ * @brief Defines the data structure of a Backward Branch Chaining Cell.
++ */
++struct __attribute__ ((packed)) BackwardBranchChainingCellContents
++{
++    /**
++     * @brief Used to hold the "call rel32" to dvmJitToInterpBackwardBranch
++     */
++    char instructionHolder[5];
++
++    unsigned int nextPC;    //!< Next bytecode PC
++
++    /**
++     * @brief Holds address of operand of jump instruction that is to be patched.
++     * After chaining, the jump is  filled with relative offset to loop header.
++     * After unchaining it is filled with relative offset to the VR write-back.
++     */
++    char * codePtr;
++
++    char * loopHeaderAddr;    //!< Address of loop header block.
++    char * vrWriteBackAddr;   //!< Address of VR write-back block.
++    char * loopPreHeaderAddr; //!< Address of loop pre-header block.
++
++    /**
++     * @brief Used for unchaining backward branch chaining cells.
++     * @param location This is location where unchaining method can assume
++     * that a Backward Branch CC exists.
++     * @return Returns size of unchained cell.
++     */
++    static size_t unchain (u1 * location)
++    {
++        //First we reinterpret the location to be a chaining cell
++        BackwardBranchChainingCellContents * contents =
++                reinterpret_cast<BackwardBranchChainingCellContents *> (location);
++
++        //We want to jump to the VR write back address and we know that the code
++        //pointer points to operand of jump. Thus we also subtract our assumed
++        //operand size of 32-bits.
++        int relativeOffset = (contents->vrWriteBackAddr - contents->codePtr)
++                - OpndSize_32;
++
++        //We want to patch with an int value so we reinterpret the address here
++        int * addressOfJumpOperand = reinterpret_cast<int *> (contents->codePtr);
++
++        //This does the actual patching with the offset we calculated
++        *(addressOfJumpOperand) = relativeOffset;
++
++        //We return size of our chaining cell
++        return sizeof(*contents);
++    }
++};
++
+ #define BYTES_OF_NORMAL_CHAINING 13
+-#define BYTES_OF_BACKWARDBRANCH_CHAINING 25
+ #define BYTES_OF_HOT_CHAINING 17
+ #define BYTES_OF_SINGLETON_CHAINING 13
+ #define BYTES_OF_PREDICTED_CHAINING 20
+ #define OFFSET_OF_PATCHADDR 9 // offset in chaining cell to the field for the location to be patched
+-#define OFFSET_OF_VRSTORECODEPTR 17 // offset in backward chaining cell to the field for the location of deferred VR store
+ #define OFFSET_OF_ISMOVEFLAG 13  // offset in hot chaining cell to the ismove_flag field
+ #define BYTES_OF_32BITS 4
+ /*
+@@ -818,12 +868,10 @@ u4* dvmJitUnchain(void* codeAddr)
+                 hot: 5+4+4+4
+                 codePtr should be within 16B line.
+ 
+-           Space for predicted chaining: 5 words = 20 bytes
++           Space for predicted chaining: 5 words = 20 bytes + padding to make it 4-byte aligned
+         */
+         int elemSize = 0;
+-        if (i == kChainingCellInvokePredicted) {
+-            elemSize = BYTES_OF_PREDICTED_CHAINING;
+-        }
++
+         COMPILER_TRACE_CHAINING(
+             ALOGI("Jit Runtime: unchaining type %d count %d", i, pChainCellCounts->u.count[i]));
+ 
+@@ -864,19 +912,18 @@ u4* dvmJitUnchain(void* codeAddr)
+                 case kChainingCellBackwardBranch:
+                     COMPILER_TRACE_CHAINING(
+                         ALOGI("Jit Runtime: unchaining of backward"));
+-                    elemSize = BYTES_OF_BACKWARDBRANCH_CHAINING;
+-                    patchAddr = (u1 *)(*(int *)((char*)pChainCells + OFFSET_OF_PATCHADDR));
+-                    vrStoreCodePtr = (u1 *)(*(int *)((char*)pChainCells + OFFSET_OF_VRSTORECODEPTR));
+-                    relativeNCG = (vrStoreCodePtr - patchAddr) - BYTES_OF_32BITS;
+-                    *(int*)patchAddr = relativeNCG;
++                    elemSize = BackwardBranchChainingCellContents::unchain (pChainCells);
+                     break;
+                 case kChainingCellInvokePredicted:
+                     COMPILER_TRACE_CHAINING(
+                         ALOGI("Jit Runtime: unchaining of predicted"));
+-                    /* 4-byte aligned */
+-                    padding = (4 - ((u4)pChainCells & 3)) & 3;
++                    //The cell is always 4-byte aligned so we need to take that
++                    //into account first
++                    padding = (4 - ((u4) pChainCells & 3)) & 3;
+                     pChainCells += padding;
+-                    predChainCell = (PredictedChainingCell *) pChainCells;
++
++                    predChainCell = reinterpret_cast<PredictedChainingCell *> (
++                            pChainCells);
+                     /*
+                      * There could be a race on another mutator thread to use
+                      * this particular predicted cell and the check has passed
+@@ -885,6 +932,8 @@ u4* dvmJitUnchain(void* codeAddr)
+                      * which serves as the key.
+                      */
+                     predChainCell->clazz = PREDICTED_CHAIN_CLAZZ_INIT;
++
++                    elemSize = sizeof(*predChainCell);
+                     break;
+                 default:
+                     ALOGI("JIT_INFO: Unexpected chaining type: %d", i);
+@@ -993,54 +1042,169 @@ static int handleHotChainingCell(CompilationUnit *cUnit, unsigned int offset, in
+     return 0;
+ }
+ 
+-/* Chaining cell for branches that branch back into the same basic block
+-   IA32 assembly:
+-                  call imm32 //relative offset to dvmJitToInterpBackwardBranch
+-                  rPC
+-                  codePtr
+-                  loop header address
+-                  vrStoreCodePtr
+-                  loop preheader address
+-*/
+-static int handleBackwardBranchChainingCell(CompilationUnit *cUnit,
+-                                     unsigned int offset, int blockId, char *loopHeaderAddr,
+-                                     char *preLoopHeaderAddr)
+-
++/**
++ * @brief Generates code for backward branch chaining cell.
++ * @param cUnit the compilation unit
++ * @param chainingCell the chaining cell we are generating code for
++ * @return true if chaining cell was successfully generated
++ */
++static bool handleBackwardBranchChainingCell (CompilationUnit *cUnit,
++        BasicBlock_O1 *chainingCell)
+ {
+-    ALOGV("In handleBackwardBranchChainingCell for method %s block %d BC offset %x NCG offset %x",
+-          cUnit->method->name, blockId, offset, stream - streamMethodStart);
+-    if(dump_x86_inst)
+-        ALOGI("LOWER BackwardBranchChainingCell at offsetPC %x offsetNCG %x @%p",
+-              offset, stream - streamMethodStart, stream);
++    assert(chainingCell != 0);
++    assert(chainingCell->blockType == kChainingCellBackwardBranch);
+ 
+-    char* vrStoreCodePtr = NULL;
+-    char* chainingCellHead = stream;
+-    call_dvmJitToInterpBackwardBranch();
++    //Get the loop entry
++    BasicBlock *loopEntry = chainingCell->fallThrough;
+ 
+-    unsigned int *ptr = (unsigned int*)stream;
+-    *ptr++ = (unsigned int)(cUnit->method->insns + offset);
++    //Paranoid
++    assert(cUnit->loopInformation != 0);
+ 
+-    //Make the label using the blockID
+-    char storeBackLabel[LABEL_SIZE];
+-    snprintf(storeBackLabel, LABEL_SIZE, ".vr_store_at_loop_back_%d", blockId);
++    //We want the loop header and preloop header
++    char *loopHeaderAddr = 0;
++    char *preLoopHeaderAddr = 0;
+ 
+-    char* codePtr = searchLabelWorklist(storeBackLabel);
++    BasicBlock_O1 *bbO1 = reinterpret_cast<BasicBlock_O1 *> (loopEntry);
++    assert(bbO1 != 0);
+ 
+-    if (codePtr == NULL)
+-        codePtr = searchNCGWorklist(blockId);
+-    else {
+-        vrStoreCodePtr = findCodeForLabel(storeBackLabel);
++    //Set the loop header address
++    loopHeaderAddr = bbO1->streamStart;
++
++    //Get the associated loop information
++    LoopInformation *info = cUnit->loopInformation;
++
++    //But if info is 0, we might not have that and should just use the fallThrough's information
++    //This can happen if the user has used the old loop system, and should only happen then
++    if (info == 0)
++    {
++        //Then request the interpreter jump back to where the loop is
++        preLoopHeaderAddr = loopHeaderAddr;
+     }
+-    *ptr++ = (unsigned int)codePtr;
+-    *ptr++ = (unsigned int)loopHeaderAddr;
+-    if (vrStoreCodePtr)
+-        *ptr++ = (int)vrStoreCodePtr;
+     else
+-        *ptr++ = (int)chainingCellHead;
+-    *ptr++ = (unsigned int) preLoopHeaderAddr;
+-    //Save back stream
+-    stream = (char *) ptr;
+-    return 0;
++    {
++        //Get the right loop
++        info = info->getLoopInformationByEntry (loopEntry);
++
++        //Paranoid
++        if (info != 0)
++        {
++            //We have a preLoop
++            BasicBlock *preLoop = info->getPreHeader ();
++
++            //Paranoid
++            if (preLoop != 0)
++            {
++                bbO1 = reinterpret_cast<BasicBlock_O1 *> (preLoop);
++
++                //Paranoid
++                if (bbO1 != 0)
++                {
++                    preLoopHeaderAddr = bbO1->streamStart;
++                }
++            }
++        }
++    }
++
++    //If we cannot find these, then we have a problem
++    if (loopHeaderAddr == 0 || preLoopHeaderAddr == 0)
++    {
++        return false;
++    }
++
++    //Every backward branch chaining cell must have a prebackward
++    //predecessor. So we look for it.
++    if (chainingCell->predecessors == 0)
++    {
++        return false;
++    }
++
++    //Initialize iterator
++    BitVectorIterator bvIterator;
++    dvmBitVectorIteratorInit (chainingCell->predecessors, &bvIterator);
++
++    //Get the block index of predecessor
++    int blockIdx = dvmBitVectorIteratorNext (&bvIterator);
++
++    //Return false if we did not find predecessor
++    if (blockIdx == -1)
++    {
++        return false;
++    }
++
++    //Get the predecessor block
++    BasicBlock_O1 *preBackward =
++            reinterpret_cast<BasicBlock_O1 *> (dvmGrowableListGetElement (
++                    &cUnit->blockList, blockIdx));
++
++    //If it is not the right type then we return false
++    if (preBackward == 0 || preBackward->blockType != kPreBackwardBlock)
++    {
++        return false;
++    }
++
++    char *vrStoreCodePtr = preBackward->streamStart;
++
++    //We should have already generated code for the prebackward block
++    if (vrStoreCodePtr == 0)
++    {
++        return false;
++    }
++
++    //If scheduling is enabled, lets assert that queue is empty. Otherwise,
++    //it is not safe to use the stream pointer.
++    if (gDvmJit.scheduling)
++    {
++        //Using stream pointer is not safe unless scheduler queue is empty.
++        //We should never get here with anything in queue.
++        if (singletonPtr<Scheduler>()->isQueueEmpty() == false)
++        {
++            return false;
++        }
++    }
++
++    //At this point we have tried gathering all information we could so we
++    //ready to generate the chaining cell
++    if (cUnit->printMe)
++    {
++        ALOGI("LOWER BackwardBranchChainingCell with offsetPC %x @%p",
++                chainingCell->startOffset, stream);
++    }
++
++    BackwardBranchChainingCellContents *backwardContents =
++            reinterpret_cast<BackwardBranchChainingCellContents *> (stream);
++
++    //Generate the call to interpreter
++    call_dvmJitToInterpBackwardBranch ();
++
++    //Paranoid, we want to make sure that chaining cell has enough room
++    //for the call instruction
++    assert((reinterpret_cast<int>(stream) - reinterpret_cast<int>(backwardContents))
++            == sizeof(backwardContents->instructionHolder));
++
++    //Find the jump that goes to the prebackward block
++    char *codePtr = searchNCGWorklist (preBackward->id);
++
++    //If we cannot find this jump, something went wrong
++    if (codePtr == 0)
++    {
++        return false;
++    }
++
++    //Now write the data into the chaining cell
++    backwardContents->nextPC =
++            reinterpret_cast<unsigned int> (cUnit->method->insns
++                    + chainingCell->startOffset);
++    backwardContents->codePtr = codePtr;
++    backwardContents->loopHeaderAddr = loopHeaderAddr;
++    backwardContents->vrWriteBackAddr = vrStoreCodePtr;
++    backwardContents->loopPreHeaderAddr = preLoopHeaderAddr;
++
++    //Update stream pointer
++    stream = reinterpret_cast<char *> (backwardContents)
++            + sizeof(*backwardContents);
++
++    //We have successfully generated the chaining cell
++    return true;
+ }
+ 
+ /* Chaining cell for monomorphic method invocations.
+@@ -1067,13 +1231,50 @@ static int handleInvokeSingletonChainingCell(CompilationUnit *cUnit,
+     return 0;
+ }
+ 
+-/* Chaining cell for monomorphic method invocations. */
+-static void handleInvokePredictedChainingCell(CompilationUnit *cUnit, int blockId)
++/**
++ * @brief Generates code for predicted chaining cell.
++ * @details This chaining cell is used for polymorphic invocations.
++ * @param cUnit the compilation unit
++ * @param chainingCell the chaining cell we are generating code for
++ * @return true if chaining cell was successfully generated
++ */
++static bool handleInvokePredictedChainingCell (CompilationUnit *cUnit,
++        BasicBlock_O1 *chainingCell)
+ {
+-    if(dump_x86_inst)
+-        ALOGI("LOWER InvokePredictedChainingCell at block %d offsetNCG %x @%p",
+-              blockId, stream - streamMethodStart, stream);
+-#ifndef PREDICTED_CHAINING
++    if(cUnit->printMe)
++    {
++        ALOGI("LOWER InvokePredictedChainingCell (block %d) @%p",
++                chainingCell->id, stream);
++    }
++
++#ifdef PREDICTED_CHAINING
++
++    //Because we will be patching this at runtime, we want to make sure that
++    //the chaining cell is 4 byte aligned. Since every field of the chaining
++    //cell is 4 byte wide, this will ensure atomic updates since the cell
++    //won't be split across cache line.
++    int padding = (4 - ((u4) stream & 3)) & 3;
++    stream += padding;
++
++    //Since we are aligning, we should also update the offset so anyone using
++    //it accesses the correct data.
++    chainingCell->label->lop.generic.offset += padding;
++
++    PredictedChainingCell *predictedContents =
++            reinterpret_cast<PredictedChainingCell *> (stream);
++
++    //Now initialize the data using the predefined macros for initialization
++    predictedContents->branch = PREDICTED_CHAIN_BX_PAIR_INIT;
++    predictedContents->branch2 = 0;
++    predictedContents->clazz = PREDICTED_CHAIN_CLAZZ_INIT;
++    predictedContents->method = PREDICTED_CHAIN_METHOD_INIT;
++    predictedContents->stagedClazz = PREDICTED_CHAIN_COUNTER_INIT;
++
++    //Update stream pointer
++    stream = reinterpret_cast<char *> (predictedContents)
++            + sizeof(*predictedContents);
++
++#else
+     //assume rPC for callee->insns in %ebx
+     scratchRegs[0] = PhysicalReg_EAX;
+ #if defined(WITH_JIT_TUNING)
+@@ -1083,29 +1284,10 @@ static void handleInvokePredictedChainingCell(CompilationUnit *cUnit, int blockI
+     move_imm_to_reg(OpndSize_32, kInlineCacheMiss, PhysicalReg_EDX, true);
+ #endif
+     call_dvmJitToInterpTraceSelectNoChain();
+-#else
+-    /* make sure section for predicited chaining cell is 4-byte aligned */
+-    //int padding = (4 - ((u4)stream & 3)) & 3;
+-    //stream += padding;
+-    int* streamData = (int*)stream;
+-    /* Should not be executed in the initial state */
+-    streamData[0] = PREDICTED_CHAIN_BX_PAIR_INIT;
+-    streamData[1] = 0;
+-    /* To be filled: class */
+-    streamData[2] = PREDICTED_CHAIN_CLAZZ_INIT;
+-    /* To be filled: method */
+-    streamData[3] = PREDICTED_CHAIN_METHOD_INIT;
+-    /*
+-     * Rechain count. The initial value of 0 here will trigger chaining upon
+-     * the first invocation of this callsite.
+-     */
+-    streamData[4] = PREDICTED_CHAIN_COUNTER_INIT;
+-#if 0
+-    ALOGI("--- DATA @ %p: %x %x %x %x", stream, *((int*)stream), *((int*)(stream+4)),
+-          *((int*)(stream+8)), *((int*)(stream+12)));
+-#endif
+-    stream += 20; //5 *4
+ #endif
++
++    //We have successfully generated the chaining cell
++    return true;
+ }
+ 
+ /* Extended MIR instructions like PHI */
+@@ -1244,7 +1426,7 @@ static void handleFallThroughBranch (CompilationUnit *cUnit, BasicBlock *bb, Bas
+     if (needFallThroughBranch == true)
+     {
+         jumpToBasicBlock(stream, nextFallThrough->id,
+-                isBasicBlockAChainingCell(nextFallThrough));
++                doesJumpToBBNeedAlignment(nextFallThrough));
+     }
+     //Clear it
+     *ptrNextFallThrough = 0;
+@@ -1684,6 +1866,7 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+                 }
+                 break;
+             case kDalvikByteCode:
++            case kPreBackwardBlock:
+                 //If hidden, we don't generate code
+                 if (bbO1->hidden == false)
+                 {
+@@ -1768,6 +1951,9 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+             //Set offset
+             bbO1->label->lop.generic.offset = (stream - streamMethodStart);
+ 
++            //Eagerly assume we successfully generated chaining cell
++            bool success = true;
++
+             int nop_size;
+             switch (chainingBlock->blockType) {
+                 case kChainingCellNormal:
+@@ -1781,7 +1967,7 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+                     bbO1->label->lop.generic.offset += nop_size; //skip over nop
+                     break;
+                 case kChainingCellInvokePredicted:
+-                    handleInvokePredictedChainingCell(cUnit, blockId);
++                    success = handleInvokePredictedChainingCell (cUnit, bbO1);
+                     break;
+                 case kChainingCellHot:
+                     nop_size = handleHotChainingCell(cUnit,
+@@ -1789,69 +1975,7 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+                     bbO1->label->lop.generic.offset += nop_size; //skip over nop
+                     break;
+                 case kChainingCellBackwardBranch:
+-                    {
+-                        //Get the loop entry
+-                        BasicBlock *loopEntry = chainingBlock->fallThrough;
+-
+-                        //Paranoid
+-                        assert (cUnit->loopInformation != 0);
+-
+-                        //We want the loop header and preloop header
+-                        char *loopHeaderAddr = 0;
+-                        char *preLoopHeaderAddr = 0;
+-
+-                        BasicBlock_O1 *bbO1 = reinterpret_cast<BasicBlock_O1 *> (loopEntry);
+-                        assert (bbO1 != 0);
+-
+-                        //Set the loop header address
+-                        loopHeaderAddr = bbO1->streamStart;
+-
+-                        //Get the associated loop information
+-                        LoopInformation *info = cUnit->loopInformation;
+-
+-                        //But if info is 0, we might not have that and should just use the fallThrough's information
+-                        //This can happen if the user has used the old loop system, and should only happen then
+-                        if (info == 0)
+-                        {
+-                            //Then request the interpreter jump back to where the loop is
+-                            preLoopHeaderAddr = loopHeaderAddr;
+-                        }
+-                        else
+-                        {
+-                            //Get the right loop
+-                            info = info->getLoopInformationByEntry (loopEntry);
+-
+-                            //Paranoid
+-                            if (info != 0)
+-                            {
+-                                //We have a preLoop
+-                                BasicBlock *preLoop = info->getPreHeader ();
+-
+-                                //Paranoid
+-                                if (preLoop != 0)
+-                                {
+-                                    bbO1 = reinterpret_cast<BasicBlock_O1 *> (preLoop);
+-
+-                                    //Paranoid
+-                                    if (bbO1 != 0)
+-                                    {
+-                                        preLoopHeaderAddr = bbO1->streamStart;
+-                                    }
+-                                }
+-                            }
+-                        }
+-
+-                        if (loopHeaderAddr == 0 || preLoopHeaderAddr == 0){
+-                            SET_JIT_ERROR(kJitErrorCodegen);
+-                            endOfTrace(true/*freeOnly*/);
+-                            cUnit->baseAddr = NULL;
+-                            return;
+-                        }
+-
+-                        nop_size = handleBackwardBranchChainingCell(cUnit,
+-                                chainingBlock->startOffset, blockId, loopHeaderAddr, preLoopHeaderAddr);
+-                        bbO1->label->lop.generic.offset += nop_size; //skip over nop
+-                    }
++                    success = handleBackwardBranchChainingCell (cUnit, bbO1);
+                     break;
+                 default:
+                     ALOGI("JIT_INFO: Bad blocktype %d", chainingBlock->blockType);
+@@ -1861,6 +1985,14 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+                     return;
+             }
+ 
++            if (success == false)
++            {
++                SET_JIT_ERROR(kJitErrorChainingCell);
++                endOfTrace (true/*freeOnly*/);
++                cUnit->baseAddr = NULL;
++                return;
++            }
++
+             if (gDvmJit.codeCacheByteUsed + (stream - streamStart) + CODE_CACHE_PADDING > gDvmJit.codeCacheSize) {
+                 ALOGI("JIT_INFO: Code cache full after ChainingCell (trace uses %uB)", (stream - streamStart));
+                 SET_JIT_ERROR(kJitErrorCodeCacheFull);
+diff --git a/vm/compiler/codegen/x86/Lower.h b/vm/compiler/codegen/x86/Lower.h
+index 28555d0..80a6d22 100644
+--- a/vm/compiler/codegen/x86/Lower.h
++++ b/vm/compiler/codegen/x86/Lower.h
+@@ -1418,7 +1418,7 @@ extern JitMode traceMode;
+ void startOfTrace(const Method* method, int, CompilationUnit*);
+ void endOfTrace(bool freeOnly);
+ LowOp* jumpToBasicBlock(char* instAddr, int targetId, bool targetIsChainingCell = false);
+-LowOp* condJumpToBasicBlock(char* instAddr, ConditionCode cc, int targetId, bool targetIsChainingCell = false);
++LowOp* condJumpToBasicBlock(char* instAddr, ConditionCode cc, int targetId, bool immediateNeedsAligned = false);
+ bool jumpToException(const char* target);
+ int codeGenBasicBlockJit(const Method* method, BasicBlock* bb);
+ void endOfBasicBlock(struct BasicBlock* bb);
+@@ -1453,7 +1453,7 @@ int preprocessingBB(CompilationUnit *cUnit, BasicBlock* bb);
+ int preprocessingTrace();
+ /** @brief align the relative offset of jmp/jcc and movl within 16B */
+ void alignOffset(int cond);
+-bool isBasicBlockAChainingCell(BasicBlock * bb);
++bool doesJumpToBBNeedAlignment(BasicBlock * bb);
+ #endif
+ 
+ void pushCallerSavedRegs(void);
+diff --git a/vm/compiler/codegen/x86/LowerHelper.cpp b/vm/compiler/codegen/x86/LowerHelper.cpp
+index aa9ce9d..ddb4b0b 100644
+--- a/vm/compiler/codegen/x86/LowerHelper.cpp
++++ b/vm/compiler/codegen/x86/LowerHelper.cpp
+@@ -3950,20 +3950,35 @@ void alignOffset(int offset) {
+ }
+ 
+ /**
+- * @brief Returns whether the BB is a chaining cell
++ * @brief Returns whether the jump to BB needs alignment
++ * because it might be patched later on.
+  * @param bb Basic Block to look at
+- * @return true if BB is chaining cell
++ * @return Returns true for all chaining cells and also for
++ * the prebackward block.
+  */
+-bool isBasicBlockAChainingCell(BasicBlock * bb) {
++bool doesJumpToBBNeedAlignment(BasicBlock * bb) {
+     // Get type for this BB
+     int type = static_cast<int>(bb->blockType);
+ 
+-    // See if its type falls into the range of the different chaining
+-    //cell definitions
+-    if (type >= static_cast<int>(kChainingCellNormal)
+-            && type < static_cast<int>(kChainingCellLast)) {
++    if ((type >= static_cast<int> (kChainingCellNormal)
++            && type < static_cast<int> (kChainingCellLast))
++            && type != static_cast<int> (kChainingCellBackwardBranch))
++    {
++        //We always return true if BB is a chaining cell except if it is
++        //backward branch chaining cell. The reason we make exception for
++        //BBCC is because we always patch the jump to preBackwardBlock and
++        //not the jump to the chaining cell
+         return true;
+-    } else {
++    }
++    else if (type == static_cast<int> (kPreBackwardBlock))
++    {
++        //Since the prebackward block is always used in front of
++        //backward branch chaining cell and the jump to it is
++        //the one being patched, we also return true.
++        return true;
++    }
++    else
++    {
+         return false;
+     }
+ }
+diff --git a/vm/compiler/codegen/x86/LowerJump.cpp b/vm/compiler/codegen/x86/LowerJump.cpp
+index 642fca0..4985c9c 100644
+--- a/vm/compiler/codegen/x86/LowerJump.cpp
++++ b/vm/compiler/codegen/x86/LowerJump.cpp
+@@ -1205,126 +1205,90 @@ int common_if(s4 tmp, ConditionCode cc_next, ConditionCode cc) {
+     BasicBlock_O1 * fallThroughBB =
+             reinterpret_cast<BasicBlock_O1 *>(traceCurrentBB->fallThrough);
+ 
+-    // Test if taken BB is a backward branch chaining cell
+-    BasicBlock_O1 * backwardBranchChainingCell =
+-            (takenBB->blockType == kChainingCellBackwardBranch) ?
+-                    takenBB : NULL;
+-    if (backwardBranchChainingCell == NULL) {
+-        // Try to see if fallThrough BB is a backward branch chaining cell
+-        backwardBranchChainingCell =
+-                (fallThroughBB->blockType == kChainingCellBackwardBranch) ?
+-                        fallThroughBB : NULL;
+-    }
++    // When assert version is disabled, fallthroughBB is not used
++    (void) fallThroughBB;
+ 
+-    if (backwardBranchChainingCell != NULL) {
+-        // We have a backward branch and thus we must deal with it specially
++    // We should always have a pre backward block before backward chaining cell
++    // so we can assert that here.
++    if (takenBB->blockType == kChainingCellBackwardBranch)
++    {
++        return -1;
++    }
+ 
+-        bool isTaken = (backwardBranchChainingCell == takenBB);
++    if (fallThroughBB->blockType == kChainingCellBackwardBranch)
++    {
++        return -1;
++    }
+ 
+-        // Figure out which one the other BB is
+-        BasicBlock_O1 * otherBB = (isTaken == true) ? fallThroughBB : takenBB;
++    // The prebackward block should always be the taken branch
++    if (fallThroughBB->blockType == kPreBackwardBlock)
++    {
++        return -1;
++    }
+ 
+-        //Figure the condition code: we basically will make the system make the taken be the BWCC
+-        ConditionCode bwcc = (backwardBranchChainingCell == takenBB) ? cc : cc_next;
++    // So if we have a Prebackward block, we need to satisfy associations
++    // of loop entry
++    if (takenBB->blockType == kPreBackwardBlock)
++    {
++        // The child of the prebackward block should always be backward
++        // chaining cell so it should never be null.
++        assert (takenBB->fallThrough != 0);
+ 
+-        if(gDvmJit.scheduling == true) {
+-            singletonPtr<Scheduler>()->signalEndOfNativeBasicBlock();
+-        }
++        BasicBlock_O1 * backward =
++                reinterpret_cast<BasicBlock_O1 *> (takenBB->fallThrough);
+ 
+-        //Now handle the registerization requested by the Backward Chaining Cell here
+-        //Compared to normally this is done here because the chaining cell can actually
+-        //Redirect the jump below to directly the right BB, bypassing the backward chaining cell
++        //This must be a backward branch chaining cell
++        assert (backward->blockType == kChainingCellBackwardBranch);
+ 
+-        // First: update the BWCC's fallthrough table: the head of the loop
+-        BasicBlock_O1 *loopEntry =
+-                reinterpret_cast<BasicBlock_O1 *>(backwardBranchChainingCell->fallThrough);
++        //Backward CC must always have as child the loop entry
++        assert (backward->fallThrough != 0);
+ 
+-        //We want to satisfy our backward branch dependencies, it contains which registers we care about
+-        if (AssociationTable::satisfyBBAssociations(backwardBranchChainingCell, loopEntry) == false) {
+-            return -1;
+-        }
++        //Get the child
++        BasicBlock_O1 * loopEntry =
++                reinterpret_cast<BasicBlock_O1 *> (backward->fallThrough);
+ 
+-        // Second: update the BWCC's table: because BWCC actually is empty this
+-        // will just update its table as what its fallthrough just got
+-        // It's not isTaken because the function wants to know if we are concerned with the fallthrough
+-        //    Here we care about the BWCC, so it is wherever not isTaken says it is
+-        if (AssociationTable::createOrSyncTable(currentBB, !isTaken) == false) {
++        //Paranoid. We want to make sure that the loop entry has been
++        //already handled.
++        if (loopEntry->associationTable.hasBeenFinalized() == false)
++        {
+             return -1;
+         }
+ 
+-        rememberState(1);
+-        alignOffset(2);
+-
+-        char storeBackLabel[LABEL_SIZE];
+-        snprintf(storeBackLabel, LABEL_SIZE, ".vr_store_at_loop_back_%d",
+-                backwardBranchChainingCell->id);
+-
+-
+-        // After chaining, the following conditional jump will no longer
+-        // be a jump to the BWCC but will go to loop start. However, for
+-        // now we are jumping to store back VRs before going back to
+-        // interpreter via the BWCC.
+-        conditional_jump(bwcc, storeBackLabel, false);
+-
+-        //Sync with the child's association table
+-        // We use isTaken here to take care of the other child
+-        if (AssociationTable::createOrSyncTable(currentBB, isTaken) == false) {
++        //Now we want to satisfy the associations of the loop entry
++        if (AssociationTable::satisfyBBAssociations (backward,
++                loopEntry) == false)
++        {
+             return -1;
+         }
++    }
+ 
+-        if (gDvmJit.scheduling) {
+-            unconditional_jump_block(otherBB->id,
+-                    isBasicBlockAChainingCell(otherBB));
+-        } else {
+-            alignOffset(1);
+-            relativeNCG = getRelativeNCG(otherBB->id, JmpCall_uncond, &unknown,
+-                    &size);
+-            unconditional_jump_int(relativeNCG, size);
+-        }
+-
+-        // At this point we need to
+-        if (insertLabel(storeBackLabel, false) == -1)
+-            return -1;
+-        goToState(1);
+-
+-        // Since we are still processing the parent, we still have its compile
+-        // table. However, let's satisfy spill requests of children
+-        if (AssociationTable::handleSpillRequestsFromME(backwardBranchChainingCell) == false)
+-            return -1;
+-
+-        // Let the fallthrough system automatically handle this branch if indeed
+-        // the BWCC is the fallthrough
+-        if (backwardBranchChainingCell != fallThroughBB) {
+-            if (gDvmJit.scheduling) {
+-                unconditional_jump_block(backwardBranchChainingCell->id, false);
+-            } else {
+-                relativeNCG = getRelativeNCG(backwardBranchChainingCell->id,
+-                        JmpCall_uncond, &unknown, &size);
+-                unconditional_jump_int(relativeNCG, size);
+-            }
+-        }
+-    } else {
+-        // First sync with the taken child
+-        if (AssociationTable::createOrSyncTable(currentBB, false) == false) {
+-            return -1;
+-        }
++    // First sync with the taken child
++    if (AssociationTable::createOrSyncTable (currentBB, false) == false)
++    {
++        return -1;
++    }
+ 
+-        if(gDvmJit.scheduling) {
+-            conditional_jump_block(cc, takenBB->id,
+-                    isBasicBlockAChainingCell(takenBB));
+-        } else {
+-            alignOffset(2);
+-            relativeNCG = getRelativeNCG(takenBB->id, JmpCall_cond, &unknown,
+-                    &size);
+-            conditional_jump_int(cc, relativeNCG, size);
+-        }
++    if (gDvmJit.scheduling)
++    {
++        conditional_jump_block (cc, takenBB->id,
++                doesJumpToBBNeedAlignment (takenBB));
++    }
++    else
++    {
++        alignOffset (2);
++        relativeNCG = getRelativeNCG (takenBB->id, JmpCall_cond, &unknown,
++                &size);
++        conditional_jump_int (cc, relativeNCG, size);
++    }
+ 
+-        // Now sync with the fallthrough child
+-        if (AssociationTable::createOrSyncTable(currentBB, true) == false) {
+-            return -1;
+-        }
++    // Now sync with the fallthrough child
++    if (AssociationTable::createOrSyncTable (currentBB, true) == false)
++    {
++        return -1;
+     }
+-    return 2;
++
++    // Return success
++    return 1;
+ }
+ #endif
+ 
+diff --git a/vm/compiler/codegen/x86/RegisterizationBE.cpp b/vm/compiler/codegen/x86/RegisterizationBE.cpp
+index c9e1560..2ba1cb7 100644
+--- a/vm/compiler/codegen/x86/RegisterizationBE.cpp
++++ b/vm/compiler/codegen/x86/RegisterizationBE.cpp
+@@ -973,11 +973,12 @@ bool AssociationTable::createOrSyncTable(BasicBlock_O1 * bb, bool forFallthrough
+     //If there is a child
+     if (child != NULL) {
+ 
+-        //If it is not a dalvik code and it's not the backward chaining cell
++        //If it is not a dalvik code and it's not prebackward block,
++        //then write back and free all registers because we might
++        //be exiting to interpreter.
+         if (child->blockType != kDalvikByteCode
+-                && child->blockType != kChainingCellBackwardBranch) {
+-            //Simply free the registers
+-            freeReg(true);
++                && child->blockType != kPreBackwardBlock) {
++            freeReg (true);
+         }
+         else {
+             if (child->associationTable.hasBeenFinalized() == false) {
+-- 
+1.7.4.1
+

@@ -1,0 +1,206 @@
+From c7b7ba58fc646ff681f48bba39f64463acb5f3b7 Mon Sep 17 00:00:00 2001
+From: srinivas pandruvada <srinivas.pandruvada@intel.com>
+Date: Thu, 24 May 2012 14:25:10 -0700
+Subject: System-core-init: Implement device triggers
+
+Android system/core/init/readme describes two triggers, which are
+not implemented in the code yet.
+They are:
+device-added-<path>
+device-removed-<path>
+Triggers of these forms occur when a device node is added or removed.
+These triggers are very important for PnP devices. For example when
+system goes to suspend, the inbuilt usb in some devices is power-off
+causing whole driver to be removed. When they are driver restarts on
+resume the sysfs files permission will be reset to root again. This
+will cause processes with non-root access to fail.
+These triggers allows to change ownership again.
+Android ueventd.*.rc file allows to modify permissions of file
+matching the path sent by udev event, but doesn't allow to set
+permissions in sysfs files or other files.
+Also this patch goes through device triggers at the end of boot
+process and fires them to account for uevents before the init
+process was created.
+
+Change-Id: Ib7f47124f324fdba4da332c7d1ea5040f45eeb13
+Signed-off-by: srinivas pandruvada <srinivas.pandruvada@intel.com>
+Signed-off-by: Daniel Leung <daniel.leung@intel.com>
+---
+ init/devices.c     |    4 +++-
+ init/init.c        |   24 ++++++++++++++++++++++++
+ init/init_parser.c |   43 +++++++++++++++++++++++++++++++++++++++++++
+ init/init_parser.h |    5 ++++-
+ 4 files changed, 74 insertions(+), 2 deletions(-)
+
+diff --git a/init/devices.c b/init/devices.c
+index e25034c..555ff5f 100644
+--- a/init/devices.c
++++ b/init/devices.c
+@@ -20,7 +20,7 @@
+ #include <stdlib.h>
+ #include <sys/stat.h>
+ #include <sys/types.h>
+-
++#include <sys/system_properties.h>
+ #include <fcntl.h>
+ #include <dirent.h>
+ #include <unistd.h>
+@@ -472,6 +472,7 @@ static void handle_device(const char *action, const char *devpath,
+ 
+     if(!strcmp(action, "add")) {
+         make_device(devpath, path, block, major, minor);
++        __system_property_set("ctl.dev_added",devpath);
+         if (links) {
+             for (i = 0; links[i]; i++)
+                 make_link(devpath, links[i]);
+@@ -483,6 +484,7 @@ static void handle_device(const char *action, const char *devpath,
+             for (i = 0; links[i]; i++)
+                 remove_link(devpath, links[i]);
+         }
++        __system_property_set("ctl.dev_removed",devpath);
+         unlink(devpath);
+     }
+ 
+diff --git a/init/init.c b/init/init.c
+index 93b5997..4e79163 100755
+--- a/init/init.c
++++ b/init/init.c
+@@ -465,6 +465,16 @@ static void msg_stop(const char *name)
+     }
+ }
+ 
++static void handle_dev_add_msg(const char *name)
++{
++    queue_device_added_removed_triggers(name, true);
++}
++
++static void handle_dev_rem_msg(const char *name)
++{
++    queue_device_added_removed_triggers(name, false);
++}
++
+ void handle_control_message(const char *msg, const char *arg)
+ {
+     if (!strcmp(msg,"start")) {
+@@ -474,6 +484,10 @@ void handle_control_message(const char *msg, const char *arg)
+     } else if (!strcmp(msg,"restart")) {
+         msg_stop(arg);
+         msg_start(arg);
++    } else if (!strcmp(msg,"dev_added")) {
++        handle_dev_add_msg(arg);
++    } else if (!strcmp(msg,"dev_removed")) {
++       handle_dev_rem_msg(arg);
+     } else {
+         ERROR("unknown control msg '%s'\n", msg);
+     }
+@@ -728,6 +742,12 @@ static int queue_property_triggers_action(int nargs, char **args)
+     return 0;
+ }
+ 
++static int queue_device_triggers_action(int nargs, char **args)
++{
++    queue_all_device_triggers();
++    return 0;
++}
++
+ #if BOOTCHART
+ static int bootchart_init_action(int nargs, char **args)
+ {
+@@ -921,6 +941,10 @@ int main(int argc, char **argv)
+         /* run all property triggers based on current state of the properties */
+     queue_builtin_action(queue_property_triggers_action, "queue_property_triggers");
+ 
++    /* run all device triggers based on current state of device nodes in /dev */
++    queue_builtin_action(queue_device_triggers_action, "queue_device_triggers");
++
++
+ 
+ #if BOOTCHART
+     queue_builtin_action(bootchart_init_action, "bootchart_init");
+diff --git a/init/init_parser.c b/init/init_parser.c
+index 686640e..3f1e876 100644
+--- a/init/init_parser.c
++++ b/init/init_parser.c
+@@ -54,6 +54,8 @@ static void parse_line_action(struct parse_state *state, int nargs, char **args)
+ #define SECTION 0x01
+ #define COMMAND 0x02
+ #define OPTION  0x04
++#define ACTION_STRING_DEVICE_ADDED "device-added-"
++#define ACTION_STRING_DEVICE_REMOVED "device-removed-"
+ 
+ #include "keywords.h"
+ 
+@@ -563,6 +565,47 @@ void queue_all_property_triggers()
+     }
+ }
+ 
++void queue_device_added_removed_triggers(const char *name, bool dev_added)
++{
++    struct listnode *node;
++    struct action *act;
++    char *action_str;
++
++    INFO("queue_device_added_removed_triggers:%s", name);
++    action_str = dev_added ? ACTION_STRING_DEVICE_ADDED : ACTION_STRING_DEVICE_REMOVED;
++    list_for_each(node, &action_list) {
++        act = node_to_item(node, struct action, alist);
++        if (!strncmp(act->name, action_str, strlen(action_str))) {
++            const char *test = act->name + strlen(action_str);
++            int len1 = strlen(test);
++            int len2 = strlen(name);
++            int len = len1 > len2 ? len2 : len1;
++            /* Last few bytes of PCI and USB enumerated devices are variable
++             based on the order of probe. So the idea is that in the init
++             script you can add a fixed part only and still get a match.
++             So comparing only with smaller of device name or trigger name.*/
++            if (!strncmp(name, test, len)) {
++                action_add_queue_tail(act);
++            }
++        }
++    }
++}
++
++void queue_all_device_triggers()
++{
++    struct listnode *node;
++    struct action *act;
++    int r;
++
++    INFO("queue_all_device_triggers");
++    list_for_each(node, &action_list) {
++        act = node_to_item(node, struct action, alist);
++        if (!strncmp(act->name, ACTION_STRING_DEVICE_ADDED, strlen(ACTION_STRING_DEVICE_ADDED))) {
++            action_add_queue_tail(act);
++        }
++    }
++}
++
+ void queue_builtin_action(int (*func)(int nargs, char **args), char *name)
+ {
+     struct action *act;
+diff --git a/init/init_parser.h b/init/init_parser.h
+index b078cad..8fdee29 100644
+--- a/init/init_parser.h
++++ b/init/init_parser.h
+@@ -17,6 +17,8 @@
+ #ifndef _INIT_INIT_PARSER_H_
+ #define _INIT_INIT_PARSER_H_
+ 
++#include <stdbool.h>
++
+ #define INIT_PARSER_MAXARGS 64
+ 
+ struct action;
+@@ -29,7 +31,8 @@ int action_queue_empty(void);
+ void queue_property_triggers(const char *name, const char *value);
+ void queue_all_property_triggers();
+ void queue_builtin_action(int (*func)(int nargs, char **args), char *name);
+-
++void queue_device_added_removed_triggers(const char *name, bool dev_added);
++void queue_all_device_triggers();
+ int init_parse_config_file(const char *fn);
+ int expand_props(char *dst, const char *src, int len);
+ 
+-- 
+1.7.4.1
+

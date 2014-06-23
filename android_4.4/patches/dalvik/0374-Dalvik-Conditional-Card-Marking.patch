@@ -1,0 +1,750 @@
+From 6bb5f665fe63a9b6fc6a13eabe1775c56a9e87fe Mon Sep 17 00:00:00 2001
+From: stasson <sebastien.tasson@intel.com>
+Date: Fri, 18 Oct 2013 15:01:39 +0200
+Subject: Dalvik: Conditional Card Marking.
+
+BZ: 139712
+
+The dirtying of the card table required for the GC scans creates a lot of
+stress on the cache and impacts multi-threaded performance. In order to
+limit access to the table, the cards are now conditionaly marked based
+on the GC state.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-GC; AOSP-Dalvik-Interpreter; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I058995ffbdf7888255f5c1c6e0ac85fcb915e236
+Orig-MCG-Change-Id: I71e346d128547f2309b676ce0369a534b2abf41c
+Signed-off-by: stasson <sebastien.tasson@intel.com>
+Reviewed-on: http://android.intel.com:8080/129488
+Reviewed-by: lab_aqa <lab_aqa@intel.com>
+Reviewed-by: Popov, Ivan G <ivan.g.popov@intel.com>
+Reviewed-by: Beyler, Jean Christophe <jean.christophe.beyler@intel.com>
+Reviewed-by: Chang, Yang <yang.chang@intel.com>
+Reviewed-by: Wang, Zuo <zuo.wang@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: Kreitzer, David L <david.l.kreitzer@intel.com>
+Reviewed-by: He, Yunan <yunan.he@intel.com>
+Reviewed-by: Lupusoru, Razvan A <razvan.a.lupusoru@intel.com>
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ Android.mk                                         |   11 ++++
+ vm/Dvm.mk                                          |    4 ++
+ vm/Globals.h                                       |   11 ++++
+ vm/Init.cpp                                        |   14 +++++-
+ vm/Thread.cpp                                      |    6 ++
+ vm/Thread.h                                        |   16 +++++-
+ vm/alloc/CardTable.cpp                             |   51 +++++++++++++++++-
+ vm/alloc/CardTable.h                               |   12 ++++
+ vm/alloc/Heap.cpp                                  |   14 +++++
+ vm/alloc/HeapSource.cpp                            |    3 +
+ .../codegen/x86/lightcg/BytecodeVisitor.cpp        |   16 ++++++
+ vm/compiler/codegen/x86/lightcg/LowerGetPut.cpp    |   24 ++++++++
+ vm/compiler/codegen/x86/pcg/LowerOther.cpp         |   19 ++++++-
+ vm/interp/Interp.cpp                               |    3 +
+ vm/mterp/common/asm-constants.h                    |    5 ++-
+ vm/mterp/out/InterpAsm-x86.S                       |   57 +++++++++++++++----
+ vm/mterp/x86/OP_APUT_OBJECT.S                      |    9 +++-
+ vm/mterp/x86/OP_FILLED_NEW_ARRAY.S                 |    6 ++-
+ vm/mterp/x86/OP_IPUT_OBJECT.S                      |    8 ++-
+ vm/mterp/x86/OP_IPUT_OBJECT_QUICK.S                |    8 ++-
+ vm/mterp/x86/OP_SPUT_OBJECT.S                      |    6 ++-
+ 21 files changed, 276 insertions(+), 27 deletions(-)
+
+diff --git a/Android.mk b/Android.mk
+index cd8451d..f156a3d 100644
+--- a/Android.mk
++++ b/Android.mk
+@@ -68,6 +68,17 @@ ifeq ($(WITH_TLA),)
+   endif
+ endif
+ 
++# Condional card marking is an optimization in DalvikVM to reduce
++# the card dirtying.cache pollution
++WITH_CONDMARK := $(strip $(WITH_CONDMARK))
++ifeq ($(WITH_CONDMARK),)
++  ifeq ($(TARGET_ARCH),x86)
++    WITH_CONDMARK := true
++  else
++    WITH_CONDMARK := false
++  endif
++endif
++
+ subdirs := $(addprefix $(LOCAL_PATH)/,$(addsuffix /Android.mk, \
+ 		libdex \
+ 		vm \
+diff --git a/vm/Dvm.mk b/vm/Dvm.mk
+index 0dcd3fd..0f5fb3f 100644
+--- a/vm/Dvm.mk
++++ b/vm/Dvm.mk
+@@ -228,6 +228,10 @@ ifeq ($(WITH_REGION_GC), true)
+   LOCAL_SRC_FILES += alloc/RegionGC.cpp
+ endif
+ 
++ifeq ($(WITH_CONDMARK), true)
++  LOCAL_CFLAGS += -DWITH_CONDMARK
++endif
++
+ # TODO: this is the wrong test, but what's the right one?
+ ifneq ($(filter arm mips,$(dvm_arch)),)
+   LOCAL_SRC_FILES += os/android.cpp
+diff --git a/vm/Globals.h b/vm/Globals.h
+index fc4e6d5..a56a25c 100644
+--- a/vm/Globals.h
++++ b/vm/Globals.h
+@@ -576,6 +576,13 @@ struct DvmGlobals {
+     u1*         biasedCardTableBase;
+ 
+     /*
++     * Card marking max target. Allows to filter card dirtying
++     * for target objects above the Immune limit.
++     */
++#ifdef WITH_CONDMARK
++    u1*         cardImmuneLimit;
++#endif
++    /*
+      * Pre-allocated throwables.
+      */
+     Object*     outOfMemoryObj;
+@@ -758,6 +765,10 @@ struct DvmGlobals {
+     /* Region GC support. */
+     bool        enableRegionGC;
+ #endif
++#ifdef WITH_CONDMARK
++    /* Conditional marking disabled if true. */
++    bool        disableCondmark;
++#endif
+ 
+     /* String pointed here will be deposited on the stack frame of dvmAbort */
+     const char *lastMessage;
+diff --git a/vm/Init.cpp b/vm/Init.cpp
+index a424f7e..2afe6ea 100644
+--- a/vm/Init.cpp
++++ b/vm/Init.cpp
+@@ -1849,7 +1849,10 @@ int processOptions(int argc, const char* const argv[], bool ignoreUnrecognized)
+ #ifdef WITH_REGION_GC
+         } else if (strcmp(argv[i], "-XnoRegionGC") == 0) {
+             gDvm.enableRegionGC = false;
+-
++#endif
++#ifdef WITH_CONDMARK
++        } else if (strcmp(argv[i], "-Xnocondmark") == 0) {
++            gDvm.disableCondmark = true;
+ #endif
+         } else {
+             if (!ignoreUnrecognized) {
+@@ -2026,6 +2029,15 @@ static void setCommandLineDefaults()
+      */
+     gDvm.enableRegionGC = true;
+ #endif
++
++#ifdef WITH_CONDMARK
++    /*
++     * Conditional marking is enabled by default.
++     * Use -Xnocondmark to disable.
++     */
++    gDvm.disableCondmark = false;
++#endif
++
+ #if defined(VTUNE_DALVIK)
+     gDvmJit.vtuneInfo = kVTuneInfoDisabled;
+     gDvmJit.vtuneVersion = VTUNE_VERSION_DEFAULT;
+diff --git a/vm/Thread.cpp b/vm/Thread.cpp
+index e4b1b4a..8a31618 100644
+--- a/vm/Thread.cpp
++++ b/vm/Thread.cpp
+@@ -924,6 +924,12 @@ static bool prepareThread(Thread* thread)
+     ALOGV("threadid=%d: interp stack at %p",
+         thread->threadId, thread->interpStackStart - thread->interpStackSize);
+ 
++#ifdef WITH_CONDMARK
++    /*
++     *  Refresh self->cardImmuneLimit;
++     */
++    thread->cardImmuneLimit = gDvm.cardImmuneLimit;
++#endif
+     /*
+      * Initialize invokeReq.
+      */
+diff --git a/vm/Thread.h b/vm/Thread.h
+index c77f04b..13f8236 100644
+--- a/vm/Thread.h
++++ b/vm/Thread.h
+@@ -157,13 +157,27 @@ struct Thread {
+     int suspendCount;
+     int dbgSuspendCount;
+ 
++    /* address of the card table*/
+     u1*         cardTable;
++#ifdef WITH_CONDMARK
++    /* address of the card immune limit */
++    u1*         cardImmuneLimit;
++#else
++    /* to keep offsets */
++    u1*         unused_cardImmuneLimit;
++#endif
+ 
+     /* current limit of stack; flexes for StackOverflowError */
+     const u1*   interpStackEnd;
+ 
+-    /* FP of bottom-most (currently executing) stack frame on interp stack */
++#if 0
++    /* FP of bottom-most (currently executing) stack frame on interp stack
++     * TODO : we may want to remove it later if not used in future releases.
++     * compiled off as unused for now and to keep following offsets unchanged.
++     */
+     void*       XcurFrame;
++#endif
++
+     /* current exception, or NULL if nothing pending */
+     Object*     exception;
+ 
+diff --git a/vm/alloc/CardTable.cpp b/vm/alloc/CardTable.cpp
+index b4b4cd1..8557d82 100644
+--- a/vm/alloc/CardTable.cpp
++++ b/vm/alloc/CardTable.cpp
+@@ -93,6 +93,9 @@ bool dvmCardTableStartup(size_t heapMaximumSize, size_t growthLimit)
+     biasedBase += gcHeap->cardTableOffset;
+     assert(((uintptr_t)biasedBase & 0xff) == GC_CARD_DIRTY);
+     gDvm.biasedCardTableBase = biasedBase;
++#ifdef WITH_CONDMARK
++    gDvm.cardImmuneLimit  = 0;
++#endif
+ 
+     return true;
+ }
+@@ -218,10 +221,54 @@ void *dvmAddrFromCard(const u1 *cardAddr)
+  */
+ void dvmMarkCard(const void *addr)
+ {
+-    u1 *cardAddr = dvmCardFromAddr(addr);
+-    *cardAddr = GC_CARD_DIRTY;
++#ifdef WITH_CONDMARK
++    if ((u1*)addr < (u1*)gDvm.cardImmuneLimit )
++#endif
++    {
++        u1 *cardAddr = dvmCardFromAddr(addr);
++        *cardAddr = GC_CARD_DIRTY;
++    }
+ }
+ 
++#ifdef WITH_CONDMARK
++/*
++ * Disable immune limit.
++ */
++void dvmDisableCardImmuneLimit(void)
++{
++    u1* cardImmuneLimit = (u1*)ULONG_MAX;
++    dvmLockThreadList(NULL);
++    gDvm.cardImmuneLimit  = cardImmuneLimit;
++    for (Thread* thread = gDvm.threadList; thread != NULL; thread = thread->next) {
++        thread->cardImmuneLimit = cardImmuneLimit;
++    }
++    dvmUnlockThreadList();
++}
++
++/*
++ * Enable immune limit.
++ *
++ * for region GC, only active heap is immune, as we still
++ * need to mark zygote's objects.
++ *
++ */
++void dvmEnableCardImmuneLimit(void)
++{
++#ifdef WITH_REGION_GC
++    u1* cardImmuneLimit = gDvm.disableCondmark ? (u1*)ULONG_MAX : (u1*)dvmGetActiveHeapBase();
++#else
++    u1* cardImmuneLimit = gDvm.disableCondmark ? (u1*)ULONG_MAX : 0;
++#endif
++    dvmLockThreadList(NULL);
++    gDvm.cardImmuneLimit = cardImmuneLimit;
++    for (Thread* thread = gDvm.threadList; thread != NULL; thread = thread->next) {
++        thread->cardImmuneLimit = cardImmuneLimit;
++    }
++    dvmUnlockThreadList();
++}
++
++#endif
++
+ /*
+  * Returns true if the object is on a dirty card.
+  */
+diff --git a/vm/alloc/CardTable.h b/vm/alloc/CardTable.h
+index f810002..5a1bd04 100644
+--- a/vm/alloc/CardTable.h
++++ b/vm/alloc/CardTable.h
+@@ -78,6 +78,18 @@ bool dvmIsValidCard(const u1 *card);
+  */
+ void dvmMarkCard(const void *addr);
+ 
++#ifdef WITH_CONDMARK
++/**
++ * Disable immune limit.
++ */
++void dvmDisableCardImmuneLimit(void);
++
++/**
++ * Enable immune limit.
++ */
++void dvmEnableCardImmuneLimit(void);
++#endif
++
+ /*
+  * Verifies that all gray objects are on a dirty card.
+  */
+diff --git a/vm/alloc/Heap.cpp b/vm/alloc/Heap.cpp
+index 97e723f..c10982e 100644
+--- a/vm/alloc/Heap.cpp
++++ b/vm/alloc/Heap.cpp
+@@ -600,6 +600,12 @@ void dvmCollectGarbageInternal(const GcSpec* spec)
+     dvmPrepareCardTables(spec);
+ 
+     if (spec->isConcurrent) {
++#ifdef WITH_CONDMARK
++        /*
++         * need to enable full card marking for concurrent scan write barrier
++         */
++        dvmDisableCardImmuneLimit();
++#endif
+         /*
+          * Resume threads while tracing from the roots.  We unlock the
+          * heap to allow mutator threads to allocate from free space.
+@@ -630,6 +636,14 @@ void dvmCollectGarbageInternal(const GcSpec* spec)
+         dvmLockHeap();
+         ATRACE_BEGIN("GC: Threads Suspended"); // Suspend B
+         dvmSuspendAllThreads(SUSPEND_FOR_GC);
++
++#ifdef WITH_CONDMARK
++        /*
++         * Scanning is done. we can now reset card table immune limit.
++         */
++        dvmEnableCardImmuneLimit();
++#endif
++
+         /*
+          * As no barrier intercepts root updates, we conservatively
+          * assume all roots may be gray and re-mark them.
+diff --git a/vm/alloc/HeapSource.cpp b/vm/alloc/HeapSource.cpp
+index 9743045..ef1954b 100644
+--- a/vm/alloc/HeapSource.cpp
++++ b/vm/alloc/HeapSource.cpp
+@@ -882,6 +882,9 @@ bool dvmHeapSourceStartupBeforeFork()
+         setMultiHeapsEnabled(true);
+         if(gDvm.enableRegionGC) {
+             regionGcResetCardTables(NULL);
++#ifdef WITH_CONDMARK
++            dvmEnableCardImmuneLimit();
++#endif
+         }
+ #endif
+         return ret;
+diff --git a/vm/compiler/codegen/x86/lightcg/BytecodeVisitor.cpp b/vm/compiler/codegen/x86/lightcg/BytecodeVisitor.cpp
+index d3e014e..562af4e 100644
+--- a/vm/compiler/codegen/x86/lightcg/BytecodeVisitor.cpp
++++ b/vm/compiler/codegen/x86/lightcg/BytecodeVisitor.cpp
+@@ -3629,10 +3629,18 @@ int updateMarkCard(TempRegInfo* infoArray, int j1/*valReg*/,
+     infoArray[j3].refCount = 3;
+     infoArray[j3].is8Bit = true;
+     infoArray[j1].refCount++;
++#ifdef WITH_CONDMARK
++    infoArray[j2].refCount += 3;
++#else
+     infoArray[j2].refCount += 2;
++#endif
+     infoArray[j3+1].regNum = 6;
+     infoArray[j3+1].physicalType = LowOpndRegType_scratch;
++#ifdef WITH_CONDMARK
++    infoArray[j3+1].refCount = 3;
++#else
+     infoArray[j3+1].refCount = 2;
++#endif
+     return j3+2;
+ }
+ 
+@@ -3642,9 +3650,17 @@ int updateMarkCard_notNull(TempRegInfo* infoArray,
+     infoArray[j3].physicalType = LowOpndRegType_gp;
+     infoArray[j3].refCount = 3;
+     infoArray[j3].is8Bit = true;
++#ifdef WITH_CONDMARK
++    infoArray[j2].refCount += 3;
++#else
+     infoArray[j2].refCount += 2;
++#endif
+     infoArray[j3+1].regNum = 2;
++#ifdef WITH_CONDMARK
++    infoArray[j3+1].refCount = 3; //DU
++#else
+     infoArray[j3+1].refCount = 2; //DU
++#endif
+     infoArray[j3+1].physicalType = LowOpndRegType_scratch;
+     return j3+2;
+ }
+diff --git a/vm/compiler/codegen/x86/lightcg/LowerGetPut.cpp b/vm/compiler/codegen/x86/lightcg/LowerGetPut.cpp
+index c8c8145..dad1bdf 100644
+--- a/vm/compiler/codegen/x86/lightcg/LowerGetPut.cpp
++++ b/vm/compiler/codegen/x86/lightcg/LowerGetPut.cpp
+@@ -757,6 +757,8 @@ int op_aput_object(const MIR * mir) { //type checking
+ 
+ /*
+    movl offThread_cardTable(self), scratchReg
++   compare_reg_mem tgtAddrReg,gDvm.cardImmuneLimit
++   jbe .markCard_skip
+    compare_imm_reg 0, valReg (testl valReg, valReg)
+    je .markCard_skip
+    shrl $GC_CARD_SHIFT, tgtAddrReg
+@@ -768,6 +770,10 @@ int op_aput_object(const MIR * mir) { //type checking
+ void markCard(int valReg, int tgtAddrReg, bool targetPhysical, int scratchReg, bool isPhysical) {
+    get_self_pointer(PhysicalReg_SCRATCH_6, isScratchPhysical);
+    move_mem_to_reg(OpndSize_32, offsetof(Thread, cardTable), PhysicalReg_SCRATCH_6, isScratchPhysical, scratchReg, isPhysical);
++#ifdef WITH_CONDMARK
++   compare_reg_mem(NULL, OpndSize_32, tgtAddrReg, targetPhysical, offsetof(Thread, cardImmuneLimit), PhysicalReg_SCRATCH_6, isScratchPhysical);
++   conditional_jump(Condition_BE, ".markCard_skip", true);
++#endif
+    compare_imm_reg(OpndSize_32, 0, valReg, isPhysical);
+    conditional_jump(Condition_E, ".markCard_skip", true);
+    alu_binary_imm_reg(OpndSize_32, shr_opc, GC_CARD_SHIFT, tgtAddrReg, targetPhysical);
+@@ -780,15 +786,33 @@ void markCard(int valReg, int tgtAddrReg, bool targetPhysical, int scratchReg, b
+ void markCard_notNull(int tgtAddrReg, int scratchReg, bool isPhysical) {
+    get_self_pointer(PhysicalReg_SCRATCH_2, isScratchPhysical);
+    move_mem_to_reg(OpndSize_32, offsetof(Thread, cardTable), PhysicalReg_SCRATCH_2, isScratchPhysical, scratchReg, isPhysical);
++#ifdef WITH_CONDMARK
++   compare_reg_mem(NULL, OpndSize_32, tgtAddrReg, isPhysical, offsetof(Thread, cardImmuneLimit), PhysicalReg_SCRATCH_2, isScratchPhysical);
++   conditional_jump(Condition_BE, ".markCard_skip", true);
++#endif
+    alu_binary_imm_reg(OpndSize_32, shr_opc, GC_CARD_SHIFT, tgtAddrReg, isPhysical);
+    move_reg_to_mem_disp_scale(OpndSize_8, scratchReg, isPhysical, scratchReg, isPhysical, 0, tgtAddrReg, isPhysical, 1);
++#ifdef WITH_CONDMARK
++   if (insertLabel(".markCard_skip", true) == -1) {
++       return;
++   }
++#endif
+ }
+ 
+ void markCard_filled(int tgtAddrReg, bool isTgtPhysical, int scratchReg, bool isScratchPhysical) {
+    get_self_pointer(PhysicalReg_SCRATCH_2, false/*isPhysical*/);
+    move_mem_to_reg(OpndSize_32, offsetof(Thread, cardTable), PhysicalReg_SCRATCH_2, isScratchPhysical, scratchReg, isScratchPhysical);
++#ifdef WITH_CONDMARK
++   compare_reg_mem(NULL, OpndSize_32, tgtAddrReg, isTgtPhysical, offsetof(Thread, cardImmuneLimit), PhysicalReg_SCRATCH_2, isScratchPhysical);
++   conditional_jump(Condition_BE, ".markCard_skip", true);
++#endif
+    alu_binary_imm_reg(OpndSize_32, shr_opc, GC_CARD_SHIFT, tgtAddrReg, isTgtPhysical);
+    move_reg_to_mem_disp_scale(OpndSize_8, scratchReg, isScratchPhysical, scratchReg, isScratchPhysical, 0, tgtAddrReg, isTgtPhysical, 1);
++#ifdef WITH_CONDMARK
++   if (insertLabel(".markCard_skip", true) == -1) {
++       return;
++   }
++#endif
+ }
+ 
+ /**
+diff --git a/vm/compiler/codegen/x86/pcg/LowerOther.cpp b/vm/compiler/codegen/x86/pcg/LowerOther.cpp
+index 918e8d7..d08a067 100644
+--- a/vm/compiler/codegen/x86/pcg/LowerOther.cpp
++++ b/vm/compiler/codegen/x86/pcg/LowerOther.cpp
+@@ -125,10 +125,15 @@ void dvmCompilerPcgTranslateMarkCard (const CompilationUnitPCG *cUnit, CGInst va
+ {
+     CGInst self = dvmCompilerPcgGetSelfPointer (cUnit);
+     CGInst cardTable = dvmCompilerPcgCreateSimpleLoad (self, offsetof (Thread, cardTable));
+-    CGLabel skipMarkCard;
++#ifdef WITH_CONDMARK
++    CGInst cardImmuneLimit = dvmCompilerPcgCreateSimpleLoad (self, offsetof (Thread, cardImmuneLimit));
++#endif
++    CGLabel skipMarkCard = CGCreateLabel ();
+ 
+-    skipMarkCard = CGCreateLabel ();
+     CGCreateNewInst ("cjcc", "rcrb", val, "eq", CGCreateNewInst ("mov", "i", 0), skipMarkCard);
++#ifdef WITH_CONDMARK
++    CGCreateNewInst ("cjcc", "rcrbp", cardImmuneLimit, "ule", targetAddr, skipMarkCard, 95);
++#endif
+ 
+     targetAddr = CGCreateNewInst ("shr", "ri", targetAddr, GC_CARD_SHIFT);
+ 
+@@ -143,12 +148,22 @@ void dvmCompilerPcgTranslateMarkCardNotNull (const CompilationUnitPCG *cUnit, CG
+ {
+     CGInst self = dvmCompilerPcgGetSelfPointer (cUnit);
+     CGInst cardTable = dvmCompilerPcgCreateSimpleLoad (self, offsetof (Thread, cardTable));
++#ifdef WITH_CONDMARK
++    CGInst cardImmuneLimit = dvmCompilerPcgCreateSimpleLoad (self, offsetof (Thread, cardImmuneLimit));
++    CGLabel skipMarkCard = CGCreateLabel ();
++
++    CGCreateNewInst ("cjcc", "rcrbp", cardImmuneLimit, "ule", targetAddr, skipMarkCard, 95);
++#endif
+ 
+     targetAddr = CGCreateNewInst ("shr", "ri", targetAddr, GC_CARD_SHIFT);
+ 
+     // store cardTable in (cardTable, targetAddr, 1)
+     CGAddr addr = CGCreateAddr (cardTable, targetAddr, 1, CGSymbolInvalid, 0);
+     CGCreateNewInst ("mov", "mr", addr, 1, (void*)1, cardTable);
++
++#ifdef WITH_CONDMARK
++    CGBindLabel (skipMarkCard);
++#endif
+ }
+ 
+ /**
+diff --git a/vm/interp/Interp.cpp b/vm/interp/Interp.cpp
+index a7ea797..cd61edd 100644
+--- a/vm/interp/Interp.cpp
++++ b/vm/interp/Interp.cpp
+@@ -1639,6 +1639,9 @@ void dvmInitInterpreterState(Thread* self)
+ 
+     // Begin initialization
+     self->cardTable = gDvm.biasedCardTableBase;
++#ifdef WITH_CONDMARK
++    self->cardImmuneLimit = gDvm.cardImmuneLimit;
++#endif
+ #if defined(WITH_JIT)
+     // One-time initializations
+     self->jitToInterpEntries = jitToInterpEntries;
+diff --git a/vm/mterp/common/asm-constants.h b/vm/mterp/common/asm-constants.h
+index 1657cbd..5436c91 100644
+--- a/vm/mterp/common/asm-constants.h
++++ b/vm/mterp/common/asm-constants.h
+@@ -196,7 +196,10 @@ MTERP_OFFSET(offThread_curHandlerTable, \
+ MTERP_OFFSET(offThread_suspendCount,      Thread, suspendCount, 48);
+ MTERP_OFFSET(offThread_dbgSuspendCount,   Thread, dbgSuspendCount, 52);
+ MTERP_OFFSET(offThread_cardTable,         Thread, cardTable, 56)
+-MTERP_OFFSET(offThread_interpStackEnd,    Thread, interpStackEnd, 60)
++#ifdef WITH_CONDMARK
++MTERP_OFFSET(offThread_cardImmuneLimit,   Thread, cardImmuneLimit, 60)
++#endif
++MTERP_OFFSET(offThread_interpStackEnd,    Thread, interpStackEnd, 64)
+ MTERP_OFFSET(offThread_exception,         Thread, exception, 68)
+ MTERP_OFFSET(offThread_debugIsMethodEntry, Thread, debugIsMethodEntry, 72)
+ MTERP_OFFSET(offThread_interpStackSize,   Thread, interpStackSize, 76)
+diff --git a/vm/mterp/out/InterpAsm-x86.S b/vm/mterp/out/InterpAsm-x86.S
+index 8dee933..d414df1 100644
+--- a/vm/mterp/out/InterpAsm-x86.S
++++ b/vm/mterp/out/InterpAsm-x86.S
+@@ -1327,7 +1327,11 @@ dvmAsmInstructionStartCode = .L_OP_NOP
+     cmpb    $'I',%al                        # Int array?
+     je      5f                               # skip card mark if so
+     movl    offThread_retval(%ecx),%eax        # eax<- object head
+-    movl    offThread_cardTable(%ecx),%ecx     # card table base
++#if defined(WITH_CONDMARK)
++    cmpl    %eax,offThread_cardImmuneLimit(%ecx)
++    jbe     5f
++#endif
++    movl    offThread_cardTable(%ecx),%ecx   # card table base
+     shrl    $GC_CARD_SHIFT,%eax             # convert to card num
+     movb    %cl,(%ecx,%eax)                  # mark card based on object head
+ 5:
+@@ -1459,7 +1463,11 @@ dvmAsmInstructionStartCode = .L_OP_NOP
+     cmpb    $'I',%al                        # Int array?
+     je      5f                               # skip card mark if so
+     movl    offThread_retval(%ecx),%eax        # eax<- object head
+-    movl    offThread_cardTable(%ecx),%ecx     # card table base
++#if defined(WITH_CONDMARK)
++    cmpl    %eax,offThread_cardImmuneLimit(%ecx)
++    jbe     5f
++#endif
++    movl    offThread_cardTable(%ecx),%ecx   # card table base
+     shrl    $GC_CARD_SHIFT,%eax             # convert to card num
+     movb    %cl,(%ecx,%eax)                  # mark card based on object head
+ 5:
+@@ -2571,12 +2579,17 @@ dvmAsmInstructionStartCode = .L_OP_NOP
+     jmp       common_exceptionThrown
+ 
+ .LOP_APUT_OBJECT_types_okay:
+-    movl      offThread_cardTable(%eax),%eax   # get card table base
+     movl      rINST,(%ecx)                   # store into array
+     UNSPILL_TMP2(rINST)                      # recover object head
+-    FETCH_INST_OPCODE 2 %ecx
++#if defined(WITH_CONDMARK)
++    cmpl      rINST,offThread_cardImmuneLimit(%eax)
++    jbe       .LOP_APUT_OBJECT_skip_mark
++#endif
++    movl      offThread_cardTable(%eax),%eax # get card table base
+     shrl      $GC_CARD_SHIFT,rINST          # object head to card number
+     movb      %al,(%eax,rINST)               # mark card using object head
++.LOP_APUT_OBJECT_skip_mark:
++    FETCH_INST_OPCODE 2 %ecx
+     ADVANCE_PC 2
+     GOTO_NEXT_R %ecx
+ 
+@@ -3252,10 +3265,14 @@ dvmAsmInstructionStartCode = .L_OP_NOP
+     testl   %ecx,%ecx                           # object null?
+     je      common_errNullObject                # object was null
+     movl    rINST,(%ecx,%eax)      # obj.field <- v[A](8/16/32 bits)
+-    movl    rSELF,%eax
+     testl   rINST,rINST                         # stored a NULL?
+-    movl    offThread_cardTable(%eax),%eax      # get card table base
+     je      1f                                  # skip card mark if null store
++    movl    rSELF,%eax
++#if defined(WITH_CONDMARK)
++    cmpl    %ecx,offThread_cardImmuneLimit(%eax)
++    jbe     1f
++#endif
++    movl    offThread_cardTable(%eax),%eax      # get card table base
+     shrl    $GC_CARD_SHIFT,%ecx                # object head to card number
+     movb    %al,(%eax,%ecx)                     # mark card using object head
+ 1:
+@@ -4031,7 +4048,11 @@ dvmAsmInstructionStartCode = .L_OP_NOP
+     je        1f                                 # skip card mark if null
+     movl      rSELF,%ecx
+     movl      offField_clazz(%eax),%eax          # eax<- method->clazz
+-    movl      offThread_cardTable(%ecx),%ecx       # get card table base
++#if defined(WITH_CONDMARK)
++    cmpl      %eax,offThread_cardImmuneLimit(%ecx)
++    jbe       1f
++#endif
++    movl      offThread_cardTable(%ecx),%ecx     # get card table base
+     shrl      $GC_CARD_SHIFT,%eax               # head to card number
+     movb      %cl,(%ecx,%eax)                    # mark card
+ 1:
+@@ -8595,10 +8616,14 @@ dvmAsmInstructionStartCode = .L_OP_NOP
+     testl     %ecx,%ecx                 # is object null?
+     je        common_errNullObject
+     movl      rINST,(%ecx,%eax,1)
+-    movl      rSELF,%eax
+     testl     rINST,rINST               # did we store null?
+-    movl      offThread_cardTable(%eax),%eax  # get card table base
++    movl      rSELF,%eax
+     je        1f                            # skip card mark if null store
++#if defined(WITH_CONDMARK)
++    cmpl      %ecx,offThread_cardImmuneLimit(%eax)
++    jbe       1f
++#endif
++    movl      offThread_cardTable(%eax),%eax  # get card table base
+     shrl      $GC_CARD_SHIFT,%ecx          # object head to card number
+     movb      %al,(%eax,%ecx)               # mark card based on object head
+ 1:
+@@ -8769,10 +8794,14 @@ dvmAsmInstructionStartCode = .L_OP_NOP
+     testl   %ecx,%ecx                           # object null?
+     je      common_errNullObject                # object was null
+     movl    rINST,(%ecx,%eax)      # obj.field <- v[A](8/16/32 bits)
+-    movl    rSELF,%eax
+     testl   rINST,rINST                         # stored a NULL?
+-    movl    offThread_cardTable(%eax),%eax      # get card table base
+     je      1f                                  # skip card mark if null store
++    movl    rSELF,%eax
++#if defined(WITH_CONDMARK)
++    cmpl    %ecx,offThread_cardImmuneLimit(%eax)
++    jbe     1f
++#endif
++    movl    offThread_cardTable(%eax),%eax      # get card table base
+     shrl    $GC_CARD_SHIFT,%ecx                # object head to card number
+     movb    %al,(%eax,%ecx)                     # mark card using object head
+ 1:
+@@ -8868,7 +8897,11 @@ dvmAsmInstructionStartCode = .L_OP_NOP
+     je        1f                                 # skip card mark if null
+     movl      rSELF,%ecx
+     movl      offField_clazz(%eax),%eax          # eax<- method->clazz
+-    movl      offThread_cardTable(%ecx),%ecx       # get card table base
++#if defined(WITH_CONDMARK)
++    cmpl      %eax,offThread_cardImmuneLimit(%ecx)
++    jbe       1f
++#endif
++    movl      offThread_cardTable(%ecx),%ecx     # get card table base
+     shrl      $GC_CARD_SHIFT,%eax               # head to card number
+     movb      %cl,(%ecx,%eax)                    # mark card
+ 1:
+diff --git a/vm/mterp/x86/OP_APUT_OBJECT.S b/vm/mterp/x86/OP_APUT_OBJECT.S
+index 0850e1c..0a0a1a0 100644
+--- a/vm/mterp/x86/OP_APUT_OBJECT.S
++++ b/vm/mterp/x86/OP_APUT_OBJECT.S
+@@ -50,12 +50,17 @@
+     jmp       common_exceptionThrown
+ 
+ .L${opcode}_types_okay:
+-    movl      offThread_cardTable(%eax),%eax   # get card table base
+     movl      rINST,(%ecx)                   # store into array
+     UNSPILL_TMP2(rINST)                      # recover object head
+-    FETCH_INST_OPCODE 2 %ecx
++#if defined(WITH_CONDMARK)
++    cmpl      rINST,offThread_cardImmuneLimit(%eax)
++    jbe       .L${opcode}_skip_mark
++#endif
++    movl      offThread_cardTable(%eax),%eax # get card table base
+     shrl      $$GC_CARD_SHIFT,rINST          # object head to card number
+     movb      %al,(%eax,rINST)               # mark card using object head
++.L${opcode}_skip_mark:
++    FETCH_INST_OPCODE 2 %ecx
+     ADVANCE_PC 2
+     GOTO_NEXT_R %ecx
+ 
+diff --git a/vm/mterp/x86/OP_FILLED_NEW_ARRAY.S b/vm/mterp/x86/OP_FILLED_NEW_ARRAY.S
+index dde53aa..de5cbb8 100644
+--- a/vm/mterp/x86/OP_FILLED_NEW_ARRAY.S
++++ b/vm/mterp/x86/OP_FILLED_NEW_ARRAY.S
+@@ -108,7 +108,11 @@
+     cmpb    $$'I',%al                        # Int array?
+     je      5f                               # skip card mark if so
+     movl    offThread_retval(%ecx),%eax        # eax<- object head
+-    movl    offThread_cardTable(%ecx),%ecx     # card table base
++#if defined(WITH_CONDMARK)
++    cmpl    %eax,offThread_cardImmuneLimit(%ecx)
++    jbe     5f
++#endif
++    movl    offThread_cardTable(%ecx),%ecx   # card table base
+     shrl    $$GC_CARD_SHIFT,%eax             # convert to card num
+     movb    %cl,(%ecx,%eax)                  # mark card based on object head
+ 5:
+diff --git a/vm/mterp/x86/OP_IPUT_OBJECT.S b/vm/mterp/x86/OP_IPUT_OBJECT.S
+index 6c9fd6e..3fefc53 100644
+--- a/vm/mterp/x86/OP_IPUT_OBJECT.S
++++ b/vm/mterp/x86/OP_IPUT_OBJECT.S
+@@ -48,10 +48,14 @@
+     testl   %ecx,%ecx                           # object null?
+     je      common_errNullObject                # object was null
+     movl    rINST,(%ecx,%eax)      # obj.field <- v[A](8/16/32 bits)
+-    movl    rSELF,%eax
+     testl   rINST,rINST                         # stored a NULL?
+-    movl    offThread_cardTable(%eax),%eax      # get card table base
+     je      1f                                  # skip card mark if null store
++    movl    rSELF,%eax
++#if defined(WITH_CONDMARK)
++    cmpl    %ecx,offThread_cardImmuneLimit(%eax)
++    jbe     1f
++#endif
++    movl    offThread_cardTable(%eax),%eax      # get card table base
+     shrl    $$GC_CARD_SHIFT,%ecx                # object head to card number
+     movb    %al,(%eax,%ecx)                     # mark card using object head
+ 1:
+diff --git a/vm/mterp/x86/OP_IPUT_OBJECT_QUICK.S b/vm/mterp/x86/OP_IPUT_OBJECT_QUICK.S
+index b628e57..1f77fa9 100644
+--- a/vm/mterp/x86/OP_IPUT_OBJECT_QUICK.S
++++ b/vm/mterp/x86/OP_IPUT_OBJECT_QUICK.S
+@@ -11,10 +11,14 @@
+     testl     %ecx,%ecx                 # is object null?
+     je        common_errNullObject
+     movl      rINST,(%ecx,%eax,1)
+-    movl      rSELF,%eax
+     testl     rINST,rINST               # did we store null?
+-    movl      offThread_cardTable(%eax),%eax  # get card table base
++    movl      rSELF,%eax
+     je        1f                            # skip card mark if null store
++#if defined(WITH_CONDMARK)
++    cmpl      %ecx,offThread_cardImmuneLimit(%eax)
++    jbe       1f
++#endif
++    movl      offThread_cardTable(%eax),%eax  # get card table base
+     shrl      $$GC_CARD_SHIFT,%ecx          # object head to card number
+     movb      %al,(%eax,%ecx)               # mark card based on object head
+ 1:
+diff --git a/vm/mterp/x86/OP_SPUT_OBJECT.S b/vm/mterp/x86/OP_SPUT_OBJECT.S
+index 95a0a34..97fa0bf 100644
+--- a/vm/mterp/x86/OP_SPUT_OBJECT.S
++++ b/vm/mterp/x86/OP_SPUT_OBJECT.S
+@@ -27,7 +27,11 @@
+     je        1f                                 # skip card mark if null
+     movl      rSELF,%ecx
+     movl      offField_clazz(%eax),%eax          # eax<- method->clazz
+-    movl      offThread_cardTable(%ecx),%ecx       # get card table base
++#if defined(WITH_CONDMARK)
++    cmpl      %eax,offThread_cardImmuneLimit(%ecx)
++    jbe       1f
++#endif
++    movl      offThread_cardTable(%ecx),%ecx     # get card table base
+     shrl      $$GC_CARD_SHIFT,%eax               # head to card number
+     movb      %cl,(%ecx,%eax)                    # mark card
+ 1:
+-- 
+1.7.4.1
+

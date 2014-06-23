@@ -1,0 +1,636 @@
+From 9d355abe35ef015bc9c5d1a1dac512d0b9c423b5 Mon Sep 17 00:00:00 2001
+From: Johnnie Birch <johnnie.l.birch.jr@intel.com>
+Date: Sun, 10 Feb 2013 15:08:50 -0800
+Subject: Dalvik: Patch implements volatile wide variants of IGET, IPUT, SPUT, and SGET
+
+BZ: 67681
+
+This patch implements the volatile wide variants of IGET, IPUT, SPUT, and SGET.
+These versions had been executed through the C (portable) version of the Dalvik
+interpreter. There is a corner case bug related to the interaction of
+non-virtual method inlining a trace formation when trace formation involves
+both the C portable interpeter and the assembly based fast interpreter. This
+patch also serves as a fix/workaround for that issue by avoid that corner case.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Interpreter
+Origin: internal
+Upstream-Candidate: yes
+
+Change-Id: I5bde4233a33bf62f0d86bb40b458971d81f9da82
+Orig-MCG-Change-Id: I32c7519c5949bd6082f8d42767e7d4cfc8c2682f
+Signed-off-by: Johnnie Birch <johnnie.l.birch.jr@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/mterp/config-x86                  |    4 -
+ vm/mterp/out/InterpAsm-x86.S         |  320 ++++++++++++++++++++++++++++++----
+ vm/mterp/out/InterpC-x86.cpp         |   16 --
+ vm/mterp/x86/OP_IGET_WIDE.S          |    8 +
+ vm/mterp/x86/OP_IGET_WIDE_VOLATILE.S |    2 +
+ vm/mterp/x86/OP_IPUT_WIDE.S          |    8 +
+ vm/mterp/x86/OP_IPUT_WIDE_VOLATILE.S |    2 +
+ vm/mterp/x86/OP_SGET_WIDE.S          |   13 ++-
+ vm/mterp/x86/OP_SGET_WIDE_VOLATILE.S |    2 +
+ vm/mterp/x86/OP_SPUT_WIDE.S          |   13 ++-
+ vm/mterp/x86/OP_SPUT_WIDE_VOLATILE.S |    2 +
+ 11 files changed, 332 insertions(+), 58 deletions(-)
+ create mode 100644 vm/mterp/x86/OP_IGET_WIDE_VOLATILE.S
+ create mode 100644 vm/mterp/x86/OP_IPUT_WIDE_VOLATILE.S
+ create mode 100644 vm/mterp/x86/OP_SGET_WIDE_VOLATILE.S
+ create mode 100644 vm/mterp/x86/OP_SPUT_WIDE_VOLATILE.S
+
+diff --git a/vm/mterp/config-x86 b/vm/mterp/config-x86
+index 9e5fa43..0b5c020 100644
+--- a/vm/mterp/config-x86
++++ b/vm/mterp/config-x86
+@@ -38,10 +38,6 @@ import c/opcommon.cpp
+ op-start x86
+     # stub -- need native impl
+     op OP_EXECUTE_INLINE_RANGE c
+-    op OP_IGET_WIDE_VOLATILE c
+-    op OP_IPUT_WIDE_VOLATILE c
+-    op OP_SGET_WIDE_VOLATILE c
+-    op OP_SPUT_WIDE_VOLATILE c
+     op OP_RETURN_VOID_BARRIER c
+     op OP_INVOKE_OBJECT_INIT_RANGE c
+ op-end
+diff --git a/vm/mterp/out/InterpAsm-x86.S b/vm/mterp/out/InterpAsm-x86.S
+index 58a55c1..6421b41 100644
+--- a/vm/mterp/out/InterpAsm-x86.S
++++ b/vm/mterp/out/InterpAsm-x86.S
+@@ -2803,8 +2803,15 @@ dvmAsmInstructionStartCode = .L_OP_NOP
+     testl   %ecx,%ecx                           # object null?
+     je      common_errNullObject                # object was null
+     leal    (%ecx,%eax,1),%eax                  # eax<- address of field
++    .if 0
++    movl %eax, OUT_ARG0(%esp)
++    call dvmQuasiAtomicRead64
++    movl %eax, %ecx
++    movl %edx, %eax
++    .else
+     movl    (%eax),%ecx                         # ecx<- lsw
+     movl    4(%eax),%eax                        # eax<- msw
++    .endif
+     SET_VREG_WORD %ecx rINST 0
+     FETCH_INST_OPCODE 2 %ecx
+     UNSPILL(rIBASE)                             # restore rIBASE
+@@ -3183,8 +3190,15 @@ dvmAsmInstructionStartCode = .L_OP_NOP
+     leal    (%ecx,%eax,1),%eax                  # eax<- address of field
+     GET_VREG_WORD %ecx rINST 0                  # ecx<- lsw
+     GET_VREG_WORD rINST rINST 1                 # rINST<- msw
++    .if 0
++    movl %eax, OUT_ARG2(%esp)
++    movl rINST, OUT_ARG1(%esp)
++    movl %ecx, OUT_ARG0(%esp)
++    call dvmQuasiAtomicSwap64Sync
++    .else
+     movl    rINST,4(%eax)
+     movl    %ecx,(%eax)
++    .endif
+     FETCH_INST_OPCODE 2 %ecx
+     UNSPILL(rIBASE)
+     ADVANCE_PC 2
+@@ -3539,7 +3553,7 @@ dvmAsmInstructionStartCode = .L_OP_NOP
+     movl      offDvmDex_pResFields(%ecx),%ecx    # ecx<- dvmDex->pResFields
+ #if defined(WITH_JIT)
+     movl      %ecx, TMP_SPILL1(%ebp)
+-    lea       (%ecx,%eax,4),%ecx
++    leal       (%ecx,%eax,4),%ecx
+     movl      %ecx, TMP_SPILL2(%ebp)
+     movl      TMP_SPILL1(%ebp), %ecx
+ #endif
+@@ -3547,8 +3561,18 @@ dvmAsmInstructionStartCode = .L_OP_NOP
+     testl     %eax,%eax                          # resolved entry null?
+     je        .LOP_SGET_WIDE_resolve                # if not, make it so
+ .LOP_SGET_WIDE_finish:     # field ptr in eax
++    .if 0
++    leal  offStaticField_value(%eax), %eax
++    movl %eax, OUT_ARG0(%esp)
++    SPILL(rIBASE)
++    call dvmQuasiAtomicRead64
++    movl %eax, %ecx
++    movl %edx, %eax
++    UNSPILL(rIBASE)
++    .else
+     movl      offStaticField_value(%eax),%ecx    # ecx<- lsw
+     movl      4+offStaticField_value(%eax),%eax  # eax<- msw
++    .endif
+     SET_VREG_WORD %ecx rINST 0
+     FETCH_INST_OPCODE 2 %ecx
+     SET_VREG_WORD %eax rINST 1
+@@ -3938,9 +3962,19 @@ dvmAsmInstructionStartCode = .L_OP_NOP
+ .LOP_SPUT_WIDE_finish:     # field ptr in eax
+     GET_VREG_WORD %ecx rINST 0                  # rINST<- lsw
+     GET_VREG_WORD rINST rINST 1                 # ecx<- msw
++    .if 0
++    SPILL(rIBASE)
++    lea offStaticField_value(%eax), rIBASE
++    movl rIBASE, OUT_ARG2(%esp)
++    movl rINST, OUT_ARG1(%esp)
++    movl %ecx, OUT_ARG0(%esp)
++    call dvmQuasiAtomicSwap64Sync
++    UNSPILL(rIBASE)
++    .else
+     movl      %ecx,offStaticField_value(%eax)
+-    FETCH_INST_OPCODE 2 %ecx
+     movl      rINST,4+offStaticField_value(%eax)
++    .endif
++    FETCH_INST_OPCODE 2 %ecx
+     ADVANCE_PC 2
+     GOTO_NEXT_R %ecx
+ 
+@@ -7996,51 +8030,265 @@ dvmAsmInstructionStartCode = .L_OP_NOP
+ /* ------------------------------ */
+     .balign 16
+ .L_OP_IGET_WIDE_VOLATILE: /* 0xe8 */
+-    /* (stub) */
+-    SAVE_PC_FP_TO_SELF %ecx          # leaves rSELF in %ecx
+-    movl %ecx,OUT_ARG0(%esp)         # self is first arg to function
+-    call      dvmMterp_OP_IGET_WIDE_VOLATILE     # do the real work
+-    movl      rSELF,%ecx
+-    LOAD_PC_FP_FROM_SELF             # retrieve updated values
+-    movl      offThread_curHandlerTable(%ecx),rIBASE  # set up rIBASE
+-    FETCH_INST
+-    GOTO_NEXT
++/* File: x86/OP_IGET_WIDE_VOLATILE.S */
++/* File: x86/OP_IGET_WIDE.S */
++    /*
++     * 64-bit instance field get.
++     *
++     */
++    /* op vA, vB, field@CCCC */
++    movl    rSELF,%ecx
++    SPILL(rIBASE)                               # preserve rIBASE
++    movzwl  2(rPC),rIBASE                       # rIBASE<- 0000CCCC
++    movl    offThread_methodClassDex(%ecx),%eax # eax<- DvmDex
++    movzbl  rINSTbl,%ecx                        # ecx<- BA
++    sarl    $4,%ecx                            # ecx<- B
++    movl    offDvmDex_pResFields(%eax),%eax     # eax<- pDvmDex->pResFields
++    andb    $0xf,rINSTbl                       # rINST<- A
++    GET_VREG_R %ecx %ecx                        # ecx<- fp[B], the object ptr
++    movl    (%eax,rIBASE,4),%eax                # resolved entry
++    testl   %eax,%eax                           # is resolved entry null?
++    jne     .LOP_IGET_WIDE_VOLATILE_finish                  # no, already resolved
++    movl    rIBASE,OUT_ARG1(%esp)               # for dvmResolveInstField
++    movl    rSELF,rIBASE
++    EXPORT_PC
++    movl    offThread_method(rIBASE),rIBASE     # rIBASE<- current method
++    movl    offMethod_clazz(rIBASE),rIBASE      # rIBASE<- method->clazz
++    SPILL_TMP1(%ecx)                            # save objpointer across call
++    movl    rIBASE,OUT_ARG0(%esp)                  # pass in method->clazz
++    call    dvmResolveInstField                 #  ... to dvmResolveInstField
++    UNSPILL_TMP1(%ecx)
++    testl   %eax,%eax                           # returns InstrField ptr
++    jne     .LOP_IGET_WIDE_VOLATILE_finish
++    jmp     common_exceptionThrown
++
++.LOP_IGET_WIDE_VOLATILE_finish:
++    /*
++     * Currently:
++     *   eax holds resolved field
++     *   ecx holds object
++     *   rINST holds A
++     */
++    movl    offInstField_byteOffset(%eax),%eax  # eax<- byte offset of field
++    testl   %ecx,%ecx                           # object null?
++    je      common_errNullObject                # object was null
++    leal    (%ecx,%eax,1),%eax                  # eax<- address of field
++    .if 1
++    movl %eax, OUT_ARG0(%esp)
++    call dvmQuasiAtomicRead64
++    movl %eax, %ecx
++    movl %edx, %eax
++    .else
++    movl    (%eax),%ecx                         # ecx<- lsw
++    movl    4(%eax),%eax                        # eax<- msw
++    .endif
++    SET_VREG_WORD %ecx rINST 0
++    FETCH_INST_OPCODE 2 %ecx
++    UNSPILL(rIBASE)                             # restore rIBASE
++    SET_VREG_WORD %eax rINST 1
++    ADVANCE_PC 2
++    GOTO_NEXT_R %ecx
++
++
+ /* ------------------------------ */
+     .balign 16
+ .L_OP_IPUT_WIDE_VOLATILE: /* 0xe9 */
+-    /* (stub) */
+-    SAVE_PC_FP_TO_SELF %ecx          # leaves rSELF in %ecx
+-    movl %ecx,OUT_ARG0(%esp)         # self is first arg to function
+-    call      dvmMterp_OP_IPUT_WIDE_VOLATILE     # do the real work
+-    movl      rSELF,%ecx
+-    LOAD_PC_FP_FROM_SELF             # retrieve updated values
+-    movl      offThread_curHandlerTable(%ecx),rIBASE  # set up rIBASE
+-    FETCH_INST
+-    GOTO_NEXT
++/* File: x86/OP_IPUT_WIDE_VOLATILE.S */
++/* File: x86/OP_IPUT_WIDE.S */
++    /*
++     * 64-bit instance field put.
++     *
++     */
++    /* op vA, vB, field@CCCC */
++    movl    rSELF,%ecx
++    SPILL(rIBASE)
++    movzwl  2(rPC),rIBASE                       # rIBASE<- 0000CCCC
++    movl    offThread_methodClassDex(%ecx),%eax # eax<- DvmDex
++    movzbl  rINSTbl,%ecx                        # ecx<- BA
++    sarl    $4,%ecx                            # ecx<- B
++    movl    offDvmDex_pResFields(%eax),%eax     # eax<- pDvmDex->pResFields
++    andb    $0xf,rINSTbl                       # rINST<- A
++    GET_VREG_R %ecx %ecx                        # ecx<- fp[B], the object ptr
++    movl    (%eax,rIBASE,4),%eax                # resolved entry
++    testl   %eax,%eax                           # is resolved entry null?
++    jne     .LOP_IPUT_WIDE_VOLATILE_finish                  # no, already resolved
++    movl    rIBASE,OUT_ARG1(%esp)
++    movl    rSELF,rIBASE
++    EXPORT_PC
++    movl    offThread_method(rIBASE),rIBASE     # rIBASE<- current method
++    movl    offMethod_clazz(rIBASE),rIBASE      # rIBASE<- method->clazz
++    SPILL_TMP1(%ecx)                            # save obj pointer across call
++    movl    rIBASE,OUT_ARG0(%esp)               # pass in method->clazz
++    call    dvmResolveInstField                 #  ... to dvmResolveInstField
++    UNSPILL_TMP1(%ecx)
++    testl   %eax,%eax                           #  ... which returns InstrField ptr
++    jne     .LOP_IPUT_WIDE_VOLATILE_finish
++    jmp     common_exceptionThrown
++
++.LOP_IPUT_WIDE_VOLATILE_finish:
++    /*
++     * Currently:
++     *   eax holds resolved field
++     *   ecx holds object
++     *   rIBASE is scratch, but needs to be unspilled
++     *   rINST holds A
++     */
++    movl    offInstField_byteOffset(%eax),%eax  # eax<- byte offset of field
++    testl   %ecx,%ecx                           # object null?
++    je      common_errNullObject                # object was null
++    leal    (%ecx,%eax,1),%eax                  # eax<- address of field
++    GET_VREG_WORD %ecx rINST 0                  # ecx<- lsw
++    GET_VREG_WORD rINST rINST 1                 # rINST<- msw
++    .if 1
++    movl %eax, OUT_ARG2(%esp)
++    movl rINST, OUT_ARG1(%esp)
++    movl %ecx, OUT_ARG0(%esp)
++    call dvmQuasiAtomicSwap64Sync
++    .else
++    movl    rINST,4(%eax)
++    movl    %ecx,(%eax)
++    .endif
++    FETCH_INST_OPCODE 2 %ecx
++    UNSPILL(rIBASE)
++    ADVANCE_PC 2
++    GOTO_NEXT_R %ecx
++
++
+ /* ------------------------------ */
+     .balign 16
+ .L_OP_SGET_WIDE_VOLATILE: /* 0xea */
+-    /* (stub) */
+-    SAVE_PC_FP_TO_SELF %ecx          # leaves rSELF in %ecx
+-    movl %ecx,OUT_ARG0(%esp)         # self is first arg to function
+-    call      dvmMterp_OP_SGET_WIDE_VOLATILE     # do the real work
++/* File: x86/OP_SGET_WIDE_VOLATILE.S */
++/* File: x86/OP_SGET_WIDE.S */
++    /*
++     * 64-bit SGET handler.
++     *
++     */
++    /* sget-wide vAA, field@BBBB */
+     movl      rSELF,%ecx
+-    LOAD_PC_FP_FROM_SELF             # retrieve updated values
+-    movl      offThread_curHandlerTable(%ecx),rIBASE  # set up rIBASE
+-    FETCH_INST
+-    GOTO_NEXT
++    movzwl    2(rPC),%eax                        # eax<- field ref BBBB
++    movl      offThread_methodClassDex(%ecx),%ecx  # ecx<- DvmDex
++    movl      offDvmDex_pResFields(%ecx),%ecx    # ecx<- dvmDex->pResFields
++#if defined(WITH_JIT)
++    movl      %ecx, TMP_SPILL1(%ebp)
++    leal       (%ecx,%eax,4),%ecx
++    movl      %ecx, TMP_SPILL2(%ebp)
++    movl      TMP_SPILL1(%ebp), %ecx
++#endif
++    movl      (%ecx,%eax,4),%eax                 # eax<- resolved StaticField ptr
++    testl     %eax,%eax                          # resolved entry null?
++    je        .LOP_SGET_WIDE_VOLATILE_resolve                # if not, make it so
++.LOP_SGET_WIDE_VOLATILE_finish:     # field ptr in eax
++    .if 1
++    leal  offStaticField_value(%eax), %eax
++    movl %eax, OUT_ARG0(%esp)
++    SPILL(rIBASE)
++    call dvmQuasiAtomicRead64
++    movl %eax, %ecx
++    movl %edx, %eax
++    UNSPILL(rIBASE)
++    .else
++    movl      offStaticField_value(%eax),%ecx    # ecx<- lsw
++    movl      4+offStaticField_value(%eax),%eax  # eax<- msw
++    .endif
++    SET_VREG_WORD %ecx rINST 0
++    FETCH_INST_OPCODE 2 %ecx
++    SET_VREG_WORD %eax rINST 1
++    ADVANCE_PC 2
++    GOTO_NEXT_R %ecx
++
++    /*
++     * Go resolve the field
++     */
++.LOP_SGET_WIDE_VOLATILE_resolve:
++    movl     rSELF,%ecx
++    movzwl   2(rPC),%eax                        # eax<- field ref BBBB
++    movl     offThread_method(%ecx),%ecx          # ecx<- current method
++    EXPORT_PC                                   # could throw, need to export
++    movl     offMethod_clazz(%ecx),%ecx         # ecx<- method->clazz
++    movl     %eax,OUT_ARG1(%esp)
++    movl     %ecx,OUT_ARG0(%esp)
++    SPILL(rIBASE)
++    call     dvmResolveStaticField              # eax<- resolved StaticField ptr
++    UNSPILL(rIBASE)
++    testl    %eax,%eax
++    je      common_exceptionThrown             # no, handle exception
++#if defined(WITH_JIT)
++    movl      TMP_SPILL2(%ebp), %ecx
++    SPILL(rIBASE)
++    call     common_verifyField
++    UNSPILL(rIBASE)
++#endif
++    jmp      .LOP_SGET_WIDE_VOLATILE_finish                 # success, continue
++
++
+ /* ------------------------------ */
+     .balign 16
+ .L_OP_SPUT_WIDE_VOLATILE: /* 0xeb */
+-    /* (stub) */
+-    SAVE_PC_FP_TO_SELF %ecx          # leaves rSELF in %ecx
+-    movl %ecx,OUT_ARG0(%esp)         # self is first arg to function
+-    call      dvmMterp_OP_SPUT_WIDE_VOLATILE     # do the real work
++/* File: x86/OP_SPUT_WIDE_VOLATILE.S */
++/* File: x86/OP_SPUT_WIDE.S */
++    /*
++     * General 32-bit SPUT handler.
++     *
++     * for: sput, sput-object, sput-boolean, sput-byte, sput-char, sput-short
++     */
++    /* op vAA, field@BBBB */
+     movl      rSELF,%ecx
+-    LOAD_PC_FP_FROM_SELF             # retrieve updated values
+-    movl      offThread_curHandlerTable(%ecx),rIBASE  # set up rIBASE
+-    FETCH_INST
+-    GOTO_NEXT
++    movzwl    2(rPC),%eax                        # eax<- field ref BBBB
++    movl      offThread_methodClassDex(%ecx),%ecx  # ecx<- DvmDex
++    movl      offDvmDex_pResFields(%ecx),%ecx    # ecx<- dvmDex->pResFields
++#if defined(WITH_JIT)
++    movl      %ecx, TMP_SPILL1(%ebp)
++    lea       (%ecx,%eax,4),%ecx
++    movl      %ecx, TMP_SPILL2(%ebp)
++    movl      TMP_SPILL1(%ebp), %ecx
++#endif
++    movl      (%ecx,%eax,4),%eax                 # eax<- resolved StaticField ptr
++    testl     %eax,%eax                          # resolved entry null?
++    je        .LOP_SPUT_WIDE_VOLATILE_resolve                # if not, make it so
++.LOP_SPUT_WIDE_VOLATILE_finish:     # field ptr in eax
++    GET_VREG_WORD %ecx rINST 0                  # rINST<- lsw
++    GET_VREG_WORD rINST rINST 1                 # ecx<- msw
++    .if 1
++    SPILL(rIBASE)
++    lea offStaticField_value(%eax), rIBASE
++    movl rIBASE, OUT_ARG2(%esp)
++    movl rINST, OUT_ARG1(%esp)
++    movl %ecx, OUT_ARG0(%esp)
++    call dvmQuasiAtomicSwap64Sync
++    UNSPILL(rIBASE)
++    .else
++    movl      %ecx,offStaticField_value(%eax)
++    movl      rINST,4+offStaticField_value(%eax)
++    .endif
++    FETCH_INST_OPCODE 2 %ecx
++    ADVANCE_PC 2
++    GOTO_NEXT_R %ecx
++
++    /*
++     * Go resolve the field
++     */
++.LOP_SPUT_WIDE_VOLATILE_resolve:
++    movl     rSELF,%ecx
++    movzwl   2(rPC),%eax                        # eax<- field ref BBBB
++    movl     offThread_method(%ecx),%ecx          # ecx<- current method
++    EXPORT_PC                                   # could throw, need to export
++    movl     offMethod_clazz(%ecx),%ecx         # ecx<- method->clazz
++    movl     %eax,OUT_ARG1(%esp)
++    movl     %ecx,OUT_ARG0(%esp)
++    SPILL(rIBASE)
++    call     dvmResolveStaticField              # eax<- resolved StaticField ptr
++    UNSPILL(rIBASE)
++    testl    %eax,%eax
++    je      common_exceptionThrown             # no, handle exception
++#if defined(WITH_JIT)
++    movl      TMP_SPILL2(%ebp), %ecx
++    SPILL(rIBASE)
++    call     common_verifyField
++    UNSPILL(rIBASE)
++#endif
++    jmp      .LOP_SPUT_WIDE_VOLATILE_finish                 # success, continue
++
++
+ /* ------------------------------ */
+     .balign 16
+ .L_OP_BREAKPOINT: /* 0xec */
+diff --git a/vm/mterp/out/InterpC-x86.cpp b/vm/mterp/out/InterpC-x86.cpp
+index 77dc888..a46bf2f 100644
+--- a/vm/mterp/out/InterpC-x86.cpp
++++ b/vm/mterp/out/InterpC-x86.cpp
+@@ -1162,22 +1162,6 @@ GOTO_TARGET_DECL(exceptionThrown);
+     }                                                                       \
+     FINISH(2);
+ 
+-/* File: c/OP_IGET_WIDE_VOLATILE.cpp */
+-HANDLE_IGET_X(OP_IGET_WIDE_VOLATILE,    "-wide-volatile", LongVolatile, _WIDE)
+-OP_END
+-
+-/* File: c/OP_IPUT_WIDE_VOLATILE.cpp */
+-HANDLE_IPUT_X(OP_IPUT_WIDE_VOLATILE,    "-wide-volatile", LongVolatile, _WIDE)
+-OP_END
+-
+-/* File: c/OP_SGET_WIDE_VOLATILE.cpp */
+-HANDLE_SGET_X(OP_SGET_WIDE_VOLATILE,    "-wide-volatile", LongVolatile, _WIDE)
+-OP_END
+-
+-/* File: c/OP_SPUT_WIDE_VOLATILE.cpp */
+-HANDLE_SPUT_X(OP_SPUT_WIDE_VOLATILE,    "-wide-volatile", LongVolatile, _WIDE)
+-OP_END
+-
+ /* File: c/OP_EXECUTE_INLINE_RANGE.cpp */
+ HANDLE_OPCODE(OP_EXECUTE_INLINE_RANGE /*{vCCCC..v(CCCC+AA-1)}, inline@BBBB*/)
+     {
+diff --git a/vm/mterp/x86/OP_IGET_WIDE.S b/vm/mterp/x86/OP_IGET_WIDE.S
+index 48032e3..8b9fdce 100644
+--- a/vm/mterp/x86/OP_IGET_WIDE.S
++++ b/vm/mterp/x86/OP_IGET_WIDE.S
+@@ -3,6 +3,7 @@
+ %verify "field already resolved"
+ %verify "field not yet resolved"
+ %verify "field cannot be resolved"
++%default {"volatile":"0"}
+     /*
+      * 64-bit instance field get.
+      *
+@@ -44,8 +45,15 @@
+     testl   %ecx,%ecx                           # object null?
+     je      common_errNullObject                # object was null
+     leal    (%ecx,%eax,1),%eax                  # eax<- address of field
++    .if $volatile
++    movl %eax, OUT_ARG0(%esp)
++    call dvmQuasiAtomicRead64
++    movl %eax, %ecx
++    movl %edx, %eax
++    .else
+     movl    (%eax),%ecx                         # ecx<- lsw
+     movl    4(%eax),%eax                        # eax<- msw
++    .endif
+     SET_VREG_WORD %ecx rINST 0
+     FETCH_INST_OPCODE 2 %ecx
+     UNSPILL(rIBASE)                             # restore rIBASE
+diff --git a/vm/mterp/x86/OP_IGET_WIDE_VOLATILE.S b/vm/mterp/x86/OP_IGET_WIDE_VOLATILE.S
+new file mode 100644
+index 0000000..f1092d9
+--- /dev/null
++++ b/vm/mterp/x86/OP_IGET_WIDE_VOLATILE.S
+@@ -0,0 +1,2 @@
++%verify "executed"
++%include "x86/OP_IGET_WIDE.S" {"volatile":"1"}
+\ No newline at end of file
+diff --git a/vm/mterp/x86/OP_IPUT_WIDE.S b/vm/mterp/x86/OP_IPUT_WIDE.S
+index d481d02..4a4adbd 100644
+--- a/vm/mterp/x86/OP_IPUT_WIDE.S
++++ b/vm/mterp/x86/OP_IPUT_WIDE.S
+@@ -3,6 +3,7 @@
+ %verify "field already resolved"
+ %verify "field not yet resolved"
+ %verify "field cannot be resolved"
++%default {"volatile":"0"}
+     /*
+      * 64-bit instance field put.
+      *
+@@ -47,8 +48,15 @@
+     leal    (%ecx,%eax,1),%eax                  # eax<- address of field
+     GET_VREG_WORD %ecx rINST 0                  # ecx<- lsw
+     GET_VREG_WORD rINST rINST 1                 # rINST<- msw
++    .if $volatile
++    movl %eax, OUT_ARG2(%esp)
++    movl rINST, OUT_ARG1(%esp)
++    movl %ecx, OUT_ARG0(%esp)
++    call dvmQuasiAtomicSwap64Sync
++    .else
+     movl    rINST,4(%eax)
+     movl    %ecx,(%eax)
++    .endif
+     FETCH_INST_OPCODE 2 %ecx
+     UNSPILL(rIBASE)
+     ADVANCE_PC 2
+diff --git a/vm/mterp/x86/OP_IPUT_WIDE_VOLATILE.S b/vm/mterp/x86/OP_IPUT_WIDE_VOLATILE.S
+new file mode 100644
+index 0000000..359597c
+--- /dev/null
++++ b/vm/mterp/x86/OP_IPUT_WIDE_VOLATILE.S
+@@ -0,0 +1,2 @@
++%verify "executed"
++%include "x86/OP_IPUT_WIDE.S" {"volatile":"1"}
+\ No newline at end of file
+diff --git a/vm/mterp/x86/OP_SGET_WIDE.S b/vm/mterp/x86/OP_SGET_WIDE.S
+index be97017..f01cda8 100644
+--- a/vm/mterp/x86/OP_SGET_WIDE.S
++++ b/vm/mterp/x86/OP_SGET_WIDE.S
+@@ -2,6 +2,7 @@
+ %verify "field already resolved"
+ %verify "field not yet resolved"
+ %verify "field cannot be resolved"
++%default {"volatile":"0"}
+     /*
+      * 64-bit SGET handler.
+      *
+@@ -13,7 +14,7 @@
+     movl      offDvmDex_pResFields(%ecx),%ecx    # ecx<- dvmDex->pResFields
+ #if defined(WITH_JIT)
+     movl      %ecx, TMP_SPILL1(%ebp)
+-    lea       (%ecx,%eax,4),%ecx
++    leal       (%ecx,%eax,4),%ecx
+     movl      %ecx, TMP_SPILL2(%ebp)
+     movl      TMP_SPILL1(%ebp), %ecx
+ #endif
+@@ -21,8 +22,18 @@
+     testl     %eax,%eax                          # resolved entry null?
+     je        .L${opcode}_resolve                # if not, make it so
+ .L${opcode}_finish:     # field ptr in eax
++    .if $volatile
++    leal  offStaticField_value(%eax), %eax
++    movl %eax, OUT_ARG0(%esp)
++    SPILL(rIBASE)
++    call dvmQuasiAtomicRead64
++    movl %eax, %ecx
++    movl %edx, %eax
++    UNSPILL(rIBASE)
++    .else
+     movl      offStaticField_value(%eax),%ecx    # ecx<- lsw
+     movl      4+offStaticField_value(%eax),%eax  # eax<- msw
++    .endif
+     SET_VREG_WORD %ecx rINST 0
+     FETCH_INST_OPCODE 2 %ecx
+     SET_VREG_WORD %eax rINST 1
+diff --git a/vm/mterp/x86/OP_SGET_WIDE_VOLATILE.S b/vm/mterp/x86/OP_SGET_WIDE_VOLATILE.S
+new file mode 100644
+index 0000000..cd47754
+--- /dev/null
++++ b/vm/mterp/x86/OP_SGET_WIDE_VOLATILE.S
+@@ -0,0 +1,2 @@
++%verify "executed"
++%include "x86/OP_SGET_WIDE.S" {"volatile":"1"}
+\ No newline at end of file
+diff --git a/vm/mterp/x86/OP_SPUT_WIDE.S b/vm/mterp/x86/OP_SPUT_WIDE.S
+index d5825f6..ed07c61 100644
+--- a/vm/mterp/x86/OP_SPUT_WIDE.S
++++ b/vm/mterp/x86/OP_SPUT_WIDE.S
+@@ -2,6 +2,7 @@
+ %verify "field already resolved"
+ %verify "field not yet resolved"
+ %verify "field cannot be resolved"
++%default {"volatile":"0"}
+     /*
+      * General 32-bit SPUT handler.
+      *
+@@ -24,9 +25,19 @@
+ .L${opcode}_finish:     # field ptr in eax
+     GET_VREG_WORD %ecx rINST 0                  # rINST<- lsw
+     GET_VREG_WORD rINST rINST 1                 # ecx<- msw
++    .if $volatile
++    SPILL(rIBASE)
++    lea offStaticField_value(%eax), rIBASE
++    movl rIBASE, OUT_ARG2(%esp)
++    movl rINST, OUT_ARG1(%esp)
++    movl %ecx, OUT_ARG0(%esp)
++    call dvmQuasiAtomicSwap64Sync
++    UNSPILL(rIBASE)
++    .else
+     movl      %ecx,offStaticField_value(%eax)
+-    FETCH_INST_OPCODE 2 %ecx
+     movl      rINST,4+offStaticField_value(%eax)
++    .endif
++    FETCH_INST_OPCODE 2 %ecx
+     ADVANCE_PC 2
+     GOTO_NEXT_R %ecx
+ 
+diff --git a/vm/mterp/x86/OP_SPUT_WIDE_VOLATILE.S b/vm/mterp/x86/OP_SPUT_WIDE_VOLATILE.S
+new file mode 100644
+index 0000000..16949dc
+--- /dev/null
++++ b/vm/mterp/x86/OP_SPUT_WIDE_VOLATILE.S
+@@ -0,0 +1,2 @@
++%verify "executed"
++%include "x86/OP_SPUT_WIDE.S" {"volatile":"1"}
+-- 
+1.7.4.1
+

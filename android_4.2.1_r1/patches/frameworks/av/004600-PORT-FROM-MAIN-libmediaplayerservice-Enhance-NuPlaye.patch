@@ -1,0 +1,456 @@
+From 93f1d1b7b8e050b2a056a21b605078d483a2e3b3 Mon Sep 17 00:00:00 2001
+From: fxiao4X <fengx.xiao@intel.com>
+Date: Sun, 25 Nov 2012 20:58:11 +0800
+Subject: [PATCH 046/170] [PORT FROM MAIN] libmediaplayerservice:Enhance
+ NuPlayer to provide video width and height info to
+ the client when player in prepare status.
+
+BZ: 48710
+
+Playback in the web browser such as httplive, when reuming from suspend status, the video view
+seems to be stretched to the full screen. This is the android defect.
+
+Original patches:
+
+34192: libmediaplayerservice: enhance the prepare process in nuplayer
+35497: libmediaplayerservice: enhance preparation to avoid the block in low bandwidth
+35710: libmediaplayerservice: notify the duration of RTSP and httplive when finish preparation
+36814: libmediaplayerservice : if program has video stream, wait until width and height is valid
+37259: NuPlayer: Seeking many times no audio/video output(part)
+48602: Enable OpenMAX AL support in NuPlayer for Flash Player
+
+Change-Id: Icc4b2758961390cc22bfad87b1c2ed6da56038ae
+Signed-off-by: fxiao4X <fengx.xiao@intel.com>
+Signed-off-by: Dan Liang <dan.liang@intel.com>
+Reviewed-on: http://android.intel.com:8080/76014
+Reviewed-by: cactus <cactus@intel.com>
+Reviewed-by: Ding, Haitao <haitao.ding@intel.com>
+Tested-by: Ding, Haitao <haitao.ding@intel.com>
+Tested-by: Tong, BoX <box.tong@intel.com>
+Reviewed-by: Tong, BoX <box.tong@intel.com>
+---
+ .../nuplayer/GenericSource.cpp                     |    7 ++
+ .../libmediaplayerservice/nuplayer/GenericSource.h |    1 +
+ .../nuplayer/HTTPLiveSource.cpp                    |    5 +
+ .../nuplayer/HTTPLiveSource.h                      |    1 +
+ media/libmediaplayerservice/nuplayer/NuPlayer.cpp  |   87 +++++++++++++++++++-
+ media/libmediaplayerservice/nuplayer/NuPlayer.h    |   10 ++
+ .../nuplayer/NuPlayerDriver.cpp                    |    7 +-
+ .../nuplayer/NuPlayerSource.h                      |    8 ++
+ .../libmediaplayerservice/nuplayer/RTSPSource.cpp  |    8 ++
+ media/libmediaplayerservice/nuplayer/RTSPSource.h  |    1 +
+ .../nuplayer/StreamingSource.h                     |    3 +
+ media/libstagefright/mpeg2ts/ATSParser.cpp         |   30 ++++++-
+ media/libstagefright/mpeg2ts/ATSParser.h           |    2 +
+ 13 files changed, 160 insertions(+), 10 deletions(-)
+
+diff --git a/media/libmediaplayerservice/nuplayer/GenericSource.cpp b/media/libmediaplayerservice/nuplayer/GenericSource.cpp
+index f0c3240..d67621f 100644
+--- a/media/libmediaplayerservice/nuplayer/GenericSource.cpp
++++ b/media/libmediaplayerservice/nuplayer/GenericSource.cpp
+@@ -262,4 +262,11 @@ bool NuPlayer::GenericSource::isSeekable() {
+     return true;
+ }
+ 
++bool NuPlayer::GenericSource::isStreamValid(bool audio) {
++    if (audio)
++        return (mAudioTrack.mSource != NULL);
++    else
++        return (mVideoTrack.mSource != NULL);
++}
++
+ }  // namespace android
+diff --git a/media/libmediaplayerservice/nuplayer/GenericSource.h b/media/libmediaplayerservice/nuplayer/GenericSource.h
+index e50b855..6f9eac0 100644
+--- a/media/libmediaplayerservice/nuplayer/GenericSource.h
++++ b/media/libmediaplayerservice/nuplayer/GenericSource.h
+@@ -48,6 +48,7 @@ struct NuPlayer::GenericSource : public NuPlayer::Source {
+     virtual status_t getDuration(int64_t *durationUs);
+     virtual status_t seekTo(int64_t seekTimeUs);
+     virtual bool isSeekable();
++    virtual bool isStreamValid(bool audio);
+ 
+ protected:
+     virtual ~GenericSource();
+diff --git a/media/libmediaplayerservice/nuplayer/HTTPLiveSource.cpp b/media/libmediaplayerservice/nuplayer/HTTPLiveSource.cpp
+index 1e98f35..ec3ba51 100644
+--- a/media/libmediaplayerservice/nuplayer/HTTPLiveSource.cpp
++++ b/media/libmediaplayerservice/nuplayer/HTTPLiveSource.cpp
+@@ -185,5 +185,10 @@ bool NuPlayer::HTTPLiveSource::isSeekable() {
+     return mLiveSession->isSeekable();
+ }
+ 
++bool NuPlayer::HTTPLiveSource::isStreamValid(bool audio) {
++    ATSParser::SourceType type = audio ? ATSParser::AUDIO : ATSParser::VIDEO;
++    return mTSParser->isStreamValid(type);
++}
++
+ }  // namespace android
+ 
+diff --git a/media/libmediaplayerservice/nuplayer/HTTPLiveSource.h b/media/libmediaplayerservice/nuplayer/HTTPLiveSource.h
+index 9950a9e..c3d79ab 100644
+--- a/media/libmediaplayerservice/nuplayer/HTTPLiveSource.h
++++ b/media/libmediaplayerservice/nuplayer/HTTPLiveSource.h
+@@ -42,6 +42,7 @@ struct NuPlayer::HTTPLiveSource : public NuPlayer::Source {
+     virtual status_t getDuration(int64_t *durationUs);
+     virtual status_t seekTo(int64_t seekTimeUs);
+     virtual bool isSeekable();
++    virtual bool isStreamValid(bool audio);
+ 
+ protected:
+     virtual ~HTTPLiveSource();
+diff --git a/media/libmediaplayerservice/nuplayer/NuPlayer.cpp b/media/libmediaplayerservice/nuplayer/NuPlayer.cpp
+index b963ec8..0888c4c 100644
+--- a/media/libmediaplayerservice/nuplayer/NuPlayer.cpp
++++ b/media/libmediaplayerservice/nuplayer/NuPlayer.cpp
+@@ -69,7 +69,9 @@ NuPlayer::NuPlayer()
+       mVideoLateByUs(0ll),
+       mNumFramesTotal(0ll),
+       mNumFramesDropped(0ll),
+-      mVideoScalingMode(NATIVE_WINDOW_SCALING_MODE_SCALE_TO_WINDOW) {
++      mVideoScalingMode(NATIVE_WINDOW_SCALING_MODE_SCALE_TO_WINDOW),
++      mSourceAlreadyStart(false),
++      mPreparePending(false) {
+ }
+ 
+ NuPlayer::~NuPlayer() {
+@@ -185,6 +187,10 @@ void NuPlayer::resetAsync() {
+     (new AMessage(kWhatReset, id()))->post();
+ }
+ 
++void NuPlayer::prepareAsync() {
++    (new AMessage(kWhatPrepare, id()))->post();
++}
++
+ void NuPlayer::seekToAsync(int64_t seekTimeUs) {
+     sp<AMessage> msg = new AMessage(kWhatSeek, id());
+     msg->setInt64("seekTimeUs", seekTimeUs);
+@@ -264,7 +270,9 @@ void NuPlayer::onMessageReceived(const sp<AMessage> &msg) {
+             mNumFramesTotal = 0;
+             mNumFramesDropped = 0;
+ 
+-            mSource->start();
++            if(!mSourceAlreadyStart) {
++                mSource->start();
++            }
+ 
+             mRenderer = new Renderer(
+                     mAudioSink,
+@@ -276,6 +284,55 @@ void NuPlayer::onMessageReceived(const sp<AMessage> &msg) {
+             break;
+         }
+ 
++        case kWhatPrepare:
++        {
++            if (mPreparePending) {
++                return;
++            }
++            mSource->start();
++            mSourceAlreadyStart = true;
++            postWaitPrepare();
++        }
++
++        case kWhatWaitPrepareDone:
++        {
++            if (!mPreparePending) {
++                return;
++            }
++            status_t err;
++            mPreparePending = false;
++            sp<AMessage>  videoformat = mSource->getFormat(false);
++            sp<AMessage>  audioformat = mSource->getFormat(true);
++            if ((err = mSource->feedMoreTSData()) != OK) {
++                if (err == ERROR_END_OF_STREAM) {
++                    notifyListener(MEDIA_PLAYBACK_COMPLETE, 0, 0);
++                } else {
++                    notifyListener(MEDIA_ERROR, MEDIA_ERROR_UNKNOWN, err);
++                }
++                finishPrepare();
++                break;
++            }
++            if( !mSource->isIStreamSource() && videoformat == NULL && ( mSource->isStreamValid(false) || audioformat == NULL) ) {
++                msg->post(100000ll);
++                mPreparePending = true;
++            } else {
++                if (mSource->isStreamValid(true) && audioformat == NULL) {
++                    msg->post(100000ll);
++                    mPreparePending = true;
++                } else if (videoformat != NULL) {
++                    int width = 0 ;
++                    int height = 0;
++                    CHECK(videoformat->findInt32("widt", &width));
++                    CHECK(videoformat->findInt32("heig", &height));
++                    notifyListener(MEDIA_SET_VIDEO_SIZE, width, height);
++                    finishPrepare();
++                } else {
++                    finishPrepare();
++                }
++            }
++            break;
++        }
++
+         case kWhatScanSources:
+         {
+             int32_t generation;
+@@ -550,6 +607,11 @@ void NuPlayer::onMessageReceived(const sp<AMessage> &msg) {
+         {
+             ALOGV("kWhatReset");
+ 
++            if(mPreparePending) {
++                finishPrepare();
++                mPreparePending = false;
++            }
++
+             if (mRenderer != NULL) {
+                 // There's an edge case where the renderer owns all output
+                 // buffers and is paused, therefore the decoder will not read
+@@ -672,6 +734,18 @@ void NuPlayer::finishFlushIfPossible() {
+     }
+ }
+ 
++void NuPlayer::finishPrepare() {
++    int64_t durationUs;
++    // notify the whole duration when finish Prepare
++    if (mDriver != NULL && mSource != NULL && mSource->getDuration(&durationUs) == OK) {
++        sp<NuPlayerDriver> driver = mDriver.promote();
++        if (driver != NULL) {
++            driver->notifyDuration(durationUs);
++        }
++    }
++    notifyListener(MEDIA_PREPARED, 0, 0);
++}
++
+ void NuPlayer::finishReset() {
+     CHECK(mAudioDecoder == NULL);
+     CHECK(mVideoDecoder == NULL);
+@@ -686,6 +760,9 @@ void NuPlayer::finishReset() {
+         mSource.clear();
+     }
+ 
++    mPreparePending =  false;
++    mSourceAlreadyStart = false;
++
+     if (mDriver != NULL) {
+         sp<NuPlayerDriver> driver = mDriver.promote();
+         if (driver != NULL) {
+@@ -706,6 +783,12 @@ void NuPlayer::postScanSources() {
+     mScanSourcesPending = true;
+ }
+ 
++void NuPlayer::postWaitPrepare() {
++    sp<AMessage> msg = new AMessage(kWhatWaitPrepareDone, id());
++    msg->post();
++    mPreparePending = true;
++}
++
+ status_t NuPlayer::instantiateDecoder(bool audio, sp<Decoder> *decoder) {
+     if (*decoder != NULL) {
+         return OK;
+diff --git a/media/libmediaplayerservice/nuplayer/NuPlayer.h b/media/libmediaplayerservice/nuplayer/NuPlayer.h
+index 36d3a9c..ea8bb55 100644
+--- a/media/libmediaplayerservice/nuplayer/NuPlayer.h
++++ b/media/libmediaplayerservice/nuplayer/NuPlayer.h
+@@ -57,6 +57,9 @@ struct NuPlayer : public AHandler {
+ 
+     status_t setVideoScalingMode(int32_t mode);
+ 
++    // Will notify the driver through "notifyPrepareComplete" once finished.
++    void prepareAsync();
++
+ protected:
+     virtual ~NuPlayer();
+ 
+@@ -88,6 +91,8 @@ private:
+         kWhatSeek                       = 'seek',
+         kWhatPause                      = 'paus',
+         kWhatResume                     = 'rsme',
++        kWhatPrepare                    = 'prep',
++        kWhatWaitPrepareDone            = 'preD',
+     };
+ 
+     wp<NuPlayerDriver> mDriver;
+@@ -107,6 +112,9 @@ private:
+     bool mScanSourcesPending;
+     int32_t mScanSourcesGeneration;
+ 
++    bool mPreparePending;
++    bool mSourceAlreadyStart;
++
+     enum FlushStatus {
+         NONE,
+         AWAITING_DISCONTINUITY,
+@@ -147,7 +155,9 @@ private:
+ 
+     static bool IsFlushingState(FlushStatus state, bool *needShutdown = NULL);
+ 
++    void finishPrepare();
+     void finishReset();
++    void postWaitPrepare();
+     void postScanSources();
+ 
+     DISALLOW_EVIL_CONSTRUCTORS(NuPlayer);
+diff --git a/media/libmediaplayerservice/nuplayer/NuPlayerDriver.cpp b/media/libmediaplayerservice/nuplayer/NuPlayerDriver.cpp
+index d03601f..36bc6e1 100644
+--- a/media/libmediaplayerservice/nuplayer/NuPlayerDriver.cpp
++++ b/media/libmediaplayerservice/nuplayer/NuPlayerDriver.cpp
+@@ -108,11 +108,8 @@ status_t NuPlayerDriver::prepare() {
+ }
+ 
+ status_t NuPlayerDriver::prepareAsync() {
+-    status_t err = prepare();
+-
+-    notifyListener(MEDIA_PREPARED);
+-
+-    return err;
++    mPlayer->prepareAsync();
++    return OK;
+ }
+ 
+ status_t NuPlayerDriver::start() {
+diff --git a/media/libmediaplayerservice/nuplayer/NuPlayerSource.h b/media/libmediaplayerservice/nuplayer/NuPlayerSource.h
+index 66aeff3..088b92e 100644
+--- a/media/libmediaplayerservice/nuplayer/NuPlayerSource.h
++++ b/media/libmediaplayerservice/nuplayer/NuPlayerSource.h
+@@ -51,6 +51,14 @@ struct NuPlayer::Source : public RefBase {
+         return false;
+     }
+ 
++    virtual bool isIStreamSource() {
++        return false;
++    }
++
++    virtual bool isStreamValid(bool audio) {
++        return false;
++    }
++
+ protected:
+     virtual ~Source() {}
+ 
+diff --git a/media/libmediaplayerservice/nuplayer/RTSPSource.cpp b/media/libmediaplayerservice/nuplayer/RTSPSource.cpp
+index 5a7a785..5d512c3 100644
+--- a/media/libmediaplayerservice/nuplayer/RTSPSource.cpp
++++ b/media/libmediaplayerservice/nuplayer/RTSPSource.cpp
+@@ -484,4 +484,12 @@ void NuPlayer::RTSPSource::finishDisconnectIfPossible() {
+     mDisconnectReplyID = 0;
+ }
+ 
++bool NuPlayer::RTSPSource::isStreamValid(bool audio) {
++    sp<AnotherPacketSource> source = getSource(audio);
++    if(source == NULL) {
++        return false;
++    }
++
++    return true;
++}
+ }  // namespace android
+diff --git a/media/libmediaplayerservice/nuplayer/RTSPSource.h b/media/libmediaplayerservice/nuplayer/RTSPSource.h
+index f07c724..068ce6f 100644
+--- a/media/libmediaplayerservice/nuplayer/RTSPSource.h
++++ b/media/libmediaplayerservice/nuplayer/RTSPSource.h
+@@ -47,6 +47,7 @@ struct NuPlayer::RTSPSource : public NuPlayer::Source {
+     virtual status_t getDuration(int64_t *durationUs);
+     virtual status_t seekTo(int64_t seekTimeUs);
+     virtual bool isSeekable();
++    virtual bool isStreamValid(bool audio);
+ 
+     void onMessageReceived(const sp<AMessage> &msg);
+ 
+diff --git a/media/libmediaplayerservice/nuplayer/StreamingSource.h b/media/libmediaplayerservice/nuplayer/StreamingSource.h
+index 3971e2a..7ccd822 100644
+--- a/media/libmediaplayerservice/nuplayer/StreamingSource.h
++++ b/media/libmediaplayerservice/nuplayer/StreamingSource.h
+@@ -34,6 +34,9 @@ struct NuPlayer::StreamingSource : public NuPlayer::Source {
+     virtual status_t feedMoreTSData();
+ 
+     virtual status_t dequeueAccessUnit(bool audio, sp<ABuffer> *accessUnit);
++    virtual bool isIStreamSource() {
++        return true;
++    }
+ 
+ protected:
+     virtual ~StreamingSource();
+diff --git a/media/libstagefright/mpeg2ts/ATSParser.cpp b/media/libstagefright/mpeg2ts/ATSParser.cpp
+index 9faa6bc..68af270 100644
+--- a/media/libstagefright/mpeg2ts/ATSParser.cpp
++++ b/media/libstagefright/mpeg2ts/ATSParser.cpp
+@@ -68,6 +68,8 @@ struct ATSParser::Program : public RefBase {
+         return mFirstPTSValid;
+     }
+ 
++    bool isStreamValid(SourceType type);
++
+     unsigned number() const { return mProgramNumber; }
+ 
+     void updateProgramMapPID(unsigned programMapPID) {
+@@ -117,6 +119,9 @@ struct ATSParser::Stream : public RefBase {
+ 
+     sp<MediaSource> getSource(SourceType type);
+ 
++    bool isAudio() const;
++    bool isVideo() const;
++
+ protected:
+     virtual ~Stream();
+ 
+@@ -144,9 +149,6 @@ private:
+ 
+     void extractAACFrames(const sp<ABuffer> &buffer);
+ 
+-    bool isAudio() const;
+-    bool isVideo() const;
+-
+     DISALLOW_EVIL_CONSTRUCTORS(Stream);
+ };
+ 
+@@ -425,6 +427,16 @@ sp<MediaSource> ATSParser::Program::getSource(SourceType type) {
+     return NULL;
+ }
+ 
++bool ATSParser::Program::isStreamValid(SourceType type) {
++    for (size_t i = 0; i < mStreams.size(); ++i) {
++        bool streamValid = (type == AUDIO) ? mStreams.editValueAt(i)->isAudio() : mStreams.editValueAt(i)->isVideo();
++        if(streamValid == true)
++            return true;
++    }
++
++    return false;
++}
++
+ int64_t ATSParser::Program::convertPTSToTimestamp(uint64_t PTS) {
+     if (!(mParser->mFlags & TS_TIMESTAMPS_ARE_ABSOLUTE)) {
+         if (!mFirstPTSValid) {
+@@ -1190,6 +1202,18 @@ status_t ATSParser::parseTS(ABitReader *br) {
+     return err;
+ }
+ 
++bool ATSParser::isStreamValid(SourceType type) {
++    for(size_t i = 0; i < mPrograms.size(); i++) {
++        const sp<Program> &program = mPrograms.editItemAt(i);
++        bool isStreamValid = program->isStreamValid(type);
++
++        if(isStreamValid == true)
++            return true;
++    }
++
++    return false;
++}
++
+ sp<MediaSource> ATSParser::getSource(SourceType type) {
+     int which = -1;  // any
+ 
+diff --git a/media/libstagefright/mpeg2ts/ATSParser.h b/media/libstagefright/mpeg2ts/ATSParser.h
+index 46edc45..31befa3 100644
+--- a/media/libstagefright/mpeg2ts/ATSParser.h
++++ b/media/libstagefright/mpeg2ts/ATSParser.h
+@@ -77,6 +77,8 @@ struct ATSParser : public RefBase {
+ 
+     bool PTSTimeDeltaEstablished();
+ 
++    bool isStreamValid(SourceType type);
++
+     enum {
+         // From ISO/IEC 13818-1: 2000 (E), Table 2-29
+         STREAMTYPE_RESERVED             = 0x00,
+-- 
+1.7.9
+

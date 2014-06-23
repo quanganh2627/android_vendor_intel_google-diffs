@@ -1,0 +1,150 @@
+From e31042da8b4b2c3539a3248bbd0e50dd5328a243 Mon Sep 17 00:00:00 2001
+From: Zhao Liang <leo.zhao@intel.com>
+Date: Thu, 19 Jul 2012 16:21:46 +0800
+Subject: [PORT FROM MAIN] libstagefright: allow mp4 muxer to be able handle length prefixed avc sample and generate media
+
+BZ: 47571
+
+original BZ: 18561
+
+Change-Id: I768aec67c1f6ff857786bff289f727b114942b80
+Orig-Change-Id: Ic0b275824e6d227af4b2ce9c92d8a24728e26b0d
+Signed-off-by: Zhao Liang <leo.zhao@intel.com>
+Signed-off-by: Tong, Bo <box.tong@intel.com>
+Reviewed-on: http://android.intel.com:8080/74827
+Reviewed-by: lab_cactus <lab_cactus@intel.com>
+Reviewed-by: buildbot <buildbot@intel.com>
+Tested-by: buildbot <buildbot@intel.com>
+---
+ include/media/stagefright/MPEG4Writer.h |    1 +
+ media/libstagefright/MPEG4Writer.cpp    |   42 +++++++++++++++++++++++-------
+ 2 files changed, 33 insertions(+), 10 deletions(-)
+
+diff --git a/include/media/stagefright/MPEG4Writer.h b/include/media/stagefright/MPEG4Writer.h
+index 88df6b0..5909e69 100644
+--- a/include/media/stagefright/MPEG4Writer.h
++++ b/include/media/stagefright/MPEG4Writer.h
+@@ -174,6 +174,7 @@ private:
+     // Acquire lock before calling these methods
+     off64_t addSample_l(MediaBuffer *buffer);
+     off64_t addLengthPrefixedSample_l(MediaBuffer *buffer);
++    off64_t addLengthPrefixedSample_lex(MediaBuffer *buffer); //To handle length prefixed avc sample
+ 
+     bool exceedsFileSizeLimit();
+     bool use32BitFileOffset() const;
+diff --git a/media/libstagefright/MPEG4Writer.cpp b/media/libstagefright/MPEG4Writer.cpp
+index 316f669..89e5362 100644
+--- a/media/libstagefright/MPEG4Writer.cpp
++++ b/media/libstagefright/MPEG4Writer.cpp
+@@ -69,6 +69,7 @@ public:
+     void addChunkOffset(off64_t offset);
+     int32_t getTrackId() const { return mTrackId; }
+     status_t dump(int fd, const Vector<String16>& args) const;
++    bool isStartCodePrefixed() const { return mStartCodePrefixed; }
+ 
+ private:
+     enum {
+@@ -208,6 +209,7 @@ private:
+     bool mIsAvc;
+     bool mIsAudio;
+     bool mIsMPEG4;
++    bool mStartCodePrefixed;
+     int32_t mTrackId;
+     int64_t mTrackDurationUs;
+     int64_t mMaxChunkDurationUs;
+@@ -1031,9 +1033,9 @@ off64_t MPEG4Writer::addSample_l(MediaBuffer *buffer) {
+     return old_offset;
+ }
+ 
+-static void StripStartcode(MediaBuffer *buffer) {
++static bool StripStartcode(MediaBuffer *buffer) {
+     if (buffer->range_length() < 4) {
+-        return;
++        return false;
+     }
+ 
+     const uint8_t *ptr =
+@@ -1042,6 +1044,11 @@ static void StripStartcode(MediaBuffer *buffer) {
+     if (!memcmp(ptr, "\x00\x00\x00\x01", 4)) {
+         buffer->set_range(
+                 buffer->range_offset() + 4, buffer->range_length() - 4);
++        //start code prefixed
++        return true;
++    } else {
++        //nal length prefixed
++        return false;
+     }
+ }
+ 
+@@ -1079,6 +1086,18 @@ off64_t MPEG4Writer::addLengthPrefixedSample_l(MediaBuffer *buffer) {
+     return old_offset;
+ }
+ 
++//To handle length prefixed avc sample
++off64_t MPEG4Writer::addLengthPrefixedSample_lex(MediaBuffer *buffer) {
++
++    off_t old_offset = mOffset;
++    size_t length = buffer->range_length();
++    if(!mUse4ByteNalLength)
++        CHECK(length < 65536);
++    ::write(mFd, (const uint8_t *)buffer->data() + buffer->range_offset(), length);
++    mOffset += length;
++    return old_offset;
++}
++
+ size_t MPEG4Writer::write(
+         const void *ptr, size_t size, size_t nmemb) {
+ 
+@@ -1348,6 +1367,7 @@ MPEG4Writer::Track::Track(
+       mCodecSpecificDataSize(0),
+       mGotAllCodecSpecificData(false),
+       mReachedEOS(false),
++      mStartCodePrefixed(true),
+       mRotation(0) {
+     getCodecSpecificDataFromInputFormatIfPossible();
+ 
+@@ -1551,7 +1571,7 @@ void MPEG4Writer::writeChunkToFile(Chunk* chunk) {
+         List<MediaBuffer *>::iterator it = chunk->mSamples.begin();
+ 
+         off64_t offset = chunk->mTrack->isAvc()
+-                                ? addLengthPrefixedSample_l(*it)
++                                ? (chunk->mTrack->isStartCodePrefixed() ? addLengthPrefixedSample_l(*it) : addLengthPrefixedSample_lex(*it))
+                                 : addSample_l(*it);
+ 
+         if (isFirstSample) {
+@@ -2146,14 +2166,17 @@ status_t MPEG4Writer::Track::threadEntry() {
+         buffer->release();
+         buffer = NULL;
+ 
+-        if (mIsAvc) StripStartcode(copy);
++        if (mIsAvc)
++            mStartCodePrefixed = StripStartcode(copy);
+ 
+         size_t sampleSize = copy->range_length();
+         if (mIsAvc) {
+-            if (mOwner->useNalLengthFour()) {
+-                sampleSize += 4;
+-            } else {
+-                sampleSize += 2;
++            if(mStartCodePrefixed) {
++                if (mOwner->useNalLengthFour()) {
++                    sampleSize += 4;
++                } else {
++                    sampleSize += 2;
++                }
+             }
+         }
+ 
+@@ -2308,8 +2331,7 @@ status_t MPEG4Writer::Track::threadEntry() {
+             trackProgressStatus(timestampUs);
+         }
+         if (!hasMultipleTracks) {
+-            off64_t offset = mIsAvc? mOwner->addLengthPrefixedSample_l(copy)
+-                                 : mOwner->addSample_l(copy);
++            off64_t offset = mIsAvc? (mStartCodePrefixed ? mOwner->addLengthPrefixedSample_l(copy) : mOwner->addLengthPrefixedSample_lex(copy)) : mOwner->addSample_l(copy);
+ 
+             uint32_t count = (mOwner->use32BitFileOffset()
+                         ? mStcoTableEntries->count()
+-- 
+1.7.4.1
+

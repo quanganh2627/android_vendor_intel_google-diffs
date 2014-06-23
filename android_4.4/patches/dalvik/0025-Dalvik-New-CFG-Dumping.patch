@@ -1,0 +1,626 @@
+From 8e22b0142ff1b71122b59d981a3481ed74a8fc39 Mon Sep 17 00:00:00 2001
+From: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Date: Mon, 29 Oct 2012 16:16:49 -0700
+Subject: Dalvik: New CFG Dumping
+
+BZ: 60166
+
+Enables better dumping of the CFG before certain loop analysis has been performed via
+the dvmCompilerDumpBasicBlocks function.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I9dfd666d5490360efc0acc9ab164320f56fd3e16
+Orig-MCG-Change-Id: Ib7d1a45e5d7f41fc85c0d869520267373a57176d
+Signed-off-by: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/Compiler.h   |   11 ++-
+ vm/compiler/Dataflow.cpp |  184 +++++++++++++++++++++++++---
+ vm/compiler/Frontend.cpp |  303 ++++++++++++++++++++++++++++++++++++++-------
+ 3 files changed, 430 insertions(+), 68 deletions(-)
+
+diff --git a/vm/compiler/Compiler.h b/vm/compiler/Compiler.h
+index d279ab4..2c84d8a 100644
+--- a/vm/compiler/Compiler.h
++++ b/vm/compiler/Compiler.h
+@@ -238,6 +238,13 @@ char *dvmCompilerGetDalvikDisassembly(const DecodedInstruction *insn,
+                                       const char *note);
+ char *dvmCompilerFullDisassembler(const struct CompilationUnit *cUnit,
+                                   const struct MIR *mir);
++
++void dvmCompilerExtendedDisassembler (const CompilationUnit *cUnit,
++                                      const MIR *mir,
++                                      const DecodedInstruction *insn,
++                                      char *buffer,
++                                      int len);
++
+ char *dvmCompilerGetSSAString(struct CompilationUnit *cUnit,
+                               struct SSARepresentation *ssaRep);
+ void dvmCompilerDataFlowAnalysisDispatcher(struct CompilationUnit *cUnit,
+@@ -252,7 +259,9 @@ JitTraceDescription *dvmCopyTraceDescriptor(const u2 *pc,
+ extern "C" void *dvmCompilerGetInterpretTemplate();
+ JitInstructionSetType dvmCompilerGetInterpretTemplateSet();
+ u8 dvmGetRegResourceMask(int reg);
+-void dvmDumpCFG(struct CompilationUnit *cUnit, const char *dirPrefix);
++void dvmDumpCFG(struct CompilationUnit *cUnit, const char *dirPrefix, const char *suffix="");
++void dvmCompilerDumpBasicBlocks (CompilationUnit *cUnit, const char *dirPrefix, const char *suffix = "");
++
+ bool dvmIsOpcodeSupportedByJit(Opcode opcode);
+ 
+ #endif  // DALVIK_VM_COMPILER_H_
+diff --git a/vm/compiler/Dataflow.cpp b/vm/compiler/Dataflow.cpp
+index 7bed839..48d65fa 100644
+--- a/vm/compiler/Dataflow.cpp
++++ b/vm/compiler/Dataflow.cpp
+@@ -829,12 +829,7 @@ char *dvmCompilerGetDalvikDisassembly(const DecodedInstruction *insn,
+ 
+     buffer[0] = 0;
+     if ((int)opcode >= (int)kMirOpFirst) {
+-        if ((int)opcode == (int)kMirOpPhi) {
+-            strcpy(buffer, "PHI");
+-        }
+-        else {
+-            sprintf(buffer, "Opcode %#x", opcode);
+-        }
++        dvmCompilerExtendedDisassembler (NULL, NULL, insn, buffer, sizeof (buffer));
+         flags = 0;
+     } else {
+         strcpy(buffer, dexGetOpcodeName(opcode));
+@@ -915,6 +910,168 @@ char *getSSAName(const CompilationUnit *cUnit, int ssaReg, char *name)
+     return name;
+ }
+ 
++
++/**
++ * @brief Add a dissassembler for the extended instructions
++ * @param cUnit the CompilationUnit (can be NULL)
++ * @param mir the MIR (can be NULL)
++ * @param insn the DecodedInstruction
++ * @param buffer the buffer in which to dissassemble
++ * @param len length of the buffer
++ */
++void dvmCompilerExtendedDisassembler (const CompilationUnit *cUnit,
++                                       const MIR *mir,
++                                       const DecodedInstruction *insn,
++                                       char *buffer,
++                                       int len)
++{
++    char operand0[256],
++         operand1[256],
++         operand2[256];
++    //Buffer and insn cannot be NULL, mir and cUnit can
++    assert (buffer != NULL && insn != NULL);
++
++    //Set to 0
++    buffer[0] = 0;
++
++    ExtendedMIROpcode value = static_cast<ExtendedMIROpcode> (insn->opcode);
++
++    //If not an extended, we can just send it to whoever is best suited
++    if (value < kMirOpFirst)
++    {
++        if (cUnit != NULL && mir != NULL && mir->ssaRep != NULL)
++        {
++            char *tmp = dvmCompilerFullDisassembler(cUnit, mir);
++            snprintf (buffer, len, "%s", tmp);
++        }
++        else
++        {
++            char *tmp = dvmCompilerGetDalvikDisassembly(insn, NULL);
++            snprintf (buffer, len, "%s", tmp);
++        }
++        return;
++    }
++
++    switch (value)
++    {
++        case kMirOpPhi:
++            {
++                //Start by putting PHI
++                snprintf (buffer, len, "PHI");
++
++                if (cUnit != NULL && mir != NULL && mir->ssaRep != NULL)
++                {
++                    int i, left, offset;
++
++                    offset = strlen (buffer);
++                    left = len - strlen (buffer);
++
++                    if (left < 0)
++                        break;
++
++                    snprintf(buffer + offset, left, " %s = (%s",
++                            getSSAName(cUnit, mir->ssaRep->defs[0], operand0),
++                            getSSAName(cUnit, mir->ssaRep->uses[0], operand1));
++                    for (i = 1; i < mir->ssaRep->numUses; i++) {
++                        offset = strlen (buffer);
++                        left = len - offset;
++
++                        if (left <= 0)
++                            break;
++
++                        snprintf(buffer + strlen (buffer), len - left, ", %s",
++                                getSSAName(cUnit, mir->ssaRep->uses[i], operand0));
++                    }
++
++                    offset = strlen (buffer);
++                    left = len - offset;
++
++                    if (left > 1)
++                        snprintf(buffer + offset, left, ")");
++                }
++            }
++            break;
++        case kMirOpNullNRangeUpCheck:
++            if (cUnit != NULL && mir != NULL && mir->ssaRep != NULL)
++            {
++                snprintf (buffer, len, "Null/Range Up Check: %s[%s], cond reg %s, m: %d, M: %d, b: %d",
++                        getSSAName (cUnit, insn->vA, operand0),
++                        getSSAName (cUnit, insn->vB, operand1),
++                        getSSAName (cUnit, insn->vC, operand2),
++                        insn->arg[0],
++                        insn->arg[1],
++                        insn->arg[2]);
++            }
++            else
++            {
++                snprintf (buffer, len, "Null/Range Up Check: v%d[v%d], cond reg v%d, m: %d, M: %d, b: %d",
++                        insn->vA,
++                        insn->vB,
++                        insn->vC,
++                        insn->arg[0],
++                        insn->arg[1],
++                        insn->arg[2]);
++            }
++            break;
++        case kMirOpNullNRangeDownCheck:
++            if (cUnit != NULL && mir != NULL && mir->ssaRep != NULL)
++            {
++                snprintf (buffer, len, "Null/Range Down Check: %s[%s], cond reg %s, m: %d, M: %d, b: %d",
++                        getSSAName (cUnit, insn->vA, operand0),
++                        getSSAName (cUnit, insn->vB, operand1),
++                        getSSAName (cUnit, insn->vC, operand2),
++                        insn->arg[0],
++                        insn->arg[1],
++                        insn->arg[2]);
++            }
++            else
++            {
++                snprintf (buffer, len, "Null/Range Down Check: v%d[v%d], cond reg v%d, m: %d, M: %d, b: %d",
++                        insn->vA,
++                        insn->vB,
++                        insn->vC,
++                        insn->arg[0],
++                        insn->arg[1],
++                        insn->arg[2]);
++            }
++            break;
++        case kMirOpLowerBound:
++            if (cUnit != NULL && mir != NULL && mir->ssaRep != NULL)
++            {
++                snprintf (buffer, len, "Lower Bound: %s, min: %d",
++                        getSSAName (cUnit, mir->dalvikInsn.vB, operand0),
++                        mir->dalvikInsn.vB);
++            }
++            else
++            {
++                snprintf (buffer, len, "Lower Bound: v%d, min: %d",
++                        insn->vA,
++                        insn->vB);
++            }
++            break;
++        case kMirOpPunt:
++            snprintf (buffer, len, "Punt");
++            break;
++        case kMirOpCheckInlinePrediction:
++            if (cUnit != NULL && mir != NULL && mir->ssaRep != NULL)
++            {
++                snprintf (buffer, len, "Inline Prediction: %s, Class %s",
++                        getSSAName (cUnit, mir->dalvikInsn.vB, operand0),
++                        mir->meta.callsiteInfo->classDescriptor);
++            }
++            else
++            {
++                snprintf (buffer, len, "Inline Prediction: v%d, Class %s",
++                        insn->vC,
++                        mir->meta.callsiteInfo->classDescriptor);
++            }
++            break;
++        default:
++            snprintf (buffer, len, "Unknown Extended Opcode");
++            break;
++    }
++}
++
+ /*
+  * Dalvik instruction disassembler with optional SSA printing.
+  */
+@@ -932,20 +1089,7 @@ char *dvmCompilerFullDisassembler(const CompilationUnit *cUnit,
+ 
+     buffer[0] = 0;
+     if (opcode >= kMirOpFirst) {
+-        if (opcode == kMirOpPhi) {
+-            snprintf(buffer, 256, "PHI %s = (%s",
+-                     getSSAName(cUnit, mir->ssaRep->defs[0], operand0),
+-                     getSSAName(cUnit, mir->ssaRep->uses[0], operand1));
+-            int i;
+-            for (i = 1; i < mir->ssaRep->numUses; i++) {
+-                snprintf(buffer + strlen(buffer), 256, ", %s",
+-                         getSSAName(cUnit, mir->ssaRep->uses[i], operand0));
+-            }
+-            snprintf(buffer + strlen(buffer), 256, ")");
+-        }
+-        else {
+-            sprintf(buffer, "Opcode %#x", opcode);
+-        }
++        dvmCompilerExtendedDisassembler (cUnit, mir, insn, buffer, sizeof (buffer));
+         goto done;
+     } else {
+         strcpy(buffer, dexGetOpcodeName((Opcode)opcode));
+diff --git a/vm/compiler/Frontend.cpp b/vm/compiler/Frontend.cpp
+index af11eed..04e1a2e 100644
+--- a/vm/compiler/Frontend.cpp
++++ b/vm/compiler/Frontend.cpp
+@@ -36,6 +36,9 @@ extern int opcodeJit[kNumPackedOpcodes];
+ static void SendTraceInfoToVTune(CompilationUnit *cUnit, JitTraceDescription *desc);
+ #endif
+ 
++//Need it for UINT_MAX
++#include <limits.h>
++
+ 
+ static inline bool contentIsInsn(const u2 *codePtr) {
+     u2 instr = *codePtr;
+@@ -641,31 +644,84 @@ static BasicBlock *findBlock(CompilationUnit *cUnit,
+     return NULL;
+ }
+ 
+-/* Dump the CFG into a DOT graph */
+-void dvmDumpCFG(CompilationUnit *cUnit, const char *dirPrefix)
++/**
++  * @brief Request a File creation with a given name
++  * @param cUnit the CompilationUnit
++  * @param dirPrefix the directory prefix to be used
++  * @param suffix a suffix string for the file name
++  * @return returns a FILE or NULL if creation failed
++  */
++static FILE *dvmCompilerDumpGetFile (CompilationUnit *cUnit, const char *dirPrefix, const char *suffix = "")
+ {
+-    const Method *method = cUnit->method;
+-    FILE *file;
+-    char *signature = dexProtoCopyMethodDescriptor(&method->prototype);
++    const Method *method;
++    char *signature;
++    char id[80];
+     char startOffset[80];
+-    sprintf(startOffset, "_%x", cUnit->entryBlock->fallThrough->startOffset);
+-    char *fileName = (char *) dvmCompilerNew(
+-                                  strlen(dirPrefix) +
+-                                  strlen(method->clazz->descriptor) +
+-                                  strlen(method->name) +
+-                                  strlen(signature) +
+-                                  strlen(startOffset) +
+-                                  strlen(".dot") + 1, true);
+-    sprintf(fileName, "%s%s%s%s%s.dot", dirPrefix,
+-            method->clazz->descriptor, method->name, signature, startOffset);
+-    free(signature);
++    char *fileName;
++    int length;
++
++    //Not thread safe
++    static int cnt = 0;
++
++    //Start with some paranoid handling:
++    if (cUnit == NULL || cUnit->method == NULL || cUnit->method->clazz == NULL)
++        return NULL;
++
++    //Create the filename
++    method = cUnit->method;
++    signature = dexProtoCopyMethodDescriptor(&method->prototype);
++
++    //Add unique counter, and increment it
++    snprintf (id, sizeof (id), "_%d", cnt);
++    cnt++;
++
++    //Also get minimim startOffset: no offset can be UINT_MAX so it will be our start test
++    unsigned int minOffset = UINT_MAX;
++
++    //Iterate through them
++    GrowableListIterator iterator;
++    dvmGrowableListIteratorInit(&cUnit->blockList, &iterator);
++    while (true) {
++        BasicBlock *bbscan = (BasicBlock *) dvmGrowableListIteratorNext(&iterator);
++        if (bbscan == NULL) break;
++
++        //We only care about code blocks for this
++        if (bbscan->blockType != kDalvikByteCode)
++        {
++            continue;
++        }
++
++        //Get offset
++        unsigned int tmpOffset = bbscan->startOffset;
++
++        if (minOffset > tmpOffset)
++        {
++            minOffset = tmpOffset;
++        }
++    }
++
++    snprintf (startOffset, sizeof (startOffset), "_%x", minOffset);
++
++    length = strlen(dirPrefix) +
++                 strlen(method->clazz->descriptor) +
++                 strlen(method->name) +
++                 strlen(signature) +
++                 strlen(id) +
++                 strlen(startOffset) +
++                 strlen(suffix) +
++                 strlen(".dot") + 1;
++    fileName = (char *) dvmCompilerNew(length, true);
++
++    snprintf(fileName, length, "%s%s%s%s%s%s%s.dot", dirPrefix,
++            method->clazz->descriptor, method->name, signature, id, startOffset, suffix);
++    free(signature), signature = NULL;
+ 
+     /*
+      * Convert the special characters into a filesystem- and shell-friendly
+      * format.
+      */
+     int i;
+-    for (i = strlen(dirPrefix); fileName[i]; i++) {
++    for (i = strlen(dirPrefix); fileName[i] != '\0'; i++) {
+         if (fileName[i] == '/') {
+             fileName[i] = '_';
+         } else if (fileName[i] == ';') {
+@@ -678,23 +734,22 @@ void dvmDumpCFG(CompilationUnit *cUnit, const char *dirPrefix)
+             fileName[i] = '=';
+         }
+     }
+-    file = fopen(fileName, "w");
+-    if (file == NULL) {
+-        return;
+-    }
+-    fprintf(file, "digraph G {\n");
+-
+-    fprintf(file, "  rankdir=TB\n");
+ 
+-    int numReachableBlocks = cUnit->numReachableBlocks;
+-    int idx;
+-    const GrowableList *blockList = &cUnit->blockList;
++    //Now actually return the file opening
++    return fopen(fileName, "w");
++}
+ 
+-    for (idx = 0; idx < numReachableBlocks; idx++) {
+-        int blockIdx = cUnit->dfsOrder.elemList[idx];
+-        BasicBlock *bb = (BasicBlock *) dvmGrowableListGetElement(blockList,
+-                                                                  blockIdx);
+-        if (bb == NULL) break;
++/**
++  * @brief Dump a BasicBlock
++  * @param cUnit the CompilationUnit
++  * @param bb the BasicBlock
++  * @param file the File in which to dump the BasicBlock
++  * @param dominators do we wish to dump the domination information? (default == false)
++  */
++void dvmDumpBasicBlock (CompilationUnit *cUnit, BasicBlock *bb, FILE *file, bool dominators = false)
++{
++        if (bb == NULL)
++            return;
+         if (bb->blockType == kEntryBlock) {
+             fprintf(file, "  entry [shape=Mdiamond];\n");
+         } else if (bb->blockType == kExitBlock) {
+@@ -706,11 +761,65 @@ void dvmDumpCFG(CompilationUnit *cUnit, const char *dirPrefix)
+             fprintf(file, "    {block id %d\\l}%s\\\n", bb->id,
+                     bb->firstMIRInsn ? " | " : " ");
+             for (mir = bb->firstMIRInsn; mir; mir = mir->next) {
+-                fprintf(file, "    {%04x %s\\l}%s\\\n", mir->offset,
+-                        mir->ssaRep ?
+-                            dvmCompilerFullDisassembler(cUnit, mir) :
+-                            dexGetOpcodeName(mir->dalvikInsn.opcode),
+-                        mir->next ? " | " : " ");
++                const char *tmp = NULL;
++                //Prefer the full information with SSA
++                if (mir->ssaRep != NULL)
++                {
++                    tmp = dvmCompilerFullDisassembler(cUnit, mir);
++                }
++                else
++                {
++                    //Otherwise, prefer the dvmCompilerGetDalvikDisassembly output
++                    tmp = dvmCompilerGetDalvikDisassembly (&(mir->dalvikInsn), NULL);
++
++                    //If all else fails, get the opcode name but only if not extended
++                    if (tmp == NULL)
++                    {
++                        if (static_cast<int> (mir->dalvikInsn.opcode) < static_cast<int> (kMirOpFirst))
++                        {
++                            tmp = dexGetOpcodeName(mir->dalvikInsn.opcode);
++                        }
++                        else
++                        {
++                            ExtendedMIROpcode value = static_cast<ExtendedMIROpcode> (mir->dalvikInsn.opcode);
++
++                            switch (value)
++                            {
++                                case kMirOpPhi:
++                                    tmp = "PHI";
++                                    break;
++                                case kMirOpNullNRangeUpCheck:
++                                    tmp = "Null/Range Up Check";
++                                    break;
++                                case kMirOpNullNRangeDownCheck:
++                                    tmp = "Null/Range Down Check";
++                                    break;
++                                case kMirOpLowerBound:
++                                    tmp = "Lower Bound";
++                                    break;
++                                case kMirOpPunt:
++                                    tmp = "Punt";
++                                    break;
++                                case kMirOpCheckInlinePrediction:
++                                    {
++                                        int len = 0;
++                                        const char *start = "Inline Prediction: ";
++                                        len = 1 + strlen (start) + strlen (mir->meta.callsiteInfo->classDescriptor);
++                                        char *intern = static_cast<char *> (dvmCompilerNew (len, false));
++
++                                        snprintf (intern, len, "%s%s", start, mir->meta.callsiteInfo->classDescriptor);
++                                        tmp = intern;
++                                    }
++                                    break;
++                                default:
++                                    tmp = "Unknown Extended Opcode";
++                                    break;
++                            }
++                        }
++                    }
++                }
++
++                fprintf(file, "    {%04x %s\\l}%s\\\n", mir->offset, tmp, mir->next ? " | " : " ");
+             }
+             fprintf(file, "  }\"];\n\n");
+         } else if (bb->blockType == kExceptionHandling) {
+@@ -792,23 +901,123 @@ void dvmDumpCFG(CompilationUnit *cUnit, const char *dirPrefix)
+         fprintf(file, "\n");
+ 
+         /*
+-         * If we need to debug the dominator tree, uncomment the following code
++         * If we need to debug the dominator tree
+          */
+-#if 1
+-        dvmGetBlockName(bb, blockName1);
+-        fprintf(file, "  cfg%s [label=\"%s\", shape=none];\n",
+-                blockName1, blockName1);
+-        if (bb->iDom) {
+-            dvmGetBlockName(bb->iDom, blockName2);
+-            fprintf(file, "  cfg%s:s -> cfg%s:n\n\n",
+-                    blockName2, blockName1);
++        if (dominators == true)
++        {
++            dvmGetBlockName(bb, blockName1);
++            fprintf(file, "  cfg%s [label=\"%s\", shape=none];\n",
++                    blockName1, blockName1);
++            if (bb->iDom) {
++                dvmGetBlockName(bb->iDom, blockName2);
++                fprintf(file, "  cfg%s:s -> cfg%s:n\n\n",
++                        blockName2, blockName1);
++            }
+         }
+-#endif
++}
++
++/**
++  * @brief Dump the CFG into a DOT graph
++  * @param cUnit the CompilationUnit
++  * @param dirPrefix the directory prefix to be used
++  * @param suffix a suffix string for the file name
++  */
++void dvmDumpCFG(CompilationUnit *cUnit, const char *dirPrefix, const char *suffix)
++{
++    FILE *file = dvmCompilerDumpGetFile (cUnit, dirPrefix, suffix);
++
++    if (file == NULL)
++        return;
++
++    fprintf(file, "digraph G {\n");
++
++    fprintf(file, "  rankdir=TB\n");
++
++    int numReachableBlocks = cUnit->numReachableBlocks;
++    int idx;
++    const GrowableList *blockList = &cUnit->blockList;
++
++    //Dump only the reachable basic blocks
++    for (idx = 0; idx < numReachableBlocks; idx++) {
++        int blockIdx = cUnit->dfsOrder.elemList[idx];
++        BasicBlock *bb = (BasicBlock *) dvmGrowableListGetElement(blockList,
++                                                                  blockIdx);
++        dvmDumpBasicBlock (cUnit, bb, file);
+     }
+     fprintf(file, "}\n");
+     fclose(file);
+ }
+ 
++/* It's ugly but it is the best method available */
++static FILE *dvmCreateGraphFile = NULL;
++/**
++ * @brief Handler for the BasicBlock dumping into a DOT graph, if the block is visted already, do nothing
++ * @param cUnit the CompilationUnit
++ * @param curBlock current block to be dumped
++ * @return whether or not this changes anything for the walker
++ */
++static bool dvmCompilerDumpBasicBlockHandler (CompilationUnit *cUnit, BasicBlock *curBlock)
++{
++    //Paranoid
++    if (dvmCreateGraphFile == NULL)
++        return false;
++
++    //If visited, then we have already dumped it, therefore nothing to do
++    if (curBlock->visited == true)
++        return false;
++    curBlock->visited = true;
++
++    //Dump the basic block
++    dvmDumpBasicBlock (cUnit, curBlock, dvmCreateGraphFile);
++
++    //We did no change
++    return false;
++}
++
++
++/**
++ * @brief Dump the CFG of every BasicBlock into a DOT graph
++ * @param cUnit the CompilationUnit
++ * @param dirPrefix the directory prefix to be used
++ * @param suffix a suffix string for the file name
++ */
++void dvmCompilerDumpBasicBlocks (CompilationUnit *cUnit, const char *dirPrefix, const char *suffix)
++{
++    //Clear visiting flags
++    dvmCompilerDataFlowAnalysisDispatcher(cUnit,
++            dvmCompilerClearVisitedFlag,
++            kAllNodes,
++            false /* isIterative */);
++
++    dvmCreateGraphFile = dvmCompilerDumpGetFile (cUnit, dirPrefix, suffix);
++
++    //Paranoid
++    if (dvmCreateGraphFile != NULL)
++    {
++        //Prepare dot header
++        fprintf (dvmCreateGraphFile, "digraph G {\n");
++
++        //Dump the basic blocks
++        dvmCompilerDataFlowAnalysisDispatcher (cUnit,
++                dvmCompilerDumpBasicBlockHandler,
++                kAllNodes,
++                false);
++
++        //Print out epilogue
++        fprintf (dvmCreateGraphFile, "}\n");
++
++        //Close file
++        fclose (dvmCreateGraphFile), dvmCreateGraphFile = NULL;
++    }
++
++    //Clear visiting flags
++    dvmCompilerDataFlowAnalysisDispatcher(cUnit,
++            dvmCompilerClearVisitedFlag,
++            kAllNodes,
++            false /* isIterative */);
++}
++
++
+ /* Verify if all the successor is connected with all the claimed predecessors */
+ static bool verifyPredInfo(CompilationUnit *cUnit, BasicBlock *bb)
+ {
+-- 
+1.7.4.1
+

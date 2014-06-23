@@ -1,0 +1,198 @@
+From 1c3cc7c410c9874b572e2a0cb245362a35d8083d Mon Sep 17 00:00:00 2001
+From: Udayan Banerji <udayan.banerji@intel.com>
+Date: Mon, 3 Jun 2013 11:03:21 -0700
+Subject: Dalvik: Find sinkable accumulation in the whole expression tree
+
+BZ: 100990
+
+This patch removes the limitation that constants at only the rightmost leaf
+of the expression tree can be removed from accumulations.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I06bd4750197bf371f9f03e1a97bbbb204faf3689
+Orig-MCG-Change-Id: I278cfa474d10b2d8a25152c33a39c2046041600c
+Signed-off-by: Udayan Banerji <udayan.banerji@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/AccumulationSinking.cpp |  113 ++++++++++++++++++++--------------
+ 1 files changed, 66 insertions(+), 47 deletions(-)
+
+diff --git a/vm/compiler/AccumulationSinking.cpp b/vm/compiler/AccumulationSinking.cpp
+index 85bb0c2..33b7785 100644
+--- a/vm/compiler/AccumulationSinking.cpp
++++ b/vm/compiler/AccumulationSinking.cpp
+@@ -217,6 +217,7 @@ static bool checkNoOtherUses(CompilationUnit *cUnit, LoopInformation *info, unsi
+ 
+     assert(defMIR->ssaRep);
+     assert(defMIR->ssaRep->numDefs > 0);
++
+     assert(dvmExtractSSARegister(cUnit, defMIR->ssaRep->defs[0]) == vr
+             || (defMIR->ssaRep->numDefs > 1 && dvmExtractSSARegister(cUnit, defMIR->ssaRep->defs[1]) == vr));
+ 
+@@ -419,7 +420,7 @@ static void buildExpressions(CompilationUnit *cUnit, LoopInformation *info,
+ }
+ 
+ static bool findDanglingConstantsHelper(Expression * expression,
+-        BytecodeExpression * & expressionRef,
++        std::vector< BytecodeExpression *> & expressionRef,
+         const int & inductionVariableIncrement)
+ {
+     if (expression == 0)
+@@ -458,19 +459,21 @@ static bool findDanglingConstantsHelper(Expression * expression,
+     BinaryExpression * binaryExpr =
+             static_cast<BinaryExpression *>(bytecodeExpr);
+ 
+-    //It is easiest if we look for constants on the right of the tree.
+-    //If we want to also consider lhs, then we need to keep track which
+-    //of the subtrees gave us the constant we wanted.
++    //Look at both sides to find the expression containing the
++    //constant. We do however, only care if the constant itself
++    //is the RHS of its expression.
+     Expression * rhsChild = binaryExpr->getRhs();
++    Expression * lhsChild = binaryExpr->getLhs();
+ 
+     //Paranoid, but should never happen because expressions guarantee
+     //non-null children.
+-    if (rhsChild == 0)
++    if (rhsChild == 0 || lhsChild == 0)
+     {
+         return false;
+     }
+ 
+-    bool foundConstant = false;
++    bool foundConstantRight = false;
++    bool foundConstantLeft = false;
+ 
+     //Now we can check if we found linear transformation using a constant.
+     //TODO A better approach here would be to check if expression evaluates to
+@@ -487,17 +490,25 @@ static bool findDanglingConstantsHelper(Expression * expression,
+         int value = constant->getValue<int>();
+ 
+         //Now compare its value with what we are looking for
+-        foundConstant = (value == inductionVariableIncrement);
++        foundConstantRight = (value == inductionVariableIncrement);
+ 
+-        expressionRef = bytecodeExpr;
++        if (foundConstantRight == true)
++        {
++            expressionRef.push_back(bytecodeExpr);
++        }
+     }
+     else
+     {
+-        foundConstant = findDanglingConstantsHelper(rhsChild, expressionRef,
++        //Look for a constant on the right
++        foundConstantRight = findDanglingConstantsHelper(rhsChild, expressionRef,
+                 inductionVariableIncrement);
+     }
+ 
+-    return foundConstant;
++    //Look for a constant on the left
++    foundConstantLeft = findDanglingConstantsHelper(lhsChild, expressionRef,
++            inductionVariableIncrement);
++
++    return (foundConstantLeft || foundConstantRight);
+ }
+ 
+ /**
+@@ -547,47 +558,55 @@ static void findDanglingConstants(LoopInformation *info,
+         //If it is a bytecode expression, it must have a MIR associated
+         assert (bytecodeExprMir != 0);
+ 
+-        BytecodeExpression * expressionToRemove = 0;
++        std::vector<BytecodeExpression *> expressionsToRemoveList;
+ 
+         foundDanglingConstant = findDanglingConstantsHelper(expression,
+-                expressionToRemove, increment);
++                expressionsToRemoveList, increment);
+ 
+-        if (foundDanglingConstant == true && expressionToRemove != 0)
++        if (foundDanglingConstant == true)
+         {
+-            //Get the MIR to remove
+-            MIR * mirToRemove = expressionToRemove->getMir();
+-
+-            //All bytecode expressions must have a MIR
+-            assert (mirToRemove != 0);
+-
+-            //Depending on the IV increment, we must decide which kind of
+-            //expression we need to generate for the sink and which kind
+-            //for the hoist.
+-            ExpressionKind sinkExpKind =
+-                    increment >= 0 ? ExpKind_Add : ExpKind_Sub;
+-            ExpressionKind hoistExpKind =
+-                    sinkExpKind == ExpKind_Sub ? ExpKind_Add : ExpKind_Sub;
+-
+-            //For the new expression we create, we want it to be the same type
+-            //as the one as we are removing.
+-            ExpressionType newMirExpType = expressionToRemove->getExpressionType();
+-
+-            //We are sinking and hoisting operations on the VR that receives result
+-            //that is at top of expression tree.
+-            int resultVR = bytecodeExprMir->dalvikInsn.vA;
+-
+-            //Create MIR to use for sinking
+-            MIR * mirToSink = BytecodeExpression::createMir(sinkExpKind,
+-                    newMirExpType, resultVR, resultVR, chosenIV);
+-
+-            //Create MIR to use for hoisting
+-            MIR * mirToHoist = BytecodeExpression::createMir(hoistExpKind,
+-                    newMirExpType, resultVR, resultVR, chosenIV);
+-
+-            //Now save all MIRs in the output lists
+-            toSink.push_back(mirToSink);
+-            toHoist.push_back(mirToHoist);
+-            toRemove.push_back(mirToRemove);
++            std::vector<BytecodeExpression *>::const_iterator toRemoveIter;
++
++            //Iterate through all the expressions which are candidates for sinking
++            for (toRemoveIter = expressionsToRemoveList.begin(); toRemoveIter != expressionsToRemoveList.end(); toRemoveIter++)
++            {
++                BytecodeExpression * expressionToRemove = *toRemoveIter;
++
++                //Get the MIR to remove
++                MIR * mirToRemove = expressionToRemove->getMir();
++
++                //All bytecode expressions must have a MIR
++                assert (mirToRemove != 0);
++
++                //Depending on the IV increment, we must decide which kind of
++                //expression we need to generate for the sink and which kind
++                //for the hoist.
++                ExpressionKind sinkExpKind =
++                        increment >= 0 ? ExpKind_Add : ExpKind_Sub;
++                ExpressionKind hoistExpKind =
++                        sinkExpKind == ExpKind_Sub ? ExpKind_Add : ExpKind_Sub;
++
++                //For the new expression we create, we want it to be the same type
++                //as the one as we are removing.
++                ExpressionType newMirExpType = expressionToRemove->getExpressionType();
++
++                //We are sinking and hoisting operations on the VR that receives result
++                //that is at top of expression tree.
++                int resultVR = bytecodeExprMir->dalvikInsn.vA;
++
++                //Create MIR to use for sinking
++                MIR * mirToSink = BytecodeExpression::createMir(sinkExpKind,
++                        newMirExpType, resultVR, resultVR, chosenIV);
++
++                //Create MIR to use for hoisting
++                MIR * mirToHoist = BytecodeExpression::createMir(hoistExpKind,
++                        newMirExpType, resultVR, resultVR, chosenIV);
++
++                //Now save all MIRs in the output lists
++                toSink.push_back(mirToSink);
++                toHoist.push_back(mirToHoist);
++                toRemove.push_back(mirToRemove);
++            }
+         }
+     }
+ }
+-- 
+1.7.4.1
+

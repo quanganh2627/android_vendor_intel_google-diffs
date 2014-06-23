@@ -1,0 +1,231 @@
+From 6b68deef79a29c9be51a34b66a02ce3740ff662c Mon Sep 17 00:00:00 2001
+From: Jonathan DE CESCO <jonathan.de.cesco@intel.com>
+Date: Fri, 23 Nov 2012 12:08:54 +0100
+Subject: [PATCH 75/78] wifi: ensure Wifi is off before calibrating
+
+BZ: 73200
+
+Use rfkill to block wpa_supplicant from using the wlan
+interface while calibrating
+
+Change-Id: Ib66bc9660a7adf3f633f66f3e94840d371b4d2fe
+Signed-off-by: Jonathan DE CESCO <jonathan.de.cesco@intel.com>
+Reviewed-on: http://android.intel.com:8080/75717
+Reviewed-by: Casasnovas, QuentinX <quentinx.casasnovas@intel.com>
+Reviewed-by: Tricot, HonoreX <honorex.tricot@intel.com>
+Tested-by: Zurmely, PierreX <pierrex.zurmely@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+---
+ wlan_prov/wlan_provisioning.c |  130 +++++++++++++++++++++++++++++++++++++----
+ 1 files changed, 119 insertions(+), 11 deletions(-)
+
+diff --git a/wlan_prov/wlan_provisioning.c b/wlan_prov/wlan_provisioning.c
+index c5a153d..bf069a4 100644
+--- a/wlan_prov/wlan_provisioning.c
++++ b/wlan_prov/wlan_provisioning.c
+@@ -42,6 +42,7 @@ const char Default_NVS_file_name[] = "/system/etc/wifi/wl1271-nvs.bin";
+ const char WLAN_SDIO_BUS_PATH[] = "/sys/bus/sdio/drivers/wl1271_sdio/";
+ #define WLAN_DRV_SDIO_NAME "wl1271_sdio"
+ #define SYSFS_SDIO_DEVICES_PATH "/sys/bus/sdio/devices/"
++#define RFKILL_SYSFS_DEVICES_PATH "/sys/class/rfkill/"
+ #define NEW_NVS_FILE_NAME		WIFI_PATH"/new-nvs.bin"
+ #define TQS_FILE				"/etc/wifi/TQS.ini"
+ #define MAX_CALIBRATION_TRIES	3
+@@ -113,7 +114,7 @@ static char *parse_uevent_file(char *path, char *pattern)
+ 			/* Pattern found */
+ 			result = (char *) malloc(strlen(line) -
+ 						strlen(pattern) + 1);
+-			strcpy(result, line + strlen(pattern));
++			strlcpy(result, line + strlen(pattern), strlen(line) - strlen(pattern) + 1);
+ 			goto close;
+ 		}
+ 	}
+@@ -125,7 +126,112 @@ out:
+ 	return NULL;
+ }
+ 
+-static int sdio_get_pci_id(char *sdio_device_path, char *pci_id)
++static int parse_type_file(char *path, char *pattern)
++{
++	FILE *file;
++	char line[128];
++	int found=0;
++	if (!path || !pattern)
++		goto out_error;
++
++	file = fopen(path, "r");
++	if (!file) {
++		LOGE("%s: %s file not found\n", __func__, path);
++		goto out_error;
++	}
++
++	while (fgets(line, sizeof(line), file) != NULL) {
++		if (!strncmp(pattern, line, strlen(pattern))) {
++			/* Pattern found */
++			found=1;
++		}
++	}
++
++	fclose(file);
++	if (found)
++		return 1;
++
++out_error:
++	return 0;
++}
++
++static int get_wlan_rfkill_path(char *path, char* result_path, int sizeof_res)
++{
++	int ret = EXIT_FAILURE;
++	struct dirent *entry;
++	DIR *rfkill_path = opendir(path);
++	char *type_entry = NULL;
++	char sub_entry[256];
++	if (!rfkill_path) {
++		LOGE("Cannot open directory, ret with %d\n", errno);
++		ret = -EINVAL;
++		goto exit;
++	}
++
++	do {
++		entry = readdir(rfkill_path);
++		if (!entry)
++			break;
++		if (!strcmp(entry->d_name, "."))
++			continue;
++		if (!strcmp(entry->d_name, ".."))
++			continue;
++
++		/* This folder shall contains only references to folders */
++		snprintf(sub_entry, sizeof(sub_entry), RFKILL_SYSFS_DEVICES_PATH"%s/",entry->d_name);
++		type_entry = find_entry_in_folder(sub_entry, "type");
++		if (type_entry) {
++			/* Read the content of type and check "DRIVER=" */
++			char type_path[256];
++			int found;
++			strlcpy(type_path, sub_entry, sizeof(type_path));
++			strlcat(type_path, "type", sizeof(type_path));
++			/* Parse the file and get the value of type */
++			found = parse_type_file(type_path, "wlan");
++			if (!found) {
++				free(type_entry);
++				continue;
++			} else {
++				strlcpy(result_path, sub_entry, sizeof_res);
++				strlcat(result_path, "state", sizeof_res);
++				ret = EXIT_SUCCESS;
++				free(type_entry);
++				goto out;
++			}
++		}
++	} while (entry);
++
++out:
++	closedir(rfkill_path);
++exit:
++	return ret;
++}
++
++
++static int toggle_wlan_radio(const char *rfkill_state_path, int enable) {
++	FILE *file = NULL;
++	int ret = EXIT_SUCCESS;
++
++	file = fopen(rfkill_state_path, "w");
++	if (!file) {
++		LOGE("Unable to open rfkill file %s in write mode", rfkill_state_path);
++		ret = -EIO;
++		goto out;
++	}
++
++	fprintf(file,"%d", enable);
++
++	if (fclose(file)) {
++		LOGE("Unable to close file");
++		ret = -EIO;
++	}
++	LOGI("toggle_wlan_radio :%s %d", rfkill_state_path, enable);
++out:
++	return ret;
++}
++
++
++static int sdio_get_pci_id(char *sdio_device_path, char *pci_id, int sizeof_dev)
+ {
+ 	int ret = EXIT_FAILURE;
+ 	struct dirent *entry;
+@@ -151,12 +257,11 @@ static int sdio_get_pci_id(char *sdio_device_path, char *pci_id)
+ 		snprintf(sub_entry, sizeof(sub_entry), SYSFS_SDIO_DEVICES_PATH"%s/",entry->d_name);
+ 		uevent_entry = find_entry_in_folder(sub_entry, "uevent");
+ 		if (uevent_entry) {
+-			/* Read the containt of uevent and check "DRIVER=" */
++			/* Read the content of uevent and check "DRIVER=" */
+ 			char uevent_path[256];
+ 			char *result;
+-			strcpy(uevent_path, sub_entry);
+-			strcpy(uevent_path + strlen(sub_entry), "uevent");
+-
++			strlcpy(uevent_path, sub_entry, sizeof(uevent_path));
++			strlcat(uevent_path, "uevent", sizeof(uevent_path));
+ 			/* Parse the file and get the value of DRIVER */
+ 			result = parse_uevent_file(uevent_path, "DRIVER=");
+ 			if (!result) {
+@@ -166,7 +271,7 @@ static int sdio_get_pci_id(char *sdio_device_path, char *pci_id)
+ 
+ 			if  (!strncmp(result, WLAN_DRV_SDIO_NAME,
+ 				     strlen(WLAN_DRV_SDIO_NAME))) {
+-				strcpy(pci_id, entry->d_name);
++				strlcpy(pci_id, entry->d_name, sizeof_dev);
+ 				free(result);
+ 				free(uevent_entry);
+ 				ret = EXIT_SUCCESS;
+@@ -238,6 +343,7 @@ int main(int argc, char **argv)
+ 	unsigned char *ChaabiMacAddr = NULL;
+ 	int res = 0;
+ 	char device_id[64];
++	char lrfkill_path[256];
+ 	int unbind_bind_request = 0;
+ 
+ 	/* Check parameters */
+@@ -246,7 +352,7 @@ int main(int argc, char **argv)
+ 		return -1;
+ 	}
+ 
+-       if (sdio_get_pci_id(SYSFS_SDIO_DEVICES_PATH, device_id)) {
++       if (sdio_get_pci_id(SYSFS_SDIO_DEVICES_PATH, device_id, sizeof(device_id))) {
+ 		LOGE("no wlan device detected, exit...");
+ 		return -1;
+        }
+@@ -271,6 +377,9 @@ int main(int argc, char **argv)
+ 		int nbCalibrationTries = 1;
+ 		LOGI("running calibration, try: %d",nbCalibrationTries);
+ 		unbind_bind_request = 1;
++		if (!get_wlan_rfkill_path(RFKILL_SYSFS_DEVICES_PATH, lrfkill_path, sizeof(lrfkill_path)))
++			toggle_wlan_radio(lrfkill_path, 0);
++
+ 		while (wifi_calibration()) {
+ 			nbCalibrationTries++;
+ 			if(nbCalibrationTries >= MAX_CALIBRATION_TRIES) {
+@@ -334,6 +443,8 @@ int main(int argc, char **argv)
+ 	}
+ 
+ end:
++	/* Take into acount the new NVS firmware */
++	sync();
+ 
+ 	if (unbind_bind_request) {
+ 		LOGI("unbind/bind the driver");
+@@ -354,9 +465,6 @@ end:
+ 		}
+ 	}
+ 
+-	/* Take into acount the new NVS firmware */
+-	sync();
+-
+ 	if(ChaabiMacAddr)
+ 	    free(ChaabiMacAddr);
+ 
+-- 
+1.7.9
+

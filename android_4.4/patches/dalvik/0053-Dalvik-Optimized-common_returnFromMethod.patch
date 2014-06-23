@@ -1,0 +1,947 @@
+From 53cfd00852611813b1ac169e5b0727c595bb83c7 Mon Sep 17 00:00:00 2001
+From: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Date: Mon, 21 Jan 2013 18:02:57 -0800
+Subject: Dalvik: Optimized common_returnFromMethod
+
+BZ: 69637
+
+Instead of generating common_returnFromMethod for every return
+bytecode, we can use pre-written assembly. This patch changes
+return bytecodes so that after updating Thread.retval, they jump
+to a common implementation which is made part of the interpreter.
+This leads to more optimal code because register allocation no
+longer causes useless spills and unspills.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Interpreter
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I069129a0ca3904156e32750cee0436d3f17801a9
+Orig-MCG-Change-Id: Ic163e561f40ad6b63e69a065c85e9bafa97fb692
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/codegen/x86/BytecodeVisitor.cpp  |  147 ++++------------------
+ vm/compiler/codegen/x86/CodegenInterface.cpp |   31 ++++-
+ vm/compiler/codegen/x86/Lower.cpp            |    2 -
+ vm/compiler/codegen/x86/Lower.h              |    3 +
+ vm/compiler/codegen/x86/LowerHelper.cpp      |   24 ++++
+ vm/compiler/codegen/x86/LowerReturn.cpp      |  133 +++++---------------
+ vm/compiler/codegen/x86/NcgHelper.h          |    5 +-
+ vm/mterp/out/InterpAsm-x86.S                 |  168 ++++++++++++++++++++------
+ vm/mterp/x86/footer.S                        |  166 ++++++++++++++++++++------
+ 9 files changed, 377 insertions(+), 302 deletions(-)
+
+diff --git a/vm/compiler/codegen/x86/BytecodeVisitor.cpp b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+index 9db5cb3..f921b05 100644
+--- a/vm/compiler/codegen/x86/BytecodeVisitor.cpp
++++ b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+@@ -3216,102 +3216,6 @@ int updateInvokeRange(TempRegInfo* infoArray, int startIndex, const MIR * curren
+     return j;
+ }
+ 
+-/* update temporaries used by RETURN bytecodes
+-   a temporary is represented by <number, type of the temporary>
+-   */
+-int updateReturnCommon(TempRegInfo* infoArray) {
+-    int numTmps;
+-    infoArray[0].regNum = 1;
+-    infoArray[0].refCount = 4; //DU
+-    infoArray[0].physicalType = LowOpndRegType_scratch;
+-    infoArray[1].regNum = 2;
+-    infoArray[1].refCount = 2; //DU
+-    infoArray[1].physicalType = LowOpndRegType_scratch;
+-    infoArray[2].regNum = PhysicalReg_EAX;
+-    infoArray[2].refCount = 5; //DU
+-    infoArray[2].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
+-
+-    infoArray[3].regNum = 1;
+-#if defined(ENABLE_TRACING)//WITH_DEBUGGER is true WITH_PROFILER can be false
+-    infoArray[3].refCount = 6+4;
+-#else
+-    infoArray[3].refCount = 6; //DU
+-#endif
+-    infoArray[3].physicalType = LowOpndRegType_gp;
+-    infoArray[4].regNum = 2;
+-    infoArray[4].refCount = 4; //DU
+-    infoArray[4].physicalType = LowOpndRegType_gp;
+-    infoArray[5].regNum = 5;
+-    infoArray[5].refCount = 2; //DU
+-    infoArray[5].physicalType = LowOpndRegType_gp;
+-    infoArray[6].regNum = 10;
+-    infoArray[6].refCount = 3;
+-    infoArray[6].physicalType = LowOpndRegType_gp;
+-    infoArray[7].regNum = 6;
+-    infoArray[7].refCount = 4; //DU
+-    infoArray[7].physicalType = LowOpndRegType_gp;
+-    infoArray[8].regNum = 3;
+-    infoArray[8].refCount = 3;
+-    infoArray[8].physicalType = LowOpndRegType_gp;
+-    infoArray[9].regNum = 7;
+-    infoArray[9].refCount = 2; //DU
+-    infoArray[9].physicalType = LowOpndRegType_gp;
+-    numTmps = 12;
+-#if defined(ENABLE_TRACING)
+-    infoArray[12].regNum = 4;
+-    infoArray[12].refCount = 3; //DU
+-    infoArray[12].physicalType = LowOpndRegType_gp;
+-    infoArray[13].regNum = 3;
+-    infoArray[13].refCount = 2; //DU
+-    infoArray[13].physicalType = LowOpndRegType_scratch;
+-    infoArray[14].regNum = 15;
+-    infoArray[14].refCount = 2; //DU
+-    infoArray[14].physicalType = LowOpndRegType_gp;
+-    infoArray[15].regNum = 16;
+-    infoArray[15].refCount = 2; //DU
+-    infoArray[15].physicalType = LowOpndRegType_gp;
+-    infoArray[16].regNum = PhysicalReg_EDX;
+-    infoArray[16].refCount = 2; //DU
+-    infoArray[16].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
+-    infoArray[17].regNum = 6;
+-    infoArray[17].refCount = 2; //DU
+-    infoArray[17].physicalType = LowOpndRegType_scratch;
+-    numTmps = 18;
+-#endif
+-    infoArray[10].regNum = 14;
+-    infoArray[10].refCount = 2; //DU
+-    infoArray[10].physicalType = LowOpndRegType_gp;
+-    infoArray[11].regNum = 4;
+-    infoArray[11].refCount = 2; //DU
+-    infoArray[11].physicalType = LowOpndRegType_scratch;
+-#ifdef DEBUG_CALL_STACK
+-    infoArray[numTmps].regNum = 5;
+-    infoArray[numTmps].refCount = 2;
+-    infoArray[numTmps].physicalType = LowOpndRegType_scratch;
+-    numTmps++;
+-#endif
+-    infoArray[numTmps].regNum = PhysicalReg_EBX;
+-    /* used to hold chaining cell
+-       updated to be returnAddr
+-       then conditionally updated to zero
+-       used to update inJitCodeCache
+-       compare against zero to determine whether to jump to native code
+-       jump to native code (%ebx)
+-    */
+-    infoArray[numTmps].refCount = 3+1+1;
+-    infoArray[numTmps].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
+-    numTmps++;
+-    infoArray[numTmps].regNum = 17;
+-    infoArray[numTmps].refCount = 2; //DU
+-    infoArray[numTmps].physicalType = LowOpndRegType_gp;
+-    numTmps++;
+-    infoArray[numTmps].regNum = 7;
+-    infoArray[numTmps].refCount = 4; //DU
+-    infoArray[numTmps].physicalType = LowOpndRegType_scratch;
+-    numTmps++;
+-    return numTmps;
+-}
+-
+ /* update temporaries used by predicted INVOKE_VIRTUAL & INVOKE_INTERFACE */
+ int updateGenPrediction(TempRegInfo* infoArray, bool isInterface) {
+     infoArray[0].regNum = 40;
+@@ -4402,33 +4306,36 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+ 
+     case OP_RETURN_VOID:
+     case OP_RETURN_VOID_BARRIER:
+-        return updateReturnCommon(infoArray);
++        infoArray[0].regNum = PhysicalReg_ECX;
++        infoArray[0].refCount = 2; //DU
++        infoArray[0].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++        infoArray[1].regNum = PhysicalReg_EDX;
++        infoArray[1].refCount = 1; //D
++        infoArray[1].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++        return 2;
+     case OP_RETURN:
+     case OP_RETURN_OBJECT:
+-        numTmps = updateReturnCommon(infoArray);
+-
+-        infoArray[numTmps].regNum = 21;
+-        infoArray[numTmps].refCount = 2; //DU
+-        infoArray[numTmps].physicalType = LowOpndRegType_gp;
+-        numTmps++;
+-        infoArray[numTmps].regNum = 22;
+-        infoArray[numTmps].refCount = 2; //DU
+-        infoArray[numTmps].physicalType = LowOpndRegType_gp;
+-        numTmps++;
+-        return numTmps;
++        infoArray[0].regNum = 1;
++        infoArray[0].refCount = 2; //DU
++        infoArray[0].physicalType = LowOpndRegType_gp;
++        infoArray[1].regNum = PhysicalReg_ECX;
++        infoArray[1].refCount = 2; //DU
++        infoArray[1].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++        infoArray[2].regNum = PhysicalReg_EDX;
++        infoArray[2].refCount = 1; //D
++        infoArray[2].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++        return 3;
+     case OP_RETURN_WIDE:
+-        numTmps = updateReturnCommon(infoArray);
+-
+-        infoArray[numTmps].regNum = 10;
+-        infoArray[numTmps].refCount = 2; //DU
+-        infoArray[numTmps].physicalType = LowOpndRegType_scratch;
+-        numTmps++;
+-        infoArray[numTmps].regNum = 1;
+-        infoArray[numTmps].refCount = 2; //DU
+-        infoArray[numTmps].physicalType = LowOpndRegType_xmm;
+-        numTmps++;
+-        return numTmps;
+-
++        infoArray[0].regNum = 1;
++        infoArray[0].refCount = 2; //DU
++        infoArray[0].physicalType = LowOpndRegType_xmm;
++        infoArray[1].regNum = PhysicalReg_ECX;
++        infoArray[1].refCount = 2; //DU
++        infoArray[1].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++        infoArray[2].regNum = PhysicalReg_EDX;
++        infoArray[2].refCount = 1; //D
++        infoArray[2].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++        return 3;
+     case OP_INVOKE_VIRTUAL:
+     case OP_INVOKE_VIRTUAL_RANGE:
+ #ifdef PREDICTED_CHAINING
+diff --git a/vm/compiler/codegen/x86/CodegenInterface.cpp b/vm/compiler/codegen/x86/CodegenInterface.cpp
+index 6349d7b..aa4a124 100644
+--- a/vm/compiler/codegen/x86/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/CodegenInterface.cpp
+@@ -26,6 +26,7 @@
+ #include "InstructionGeneration.h"
+ #include "Singleton.h"
+ #include "ExceptionHandling.h"
++#include "Scheduler.h"
+ 
+ #ifdef HAVE_ANDROID_OS
+ #include <cutils/properties.h>
+@@ -400,11 +401,31 @@ done:
+     return;
+ }
+ 
+-void jumpWithRelOffset(char* instAddr, int relOffset) {
+-    stream = instAddr;
+-    OpndSize immSize = estOpndSizeFromImm(relOffset);
+-    relOffset -= getJmpCallInstSize(immSize, JmpCall_uncond);
+-    dump_imm(Mnemonic_JMP, immSize, relOffset);
++/**
++ * @brief Generates a jump with 32-bit relative immediate that jumps
++ * to the target.
++ * @details Updates the instruction stream with the jump.
++ * @param target absolute address of target.
++ */
++void unconditional_jump_rel32(void * target) {
++    // We will need to figure out the immediate to use for the relative
++    // jump, so we need to flush scheduler so that stream is updated.
++    // In most cases this won't affect the schedule since the jump would've
++    // ended the native BB anyway and would've been scheduled last.
++    if(gDvmJit.scheduling)
++        singletonPtr<Scheduler>()->signalEndOfNativeBasicBlock();
++
++    // Calculate the address offset between the destination of jump and the
++    // function we are jumping to.
++    int relOffset = reinterpret_cast<int>(target)
++            - reinterpret_cast<int>(stream);
++
++    // Since instruction pointer will already be updated when executing this,
++    // subtract size of jump instruction
++    relOffset -= getJmpCallInstSize(OpndSize_32, JmpCall_uncond);
++
++    // Generate the unconditional jump now
++    unconditional_jump_int(relOffset, OpndSize_32);
+ }
+ 
+ // works whether instructions for target basic block are generated or not
+diff --git a/vm/compiler/codegen/x86/Lower.cpp b/vm/compiler/codegen/x86/Lower.cpp
+index 9edafeb..2550c5e 100644
+--- a/vm/compiler/codegen/x86/Lower.cpp
++++ b/vm/compiler/codegen/x86/Lower.cpp
+@@ -208,8 +208,6 @@ int iget_iput_helper(int flag);
+ int check_cast_helper(bool instance);
+ int new_array_helper();
+ 
+-int common_returnFromMethod();
+-
+ /*!
+ \brief dump helper functions
+ 
+diff --git a/vm/compiler/codegen/x86/Lower.h b/vm/compiler/codegen/x86/Lower.h
+index 9c07180..af74c47 100644
+--- a/vm/compiler/codegen/x86/Lower.h
++++ b/vm/compiler/codegen/x86/Lower.h
+@@ -818,6 +818,7 @@ void unconditional_jump_int(int target, OpndSize size);
+ void conditional_jump_block(ConditionCode cc, int targetBlockId);
+ void unconditional_jump_block(int targetBlockId);
+ void unconditional_jump_reg(int reg, bool isPhysical);
++void unconditional_jump_rel32(void * target);
+ void call(const char* target);
+ void call_reg(int reg, bool isPhysical);
+ void call_reg_noalloc(int reg, bool isPhysical);
+@@ -963,6 +964,8 @@ int set_glue_dvmdex(int reg, bool isPhysical);
+ int get_suspendCount(int reg, bool isPhysical);
+ int get_return_value(OpndSize size, int reg, bool isPhysical);
+ int set_return_value(OpndSize size, int reg, bool isPhysical);
++void set_return_value(OpndSize size, int sourceReg, bool isSourcePhysical,
++        int scratchRegForSelfThread, int isScratchPhysical);
+ int clear_exception();
+ int get_exception(int reg, bool isPhysical);
+ int set_exception(int reg, bool isPhysical);
+diff --git a/vm/compiler/codegen/x86/LowerHelper.cpp b/vm/compiler/codegen/x86/LowerHelper.cpp
+index 3438390..0fd0d28 100644
+--- a/vm/compiler/codegen/x86/LowerHelper.cpp
++++ b/vm/compiler/codegen/x86/LowerHelper.cpp
+@@ -2618,6 +2618,7 @@ int get_return_value(OpndSize size, int reg, bool isPhysical) {
+     move_mem_to_reg(size, offsetof(Thread, interpSave.retval), C_SCRATCH_1, isScratchPhysical, reg, isPhysical);
+     return 0;
+ }
++
+ //!generate native code to set retval in glue
+ 
+ //!It uses one scratch register
+@@ -2626,6 +2627,29 @@ int set_return_value(OpndSize size, int reg, bool isPhysical) {
+     move_reg_to_mem(size, reg, isPhysical, offsetof(Thread, interpSave.retval), C_SCRATCH_1, isScratchPhysical);
+     return 0;
+ }
++
++/**
++ * @brief Sets self Thread's retval.
++ * @details This needs a scratch register to hold pointer to self.
++ * @param size Size of return value
++ * @param sourceReg Register that holds the return value.
++ * @param isSourcePhysical Flag that determines if the source register is
++ * physical or not. For example, the source register can be a temporary.
++ * @param scratchRegForSelfThread Scratch register to use for self pointer
++ * @param isScratchPhysical Marks whether the scratch register is physical
++ * or not.
++ * @todo Is retval set as expected for 64-bit? If retval is set as 64 bit
++ * but read as 32-bit, is this correct?
++ */
++void set_return_value(OpndSize size, int sourceReg, bool isSourcePhysical,
++        int scratchRegForSelfThread, int isScratchPhysical) {
++    // Get self pointer
++    get_self_pointer(scratchRegForSelfThread, isScratchPhysical);
++
++    // Now set Thread.retval with the source register's value
++    move_reg_to_mem(size, sourceReg, isSourcePhysical,
++            offsetof(Thread, interpSave.retval), scratchRegForSelfThread, isScratchPhysical);
++}
+ //!generate native code to clear exception object in glue
+ 
+ //!It uses two scratch registers
+diff --git a/vm/compiler/codegen/x86/LowerReturn.cpp b/vm/compiler/codegen/x86/LowerReturn.cpp
+index 336a5dc..12f2a28 100644
+--- a/vm/compiler/codegen/x86/LowerReturn.cpp
++++ b/vm/compiler/codegen/x86/LowerReturn.cpp
+@@ -19,96 +19,33 @@
+     \brief This file lowers the following bytecodes: RETURN
+ 
+ */
+-#include "libdex/DexOpcodes.h"
+-#include "libdex/DexFile.h"
+-#include "mterp/Mterp.h"
++
+ #include "Lower.h"
+-#include "enc_wrapper.h"
+ #include "NcgHelper.h"
+ 
+-//4 GPRs and scratch registers used in get_self_pointer, set_glue_method and set_glue_dvmdex
+-//will jump to "gotoBail" if caller method is NULL or if debugger is active
+-//what is %edx for each case? for the latter case, it is 1
+-#define P_GPR_1 PhysicalReg_ECX //must be ecx
+-#define P_GPR_2 PhysicalReg_EBX
+-#define P_SCRATCH_1 PhysicalReg_EDX
+-#define P_OLD_FP PhysicalReg_EAX
+-/*!
+-\brief common section to return from a method
+-
+-If the helper switch is on, this will generate a helper function
+-*/
+-int common_returnFromMethod() {
+-#if defined(ENABLE_TRACING) && !defined(TRACING_OPTION2)
+-    insertMapWorklist(offsetPC, mapFromBCtoNCG[offsetPC], 1); //check when helper switch is on
+-#endif
+-
+-    scratchRegs[0] = PhysicalReg_SCRATCH_7;
+-    get_self_pointer(2, false);
+-
+-    //update rFP to caller stack frame
+-    move_reg_to_reg(OpndSize_32, PhysicalReg_FP, true, 10, false);
+-    move_mem_to_reg(OpndSize_32, -sizeofStackSaveArea+offStackSaveArea_prevFrame, PhysicalReg_FP, true, PhysicalReg_FP, true); //update rFP
+-    //get caller method by accessing the stack save area
+-    move_mem_to_reg(OpndSize_32, -sizeofStackSaveArea+offStackSaveArea_method, PhysicalReg_FP, true, 6, false);
+-    compare_imm_reg(OpndSize_32, 0, 6, false);
+-    conditional_jump(Condition_E, "common_gotoBail_0", false);
+-    get_self_pointer(3, false);
+-    //update glue->method
+-    move_reg_to_mem(OpndSize_32, 6, false, offsetof(Thread, interpSave.method), 2, false);
+-    //get clazz of caller method
+-    move_mem_to_reg(OpndSize_32, offMethod_clazz, 6, false, 14, false);
+-    //update self->frame
+-    move_reg_to_mem(OpndSize_32, PhysicalReg_FP, true, offThread_curFrame, 3, false);
+-    //get method->clazz->pDvmDex
+-    move_mem_to_reg(OpndSize_32, offClassObject_pDvmDex, 14, false, 7, false);
+-    move_reg_to_mem(OpndSize_32, 7, false, offsetof(Thread, interpSave.methodClassDex), 2, false);
+-
+-    compare_imm_mem(OpndSize_32, 0, offsetof(Thread, suspendCount), 2, false); /* suspendCount */
+-    move_mem_to_reg(OpndSize_32, -sizeofStackSaveArea+offStackSaveArea_returnAddr, 10, false, PhysicalReg_EBX, true);
+-    move_imm_to_reg(OpndSize_32, 0, 17, false);
+-    /* if suspendCount is not zero, clear the chaining cell address */
+-    conditional_move_reg_to_reg(OpndSize_32, Condition_NZ, 17, false/*src*/, PhysicalReg_EBX, true/*dst*/);
+-    move_mem_to_reg(OpndSize_32, -sizeofStackSaveArea+offStackSaveArea_savedPc, 10, false, PhysicalReg_EAX, true);
+-    //if returnAddr is not NULL, the thread is still in code cache
+-    move_reg_to_mem(OpndSize_32, PhysicalReg_EBX, true, offThread_inJitCodeCache, 3, false);
+-
+-    if (insertLabel(".LreturnToInterp", true) == -1) //local label
+-        return -1;
+-    //move rPC by 6 (3 bytecode units for INVOKE)
+-    alu_binary_imm_reg(OpndSize_32, add_opc, 6, PhysicalReg_EAX, true);
+-
+-    //returnAddr in %ebx, if not zero, jump to returnAddr
+-    compare_imm_reg(OpndSize_32, 0, PhysicalReg_EBX, true);
+-    conditional_jump(Condition_E, ".LcontinueToInterp", true);
+-#ifdef DEBUG_CALL_STACK3
+-    move_reg_to_reg(OpndSize_32, PhysicalReg_EBX, true, PhysicalReg_ESI, true);
+-    move_imm_to_reg(OpndSize_32, 0xaabb, PhysicalReg_EBX, true);
+-    scratchRegs[0] = PhysicalReg_EAX;
+-    call_debug_dumpSwitch(); //%ebx, %eax, %edx
+-    move_reg_to_reg(OpndSize_32, PhysicalReg_ESI, true, PhysicalReg_EBX, true);
+-    call_debug_dumpSwitch();
+-    move_reg_to_reg(OpndSize_32, PhysicalReg_ESI, true, PhysicalReg_EBX, true);
+-#endif
+-    unconditional_jump_reg(PhysicalReg_EBX, true);
+-    if (insertLabel(".LcontinueToInterp", true) == -1)
+-        return -1;
+-    scratchRegs[0] = PhysicalReg_SCRATCH_4;
+-    typedef void (*vmHelper)(int);
+-    vmHelper funcPtr = dvmJitToInterpNoChainNoProfile; //%eax is the input
+-    move_imm_to_reg(OpndSize_32, (int)funcPtr, C_SCRATCH_1, isScratchPhysical);
+-#if defined(WITH_JIT_TUNING)
+-    /* Return address not in code cache. Indicate that continuing with interpreter.
+-     */
+-    move_imm_to_mem(OpndSize_32, kCallsiteInterpreted, 0, PhysicalReg_ESP, true);
+-#endif
+-    unconditional_jump_reg(C_SCRATCH_1, isScratchPhysical);
+-    touchEax();
++/**
++ * @brief Generates jump to dvmJitHelper_returnFromMethod.
++ * @details Uses one scratch register to make the jump
++ * @return value 0 when successful
++ */
++inline int jumpTocommon_returnFromMethod() {
++    void * funcPtr = reinterpret_cast<void *>(dvmJitHelper_returnFromMethod);
++
++    // Load save area into EDX
++    load_effective_addr(-sizeofStackSaveArea, PhysicalReg_FP, true, PhysicalReg_EDX, true);
++
++    // We may suffer from agen stall here due if edx is not ready
++    // So instead of doing:
++    //   movl offStackSaveArea_prevFrame(%edx), rFP
++    // We can just compute directly
++    //   movl (offStackSaveArea_prevFrame - sizeofStackSaveArea)(rFP), rFP
++    move_mem_to_reg(OpndSize_32,
++            offStackSaveArea_prevFrame - sizeofStackSaveArea, PhysicalReg_FP,
++            true, PhysicalReg_FP, true);
++
++    unconditional_jump_rel32(funcPtr);
+     return 0;
+ }
+-#undef P_GPR_1
+-#undef P_GPR_2
+-#undef P_SCRATCH_1
+ 
+ /**
+  * @brief Generate native code for bytecodes return-void
+@@ -119,10 +56,11 @@ int common_returnFromMethod() {
+ int op_return_void(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_RETURN_VOID
+             || mir->dalvikInsn.opcode == OP_RETURN_VOID_BARRIER);
+-    int retval;
+-    retval = common_returnFromMethod();
+-    rPC += 1;
+-    return retval;
++
++    // Put self pointer in ecx
++    get_self_pointer(PhysicalReg_ECX, true);
++
++    return jumpTocommon_returnFromMethod();
+ }
+ 
+ /**
+@@ -135,12 +73,11 @@ int op_return(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_RETURN
+             || mir->dalvikInsn.opcode == OP_RETURN_OBJECT);
+     u2 vA = mir->dalvikInsn.vA;
+-    get_virtual_reg(vA, OpndSize_32, 22, false);
+-    scratchRegs[0] = PhysicalReg_SCRATCH_1;
+-    set_return_value(OpndSize_32, 22, false);
++    get_virtual_reg(vA, OpndSize_32, 1, false);
+ 
+-    int retVal = common_returnFromMethod();
+-    return retVal;
++    set_return_value(OpndSize_32, 1, false, PhysicalReg_ECX, true);
++
++    return jumpTocommon_returnFromMethod();
+ }
+ 
+ /**
+@@ -152,10 +89,8 @@ int op_return_wide(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_RETURN_WIDE);
+     u2 vA = mir->dalvikInsn.vA;
+     get_virtual_reg(vA, OpndSize_64, 1, false);
+-    scratchRegs[0] = PhysicalReg_SCRATCH_10; scratchRegs[1] = PhysicalReg_Null;
+-    scratchRegs[2] = PhysicalReg_Null; scratchRegs[3] = PhysicalReg_Null;
+-    set_return_value(OpndSize_64, 1, false);
+ 
+-    int retVal = common_returnFromMethod();
+-    return retVal;
++    set_return_value(OpndSize_64, 1, false, PhysicalReg_ECX, true);
++
++    return jumpTocommon_returnFromMethod();
+ }
+diff --git a/vm/compiler/codegen/x86/NcgHelper.h b/vm/compiler/codegen/x86/NcgHelper.h
+index e00396c..6c97b43 100644
+--- a/vm/compiler/codegen/x86/NcgHelper.h
++++ b/vm/compiler/codegen/x86/NcgHelper.h
+@@ -24,6 +24,9 @@ s4 dvmJitHandlePackedSwitch(const s4*, s4, u2, s4);
+ s4 dvmJitHandleSparseSwitch(const s4*, u2, s4);
+ extern "C" void dvmNcgInvokeInterpreter(int pc); //interpreter to execute at pc
+ extern "C" void dvmNcgInvokeNcg(int pc);
++
++#if defined(WITH_JIT)
++extern "C" void dvmJitHelper_returnFromMethod();
+ extern "C" void dvmJitToInterpNormal(int targetpc); //in %ebx
+ extern "C" void dvmJitToInterpTraceSelect(int targetpc); //in %ebx
+ extern "C" void dvmJitToInterpTraceSelectNoChain(int targetpc); //in %ebx
+@@ -31,8 +34,6 @@ extern "C" void dvmJitToInterpNoChain(int targetpc); //in %eax
+ extern "C" void dvmJitToInterpNoChainNoProfile(int targetpc); //in %eax
+ extern "C" void dvmJitToInterpPunt(int targetpc); //in currentPc
+ extern "C" void dvmJitToExceptionThrown(int targetpc); //in currentPc
+-#ifdef DEBUG_CALL_STACK3
+-void debug_dumpSwitch(int); //in %ebx
+ #endif
+ 
+ const Method *dvmJitToPatchPredictedChain(const Method *method,
+diff --git a/vm/mterp/out/InterpAsm-x86.S b/vm/mterp/out/InterpAsm-x86.S
+index 6836e0c..07d976e 100644
+--- a/vm/mterp/out/InterpAsm-x86.S
++++ b/vm/mterp/out/InterpAsm-x86.S
+@@ -5567,7 +5567,6 @@ dvmAsmInstructionStartCode = .L_OP_NOP
+     GOTO_NEXT_R %ecx
+ 
+ 
+-
+ /* ------------------------------ */
+     .balign 16
+ .L_OP_REM_INT: /* 0x94 */
+@@ -5622,7 +5621,6 @@ dvmAsmInstructionStartCode = .L_OP_NOP
+     GOTO_NEXT_R %ecx
+ 
+ 
+-
+ /* ------------------------------ */
+     .balign 16
+ .L_OP_AND_INT: /* 0x95 */
+@@ -16873,58 +16871,50 @@ common_invokeMethodNoRange:
+ /*
+  * Common code for handling a return instruction
+  */
++    .balign 16
+ common_returnFromMethod:
+     movl    rSELF, %ecx
+     SAVEAREA_FROM_FP %eax                       # %eax<- saveArea(old)
+     cmpw    $0, offThread_subMode(%ecx)          # special action needed?
+-    jne     19f                                   # go if so
+-14:
++    jne     .common_returnFromMethod_submodeHandler # go if so
++    // othewise fall through
+ 
+-    movl        offStackSaveArea_prevFrame(%eax), rFP # rFP<- saveArea->PrevFrame
+-    movl        (offStackSaveArea_method - sizeofStackSaveArea)(rFP), rINST # rINST<- method we are returning to
+-    cmpl        $0, rINST               # check for break frame
+-    je          common_gotoBail         # bail if break frame
+-    movl        offThread_curHandlerTable(%ecx),rIBASE
++    // When we get to this point, %ecx must hold self Thread pointer
++    // and %eax must hold the save area
++.common_returnFromMethod_resume:
++    movl        (offStackSaveArea_prevFrame - sizeofStackSaveArea)(rFP), rFP # rFP<- saveArea->PrevFrame
+     movl        offStackSaveArea_savedPc(%eax), rPC # rPC<- saveAreaOld->savedPc
+ #if defined(WITH_JIT)
+-    movl        offStackSaveArea_returnAddr(%eax), %ecx
++    movl        offStackSaveArea_returnAddr(%eax), %eax
+ #endif
+-    movl        rSELF, %eax
+-    movl        rINST, offThread_method(%eax) # glue->method<- newSave->method
++    movl        (offStackSaveArea_method - sizeofStackSaveArea)(rFP), rINST # rINST<- method we are returning to
++    movl        rFP, offThread_curFrame(%ecx) # glue->self->curFrame<- rFP
++    testl       rINST, rINST               # check for break frame
++    je          common_gotoBail         # bail if break frame
++
++    movl        rINST, offThread_method(%ecx) # glue->method<- newSave->method
+     movl        offMethod_clazz(rINST), rINST # rINST<- method->clazz
+-    movl        rFP, offThread_curFrame(%eax) # glue->self->curFrame<- rFP
+ #if defined(WITH_JIT)
+-    //update self->offThread_inJitCodeCache
+-    movl        %ecx, offThread_inJitCodeCache(%eax)
++    movl        %eax, offThread_inJitCodeCache(%ecx)
+ #endif
+     movl        offClassObject_pDvmDex(rINST), rINST # rINST<- method->clazz->pDvmDex
+-    movl        rINST, offThread_methodClassDex(%eax) # glue->pDvmDex<- method->clazz->pDvmDex
++    movl        rINST, offThread_methodClassDex(%ecx) # glue->pDvmDex<- method->clazz->pDvmDex
+ #if defined(WITH_JIT)
+-    cmp         $0, %ecx
+-    je          .returnToBC
+-    movl        %ecx, %eax
++    testl       %eax, %eax
++    je          .common_returnFromMethod_startInterpreting
+     jmp         *%eax
+ #endif
++    // fallthrough so we can execute next bytecode
+ 
+-.returnToBC:
+-
+-#if defined(WITH_JIT)
+-    FETCH_INST_OPCODE  3, %ecx                 # %eax<- next instruction hi; fetch, advance
+-    // %ecx has the opcode
+-    addl         $6, rPC               # 3*2 = 6
+-    SPILL_TMP1   (%ecx)
+-    movl         rSELF, %ecx
+-    FETCH_INST
+-    UNSPILL_TMP1   (%ecx)
+-    movzbl      1(rPC), rINST
+-    jmp     *(rIBASE,%ecx,4)
+-#else
+-    FETCH_INST_WORD 3
++.common_returnFromMethod_startInterpreting:
++    // Restore handler table
++    movl        offThread_curHandlerTable(%ecx),rIBASE
++    // Step over the invoke
++    FETCH_INST_OPCODE 3 %eax
+     ADVANCE_PC 3
+-    GOTO_NEXT
+-#endif
++    GOTO_NEXT_R %eax
+ 
+-19:
++.common_returnFromMethod_submodeHandler:
+     /*
+      * Handle special subMode actions
+      * On entry, rFP: prevFP, %ecx: self, %eax: saveArea
+@@ -16936,9 +16926,111 @@ common_returnFromMethod:
+     movl     %ecx, OUT_ARG0(%esp)             # parameter self
+     call     dvmReportReturn                  # (self)
+     UNSPILL_TMP1(%ebx)
+-    movl     rSELF, %ecx                      # restore self
+     SAVEAREA_FROM_FP %eax                     # restore saveArea
+-    jmp      14b
++    movl     rSELF, %ecx                      # restore self
++    jmp      .common_returnFromMethod_resume   # Resume returning from method
++
++#if defined(WITH_JIT)
++    .balign 16
++    // This implementation is a superset of implementation of .common_returnFromMethod_resume
++    .global dvmJitHelper_returnFromMethod
++dvmJitHelper_returnFromMethod:
++    // When we get to this point, %ecx must hold self Thread pointer
++    // %edx must hold the save area, and rFP must hold previous frame.
++
++    // Update thread's current frame
++    movl     rFP, offThread_curFrame(%ecx)
++    // Since we have updated the frame pointer, we must use edx now to
++    // access the old save area
++    movl     offStackSaveArea_returnAddr(%edx), %eax
++    // Put the method we are return to in rINST
++    movl     (offStackSaveArea_method - sizeofStackSaveArea)(rFP), rINST
++
++    // Check for break frame and bail if necessary
++    testl    rINST, rINST
++    jz       .jitHelper_returnFromMethod_bail
++
++    // Finish up return bookkeeping
++    movl     rINST, offThread_method(%ecx) # self->method <- newSave->method
++    movl     offMethod_clazz(rINST), rINST # rINST <- method->clazz
++    // Update PC with the invoke bytecode only after bailing
++    movl     offStackSaveArea_savedPc(%edx), rPC # rPC <- saveAreaOld->savedPc
++    movl     %eax, offThread_inJitCodeCache(%ecx) # self->inJitCodeCache <- returnAddr
++    movl     offClassObject_pDvmDex(rINST), rINST # rINST <- method->clazz->pDvmDex
++    movl     rINST, offThread_methodClassDex(%ecx) # self->methodClassDex <- method->clazz->pDvmDex
++
++    // Technically here we should check break flags, but x86 JIT doesn't
++    // support single step. Break flags are always set to kInterpSafePoint
++    // when Thread.suspendCount is non-zero, thus this check is okay.
++    cmpl     $0,offThread_suspendCount(%ecx)
++    // If suspend count is non-zero, we should chain to native trace
++    // directly. However, in order to stay consistent with ARM implementation
++    // which jumps to dvmJitToInterpNoChainNoProfile even if break flags are
++    // non-zero, look for a native trace head before deciding to interpret.
++    jnz      .jitHelper_returnFromMethod_lookForNativeTrace
++
++    // Do we have a native trace to return to?
++    testl    %eax, %eax
++#ifndef WITH_SELF_VERIFICATION
++    // At this point, if return address is zero, we can look for a native trace.
++    jz       .jitHelper_returnFromMethod_lookForNativeTrace
++#else
++    // If we have self verification, we need to go to interpreter.
++    // Technically, we shouldn't even consider returning to native trace.
++    // However, since testing for SV was done by still allowing returning
++    // to native address and since the effects of method inlining on SV
++    // are not clear, let's still allow the return to native trace. However,
++    // if return address is zero, instead of going to interpreter to start
++    // interpreting, go to special SV handler.
++    jz       .jitHelper_returnFromMethod_SVHandler
++#endif
++    jmp      *%eax
++
++.jitHelper_returnFromMethod_lookForNativeTrace:
++    // We know that our return address is zero, but we can still
++    // look for a native trace
++    leal     6(rPC),%edx              # Compute PC that skips over the invoke
++    movl     %edx,OUT_ARG0(%esp)
++    movl     %ecx,OUT_ARG1(%esp)      # Move self as parameter
++    call     dvmJitGetTraceAddrThread  # (pc, self)
++    movl     rSELF,%ecx                # Restore self
++    testl    %eax, %eax
++    movl     %eax,offThread_inJitCodeCache(%ecx)  # set inJitCodeCache flag
++    jz       .jitHelper_returnFromMethod_startInterpreting
++    jmp      *%eax
++
++.jitHelper_returnFromMethod_startInterpreting:
++    // When we get here, ecx must hold thread pointer
++#ifdef WITH_JIT_TUNING
++    movl     $kCallsiteInterpreted,OUT_ARG0(%esp)
++    call     dvmBumpNoChain
++    movl     rSELF,%ecx                # Restore self
++#endif
++    // Since we start interpreting, we are no longer in JITed code
++    movl     $0, offThread_inJitCodeCache(%ecx)
++    // Restore handler table
++    movl     offThread_curHandlerTable(%ecx),rIBASE
++    // Step over the invoke
++    FETCH_INST_OPCODE 3 %eax
++    ADVANCE_PC 3
++    GOTO_NEXT_R %eax
++
++.jitHelper_returnFromMethod_bail:
++    movl     $0, offThread_inJitCodeCache(%ecx) # If we bail, we are no longer in jit code cache
++    // PC should be that of the return bytecode before bailing
++    jmp      common_gotoBail         # bail if break frame
++
++#ifdef WITH_SELF_VERIFICATION
++// Handler for self verification
++.jitHelper_returnFromMethod_SVHandler:
++    // When we get here, the PC hasn't been updated to skip over the invoke.
++    // So we put it in eax because that's where dvmJitToInterpNoChainNoProfile
++    // expects it.
++    leal     6(rPC),%eax
++    jmp      dvmJitToInterpNoChainNoProfile
++#endif
++#endif
++
+ 
+ 
+ /*
+diff --git a/vm/mterp/x86/footer.S b/vm/mterp/x86/footer.S
+index dfb3d68..2da775f 100644
+--- a/vm/mterp/x86/footer.S
++++ b/vm/mterp/x86/footer.S
+@@ -650,58 +650,50 @@ common_invokeMethodNoRange:
+ /*
+  * Common code for handling a return instruction
+  */
++    .balign 16
+ common_returnFromMethod:
+     movl    rSELF, %ecx
+     SAVEAREA_FROM_FP %eax                       # %eax<- saveArea(old)
+     cmpw    $$0, offThread_subMode(%ecx)          # special action needed?
+-    jne     19f                                   # go if so
+-14:
++    jne     .common_returnFromMethod_submodeHandler # go if so
++    // othewise fall through
+ 
+-    movl        offStackSaveArea_prevFrame(%eax), rFP # rFP<- saveArea->PrevFrame
+-    movl        (offStackSaveArea_method - sizeofStackSaveArea)(rFP), rINST # rINST<- method we are returning to
+-    cmpl        $$0, rINST               # check for break frame
+-    je          common_gotoBail         # bail if break frame
+-    movl        offThread_curHandlerTable(%ecx),rIBASE
++    // When we get to this point, %ecx must hold self Thread pointer
++    // and %eax must hold the save area
++.common_returnFromMethod_resume:
++    movl        (offStackSaveArea_prevFrame - sizeofStackSaveArea)(rFP), rFP # rFP<- saveArea->PrevFrame
+     movl        offStackSaveArea_savedPc(%eax), rPC # rPC<- saveAreaOld->savedPc
+ #if defined(WITH_JIT)
+-    movl        offStackSaveArea_returnAddr(%eax), %ecx
++    movl        offStackSaveArea_returnAddr(%eax), %eax
+ #endif
+-    movl        rSELF, %eax
+-    movl        rINST, offThread_method(%eax) # glue->method<- newSave->method
++    movl        (offStackSaveArea_method - sizeofStackSaveArea)(rFP), rINST # rINST<- method we are returning to
++    movl        rFP, offThread_curFrame(%ecx) # glue->self->curFrame<- rFP
++    testl       rINST, rINST               # check for break frame
++    je          common_gotoBail         # bail if break frame
++
++    movl        rINST, offThread_method(%ecx) # glue->method<- newSave->method
+     movl        offMethod_clazz(rINST), rINST # rINST<- method->clazz
+-    movl        rFP, offThread_curFrame(%eax) # glue->self->curFrame<- rFP
+ #if defined(WITH_JIT)
+-    //update self->offThread_inJitCodeCache
+-    movl        %ecx, offThread_inJitCodeCache(%eax)
++    movl        %eax, offThread_inJitCodeCache(%ecx)
+ #endif
+     movl        offClassObject_pDvmDex(rINST), rINST # rINST<- method->clazz->pDvmDex
+-    movl        rINST, offThread_methodClassDex(%eax) # glue->pDvmDex<- method->clazz->pDvmDex
++    movl        rINST, offThread_methodClassDex(%ecx) # glue->pDvmDex<- method->clazz->pDvmDex
+ #if defined(WITH_JIT)
+-    cmp         $$0, %ecx
+-    je          .returnToBC
+-    movl        %ecx, %eax
++    testl       %eax, %eax
++    je          .common_returnFromMethod_startInterpreting
+     jmp         *%eax
+ #endif
++    // fallthrough so we can execute next bytecode
+ 
+-.returnToBC:
+-
+-#if defined(WITH_JIT)
+-    FETCH_INST_OPCODE  3, %ecx                 # %eax<- next instruction hi; fetch, advance
+-    // %ecx has the opcode
+-    addl         $$6, rPC               # 3*2 = 6
+-    SPILL_TMP1   (%ecx)
+-    movl         rSELF, %ecx
+-    FETCH_INST
+-    UNSPILL_TMP1   (%ecx)
+-    movzbl      1(rPC), rINST
+-    jmp     *(rIBASE,%ecx,4)
+-#else
+-    FETCH_INST_WORD 3
++.common_returnFromMethod_startInterpreting:
++    // Restore handler table
++    movl        offThread_curHandlerTable(%ecx),rIBASE
++    // Step over the invoke
++    FETCH_INST_OPCODE 3 %eax
+     ADVANCE_PC 3
+-    GOTO_NEXT
+-#endif
++    GOTO_NEXT_R %eax
+ 
+-19:
++.common_returnFromMethod_submodeHandler:
+     /*
+      * Handle special subMode actions
+      * On entry, rFP: prevFP, %ecx: self, %eax: saveArea
+@@ -713,9 +705,111 @@ common_returnFromMethod:
+     movl     %ecx, OUT_ARG0(%esp)             # parameter self
+     call     dvmReportReturn                  # (self)
+     UNSPILL_TMP1(%ebx)
+-    movl     rSELF, %ecx                      # restore self
+     SAVEAREA_FROM_FP %eax                     # restore saveArea
+-    jmp      14b
++    movl     rSELF, %ecx                      # restore self
++    jmp      .common_returnFromMethod_resume   # Resume returning from method
++
++#if defined(WITH_JIT)
++    .balign 16
++    // This implementation is a superset of implementation of .common_returnFromMethod_resume
++    .global dvmJitHelper_returnFromMethod
++dvmJitHelper_returnFromMethod:
++    // When we get to this point, %ecx must hold self Thread pointer
++    // %edx must hold the save area, and rFP must hold previous frame.
++
++    // Update thread's current frame
++    movl     rFP, offThread_curFrame(%ecx)
++    // Since we have updated the frame pointer, we must use edx now to
++    // access the old save area
++    movl     offStackSaveArea_returnAddr(%edx), %eax
++    // Put the method we are return to in rINST
++    movl     (offStackSaveArea_method - sizeofStackSaveArea)(rFP), rINST
++
++    // Check for break frame and bail if necessary
++    testl    rINST, rINST
++    jz       .jitHelper_returnFromMethod_bail
++
++    // Finish up return bookkeeping
++    movl     rINST, offThread_method(%ecx) # self->method <- newSave->method
++    movl     offMethod_clazz(rINST), rINST # rINST <- method->clazz
++    // Update PC with the invoke bytecode only after bailing
++    movl     offStackSaveArea_savedPc(%edx), rPC # rPC <- saveAreaOld->savedPc
++    movl     %eax, offThread_inJitCodeCache(%ecx) # self->inJitCodeCache <- returnAddr
++    movl     offClassObject_pDvmDex(rINST), rINST # rINST <- method->clazz->pDvmDex
++    movl     rINST, offThread_methodClassDex(%ecx) # self->methodClassDex <- method->clazz->pDvmDex
++
++    // Technically here we should check break flags, but x86 JIT doesn't
++    // support single step. Break flags are always set to kInterpSafePoint
++    // when Thread.suspendCount is non-zero, thus this check is okay.
++    cmpl     $$0,offThread_suspendCount(%ecx)
++    // If suspend count is non-zero, we should chain to native trace
++    // directly. However, in order to stay consistent with ARM implementation
++    // which jumps to dvmJitToInterpNoChainNoProfile even if break flags are
++    // non-zero, look for a native trace head before deciding to interpret.
++    jnz      .jitHelper_returnFromMethod_lookForNativeTrace
++
++    // Do we have a native trace to return to?
++    testl    %eax, %eax
++#ifndef WITH_SELF_VERIFICATION
++    // At this point, if return address is zero, we can look for a native trace.
++    jz       .jitHelper_returnFromMethod_lookForNativeTrace
++#else
++    // If we have self verification, we need to go to interpreter.
++    // Technically, we shouldn't even consider returning to native trace.
++    // However, since testing for SV was done by still allowing returning
++    // to native address and since the effects of method inlining on SV
++    // are not clear, let's still allow the return to native trace. However,
++    // if return address is zero, instead of going to interpreter to start
++    // interpreting, go to special SV handler.
++    jz       .jitHelper_returnFromMethod_SVHandler
++#endif
++    jmp      *%eax
++
++.jitHelper_returnFromMethod_lookForNativeTrace:
++    // We know that our return address is zero, but we can still
++    // look for a native trace
++    leal     6(rPC),%edx              # Compute PC that skips over the invoke
++    movl     %edx,OUT_ARG0(%esp)
++    movl     %ecx,OUT_ARG1(%esp)      # Move self as parameter
++    call     dvmJitGetTraceAddrThread  # (pc, self)
++    movl     rSELF,%ecx                # Restore self
++    testl    %eax, %eax
++    movl     %eax,offThread_inJitCodeCache(%ecx)  # set inJitCodeCache flag
++    jz       .jitHelper_returnFromMethod_startInterpreting
++    jmp      *%eax
++
++.jitHelper_returnFromMethod_startInterpreting:
++    // When we get here, ecx must hold thread pointer
++#ifdef WITH_JIT_TUNING
++    movl     $$kCallsiteInterpreted,OUT_ARG0(%esp)
++    call     dvmBumpNoChain
++    movl     rSELF,%ecx                # Restore self
++#endif
++    // Since we start interpreting, we are no longer in JITed code
++    movl     $$0, offThread_inJitCodeCache(%ecx)
++    // Restore handler table
++    movl     offThread_curHandlerTable(%ecx),rIBASE
++    // Step over the invoke
++    FETCH_INST_OPCODE 3 %eax
++    ADVANCE_PC 3
++    GOTO_NEXT_R %eax
++
++.jitHelper_returnFromMethod_bail:
++    movl     $$0, offThread_inJitCodeCache(%ecx) # If we bail, we are no longer in jit code cache
++    // PC should be that of the return bytecode before bailing
++    jmp      common_gotoBail         # bail if break frame
++
++#ifdef WITH_SELF_VERIFICATION
++// Handler for self verification
++.jitHelper_returnFromMethod_SVHandler:
++    // When we get here, the PC hasn't been updated to skip over the invoke.
++    // So we put it in eax because that's where dvmJitToInterpNoChainNoProfile
++    // expects it.
++    leal     6(rPC),%eax
++    jmp      dvmJitToInterpNoChainNoProfile
++#endif
++#endif
++
+ 
+ 
+ /*
+-- 
+1.7.4.1
+

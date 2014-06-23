@@ -1,0 +1,276 @@
+From 2ded7d191527f1421eadabb16041960163c11165 Mon Sep 17 00:00:00 2001
+From: Andrew Boie <andrew.p.boie@intel.com>
+Date: Thu, 9 May 2013 13:31:29 -0700
+Subject: sign_target_files_apks: sign modules and build boot images
+
+Kernel modules are not declared with LOCAL_MODULE in the build
+system; for now just provide a single key to re-sign all the
+.ko files found.
+
+ota_from_target_files will build the boot images itself unless
+it finds prebuilt copies in the TFP under BOOTABLE_IMAGES/.
+Add capability to generate and sign the boot images here.
+
+Change-Id: Ifd83bd9087fa050a27ec7f882093ae5a01940040
+For: AXIA-2386
+Signed-off-by: Andrew Boie <andrew.p.boie@intel.com>
+---
+ core/Makefile                             |    1 +
+ tools/releasetools/common.py              |   31 ++++++++++
+ tools/releasetools/sign_target_files_apks |   87 +++++++++++++++++++++++++++-
+ 3 files changed, 115 insertions(+), 4 deletions(-)
+
+diff --git a/core/Makefile b/core/Makefile
+index 0ad2d3a..7cd78a5 100644
+--- a/core/Makefile
++++ b/core/Makefile
+@@ -1194,6 +1194,7 @@ DISTTOOLS :=  $(HOST_OUT_EXECUTABLES)/minigzip \
+ 	  $(HOST_OUT_EXECUTABLES)/mkuserimg.sh \
+ 	  $(HOST_OUT_EXECUTABLES)/make_ext4fs \
+ 	  $(HOST_OUT_EXECUTABLES)/simg2img \
++	  $(HOST_OUT_EXECUTABLES)/sign-file \
+ 	  $(HOST_OUT_EXECUTABLES)/e2fsck
+ 
+ OTATOOLS := $(DISTTOOLS) \
+diff --git a/tools/releasetools/common.py b/tools/releasetools/common.py
+index 674f9b6..68ade64 100644
+--- a/tools/releasetools/common.py
++++ b/tools/releasetools/common.py
+@@ -509,6 +509,37 @@ def SbsignFile(input_name, output_name, key, password):
+   cert_f.close()
+ 
+ 
++def SignKmodule(input_name, output_name, key, password):
++  """Sign the input_name binary with Linux sign-file, producing output_name.
++  Use the given key and password (the latter may be None if the key
++  does not have a password.
++  """
++
++  # sign-file wants a PEM formatted key and a DER certificate
++  key_data = GetPrivateKeyPEM(ReadPrivateKeyFile(key))
++  key_f = tempfile.NamedTemporaryFile()
++  key_f.write(key_data)
++  key_f.flush()
++
++  cert_data = GetCertificateDER(ReadCertificateFile(key))
++  cert_f = tempfile.NamedTemporaryFile()
++  cert_f.write(cert_data)
++  cert_f.flush()
++
++  cmd = ["sign-file", "-v", "sha512", key_f.name, cert_f.name,
++          input_name, output_name]
++
++  p = Run(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
++  if password is not None:
++    password += "\n"
++  p.communicate(password)
++  if p.returncode != 0:
++    raise ExternalError("sign-file failed: return code %s" % (p.returncode,))
++
++  key_f.close()
++  cert_f.close()
++
++
+ def BinaryCertReplaceFile(input_name, output_name, key, password):
+   """Sign the input_name binary with sbsign, producing output_name.
+   Use the given key and password (the latter may be None if the key
+diff --git a/tools/releasetools/sign_target_files_apks b/tools/releasetools/sign_target_files_apks
+index 832b76d..a0aedde 100755
+--- a/tools/releasetools/sign_target_files_apks
++++ b/tools/releasetools/sign_target_files_apks
+@@ -40,6 +40,21 @@ Usage:  sign_target_files_apks [flags] input_target_files output_target_files
+       that binary contained in the sbsign_certs.txt file.  Option may
+       be repeated to give multiple extra binaries.
+ 
++  -m  (--kmodule_key) <key>
++      Re-sign all .ko files under /system/lib/modules inside the target
++      files package with the provided key.
++
++  -B  (--binary_bootimages) <name,name,...>
++      Generate binary boot image which will end up in the generated
++      target-files-package under BOOTABLE_IMAGES. For each specified name,
++      It will look for the necessary files in an upper-case
++      subdirectory <NAME> and produce BOOTABLE_IMAGES/<name>.img.
++
++  -M  (--mkbootimg_args) <args>
++      Override mkbootimg_args in META/misc_info.txt; only useful if
++      -B is used. For secure boot scenarios this typically has key/signing
++      tool information.
++
+   -k  (--key_mapping)  <src_key=dest_key>
+       Add a mapping from the key name as specified in apkcerts.txt (the
+       src_key) to the real key you wish to sign the package with
+@@ -95,6 +110,7 @@ import re
+ import subprocess
+ import tempfile
+ import zipfile
++import shutil
+ 
+ import common
+ 
+@@ -103,9 +119,11 @@ OPTIONS = common.OPTIONS
+ OPTIONS.extra_apks = {}
+ OPTIONS.extra_sbsign = {}
+ OPTIONS.extra_bin_cert_replace = {}
++OPTIONS.kmodule_key = None
+ OPTIONS.key_map = {}
+ OPTIONS.replace_ota_keys = False
+ OPTIONS.tag_changes = ("-test-keys", "-dev-keys", "+release-keys")
++OPTIONS.mkbootimg_args = None
+ 
+ def GetApkCerts(tf_zip):
+   certmap = common.ReadApkCerts(tf_zip)
+@@ -231,6 +249,22 @@ def SbsignBinary(data, keyname, pw):
+   return data
+ 
+ 
++def SignKmodule(data, keyname, pw):
++  unsigned = tempfile.NamedTemporaryFile()
++  unsigned.write(data)
++  unsigned.flush()
++
++  signed = tempfile.NamedTemporaryFile()
++
++  common.SignKmodule(unsigned.name, signed.name, keyname, pw)
++
++  data = signed.read()
++  unsigned.close()
++  signed.close()
++
++  return data
++
++
+ def BinaryCertReplace(data, cert_discard_data, cert_replace_prefix):
+   old_cert_data = common.GetCertificateDER(cert_discard_data)
+ 
+@@ -254,9 +288,33 @@ def BinaryCertReplace(data, cert_discard_data, cert_replace_prefix):
+   return output
+ 
+ 
++def BuildBootimages(built_bootimages, filename):
++  if not built_bootimages:
++    return
++
++  tmpdir, output_zip = common.UnzipTemp(filename)
++  misc_info = common.LoadInfoDict(output_zip)
++  if OPTIONS.mkbootimg_args:
++    misc_info["mkbootimg_args"] = OPTIONS.mkbootimg_args
++  output_zip.close()
++
++  images = {}
++  for b in built_bootimages:
++    dirname = b.upper()
++    imgname = b.lower()
++    images[imgname] = common.BuildBootableImage(
++          os.path.join(tmpdir, dirname),
++          os.path.join(tmpdir, "META/" + imgname + "_filesystem_config.txt"),
++          misc_info)
++  output_zip = zipfile.ZipFile(filename, "a")
++  for name, data in images.iteritems():
++    output_zip.writestr("BOOTABLE_IMAGES/" + name + ".img", data)
++  output_zip.close()
++
++
+ def SignFiles(input_tf_zip, output_tf_zip, apk_key_map,
+               sbsign_key_map, binary_cert_replace_map,
+-              key_passwords):
++              kmodule_key, key_passwords):
+   maxsize = max([len(os.path.basename(i.filename))
+                  for i in input_tf_zip.infolist()
+                  if i.filename.endswith('.apk')])
+@@ -295,6 +353,11 @@ def SignFiles(input_tf_zip, output_tf_zip, apk_key_map,
+         # an APK we're not supposed to sign.
+         print "NOT signing: %s" % (name,)
+         output_tf_zip.writestr(out_info, data)
++    elif kmodule_key and info.filename.endswith(".ko"):
++      name = os.path.basename(info.filename)
++      print "    signing: %-*s (%s)" % (maxsize, name, kmodule_key)
++      signed_data = SignKmodule(data, kmodule_key, key_passwords[kmodule_key])
++      output_tf_zip.writestr(out_info, signed_data)
+     elif info.filename in ("SYSTEM/build.prop",
+                            "RECOVERY/RAMDISK/default.prop"):
+       print "rewriting %s:" % (info.filename,)
+@@ -487,6 +550,7 @@ def BuildKeyMap(misc_info, key_mapping_options):
+           devkeydir + "/platform": d + "/platform",
+           "uefi_shim_key":         d + "/uefi_shim_key",
+           "uefi_bios_db_key":      d + "/uefi_bios_db_key",
++          "kmodule_key":           d + "/kmodule_key",
+           })
+     else:
+       OPTIONS.key_map[s] = d
+@@ -495,6 +559,7 @@ def BuildKeyMap(misc_info, key_mapping_options):
+ def main(argv):
+ 
+   key_mapping_options = []
++  built_bootimages = []
+ 
+   def option_handler(o, a):
+     if o in ("-e", "--extra_apks"):
+@@ -512,12 +577,18 @@ def main(argv):
+       names = names.split(",")
+       for n in names:
+         OPTIONS.extra_bin_cert_replace[n] = key
++    elif o in ("-m", "--kmodule_key"):
++      OPTIONS.kmodule_key = a
+     elif o in ("-d", "--default_key_mappings"):
+       key_mapping_options.append((None, a))
+     elif o in ("-k", "--key_mapping"):
+       key_mapping_options.append(a.split("=", 1))
+     elif o in ("-o", "--replace_ota_keys"):
+       OPTIONS.replace_ota_keys = True
++    elif o in ("-M", "--mkbootimg_args"):
++      OPTIONS.mkbootimg_args = a
++    elif o in ("-B", "--binary_bootimages"):
++      built_bootimages.extend(a.split(","))
+     elif o in ("-t", "--tag_changes"):
+       new = []
+       for i in a.split(","):
+@@ -531,14 +602,17 @@ def main(argv):
+     return True
+ 
+   args = common.ParseOptions(argv, __doc__,
+-                             extra_opts="e:b:r:d:k:ot:",
++                             extra_opts="e:b:r:d:k:m:ot:B:M:",
+                              extra_long_opts=["extra_apks=",
+                                               "extra_sbsign=",
+                                               "extra_bin_cert_replace=",
+                                               "default_key_mappings=",
++                                              "kmodule_key=",
+                                               "key_mapping=",
+                                               "replace_ota_keys",
+-                                              "tag_changes="],
++                                              "tag_changes=",
++                                              "binary_bootimages=",
++                                              "mkbootimg_args="],
+                              extra_option_handler=option_handler)
+ 
+   if len(args) != 2:
+@@ -560,15 +634,18 @@ def main(argv):
+ 
+   key_passwords = common.GetKeyPasswords(set(apk_key_map.values()))
+   key_passwords.update(common.GetKeyPasswords(set(sbsign_key_map.values())))
++  if OPTIONS.kmodule_key:
++      key_passwords.update(common.GetKeyPasswords(set([OPTIONS.kmodule_key])))
+ 
+   SignFiles(input_zip, output_zip, apk_key_map, sbsign_key_map,
+-            binary_cert_replace_map, key_passwords)
++            binary_cert_replace_map, OPTIONS.kmodule_key, key_passwords)
+ 
+   if OPTIONS.replace_ota_keys:
+     ReplaceOtaKeys(input_zip, output_zip, misc_info)
+ 
+   input_zip.close()
+   output_zip.close()
++  BuildBootimages(built_bootimages, args[1])
+ 
+   print "done."
+ 
+@@ -581,3 +658,5 @@ if __name__ == '__main__':
+     print "   ERROR: %s" % (e,)
+     print
+     sys.exit(1)
++  finally:
++    common.Cleanup()
+-- 
+1.7.4.1
+

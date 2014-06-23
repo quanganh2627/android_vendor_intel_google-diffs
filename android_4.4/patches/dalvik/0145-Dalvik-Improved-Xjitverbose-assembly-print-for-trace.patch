@@ -1,0 +1,371 @@
+From 2927c48efd5e7343f903eea40b1cdd98eea4267d Mon Sep 17 00:00:00 2001
+From: Dong-Yuan Chen <dong-yuan.chen@intel.com>
+Date: Fri, 19 Apr 2013 19:08:04 -0700
+Subject: Dalvik: Improved -Xjitverbose assembly print for traces.
+
+BZ: 93131
+
+The -Xjitverbse assembly print for traces was broken with the new chaining
+cell format. This patch revised the trace assembly print so that the
+chaining cell blocks and exception handling VR store code are printed out
+properly.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I554462e9f10e56c34fe54e119b70fc4915949a40
+Orig-MCG-Change-Id: Idcdf27e16aced1a30286de84ead3782865ba8687
+Signed-off-by: Dong-Yuan Chen <dong-yuan.chen@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/codegen/x86/CodegenInterface.cpp |  258 ++++++++++++++++++++++----
+ 1 files changed, 222 insertions(+), 36 deletions(-)
+
+diff --git a/vm/compiler/codegen/x86/CodegenInterface.cpp b/vm/compiler/codegen/x86/CodegenInterface.cpp
+index 96f0349..2038cc7 100644
+--- a/vm/compiler/codegen/x86/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/CodegenInterface.cpp
+@@ -1410,6 +1410,173 @@ void printEmittedCodeBlock(unsigned char *startAddr, unsigned char *endAddr)
+ }
+ 
+ /**
++ * @brief Print the content of chaining cell block in code cache to LOG.
++ * @param startAddr - starting address of the chaining cell block in code cache
++ * @param blockType - chaining cell block type
++ */
++static void printChainingCellBlocks(char *startAddr, BBType blockType)
++{
++    unsigned int *ui_ptr;
++
++    if (startAddr == 0 || blockType >= kChainingCellGap) {
++        return;
++    }
++
++    // Chaining cell block starts with a 5B "call rel32" at [startAddr, ui_ptr).
++    ui_ptr = (unsigned int *) ((unsigned char *)(startAddr+5));
++
++    switch (blockType) {
++        case kChainingCellNormal:
++            ALOGD("** // Normal Chaining Cell");
++            printEmittedCodeBlock((unsigned char *) startAddr, (unsigned char *) ui_ptr);
++            ALOGD("**  %p: %#x \t// next bytecode PC", (void*)ui_ptr, *ui_ptr);
++            ui_ptr++;
++            ALOGD("**  %p: %#x \t// code address to be patched", (void*)ui_ptr, *ui_ptr);
++            break;
++
++        case kChainingCellInvokeSingleton:
++            ALOGD("** // InvokeSingleton Chaining Cell");
++            printEmittedCodeBlock((unsigned char *) startAddr, (unsigned char *) ui_ptr);
++            ALOGD("**  %p: %#x \t// next bytecode PC", (void*)ui_ptr, *ui_ptr);
++            ui_ptr++;
++            ALOGD("**  %p: %#x \t// code address to be patched", (void*)ui_ptr, *ui_ptr);
++            break;
++
++        case kChainingCellHot:
++            ALOGD("** // Hot Chaining Cell");
++            printEmittedCodeBlock((unsigned char *) startAddr, (unsigned char *) ui_ptr);
++            ALOGD("**  %p: %#x \t// next bytecode PC", (void*)ui_ptr, *ui_ptr);
++            ui_ptr++;
++            ALOGD("**  %p: %#x \t// code address to be patched", (void*)ui_ptr, *ui_ptr);
++            ui_ptr++;
++            ALOGD("**  %p: %d   \t// above needs an IP-relative offset", (void*)ui_ptr, *ui_ptr);
++            break;
++
++        case kChainingCellBackwardBranch:
++            ALOGD("** // BackwardBranch Chaining Cell");
++            printEmittedCodeBlock((unsigned char *) startAddr, (unsigned char *) ui_ptr);
++            ALOGD("**  %p: %#x \t// next bytecode PC", (void*)ui_ptr, *ui_ptr);
++            ui_ptr++;
++            ALOGD("**  %p: %#x \t// code address to be patched", (void*)ui_ptr, *ui_ptr);
++            ui_ptr++;
++            ALOGD("**  %p: %#x \t// address of loop header block", (void*)ui_ptr, *ui_ptr);
++            ui_ptr++;
++            ALOGD("**  %p: %#x \t// address of VR write-back block", (void*)ui_ptr, *ui_ptr);
++            ui_ptr++;
++            ALOGD("**  %p: %#x \t// address of loop pre-header block", (void*)ui_ptr, *ui_ptr);
++            break;
++
++        case kChainingCellInvokePredicted:
++            ui_ptr = (unsigned int *) startAddr;
++            ALOGD("** // InvokePredicted Chaining Cell: %p",
++                  (void*) startAddr);
++            ALOGD("**  %p: %#x \t// to be patched", (void*)ui_ptr, *ui_ptr);
++            ui_ptr++;
++            ALOGD("**  %p: %#x \t// to be patched", (void*)ui_ptr, *ui_ptr);
++            ui_ptr++;
++            ALOGD("**  %p: %#x \t// class", (void*)ui_ptr, *ui_ptr);
++            ui_ptr++;
++            ALOGD("**  %p: %#x \t// method", (void*)ui_ptr, *ui_ptr);
++            ui_ptr++;
++            ALOGD("**  %p: %#x \t// rechain count", (void*)ui_ptr, *ui_ptr);
++            break;
++
++        default:
++            ALOGD("printChainingCellBlocks: Unknown chaining cell type %u!",
++                  blockType);
++            break;      // Not yet supported! Do nothing.
++    }
++}
++
++/**
++ * @brief Print the content of the content of a trace to LOG.
++ * @param cUnit - pointer to the CompilationUnit
++ * @param code_block_table - reference to the code block table for code/data section addresses
++ * @param chainCellCounts - reference to the ChainCellCounts table
++ * @param wide_const_count - number of long/double constants in the constant section
++ * @param pCCOffsetSection - pointer to the chaining cell offset header
++ */
++typedef std::pair<BBType, char*> CodeBlockElem;
++static void printTrace(CompilationUnit *cUnit, std::vector<CodeBlockElem> &code_block_table,
++                       ChainCellCounts &chainCellCounts, int wide_const_count, u2* pCCOffsetSection)
++{
++    char *code_ptr, *next_code_ptr;
++    BBType blk_type;
++    int k;
++
++    ALOGD("-------- Emit trace for [%s%s@%#x] binary code starts at %p (cache start %p)",
++          cUnit->method->clazz->descriptor, cUnit->method->name,
++          cUnit->traceDesc->trace[0].info.frag.startOffset,
++          cUnit->baseAddr, gDvmJit.codeCache);
++    ALOGD("** %s%s@%#x:", cUnit->method->clazz->descriptor,
++          cUnit->method->name, cUnit->traceDesc->trace[0].info.frag.startOffset);
++
++    for (k = 0; k < (code_block_table.size() - 1); k++) {
++        blk_type = code_block_table[k].first;
++        code_ptr = code_block_table[k].second;
++        next_code_ptr = code_block_table[k+1].second;
++
++        switch (blk_type) {
++        case kExceptionHandling:
++            if (code_ptr < next_code_ptr) {
++                ALOGD("** // exception handling VR restores");
++                // print like a normal code block
++                printEmittedCodeBlock((unsigned char *) code_ptr,
++                                      (unsigned char *) next_code_ptr);
++            }
++            break;
++
++        case kDalvikByteCode:
++            if (code_ptr < next_code_ptr) {
++                printEmittedCodeBlock((unsigned char *) code_ptr,
++                                      (unsigned char *) next_code_ptr);
++            }
++            break;
++
++        case kChainingCellNormal:
++        case kChainingCellHot:
++        case kChainingCellInvokeSingleton:
++        case kChainingCellInvokePredicted:
++        case kChainingCellBackwardBranch:
++            printChainingCellBlocks(code_ptr, blk_type);
++            break;
++
++        default:          // no print for other block types
++            break;
++        }
++    }
++
++    // next_code_ptr should hold the pre-padded address of the chaining cell count section
++    // print the chaining cell count section
++    next_code_ptr = reinterpret_cast<char*>((reinterpret_cast<unsigned int>(next_code_ptr) + 3) & ~0x3);
++    ALOGD("** // chaining cell counts section (4B aligned)");
++    for (k=0; k< kChainingCellGap; k++) {
++        ALOGD("**  %p: %u", (void*) next_code_ptr, chainCellCounts.u.count[k]);
++        next_code_ptr += sizeof(chainCellCounts.u.count[k]);
++    }
++
++    // print the long/double constant section if any
++    if (wide_const_count > 0) {
++        long long *llptr;
++        double *dblptr;
++        ALOGD("** // long/double constant section (16B aligned)");
++        next_code_ptr = reinterpret_cast<char*>((reinterpret_cast<unsigned int>(next_code_ptr) + 0xF) & ~0xF);
++        llptr = (long long *) next_code_ptr;
++        for (k=0; k<wide_const_count; k++) {
++            dblptr = (double *) llptr;
++            ALOGD("**  %p: %lld (%g)", llptr, *llptr, *dblptr);
++            llptr++;        // increases pointer by 8B
++        }
++    }
++
++    // print the chaining cell offset header content
++    ALOGD("** // Patched (offset to chaining cell counts)@%p = %#x",
++          (void*)pCCOffsetSection, *pCCOffsetSection);
++    ALOGD("** // Patched (offset to chaining cell blocks)@%p = %#x",
++          (void*)&pCCOffsetSection[1], pCCOffsetSection[1]);
++}
++
++/**
+  * @brief Handle fallthrough branch: determine whether we need one or not
+  * @param cUnit the CompilationUnit
+  * @param bb the BasicBlock
+@@ -1694,6 +1861,12 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+ {
+     //Used to determine whether we need a fallthrough jump
+     BasicBlock *nextFallThrough = 0;
++    // Define the code_block_table for tracking various type of code blocks
++    //  for printing.
++    // CodeBlockElem has a block type and the starting address of the block.
++    std::vector<CodeBlockElem> code_block_table;
++    char *print_stream_ptr = 0; // current block stream pointer
++
+     dump_x86_inst = cUnit->printMe;
+ 
+     GrowableList chainingListByType[kChainingCellLast];
+@@ -1873,6 +2046,13 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+             }
+         }
+ 
++    if (cUnit->printMe) {
++        // record all assmebly code before chaining cells as a block
++        CodeBlockElem code_blk_elem(kDalvikByteCode, streamMethodStart);
++        code_block_table.push_back(code_blk_elem);
++        print_stream_ptr = stream;
++    }
++
+     char* streamChainingStart = (char*)stream;
+     /* Handle the chaining cells in predefined order */
+ 
+@@ -1887,6 +2067,14 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+         //First handle fallthrough branch
+         handleFallThroughBranch (cUnit, 0, &nextFallThrough);
+ 
++        if (cUnit->printMe && print_stream_ptr < stream) {
++            // If there is any code before the chaining cell block and the
++            // last recorded block, make it a separate code block.
++            CodeBlockElem code_blk_elem(kDalvikByteCode, print_stream_ptr);
++            code_block_table.push_back(code_blk_elem);
++            print_stream_ptr = stream;
++        }
++
+         /* Record the first LIR for a new type of chaining cell */
+         for (j = 0; j < chainingListByType[i].numUsed; j++) {
+             int blockId = (int) dvmGrowableListGetElement (& (chainingListByType[i]), j);
+@@ -1937,6 +2125,7 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+                     SET_JIT_ERROR(kJitErrorTraceFormation);
+                     cUnit->baseAddr = NULL;
+                     endOfTrace(true); /* need to free structures */
++                    code_block_table.clear();
+                     return;
+             }
+ 
+@@ -1948,6 +2137,13 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+                 return;
+             }
+ 
++            if (cUnit->printMe) {
++                // record the chaining cell block
++                CodeBlockElem code_blk_elem(chainingBlock->blockType, print_stream_ptr);
++                code_block_table.push_back(code_blk_elem);
++                print_stream_ptr = stream;
++            }
++
+             if (gDvmJit.codeCacheByteUsed + (stream - streamStart) + CODE_CACHE_PADDING > gDvmJit.codeCacheSize) {
+                 ALOGI("JIT_INFO: Code cache full after ChainingCell (trace uses %uB)", (stream - streamStart));
+                 SET_JIT_ERROR(kJitErrorCodeCacheFull);
+@@ -1955,6 +2151,7 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+                 cUnit->baseAddr = NULL;
+                 endOfTrace(true); /* need to free structures */
+                 PROTECT_CODE_CACHE(stream, unprotected_code_cache_bytes);
++                code_block_table.clear();
+                 return;
+             }
+         }
+@@ -1969,6 +2166,13 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+ 
+     endOfTrace(false);
+ 
++    if (cUnit->printMe) {
++        // record exception VR restores as block type kExceptionHandling
++        CodeBlockElem code_blk_elem(kExceptionHandling, print_stream_ptr);
++        code_block_table.push_back(code_blk_elem);
++        print_stream_ptr = stream;
++    }
++
+     if (gDvmJit.codeCacheFull) {
+         // We hit code cache size limit either after dumping exception handling
+         // state or after calling endOfTrace. Bail out for this trace!
+@@ -1976,6 +2180,7 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+         SET_JIT_ERROR(kJitErrorCodeCacheFull);
+         cUnit->baseAddr = NULL;
+         PROTECT_CODE_CACHE(stream, unprotected_code_cache_bytes);
++        code_block_table.clear();
+         return;
+     }
+ 
+@@ -1999,6 +2204,7 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+         gDvmJit.codeCacheFull = true;
+         cUnit->baseAddr = NULL;
+         PROTECT_CODE_CACHE(stream, unprotected_code_cache_bytes);
++        code_block_table.clear();
+         return;
+     }
+ 
+@@ -2050,44 +2256,24 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+         }
+     }
+ 
+-    gDvmJit.codeCacheByteUsed += (stream - streamStart); // store code cache byte used to include the current trace
+-    cUnit->totalSize = (stream - streamStart);           // store size of trace in cUnit->totalSize
+-
+-    if (cUnit->printMe == true) {
+-        unsigned char* codeBaseAddr = static_cast<unsigned char *>(cUnit->baseAddr);
+-        unsigned char* codeBaseAddrNext = static_cast<unsigned char *>(gDvmJit.codeCache) + gDvmJit.codeCacheByteUsed;
+-        ALOGD("-------- Built trace for %s%s, JIT code [%p, %p) cache start %p",
+-              cUnit->method->clazz->descriptor, cUnit->method->name,
+-              codeBaseAddr, codeBaseAddrNext, gDvmJit.codeCache);
+-        ALOGD("** %s%s@0x%x:", cUnit->method->clazz->descriptor,
+-              cUnit->method->name, cUnit->traceDesc->trace[0].info.frag.startOffset);
+-        printEmittedCodeBlock(codeBaseAddr, codeBaseAddrNext);
+-        ALOGD("JIT CODE after trace %p to %p size %x START %p", cUnit->baseAddr,
+-          (char *) gDvmJit.codeCache + gDvmJit.codeCacheByteUsed, cUnit->totalSize, gDvmJit.codeCache);
+-    }
+-
+-    gDvmJit.codeCacheByteUsed += (streamEnd - stream); // adjust code cache byte used to include constants in current trace
+-    cUnit->totalSize = (streamEnd - streamStart);      // adjust size of trace in cUnit->totalSize to include constants
+-
+-    if((gDvmJit.disableOpt & (1 << kElimConstInitOpt)) == false) {
+-        if ((cUnit->printMe && (patchCount > 0) ) == true) {
+-            ALOGD("-------- Constant Data Section ------");
+-            unsigned long long *longaddr;
+-            constListTemp = cUnit->constListHead;
+-            while(constListTemp != NULL){
+-                longaddr = reinterpret_cast<unsigned long long*>(constListTemp->constAddr);
+-                ALOGD("**  %p: %d (%x)",  constListTemp->constAddr,  *longaddr, *longaddr); //print each constant
+-                longaddr++;
+-                constListTemp = constListTemp->next;
+-            }
+-        }
+-        cUnit->constListHead = NULL;
+-
+-        if (cUnit->printMe && (patchCount > 0) == true) {
+-            ALOGD("JIT CODE after Constant Data Section in trace %p to %p size %x START %p", cUnit->baseAddr,
+-                  (char *) gDvmJit.codeCache + gDvmJit.codeCacheByteUsed, cUnit->totalSize, gDvmJit.codeCache);
+-        }
++    cUnit->constListHead = NULL;
++    cUnit->totalSize = (streamEnd - streamStart);  // store size of trace in cUnit->totalSize
++    gDvmJit.codeCacheByteUsed += cUnit->totalSize; // store code cache byte used to include the current trace
++
++    // Now print out the trace in code cache based on code_block_table
++    if (cUnit->printMe) {
++        // Push an kExitBlock block as an end marker of the trace.
++        // The chaining cell count and the long/double constants are
++        //  emit after the end marker.
++        CodeBlockElem code_blk_elem(kExitBlock, print_stream_ptr);
++        code_block_table.push_back(code_blk_elem);
++        printTrace(cUnit, code_block_table, chainCellCounts, patchCount, pOffset);
+     }
++    code_block_table.clear();
++    ALOGV("JIT CODE after trace %p to %p size %x START %p", cUnit->baseAddr,
++          (char *) gDvmJit.codeCache + gDvmJit.codeCacheByteUsed,
++          cUnit->totalSize, gDvmJit.codeCache);
++
+     gDvmJit.numCompilations++;
+ 
+     info->codeAddress = (char*)cUnit->baseAddr;// + cUnit->headerSize;
+-- 
+1.7.4.1
+

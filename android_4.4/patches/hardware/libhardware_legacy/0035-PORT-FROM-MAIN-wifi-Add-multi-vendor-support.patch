@@ -1,0 +1,673 @@
+From 07372179d4cf6bf0738d1c70df24e1c32121631b Mon Sep 17 00:00:00 2001
+From: Quentin Casasnovas <quentinx.casasnovas@intel.com>
+Date: Mon, 8 Jul 2013 18:20:26 +0200
+Subject: [PORT FROM MAIN]wifi: Add multi-vendor support
+
+BZ: 125764
+
+This patch adds an extra layer of indirection to call vendor specific code in
+the wifi HAL. The vendor specific code is called depending on
+wlan.driver.vendor property, itself defined by ueventd when it receives a
+specific modalias. Vendor specific code can also be disabled at compile time
+without compilation error as enums and other array of functions pointers are
+built at compile time.
+
+Change-Id: I4dd608050a2549055eb3d4dab0b1369b7b8304f4
+Orig-Change-Id: If430d833e64afea54f0f078558fffe4a196ae3f2
+Category: device enablement
+Domain: CWS.WIFI-Common
+Origin: internal
+Upstream-Candidate: yes
+Signed-off-by: Quentin Casasnovas <quentinx.casasnovas@intel.com>
+Reviewed-on: http://android.intel.com:8080/120542
+Reviewed-by: Champciaux, Nicolas <nicolas.champciaux@intel.com>
+Tested-by: Champciaux, Nicolas <nicolas.champciaux@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+---
+ wifi/Android.mk           |    9 ++
+ wifi/vendors/bcm.c        |  121 ++++++++++++++++++++
+ wifi/vendors/bcm.h        |   32 ++++++
+ wifi/vendors/vendors.def  |   27 +++++
+ wifi/vendors/vendors.def~ |   51 +++++++++
+ wifi/wifi.c               |  268 +++++++++++++++++----------------------------
+ wifi/wifi.h               |   18 +++-
+ 7 files changed, 356 insertions(+), 170 deletions(-)
+ create mode 100644 wifi/vendors/bcm.c
+ create mode 100644 wifi/vendors/bcm.h
+ create mode 100644 wifi/vendors/vendors.def
+ create mode 100644 wifi/vendors/vendors.def~
+
+diff --git a/wifi/Android.mk b/wifi/Android.mk
+index d5be810..2cf4e37 100644
+--- a/wifi/Android.mk
++++ b/wifi/Android.mk
+@@ -8,6 +8,7 @@ ifeq ($(TARGET_BOARD_PLATFORM),bigcore)
+ 	ADDITIONAL_DEFAULT_PROPERTIES += wifi.interface=wlan0
+ 	LOCAL_SRC_FILES += wifi/wifi_bc.c
+ else
++ifneq (,$(filter wifi_bcm%,$(PRODUCTS.$(INTERNAL_PRODUCT).PRODUCT_PACKAGES)))
+ 	ifdef WIFI_DRIVER_MODULE_PATH
+ 	LOCAL_CFLAGS += -DWIFI_DRIVER_MODULE_PATH=\"$(WIFI_DRIVER_MODULE_PATH)\"
+ 	endif
+@@ -46,6 +47,14 @@ else
+ 	LOCAL_CFLAGS += -DWIFI_DRIVER_FW_PATH_PARAM=\"$(WIFI_DRIVER_FW_PATH_PARAM)\"
+ 	endif
+ 
++	LOCAL_CFLAGS += -DWIFI_GLUE_WITH_BCM
++	LOCAL_SRC_FILES += wifi/vendors/bcm.c
++endif
++
++ifneq (,$(filter wifi_ti%,$(PRODUCTS.$(INTERNAL_PRODUCT).PRODUCT_PACKAGES)))
++	LOCAL_CFLAGS += -DWIFI_GLUE_WITH_TI
++endif
++
+ 	LOCAL_SRC_FILES += wifi/wifi.c
+ 	LOCAL_SRC_FILES += wifi/utils.c
+ 	LOCAL_SRC_FILES += wifi/supplicant.c
+diff --git a/wifi/vendors/bcm.c b/wifi/vendors/bcm.c
+new file mode 100644
+index 0000000..83f278c
+--- /dev/null
++++ b/wifi/vendors/bcm.c
+@@ -0,0 +1,121 @@
++/*
++ * Copyright 2008, The Android Open Source Project
++ * Copyright 2012-2013, Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "../wifi.h"
++#include "bcm.h"
++
++int bcm_load_driver(void)
++{
++    property_set(DRIVER_PROP_NAME, "ok");
++
++    return 0;
++}
++
++int bcm_unload_driver(void)
++{
++    property_set(DRIVER_PROP_NAME, "unloaded");
++
++    return 0;
++}
++
++int bcm_is_driver_loaded(void)
++{
++    char driver_status[PROPERTY_VALUE_MAX];
++#ifdef WIFI_DRIVER_MODULE_PATH
++    FILE *proc;
++    char line[sizeof(DRIVER_MODULE_TAG)+10];
++#endif
++
++    if (!property_get(DRIVER_PROP_NAME, driver_status, NULL)
++            || strcmp(driver_status, "ok") != 0) {
++        return 0;  /* driver not loaded */
++    }
++#ifdef WIFI_DRIVER_MODULE_PATH
++    /*
++     * If the property says the driver is loaded, check to
++     * make sure that the property setting isn't just left
++     * over from a previous manual shutdown or a runtime
++     * crash.
++     */
++    if ((proc = fopen(MODULE_FILE, "r")) == NULL) {
++        ALOGW("Could not open %s: %s", MODULE_FILE, strerror(errno));
++        property_set(DRIVER_PROP_NAME, "unloaded");
++        return 0;
++    }
++    while ((fgets(line, sizeof(line), proc)) != NULL) {
++        if (strncmp(line, DRIVER_MODULE_TAG, strlen(DRIVER_MODULE_TAG)) == 0) {
++            fclose(proc);
++            return 1;
++        }
++    }
++    fclose(proc);
++    property_set(DRIVER_PROP_NAME, "unloaded");
++    return 0;
++#else
++    return 1;
++#endif
++}
++
++int bcm_switch_driver_mode(int mode)
++{
++    char mode_str[8];
++    char bcm_prop_chip[PROPERTY_VALUE_MAX]="";
++
++    /**
++     * BIT(0), BIT(1),.. come from dhd.h in the driver code, and we need to
++     * stay aligned with their definition.
++     *
++     * TODO:
++     *   - Find a way to include dhd.h and use the values from there directly to
++     *     prevent any problems in future modifications of the ABI.
++     */
++    switch (mode) {
++    case WIFI_STA_MODE:
++        snprintf(mode_str, sizeof(mode_str), "%u\n", BIT(0) | BIT(2) | BIT(4));
++        break;
++    case WIFI_AP_MODE:
++        snprintf(mode_str, sizeof(mode_str), "%u\n", BIT(1));
++        break;
++    case WIFI_P2P_MODE:
++        snprintf(mode_str, sizeof(mode_str), "%u\n", BIT(2));
++        break;
++    default:
++        ALOGE("wifi_switch_driver_mode: invalid mode %ud", mode);
++        return -EINVAL;
++    }
++
++    ALOGE("wifi_switch_driver_mode: switching FW opmode");
++    if (file_exist(WIFI_MODULE_43241_OPMODE))
++        return write_to_file(WIFI_MODULE_43241_OPMODE, mode_str, strlen(mode_str));
++    else if (file_exist(WIFI_MODULE_4334_OPMODE))
++        return write_to_file(WIFI_MODULE_4334_OPMODE, mode_str, strlen(mode_str));
++    else if (file_exist(WIFI_MODULE_4334X_OPMODE))
++        return write_to_file(WIFI_MODULE_4334X_OPMODE, mode_str, strlen(mode_str));
++    else if (file_exist(WIFI_MODULE_4335_OPMODE))
++        return write_to_file(WIFI_MODULE_4335_OPMODE, mode_str, strlen(mode_str));
++    else {
++        ALOGE("wifi_switch_driver_mode: failed to switch opmode file not found");
++        return -1;
++    }
++}
++
++int bcm_change_fw_path(const char *fwpath)
++{
++    return write_to_file(WIFI_DRIVER_FW_PATH_PARAM,
++                         fwpath, strlen(fwpath) + 1);
++}
++
+diff --git a/wifi/vendors/bcm.h b/wifi/vendors/bcm.h
+new file mode 100644
+index 0000000..cc1db1f
+--- /dev/null
++++ b/wifi/vendors/bcm.h
+@@ -0,0 +1,32 @@
++/*
++ * Copyright 2008, The Android Open Source Project
++ * Copyright 2012-2013, Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef BCM_H_
++# define BCM_H_
++
++#define WIFI_MODULE_43241_OPMODE        "/sys/module/bcm43241/parameters/op_mode"
++#define WIFI_MODULE_4334_OPMODE         "/sys/module/bcm4334/parameters/op_mode"
++#define WIFI_MODULE_4334X_OPMODE        "/sys/module/bcm4334x/parameters/op_mode"
++#define WIFI_MODULE_4335_OPMODE         "/sys/module/bcm4335/parameters/op_mode"
++
++int bcm_load_driver(void);
++int bcm_unload_driver(void);
++int bcm_is_driver_loaded(void);
++int bcm_switch_driver_mode(int mode);
++int bcm_change_fw_path(const char *fwpath);
++
++#endif /* !BCM_H_ */
+diff --git a/wifi/vendors/vendors.def b/wifi/vendors/vendors.def
+new file mode 100644
+index 0000000..26c4907
+--- /dev/null
++++ b/wifi/vendors/vendors.def
+@@ -0,0 +1,27 @@
++/*
++ * Copyright 2008, The Android Open Source Project
++ * Copyright 2012-2013, Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++ /* WIFI_GLUE (VENDOR_NAME, LOAD, UNLOAD, SWITCH, CHANGE_FW, GET_FW, IS_LOADED) */
++
++#ifdef WIFI_GLUE_WITH_BCM
++WIFI_GLUE(BCM, bcm_load_driver, bcm_unload_driver, bcm_switch_driver_mode,
++	  bcm_change_fw_path, NULL, bcm_is_driver_loaded)
++#endif
++
++#ifdef WIFI_GLUE_WITH_TI
++WIFI_GLUE(TI, NULL, NULL, NULL, NULL, NULL, NULL)
++#endif
+diff --git a/wifi/vendors/vendors.def~ b/wifi/vendors/vendors.def~
+new file mode 100644
+index 0000000..3deb265
+--- /dev/null
++++ b/wifi/vendors/vendors.def~
+@@ -0,0 +1,51 @@
++/*
++ * Copyright 2008, The Android Open Source Project
++ * Copyright 2012-2013, Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/* WIFI_GLUE (VENDOR_NAME, LOAD, UNLOAD, SWITCH, CHANGE_FW, GET_FW, IS_LOADED) */
++
++#ifdef WIFI_GLUE_WITH_BCM
++WIFI_GLUE(BCM, bcm_load_driver, bcm_unload_driver, bcm_switch_driver_mode,
++	  bcm_change_fw_path, NULL, bcm_is_driver_loaded)
++#endif
++
++#ifdef WIFI_GLUE_WITH_TI
++WIFI_GLUE(TI, NULL, NULL, NULL, NULL, NULL, NULL)
++#endif
++
++#ifdef WIFI_GLUE_WITH_INTEL
++WIFI_GLUE(INTEL, NULL, NULL, NULL, NULL, NULL, NULL)
++#endif
++
++#ifdef WIFI_GLUE_WITH_BC
++/*
++ * Firmware switching.  These are called from
++ * system/netd/SoftapController.cpp to support devices that need
++ * different firmware for STA/AP/P2P modes.  None of our supported
++ * drivers require that, and AFAICT the drivers (driver, rather:
++ * orinoco was the only one I found with this property) in the
++ * mainline kernel will already request the proper firmware files
++ * automatically via request_firmware()/hotplug, and presumably be
++ * handled correctly already with no help needed from the HAL.
++ */
++WIFI_GLUE(BC, bc_load_driver, bc_unload_driver, NULL,
++	  NULL, NULL, bc_is_driver_loaded)
++#endif
++
++#ifdef WIFI_GLUE_WITH_MTK
++WIFI_GLUE(MTK, mtk_load_driver, mtk_unload_driver, mtk_switch_driver_mode,
++	  NULL, NULL, mtk_is_driver_loaded)
++#endif
+diff --git a/wifi/wifi.c b/wifi/wifi.c
+index 2675279..cdcd5f2 100644
+--- a/wifi/wifi.c
++++ b/wifi/wifi.c
+@@ -22,195 +22,131 @@
+  */
+ static const char BCM_PROP_CHIP[]	= "wlan.bcm.chip";
+ 
+-int is_wifi_driver_loaded() {
+-    char driver_status[PROPERTY_VALUE_MAX];
+-#ifdef WIFI_DRIVER_MODULE_PATH
+-    FILE *proc;
+-    char line[sizeof(DRIVER_MODULE_TAG)+10];
++#ifdef WIFI_GLUE_WITH_BCM
++#  include "vendors/bcm.h"
+ #endif
++ 
++enum {
++    /* See X Macro trick on Wikipedia */
++#define WIFI_GLUE(Vendor, Ops...) VENDOR_ ## Vendor,
++#include "vendors/vendors.def"
++#undef WIFI_GLUE
++    MAX_VENDORS
++};
++
++struct wifi_glue_ops wops[MAX_VENDORS] = {
++    /* See X Macro trick on Wikipedia */
++#define WIFI_GLUE(Vendor, Load_driver, Unload_driver, Switch_mode, Change_fw, Get_fw, Is_loaded) \
++    [VENDOR_ ## Vendor] = {                                             \
++        .load_driver =  Load_driver,                                    \
++        .unload_driver = Unload_driver,                                 \
++        .switch_driver_mode = Switch_mode,                              \
++        .change_fw_path = Change_fw,                                    \
++        .get_fw_path = Get_fw,                                          \
++        .is_driver_loaded = Is_loaded                                   \
++    },
++#include "vendors/vendors.def"
++#undef WIFI_GLUE
++};
++
++static int wifi_get_vendor(void)
++{
++    char wifi_vendor[PROPERTY_VALUE_MAX];
+ 
+-    if (!property_get(DRIVER_PROP_NAME, driver_status, NULL)
+-            || strcmp(driver_status, "ok") != 0) {
+-        return 0;  /* driver not loaded */
+-    }
+-#ifdef WIFI_DRIVER_MODULE_PATH
+-    /*
+-     * If the property says the driver is loaded, check to
+-     * make sure that the property setting isn't just left
+-     * over from a previous manual shutdown or a runtime
+-     * crash.
+-     */
+-    if ((proc = fopen(MODULE_FILE, "r")) == NULL) {
+-        ALOGW("Could not open %s: %s", MODULE_FILE, strerror(errno));
+-        property_set(DRIVER_PROP_NAME, "unloaded");
+-        return 0;
++    if (!property_get(VENDOR_PROP_NAME, wifi_vendor, NULL)) {
++        ALOGE("wifi_get_vendor: prop %s is not set!",
++              VENDOR_PROP_NAME);
++        return -ENODEV;
+     }
+-    while ((fgets(line, sizeof(line), proc)) != NULL) {
+-        if (strncmp(line, DRIVER_MODULE_TAG, strlen(DRIVER_MODULE_TAG)) == 0) {
+-            fclose(proc);
+-            return 1;
+-        }
+-    }
+-    fclose(proc);
+-    property_set(DRIVER_PROP_NAME, "unloaded");
+-    return 0;
+-#else
+-    return 1;
+-#endif
++
++    /* See X Macro trick on Wikipedia */
++#define WIFI_GLUE(Vendor, Ops...)               \
++    if (strcasecmp(wifi_vendor, # Vendor) == 0) \
++        return VENDOR_ ## Vendor;
++#include "vendors/vendors.def"
++#undef WIFI_GLUE
++
++    ALOGE("wifi_get_vendor: Unknown vendor %s!", wifi_vendor);
++    return -ENODEV;
+ }
+ 
+-int wifi_load_driver()
++int wifi_switch_driver_mode(int mode)
+ {
+-#ifdef WIFI_DRIVER_MODULE_PATH
+-    char driver_status[PROPERTY_VALUE_MAX];
+-    int count = 100; /* wait at most 20 seconds for completion */
++    unsigned int vendor = 0;
+ 
+-    if (is_wifi_driver_loaded()) {
++    vendor = wifi_get_vendor();
++
++    if (vendor < MAX_VENDORS && wops[vendor].switch_driver_mode)
++        return wops[vendor].switch_driver_mode(mode);
++    else if (vendor < MAX_VENDORS)
+         return 0;
+-    }
++    return -1;
++}
+ 
+-    if (insmod(DRIVER_MODULE_PATH, DRIVER_MODULE_ARG) < 0)
+-        return -1;
++int wifi_change_fw_path(const char *fwpath)
++{
++    unsigned int vendor = 0;
+ 
+-    if (strcmp(FIRMWARE_LOADER,"") == 0) {
+-        property_set(DRIVER_PROP_NAME, "ok");
+-    }
+-    else {
+-        property_set("ctl.start", FIRMWARE_LOADER);
+-    }
+-    sched_yield();
+-    while (count-- > 0) {
+-        if (property_get(DRIVER_PROP_NAME, driver_status, NULL)) {
+-            if (strcmp(driver_status, "ok") == 0)
+-                return 0;
+-            else if (strcmp(DRIVER_PROP_NAME, "failed") == 0) {
+-                wifi_unload_driver();
+-                return -1;
+-            }
+-        }
+-        usleep(200000);
+-    }
+-    property_set(DRIVER_PROP_NAME, "timeout");
+-    wifi_unload_driver();
++    vendor = wifi_get_vendor();
++
++    if (vendor < MAX_VENDORS && wops[vendor].change_fw_path)
++        return wops[vendor].change_fw_path(fwpath);
++    else if (vendor < MAX_VENDORS)
++        return 0;
+     return -1;
+-#else
+-    property_set(DRIVER_PROP_NAME, "ok");
+-    return 0;
+-#endif
+ }
+ 
+-int wifi_unload_driver()
++int wifi_load_driver(void)
+ {
+-    usleep(200000); /* allow to finish interface down */
+-#ifdef WIFI_DRIVER_MODULE_PATH
+-    if (rmmod(DRIVER_MODULE_NAME) == 0) {
+-        int count = 20; /* wait at most 10 seconds for completion */
+-        while (count-- > 0) {
+-            if (!is_wifi_driver_loaded())
+-                break;
+-            usleep(500000);
+-        }
+-        usleep(500000); /* allow card removal */
+-        if (count) {
+-            return 0;
+-        }
+-        return -1;
+-    } else
+-        return -1;
+-#else
+-    property_set(DRIVER_PROP_NAME, "unloaded");
+-    return 0;
+-#endif
++    unsigned int vendor = 0;
++
++    vendor = wifi_get_vendor();
++
++    if (vendor < MAX_VENDORS && wops[vendor].load_driver)
++        return wops[vendor].load_driver();
++    else if (vendor < MAX_VENDORS)
++        return 0;
++
++    return -1;
+ }
+ 
+-const char *wifi_get_fw_path(int fw_type)
++int wifi_unload_driver(void)
+ {
+-    char bcm_prop_chip[PROPERTY_VALUE_MAX];
+-
+-    switch (fw_type) {
+-    case WIFI_GET_FW_PATH_STA:
+-	if (property_get(BCM_PROP_CHIP, bcm_prop_chip, NULL)) {
+-	    if (strstr(bcm_prop_chip, "43241"))
+-		return WIFI_DRIVER_43241_FW_PATH_STA;
+-	    else if (strstr(bcm_prop_chip, "4334"))
+-		return WIFI_DRIVER_4334_FW_PATH_STA;
+-	    else if (strstr(bcm_prop_chip, "4335"))
+-		return WIFI_DRIVER_4335_FW_PATH_STA;
+-	}
+-	else
+-	    return WIFI_DRIVER_FW_PATH_STA;
+-    case WIFI_GET_FW_PATH_AP:
+-	if (property_get(BCM_PROP_CHIP, bcm_prop_chip, NULL)) {
+-	    if (strstr(bcm_prop_chip, "43241"))
+-		return WIFI_DRIVER_43241_FW_PATH_AP;
+-	    else if (strstr(bcm_prop_chip, "4334"))
+-		return WIFI_DRIVER_4334_FW_PATH_AP;
+-	    else if (strstr(bcm_prop_chip, "4335"))
+-		return WIFI_DRIVER_4335_FW_PATH_AP;
+-	}
+-	else
+-	    return WIFI_DRIVER_FW_PATH_AP;
+-    case WIFI_GET_FW_PATH_P2P:
+-	if (property_get(BCM_PROP_CHIP, bcm_prop_chip, NULL)) {
+-	    if (strstr(bcm_prop_chip, "43241"))
+-		return WIFI_DRIVER_43241_FW_PATH_P2P;
+-	    else if (strstr(bcm_prop_chip, "4334"))
+-		return WIFI_DRIVER_4334_FW_PATH_P2P;
+-	    else if (strstr(bcm_prop_chip, "4335"))
+-		return WIFI_DRIVER_4335_FW_PATH_P2P;
+-	}
+-	else
+-	    return WIFI_DRIVER_FW_PATH_P2P;
+-    default:
+-	    ALOGE("Unknown firmware type (%d)", fw_type);
+-    }
++    unsigned int vendor = 0;
++
++    vendor = wifi_get_vendor();
++
++    if (vendor < MAX_VENDORS && wops[vendor].unload_driver)
++        return wops[vendor].unload_driver();
++    else
++        return 0;
+ 
+-    return NULL;
++    return -1;
+ }
+ 
+-int wifi_change_fw_path(const char *fwpath)
++int is_wifi_driver_loaded()
+ {
+-    return write_to_file(WIFI_DRIVER_FW_PATH_PARAM,
+-			 fwpath, strlen(fwpath) + 1);
++    unsigned int vendor = 0;
++
++    vendor = wifi_get_vendor();
++
++    if (vendor < MAX_VENDORS && wops[vendor].is_driver_loaded)
++        return wops[vendor].is_driver_loaded();
++    else if (vendor < MAX_VENDORS)
++        return 0;
++
++    return -1;
+ }
+ 
+-int wifi_switch_driver_mode(int mode)
++const char *wifi_get_fw_path(int fw_type)
+ {
+-    char mode_str[8];
+-    char bcm_prop_chip[PROPERTY_VALUE_MAX]="";
+-
+-    /**
+-     * BIT(0), BIT(1),.. come from dhd.h in the driver code, and we need to
+-     * stay aligned with their definition.
+-     *
+-     * TODO:
+-     *   - Find a way to include dhd.h and use the values from there directly to
+-     *     prevent any problems in future modifications of the ABI.
+-     */
+-    switch (mode) {
+-    case WIFI_STA_MODE:
+-	snprintf(mode_str, sizeof(mode_str), "%u\n", BIT(0) | BIT(2) | BIT(4));
+-	break;
+-    case WIFI_AP_MODE:
+-	snprintf(mode_str, sizeof(mode_str), "%u\n", BIT(1));
+-	break;
+-    case WIFI_P2P_MODE:
+-	snprintf(mode_str, sizeof(mode_str), "%u\n", BIT(2));
+-	break;
+-    default:
+-	ALOGE("wifi_switch_driver_mode: invalid mode %ud", mode);
+-	return -EINVAL;
+-    }
++    unsigned int vendor = 0;
++    vendor = wifi_get_vendor();
+ 
+-    ALOGE("wifi_switch_driver_mode:  %s switching FW opmode", BCM_PROP_CHIP);
+-    if (file_exist(WIFI_MODULE_43241_OPMODE))
+-        return write_to_file(WIFI_MODULE_43241_OPMODE, mode_str, strlen(mode_str));
+-    else if (file_exist(WIFI_MODULE_4334_OPMODE))
+-        return write_to_file(WIFI_MODULE_4334_OPMODE, mode_str, strlen(mode_str));
+-    else if (file_exist(WIFI_MODULE_4335_OPMODE))
+-        return write_to_file(WIFI_MODULE_4335_OPMODE, mode_str, strlen(mode_str));
+-    else {
+-        ALOGE("wifi_switch_driver_mode: failed to switch opmode file not found");
+-        return -1;
+-    }
++    if (vendor < MAX_VENDORS && wops[vendor].get_fw_path)
++        return wops[vendor].get_fw_path(fw_type);
++    else if (vendor < MAX_VENDORS)
++        return "NO_FW_PATH";
++
++    return 0;
+ }
+diff --git a/wifi/wifi.h b/wifi/wifi.h
+index d738b58..94e8843 100644
+--- a/wifi/wifi.h
++++ b/wifi/wifi.h
+@@ -28,6 +28,7 @@
+ #include <poll.h>
+ #include <pthread.h>
+ #include <assert.h>
++#include <strings.h>
+ 
+ #include "hardware_legacy/wifi.h"
+ #include "libwpa_client/wpa_ctrl.h"
+@@ -68,15 +69,14 @@
+ #define DRIVER_PROP_NAME "wlan.driver.status"
+ #define VENDOR_PROP_NAME "wlan.driver.vendor"
+ 
+-#define WIFI_MODULE_43241_OPMODE	"/sys/module/bcm43241/parameters/op_mode"
+-#define WIFI_MODULE_4334_OPMODE		"/sys/module/bcm4334/parameters/op_mode"
+-#define WIFI_MODULE_4335_OPMODE		"/sys/module/bcm4335/parameters/op_mode"
+-
++/* libnetutils */
+ extern int do_dhcp();
+ extern int ifc_init();
+ extern void ifc_close();
+ extern char *dhcp_lasterror();
+ extern void get_dhcp_info();
++
++/* bionic */
+ extern int init_module(void *, unsigned long, const char *);
+ extern int delete_module(const char *, unsigned int);
+ void wifi_close_sockets();
+@@ -89,4 +89,14 @@ int file_exist(char *filename);
+ void log_cmd(const char *cmd);
+ void log_reply(char *reply, size_t *reply_len);
+ 
++struct wifi_glue_ops {
++        int             (*load_driver)(void);
++        int             (*unload_driver)(void);
++        int             (*switch_driver_mode)(int);
++        int             (*change_fw_path)(const char*);
++        const char *    (*get_fw_path)(int);
++        int             (*is_driver_loaded)(void);
++};
++
++
+ #endif /* !WIFI_H_ */
+-- 
+1.7.4.1
+

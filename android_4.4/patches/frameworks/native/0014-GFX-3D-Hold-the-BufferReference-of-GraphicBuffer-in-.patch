@@ -1,0 +1,138 @@
+From 250522cb05303a59be4ca8c8495ca26bcffb68d3 Mon Sep 17 00:00:00 2001
+From: Lingyun Zhu <lingyun.zhu@intel.com>
+Date: Wed, 17 Apr 2013 15:38:43 +0800
+Subject: GFX-3D: Hold the BufferReference of GraphicBuffer in BpGraphicBufferAlloc
+
+BZ: 86716
+
+In WIDI usage, BufferQueue is outside of SurfaceFlinger. If BufferQueue
+allocates a GraphicBuffer from SurfaceFlinger, BnGraphicBufferAlloc will
+create a BufferReference to hold a last ref to the GraphicBuffer, but
+when the transction finishes, the parcel used in the transaction will be
+destroyed and the BufferReference will be freed which caused the last
+ref of the GraphicBuffer in SurfaceFlinger side goes away and then
+destroy the GraphicBuffer. This leads to the buffer state between
+BufferQueue and SurfaceFlinger out of sync, because in BufferQueue side,
+the GraphicBuffer was just created and will be used later.
+
+This patch add a sp<IBinder> of BufferReference for each GraphicBuffer
+when created in BpGraphicBufferAlloc, this will make the BufferReference
+in BnGraphicBufferAlloc stay still when the transaction finishes, which
+also leads the GraphicBuffer be held. When BufferQueue free a
+GraphicBuffer, the sp<IBinder> BufferReference will be set to 0 which
+will free BufferReference and then GraphicBuffer in
+BnGraphicBufferAlloc/SurfaceFlinger side, and will not lead to memory
+leak.
+
+In normal use case, since the BufferQueue and SurfaceFlinger are in the
+same process, there will no Bp side exist. Thus, this patch will not
+affect the normal use case.
+
+Category: aosp improvement
+Domain:  <Graphics.UI>
+Origin: internal
+Upstream-Candiate:yes
+
+Change-Id: I223cfff14670b8a3091daf192475b59ee39c5439
+Orig-Change-Id: I812bbf046fd592a6dca1e4d157b459c9654835fb
+Signed-off-by: Lingyun Zhu <lingyun.zhu@intel.com>
+Signed-off-by: yifeix.xue <yifeix.xue@intel.com>
+---
+ include/gui/IGraphicBufferAlloc.h |    4 ++++
+ libs/gui/BufferQueue.cpp          |    2 ++
+ libs/gui/IGraphicBufferAlloc.cpp  |   26 +++++++++++++++++++++++---
+ 3 files changed, 29 insertions(+), 3 deletions(-)
+
+diff --git a/include/gui/IGraphicBufferAlloc.h b/include/gui/IGraphicBufferAlloc.h
+index cee41d9..4c4b41a 100644
+--- a/include/gui/IGraphicBufferAlloc.h
++++ b/include/gui/IGraphicBufferAlloc.h
+@@ -38,6 +38,10 @@ public:
+      */
+     virtual sp<GraphicBuffer> createGraphicBuffer(uint32_t w, uint32_t h,
+             PixelFormat format, uint32_t usage, status_t* error) = 0;
++
++    virtual void acquireBufferReferenceSlot(int32_t slot) {}
++    virtual void releaseBufferReferenceSlot(int32_t slot) {}
++
+ };
+ 
+ // ----------------------------------------------------------------------------
+diff --git a/libs/gui/BufferQueue.cpp b/libs/gui/BufferQueue.cpp
+index 85f7757..712c511 100644
+--- a/libs/gui/BufferQueue.cpp
++++ b/libs/gui/BufferQueue.cpp
+@@ -432,6 +432,7 @@ status_t BufferQueue::dequeueBuffer(int *outBuf, sp<Fence>* outFence, bool async
+ 
+     if (returnFlags & IGraphicBufferProducer::BUFFER_NEEDS_REALLOCATION) {
+         status_t error;
++        mGraphicBufferAlloc->acquireBufferReferenceSlot(*outBuf);
+         sp<GraphicBuffer> graphicBuffer(
+                 mGraphicBufferAlloc->createGraphicBuffer(w, h, format, usage, &error));
+         if (graphicBuffer == 0) {
+@@ -844,6 +845,7 @@ void BufferQueue::dump(String8& result, const char* prefix) const {
+ void BufferQueue::freeBufferLocked(int slot) {
+     ST_LOGV("freeBufferLocked: slot=%d", slot);
+     mSlots[slot].mGraphicBuffer = 0;
++    mGraphicBufferAlloc->releaseBufferReferenceSlot(slot);
+     if (mSlots[slot].mBufferState == BufferSlot::ACQUIRED) {
+         mSlots[slot].mNeedsCleanupOnRelease = true;
+     }
+diff --git a/libs/gui/IGraphicBufferAlloc.cpp b/libs/gui/IGraphicBufferAlloc.cpp
+index 139f219..3bca38c 100644
+--- a/libs/gui/IGraphicBufferAlloc.cpp
++++ b/libs/gui/IGraphicBufferAlloc.cpp
+@@ -24,6 +24,7 @@
+ 
+ #include <ui/GraphicBuffer.h>
+ 
++#include <gui/BufferQueue.h>
+ #include <gui/IGraphicBufferAlloc.h>
+ 
+ // ---------------------------------------------------------------------------
+@@ -40,6 +41,7 @@ public:
+     BpGraphicBufferAlloc(const sp<IBinder>& impl)
+         : BpInterface<IGraphicBufferAlloc>(impl)
+     {
++        mSlotIndex = -1;
+     }
+ 
+     virtual sp<GraphicBuffer> createGraphicBuffer(uint32_t w, uint32_t h,
+@@ -56,13 +58,31 @@ public:
+         if (result == NO_ERROR) {
+             graphicBuffer = new GraphicBuffer();
+             result = reply.read(*graphicBuffer);
+-            // reply.readStrongBinder();
+-            // here we don't even have to read the BufferReference from
+-            // the parcel, it'll die with the parcel.
++            if (mSlotIndex != -1) {
++                mSlots[mSlotIndex].mBufRef = reply.readStrongBinder();
++            }
+         }
+         *error = result;
+         return graphicBuffer;
+     }
++
++    virtual void acquireBufferReferenceSlot(int32_t slot) {
++        mSlotIndex = slot;
++    }
++
++    virtual void releaseBufferReferenceSlot(int32_t slot) {
++        mSlots[slot].mBufRef = 0;
++    }
++
++    struct BufferReferenceSlot {
++        BufferReferenceSlot() : mBufRef(0) {}
++        sp<IBinder> mBufRef;
++    };
++
++protected:
++    enum { NUM_BUFFER_SLOTS = BufferQueue::NUM_BUFFER_SLOTS };
++    BufferReferenceSlot mSlots[NUM_BUFFER_SLOTS];
++    int mSlotIndex;
+ };
+ 
+ IMPLEMENT_META_INTERFACE(GraphicBufferAlloc, "android.ui.IGraphicBufferAlloc");
+-- 
+1.7.4.1
+

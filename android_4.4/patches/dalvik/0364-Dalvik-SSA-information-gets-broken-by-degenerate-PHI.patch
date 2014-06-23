@@ -1,0 +1,212 @@
+From c6ae37380284ef60c1cc6663d63666830e4d2838 Mon Sep 17 00:00:00 2001
+From: David L Kreitzer <david.l.kreitzer@intel.com>
+Date: Thu, 10 Oct 2013 06:27:06 -0700
+Subject: Dalvik: SSA information gets broken by degenerate PHI removal
+
+BZ: 144224
+
+Fix up the SSA information following degenerate PHI removal.  Allow the
+degenerate PHIs to be removed in insertPhiNodeOperands but compute a mapping
+from the PHI's SSA number to the SSA number of its sole operand.  Subsequently
+walk the MIR, using the map to replace degenerate PHI references with
+references to their operands.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I5c24d8fbad060dba32ecc026d570fe25b5cca5d2
+Orig-MCG-Change-Id: If66a6b23552560ecb6fbd4e3f0bdae1c9e9b110d
+Signed-off-by: Kreitzer, David L <david.l.kreitzer@intel.com>
+Reviewed-on: http://android.intel.com:8080/137644
+Reviewed-by: Hartley, Timothy D <timothy.d.hartley@intel.com>
+Reviewed-by: Dittert, Eric <eric.dittert@intel.com>
+Reviewed-by: Banerji, Udayan <udayan.banerji@intel.com>
+Reviewed-by: Ansari, Zia <zia.ansari@intel.com>
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/CompilerIR.h          |   13 ++++++
+ vm/compiler/Frontend.cpp          |    8 ++++
+ vm/compiler/SSATransformation.cpp |   77 ++++++++++++++++++++++++++++++-------
+ 3 files changed, 84 insertions(+), 14 deletions(-)
+
+diff --git a/vm/compiler/CompilerIR.h b/vm/compiler/CompilerIR.h
+index 6ad2f20..373238e 100644
+--- a/vm/compiler/CompilerIR.h
++++ b/vm/compiler/CompilerIR.h
+@@ -523,6 +523,19 @@ typedef struct CompilationUnit {
+      * the global renaming property for the frame pointer which applies for all virtual registers in cUnit.
+      */
+     int registerWindowShift;
++
++    /**
++     * @brief Keeps track of the SSA numbers associated with degenerate PHIs
++     * @details A degenerate PHI node is a PHI with a single operand, i.e. a PHI
++     * that has only one reaching definition.  Degenerate PHIs are removed from
++     * the IR, and references to them are eventually replaced by references to
++     * the single reaching definition.  The degeneratePhiMap maintains an
++     * association between the SSA number of the PHI (the key) and the SSA
++     * number of the single reaching def (the value) from the time when the
++     * degenerate PHIs are removed to the time when the references to them
++     * are updated.
++     */
++    std::map<int, int> *degeneratePhiMap;
+ }CompilationUnit;
+ 
+ #if defined(WITH_SELF_VERIFICATION)
+diff --git a/vm/compiler/Frontend.cpp b/vm/compiler/Frontend.cpp
+index 1d732c0..63880bf 100644
+--- a/vm/compiler/Frontend.cpp
++++ b/vm/compiler/Frontend.cpp
+@@ -1811,6 +1811,10 @@ bool dvmCompileMethod(const Method *method, JitTranslationInfo *info)
+     std::map<int, int> constantValues;
+     cUnit.constantValues = &constantValues;
+ 
++    // Initialize the degenerate PHI map
++    std::map<int, int> degeneratePhiMap;
++    cUnit.degeneratePhiMap = &degeneratePhiMap;
++
+     /* Initialize the block list */
+     dvmInitGrowableList(&cUnit.blockList, 4);
+ 
+@@ -2408,6 +2412,10 @@ bool dvmCompileTrace(JitTraceDescription *desc, int numMaxInsts,
+     std::map<int, int> constantValues;
+     cUnit.constantValues = &constantValues;
+ 
++    // Initialize the degenerate PHI map
++    std::map<int, int> degeneratePhiMap;
++    cUnit.degeneratePhiMap = &degeneratePhiMap;
++
+ #if defined(WITH_JIT_TUNING)
+     /* Locate the entry to store compilation statistics for this method */
+     methodStats = dvmCompilerAnalyzeMethodBody(desc->method, false);
+diff --git a/vm/compiler/SSATransformation.cpp b/vm/compiler/SSATransformation.cpp
+index 4c76d42..2fb4279 100644
+--- a/vm/compiler/SSATransformation.cpp
++++ b/vm/compiler/SSATransformation.cpp
+@@ -718,20 +718,6 @@ static bool insertPhiNodeOperands(CompilationUnit *cUnit, BasicBlock *bb)
+         /* Count the number of SSA registers for a Dalvik register */
+         int numUses = dvmCountSetBits(ssaRegV);
+ 
+-        //If ever this MIR only has now one numUses due to the previous statement, than it isn't even a PHI node
+-        //Remove it now
+-        if (numUses == 1)
+-        {
+-            //First get the next one
+-            MIR *old = mir;
+-            mir = mir->next;
+-
+-            dvmCompilerRemoveMIR (old);
+-
+-            //On with the next MIR
+-            continue;
+-        }
+-
+         //Only need to allocate if we don't have enough in size
+         if (mir->ssaRep->numUses < numUses)
+         {
+@@ -755,6 +741,22 @@ static bool insertPhiNodeOperands(CompilationUnit *cUnit, BasicBlock *bb)
+             *usePtr++ = ssaRegIdx;
+         }
+ 
++        //If ever this MIR only has now one numUses due to the previous
++        //statement, than it isn't even a PHI node.
++        //Remove it now, but remember the SSA number of its one operand so that
++        //we can fix up any references to this PHI.
++        if (numUses == 1)
++        {
++            //First get the next one
++            MIR *old = mir;
++            mir = mir->next;
++            (*cUnit->degeneratePhiMap)[old->ssaRep->defs[0]] = old->ssaRep->uses[0];
++            dvmCompilerRemoveMIR (old);
++
++            //On with the next MIR
++            continue;
++        }
++
+         //Next MIR
+         mir = mir->next;
+     }
+@@ -762,6 +764,41 @@ static bool insertPhiNodeOperands(CompilationUnit *cUnit, BasicBlock *bb)
+     return true;
+ }
+ 
++/**
++ * @brief Update any references to degenerate PHIs within a basic block
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock
++ * @return unconditionally return true indicating that we might have changed
++ * bb. This function is only used in a non-iterative data flow, so the return
++ * value is really a "don't care".
++ */
++static bool fixDegeneratePhiUses(CompilationUnit *cUnit, BasicBlock *bb)
++{
++    // Walk the basic block
++    MIR *mir = bb->firstMIRInsn;
++
++    while (mir != 0)
++    {
++        // Foreach use SSANum
++        for (int i = 0; i < mir->ssaRep->numUses; i++)
++        {
++            int useSSANum = mir->ssaRep->uses[i];
++            std::map<int, int>::iterator it;
++
++            // Was the use SSANum defined by a deleted degenerate PHI?
++            it = cUnit->degeneratePhiMap->find (useSSANum);
++            if (it != cUnit->degeneratePhiMap->end ())
++            {
++                // If so, reference the degenerate PHI's operand instead.
++                mir->ssaRep->uses[i] = it->second;
++            }
++        }
++        mir = mir->next;
++    }
++
++    return true;
++}
++
+ /* Perform SSA transformation for the whole method */
+ void dvmCompilerMethodSSATransformation(CompilationUnit *cUnit)
+ {
+@@ -795,9 +832,15 @@ void dvmCompilerMethodSSATransformation(CompilationUnit *cUnit)
+                                                         false);
+ 
+     /* Insert phi-operands with latest SSA names from predecessor blocks */
++    cUnit->degeneratePhiMap->clear ();
+     dvmCompilerDataFlowAnalysisDispatcher(cUnit, insertPhiNodeOperands,
+                                           kReachableNodes,
+                                           false /* isIterative */);
++    if (cUnit->degeneratePhiMap->empty () == false) {
++        dvmCompilerDataFlowAnalysisDispatcher(cUnit, fixDegeneratePhiUses,
++                                              kReachableNodes,
++                                              false /* isIterative */);
++    }
+ }
+ 
+ /**
+@@ -1086,9 +1129,15 @@ bool dvmCompilerCalculateBasicBlockInformation (CompilationUnit *cUnit, bool fil
+     }
+ 
+     /* Insert phi-operands with latest SSA names from predecessor blocks */
++    cUnit->degeneratePhiMap->clear ();
+     dvmCompilerDataFlowAnalysisDispatcher(cUnit, insertPhiNodeOperands,
+                                           kReachableNodes,
+                                           false /* isIterative */);
++    if (cUnit->degeneratePhiMap->empty () == false) {
++        dvmCompilerDataFlowAnalysisDispatcher(cUnit, fixDegeneratePhiUses,
++                                              kReachableNodes,
++                                              false /* isIterative */);
++    }
+ 
+     //Set walk data: create the data on the stack, will get destroyed automatically at the end of the function
+     SSAWalkData data (cUnit);
+-- 
+1.7.4.1
+

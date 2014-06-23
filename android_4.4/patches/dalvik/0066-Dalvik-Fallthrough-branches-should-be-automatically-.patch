@@ -1,0 +1,241 @@
+From 7a238ffd9e33532cabb0fb18d08657f31a6dc441 Mon Sep 17 00:00:00 2001
+From: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Date: Thu, 24 Jan 2013 14:38:08 -0800
+Subject: Dalvik: Fallthrough branches should be automatically handled by the backend
+
+BZ: 75981
+
+Fallthrough branches should be automatically handled by the backend.
+Removing the need to use the needFallThroughBranch flag and use the next basic
+  block information.
+
+- CodegenInterface.cpp:
+  - Implemented fallthrough handling automatically in the back-end
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Ie68adf73c311d957ad61543aab4469e22ad226d0
+Orig-MCG-Change-Id: I1f0b5b7d589fcb2327294a8bbf2f447fffcb60ff
+Signed-off-by: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/codegen/x86/CodegenInterface.cpp |  107 +++++++++++++++++---------
+ 1 files changed, 72 insertions(+), 35 deletions(-)
+
+diff --git a/vm/compiler/codegen/x86/CodegenInterface.cpp b/vm/compiler/codegen/x86/CodegenInterface.cpp
+index d82ade9..48680db 100644
+--- a/vm/compiler/codegen/x86/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/CodegenInterface.cpp
+@@ -930,24 +930,6 @@ static void handleInvokePredictedChainingCell(CompilationUnit *cUnit, int blockI
+ #endif
+ }
+ 
+-/* Load the Dalvik PC into r0 and jump to the specified target */
+-static void handlePCReconstruction(CompilationUnit *cUnit,
+-                                   LowOpBlockLabel *targetLabel)
+-{
+-#if 0
+-    LowOp **pcrLabel =
+-        (LowOp **) cUnit->pcReconstructionList.elemList;
+-    int numElems = cUnit->pcReconstructionList.numUsed;
+-    int i;
+-    for (i = 0; i < numElems; i++) {
+-        dvmCompilerAppendLIR(cUnit, (LIR *) pcrLabel[i]);
+-        /* r0 = dalvik PC */
+-        loadConstant(cUnit, r0, pcrLabel[i]->operands[0]);
+-        genUnconditionalBranch(cUnit, targetLabel);
+-    }
+-#endif
+-}
+-
+ /* Extended MIR instructions like PHI */
+ void handleExtendedMIR(CompilationUnit *cUnit, MIR *mir)
+ {
+@@ -1097,14 +1079,36 @@ bool hasBranchInLoop(CompilationUnit *cUnit)
+     return true;
+ }
+ 
++/**
++ * @brief Handle fallthrough branch: determine whether we need one or not
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock
++ * @param ptrNextFallThrough pointer to the nextFallThrough if requested (can be 0)
++ */
++static void handleFallThroughBranch (CompilationUnit *cUnit, BasicBlock *bb, BasicBlock **ptrNextFallThrough)
++{
++    //Get next fall through
++    BasicBlock *nextFallThrough = *ptrNextFallThrough;
++
++    //We need a fallthrough branch if we had a next and it isn't the current BasicBlock
++    bool needFallThroughBranch = (nextFallThrough != 0 && bb != nextFallThrough);
++
++    if (needFallThroughBranch == true)
++    {
++        jumpToBasicBlock (stream, nextFallThrough->id);
++    }
++    //Clear it
++    *ptrNextFallThrough = 0;
++}
+ 
+ /**
+  * @brief Generate the code for the BasicBlock
+  * @param cUnit the CompilationUnit
+  * @param bb the BasicBlock
++ * @param nextFallThrough a pointer to the next fall through BasicBlock
+  * @return whether the generation went well
+  */
+-static bool generateCode (CompilationUnit *cUnit, BasicBlock *bb)
++static bool generateCode (CompilationUnit *cUnit, BasicBlock *bb, BasicBlock **nextFallThrough)
+ {
+     ALOGV("Get ready to handle JIT bb %d type %d hidden %d",
+             bb->id, bb->blockType, bb->hidden);
+@@ -1204,14 +1208,30 @@ static bool generateCode (CompilationUnit *cUnit, BasicBlock *bb)
+         } // end for
+     } // end else //JIT + O0 code generator
+ 
+-    /*
+-     * Check if the block is terminated due to trace length constraint -
+-     * insert an unconditional branch to the chaining cell.
+-     */
+-    if (bb->needFallThroughBranch) {
+-        jumpToBasicBlock(stream, bb->fallThrough->id);
++    //Ok we are going to skip this if the last instruction is an if
++    //This could be skipped if the if was not automatically generating the fallthrough jump
++    MIR *lastInsn = bb->lastMIRInsn;
++    bool shouldRegister = (lastInsn == 0);
++
++    if (lastInsn != 0)
++    {
++        Opcode opcode = lastInsn->dalvikInsn.opcode;
++        //We don't care about instructions that can branch in general
++        shouldRegister = ((dexGetFlagsFromOpcode(opcode) & kInstrCanBranch) == 0);
+     }
+ 
++    //If need be, register it: handleFallThroughBranch will do the rest
++    if (shouldRegister == true)
++    {
++        *nextFallThrough = bb->fallThrough;
++    }
++    else
++    {
++        //Otherwise, reset nextFallThrough
++        *nextFallThrough = 0;
++    }
++
++    //Everything went fine
+     return true;
+ }
+ 
+@@ -1227,6 +1247,9 @@ static bool generateCode (CompilationUnit *cUnit, BasicBlock *bb)
+ //! \param info: JitTranslationInfo. Holds generated code address on success
+ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+ {
++    //Used to determine whether we need a fallthrough jump
++    BasicBlock *nextFallThrough = 0;
++
+     dump_x86_inst = cUnit->printMe;
+ 
+     /* Used to hold the labels of each block */
+@@ -1331,23 +1354,33 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+         switch (bb->blockType)
+         {
+             case kEntryBlock:
++                //First handle fallthrough branch
++                handleFallThroughBranch (cUnit, bb, &nextFallThrough);
++
+                 labelList[i].lop.opCode2 = ATOM_PSEUDO_ENTRY_BLOCK;
+ 
+                 //Set label offset
+                 labelList[i].lop.generic.offset = (stream - streamMethodStart);
+ 
+-                if (generateCode (cUnit, bb) == false)
++                if (generateCode (cUnit, bb, &nextFallThrough) == false)
+                 {
+                     //Generate code set an error for the jit, we can just return
+                     return;
+                 }
+                 break;
+             case kExitBlock:
++                //Only do the handle through if there is an instruction in the exit block
++                if (bb->firstMIRInsn != 0)
++                {
++                    //First handle fallthrough branch
++                    handleFallThroughBranch (cUnit, bb, &nextFallThrough);
++                }
++
+                 labelList[i].lop.opCode2 = ATOM_PSEUDO_EXIT_BLOCK;
+                 //Set label offset
+                 labelList[i].lop.generic.offset = (stream - streamMethodStart);
+ 
+-                if (generateCode (cUnit, bb) == false)
++                if (generateCode (cUnit, bb, &nextFallThrough) == false)
+                 {
+                     //Generate code set an error for the jit, we can just return
+                     return;
+@@ -1357,11 +1390,14 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+                 //If hidden, we don't generate code
+                 if (bb->hidden == false)
+                 {
++                    //First handle fallthrough branch
++                    handleFallThroughBranch (cUnit, bb, &nextFallThrough);
++
+                     labelList[i].lop.opCode2 = ATOM_PSEUDO_NORMAL_BLOCK_LABEL;
+                     //Set label offset
+                     labelList[i].lop.generic.offset = (stream - streamMethodStart);
+ 
+-                    if (generateCode (cUnit, bb) == false)
++                    if (generateCode (cUnit, bb, &nextFallThrough) == false)
+                     {
+                         //Generate code set an error for the jit, we can just return
+                         return;
+@@ -1390,13 +1426,9 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+                 /* Handle the codegen later */
+                 dvmInsertGrowableList(&chainingListByType[kChainingCellHot], i);
+                 break;
+-            case kPCReconstruction:
+-                /* Make sure exception handling block is next */
+-                labelList[i].lop.opCode2 = ATOM_PSEUDO_PC_RECONSTRUCTION_BLOCK_LABEL;
+-                labelList[i].lop.generic.offset = (stream - streamMethodStart);
+-                handlePCReconstruction(cUnit, &labelList[cUnit->puntBlock->id]);
+-                break;
+             case kExceptionHandling:
++                //First handle fallthrough branch
++                handleFallThroughBranch (cUnit, bb, &nextFallThrough);
+                 labelList[i].lop.opCode2 = ATOM_PSEUDO_EH_BLOCK_LABEL;
+                 labelList[i].lop.generic.offset = (stream - streamMethodStart);
+                 scratchRegs[0] = PhysicalReg_EAX;
+@@ -1424,6 +1456,9 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+         if (cUnit->numChainingCells[i] == 0)
+             continue;
+ 
++        //First handle fallthrough branch
++        handleFallThroughBranch (cUnit, 0, &nextFallThrough);
++
+         /* Record the first LIR for a new type of chaining cell */
+         cUnit->firstChainingLIR[i] = (LIR *) &labelList[blockIdList[0]];
+         for (j = 0; j < chainingListByType[i].numUsed; j++) {
+@@ -1437,7 +1472,6 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+             /* Insert the pseudo chaining instruction */
+             dvmCompilerAppendLIR(cUnit, (LIR *) &labelList[blockId]);
+ 
+-
+             int nop_size;
+             switch (chainingBlock->blockType) {
+                 case kChainingCellNormal:
+@@ -1487,6 +1521,9 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+     // restore state to the code stream
+     singletonPtr<ExceptionHandlingRestoreState>()->dumpAllExceptionHandlingRestoreState();
+ 
++    //In case, handle fallthrough branch
++    handleFallThroughBranch (cUnit, 0, &nextFallThrough);
++
+     endOfTrace(false);
+ 
+     if (gDvmJit.codeCacheFull) {
+-- 
+1.7.4.1
+

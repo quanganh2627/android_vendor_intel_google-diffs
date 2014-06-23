@@ -1,0 +1,2548 @@
+From 659c68589ca60bbedbcbac7f8146a03b38bc0dd3 Mon Sep 17 00:00:00 2001
+From: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Date: Thu, 13 Jun 2013 14:58:28 -0700
+Subject: Dalvik: Clean up inlining logic
+
+BZ: 113228
+
+The inlining logic has been updated to use new helpers and fields
+which were not available when first developed. It also has been
+restructured to reduce code duplication between getter/setter logic
+and to prepare for virtual inlining and aggressive method inlining.
+
+The flag -Xjitdisableinlining can be used to disable method inlining.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I468ea8a93e67aec7d967b7fe5f0d81a064acae2e
+Orig-MCG-Change-Id: I5d60701d01deb29532e6b3a4d787823b51db4ab1
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/Init.cpp                                  |    3 +
+ vm/compiler/Compiler.h                       |    2 +
+ vm/compiler/CompilerIR.h                     |    6 +-
+ vm/compiler/Frontend.cpp                     |    7 +-
+ vm/compiler/InlineTransformation.cpp         | 1609 +++++++++++++++++++-------
+ vm/compiler/codegen/x86/AnalysisO1.cpp       |    6 +
+ vm/compiler/codegen/x86/BytecodeVisitor.cpp  |    6 -
+ vm/compiler/codegen/x86/CodegenInterface.cpp |    7 +-
+ vm/compiler/codegen/x86/Lower.cpp            |   45 +-
+ vm/compiler/codegen/x86/Lower.h              |   11 +-
+ vm/compiler/codegen/x86/LowerGetPut.cpp      |   13 +-
+ vm/compiler/codegen/x86/LowerInvoke.cpp      |   56 +-
+ vm/compiler/codegen/x86/LowerJump.cpp        |   79 +-
+ vm/compiler/codegen/x86/LowerMove.cpp        |    8 +-
+ 14 files changed, 1304 insertions(+), 554 deletions(-)
+
+diff --git a/vm/Init.cpp b/vm/Init.cpp
+index 28c6ac6..d1ccaa8 100644
+--- a/vm/Init.cpp
++++ b/vm/Init.cpp
+@@ -171,6 +171,7 @@ static void usage(const char* progName)
+     dvmFprintf(stderr, "  -Xjitignorepasses:<value> (Ignore certain loop passes, the full name of the pass must be included, see -Xjitlooppasses to get a list)\n");
+     dvmFprintf(stderr, "  -Xjitlooppasses (Prints the loop passes available)\n");
+     dvmFprintf(stderr, "  -Xjitregisterization:<value> Request a maximum of registerization requests\n");
++    dvmFprintf(stderr, "  -Xjitdisableinlining Disable method inlining\n");
+ #if defined(VTUNE_DALVIK)
+     dvmFprintf(stderr, "  -Xjitsepdalvik\n");
+     dvmFprintf(stderr, "  -Xjitvtuneinfo:{none,jit,dex,src}\n");
+@@ -1294,6 +1295,8 @@ static int processOptions(int argc, const char* const argv[],
+             {
+                 dvmFprintf (stderr, "Refusing option for %s, it is not a valid number: must be only a strictly positive number\n", argv[i]);
+             }
++        } else if (strncmp(argv[i], "-Xjitdisableinlining", 20) == 0) {
++            gDvmJit.disableOpt |= 1 << kMethodInlining;
+         } else if (strncmp(argv[i], "-Xjitoldloops", 13) == 0) {
+             gDvmJit.oldLoopDetection = true;
+         } else if (strncmp(argv[i], "-Xjitignorepasses:", 18) == 0) {
+diff --git a/vm/compiler/Compiler.h b/vm/compiler/Compiler.h
+index e6be4c7..3d71cb5 100644
+--- a/vm/compiler/Compiler.h
++++ b/vm/compiler/Compiler.h
+@@ -153,6 +153,7 @@ typedef enum JitMethodAttributes {
+     kIsGetter,          /* Method fits the getter pattern */
+     kIsSetter,          /* Method fits the setter pattern */
+     kCannotCompile,     /* Method cannot be compiled */
++    kCannotInline,      /* Method cannot be inlined */
+ } JitMethodAttributes;
+ 
+ #define METHOD_IS_CALLEE        (1 << kIsCallee)
+@@ -163,6 +164,7 @@ typedef enum JitMethodAttributes {
+ #define METHOD_IS_GETTER        (1 << kIsGetter)
+ #define METHOD_IS_SETTER        (1 << kIsSetter)
+ #define METHOD_CANNOT_COMPILE   (1 << kCannotCompile)
++#define METHOD_CANNOT_INLINE    (1 << kCannotInline)
+ 
+ /* Vectors to provide optimization hints */
+ typedef enum JitOptimizationHints {
+diff --git a/vm/compiler/CompilerIR.h b/vm/compiler/CompilerIR.h
+index b88b3df..e3d397e 100644
+--- a/vm/compiler/CompilerIR.h
++++ b/vm/compiler/CompilerIR.h
+@@ -116,8 +116,9 @@ enum ExtendedMIROpcode {
+     /** @brief Punt
+       No arguments for the back end */
+     kMirOpPunt,
+-    /** @brief Gen checks for predicted inlining
+-      vC: this, contains call information */
++    /** @brief Checks for validity of predicted inlining
++      vB: Class object pointer
++      vC: The register that holds "this" reference */
+     kMirOpCheckInlinePrediction,
+     /** @brief Null Check, va: objectReg */
+     kMirOpNullCheck,
+@@ -335,7 +336,6 @@ typedef struct CompilationUnit {
+     const Method *method;
+ #ifdef ARCH_IA32
+     int exceptionBlockId;               /**< @brief The block corresponding to exception handling */
+-    bool singletonInlined;              /**< @brief TRUE if singleton call inlined */
+     struct ConstInfo *constListHead;    /**< @brief pointer to head of the list of 64 bit constants */
+ #endif
+     unsigned int maximumRegisterization;    /**< @brief Maximum registerization to be accepted */
+diff --git a/vm/compiler/Frontend.cpp b/vm/compiler/Frontend.cpp
+index 1e35537..ba936cb 100644
+--- a/vm/compiler/Frontend.cpp
++++ b/vm/compiler/Frontend.cpp
+@@ -2692,9 +2692,10 @@ bool dvmCompileTrace(JitTraceDescription *desc, int numMaxInsts,
+     /* Set the instruction set to use (NOTE: later components may change it) */
+     cUnit.instructionSet = dvmCompilerInstructionSet();
+ 
+-    /* Inline transformation @ the MIR level */
+-    if (cUnit.hasInvoke && !(gDvmJit.disableOpt & (1 << kMethodInlining))) {
+-        dvmCompilerInlineMIR(&cUnit, info);
++    //Try to inline invokes
++    if (cUnit.hasInvoke == true)
++    {
++        dvmCompilerInlineMIR (&cUnit, info);
+     }
+ 
+     cUnit.numDalvikRegisters = cUnit.method->registersSize
+diff --git a/vm/compiler/InlineTransformation.cpp b/vm/compiler/InlineTransformation.cpp
+index ed2036c..3798591 100755
+--- a/vm/compiler/InlineTransformation.cpp
++++ b/vm/compiler/InlineTransformation.cpp
+@@ -18,6 +18,218 @@
+ #include "Dataflow.h"
+ #include "libdex/DexOpcodes.h"
+ 
++/**
++ * @brief Used to define different failure modes for inlining
++ */
++enum InliningFailure
++{
++    kInliningNoError = 0,                //!< @brief No inlining error
++    kInliningSuccess = kInliningNoError, //!< @brief Inlining success is the same as having no inlining error
++    kInliningMirRemovalFailed,           //!< @brief Used when removal of an MIR fails
++    kInliningNoPredictedCC,              //!< @brief Used when invoke is predicted but does not have a CC
++    kInliningInvokeBBNoChild,            //!< @brief Used when the invoke's BB does not have a child
++    kInliningOverlapUseWithDef,          //!< @brief Used when there is rewriting and there is overlapping use with def
++    kInliningBadCalleeCFG,               //!< @brief Used when the callee CFG created is bad
++    kInliningCalleeCFGHasLoops,          //!< @brief Used when the callee CFG has loops
++    kInliningUnsupportedBytecodes,       //!< @brief Used when CFG building fails because of unsupported bytecodes for inlining
++    kInliningCannotFindReturn,           //!< @brief Used when return bytecode from callee cannot be found
++    kInliningCannotFindMoveResult,       //!< @brief Used when move-result bytecode from caller cannot be found
++    kInliningMoveResultNoMatchReturn,    //!< @brief Used when move-result does not match return type
++    kInliningCannotFindBytecode,         //!< @brief Used when bytecode for rewriting cannot be found
++    kInliningNativeMethod,               //!< @brief Used when for inlining is native
++    kInliningFailedBefore,               //!< @brief Used when we've tried inlining before and failed for same method
++    kInliningNoVirtualSupport,           //!< @brief Used when backend does not support devirtualization
++    kInliningMethodComplicated,          //!< @brief Used when method is too complicated for inliner
++    kInliningDisabled,                   //!< @brief Used when inlining is disabled
++    kInliningMethodTraceEnabled,         //!< @brief Used when method trace is enabled because inlining cannot happen
++    kInliningSingleStepInvoke,           //!< @brief Used when invoke is selected for single stepping and thus inlining cannot happen
++    kInliningInvokeBBProblem,            //!< @brief Used when the BB of invoke does not match what invoke believes
++    kInliningNestedInlining,             //!< @brief Used when we try to inline an invoke that itself has been inlined
++    kInliningUnknownMethod,              //!< @brief Used when it is not know which method to inline
++    kInliningMoreThanOneBytecode,        //!< @brief Used when we are trying to inline a method with one bytecode and we find more than one
++    kInliningAlreadyInlined,             //!< @brief Used when we have already inlined the invoke
++};
++
++/**
++ * @brief Used to get a message for failure mode
++ * @param failure The type of inlining failure
++ * @return Returns the message matching failure
++ */
++static const char *getFailureMessage (InliningFailure failure)
++{
++    const char *message = "unknown inlining failure";
++
++    switch (failure) {
++        case kInliningNoError:
++            message = "";
++            break;
++        case kInliningMirRemovalFailed:
++            message = "removing an MIR failed";
++            break;
++        case kInliningNoPredictedCC:
++            message = "invoke is virtual but CFG does not have a predicted chaining cell";
++            break;
++        case kInliningInvokeBBNoChild:
++            message = "invoke's basic block does not have a child basic block";
++            break;
++        case kInliningOverlapUseWithDef:
++            message = "cannot handle rewriting when there is overlapping use with def";
++            break;
++        case kInliningBadCalleeCFG:
++            message = "the callee method CFG has unexpected shape";
++            break;
++        case kInliningCalleeCFGHasLoops:
++            message = "the CFG of callee method has loops and those are not yet supported";
++            break;
++        case kInliningUnsupportedBytecodes:
++            message = "during building of callee CFG, unsupported bytecodes were found";
++            break;
++        case kInliningCannotFindReturn:
++            message = "cannot find return bytecode in callee CFG";
++            break;
++        case kInliningCannotFindMoveResult:
++            message = "cannot find move-result in caller and we need one";
++            break;
++        case kInliningMoveResultNoMatchReturn:
++            message = "the type of move-result does not match type of return";
++            break;
++        case kInliningCannotFindBytecode:
++            message = "the single bytecode that we need to rewrite cannot be found";
++            break;
++        case kInliningNativeMethod:
++            message = "native methods cannot be inlined";
++            break;
++        case kInliningFailedBefore:
++            message = "we tried inlining method before and we failed";
++            break;
++        case kInliningNoVirtualSupport:
++            message = "backend does not support devirtualization so we cannot inline virtual invokes";
++            break;
++        case kInliningMethodComplicated:
++            message = "method is too complicated for inliner";
++            break;
++        case kInliningDisabled:
++            message = "inlining is disabled";
++            break;
++        case kInliningMethodTraceEnabled:
++            message = "method tracing is enabled and thus we should not be inlining";
++            break;
++        case kInliningSingleStepInvoke:
++            message = "invoke was selected for single stepping and we should not be inlining";
++            break;
++        case kInliningInvokeBBProblem:
++            message = "the BB that holds invoke does not match what the invoke believe is its parent";
++            break;
++        case kInliningNestedInlining:
++            message = "inlining of inlined invoke is not yet supported";
++            break;
++        case kInliningUnknownMethod:
++            message = "cannot figure out what method needs to be inlined";
++            break;
++        case kInliningMoreThanOneBytecode:
++            message = "more than one bytecode found when we weren't expecting";
++            break;
++        case kInliningAlreadyInlined:
++            message = "already inlined invoke";
++            break;
++        default:
++            break;
++    }
++
++    return message;
++}
++
++/**
++ * @brief Checks if inlining failure that occurred is recoverable
++ * @param failure The inlining failure
++ * @return Returns true if inliner believes that error is fatal
++ */
++static bool isInliningFailureFatal (InliningFailure failure)
++{
++    bool isFatal = false;
++
++    switch (failure) {
++        //Bad CFG because invoke's BB should be consistent with the BB
++        case kInliningInvokeBBProblem:
++        //Bad CFG because there should always be BB after invoke's BB
++        case kInliningInvokeBBNoChild:
++        //MIR removal can only fail if there is a bad CFG when we cannot find a MIR in its BB
++        case kInliningMirRemovalFailed:
++            isFatal = true;
++            break;
++        default:
++            break;
++    }
++
++    return isFatal;
++}
++
++/**
++ * @brief Determines if bytecode can be inlined.
++ * @details Checks if all fields are resolved and then checks for unsupported bytecodes
++ * @param method The method that is being inlined
++ * @param insn The decoded instruction we want to examine
++ * @param failureMessage In case of false return, it may be updated to point to a failure message.
++ * @return Returns whether this bytecode can be inlined
++ */
++static bool canInlineBytecode (const Method *method, const DecodedInstruction *insn, const char **failureMessage)
++{
++    if (dvmCompilerCheckResolvedReferences (method, insn) == false)
++    {
++        if (failureMessage != 0)
++        {
++            *failureMessage = "could not resolve fields";
++        }
++        return false;
++    }
++
++    switch (insn->opcode)
++    {
++        case OP_INVOKE_VIRTUAL:
++        case OP_INVOKE_INTERFACE:
++        case OP_INVOKE_VIRTUAL_RANGE:
++        case OP_INVOKE_INTERFACE_RANGE:
++            if (failureMessage != 0)
++            {
++                *failureMessage = "no support for making prediction for inlined virtual invokes";
++            }
++            return false;
++
++        case OP_PACKED_SWITCH:
++        case OP_SPARSE_SWITCH:
++            if (failureMessage != 0)
++            {
++                *failureMessage = "no support for sparse/packed switch";
++            }
++            return false;
++
++        case OP_IGET_VOLATILE:
++        case OP_IPUT_VOLATILE:
++        case OP_SGET_VOLATILE:
++        case OP_SPUT_VOLATILE:
++        case OP_IGET_OBJECT_VOLATILE:
++        case OP_IGET_WIDE_VOLATILE:
++        case OP_IPUT_WIDE_VOLATILE:
++        case OP_SGET_WIDE_VOLATILE:
++        case OP_SPUT_WIDE_VOLATILE:
++        case OP_IPUT_OBJECT_VOLATILE:
++        case OP_SGET_OBJECT_VOLATILE:
++        case OP_SPUT_OBJECT_VOLATILE:
++            //We should not be inlining volatile bytecodes
++            if (failureMessage != 0)
++            {
++                *failureMessage = "volatile bytecodes should not be inlined";
++            }
++            return false;
++
++        default:
++            break;
++    }
++
++    //We can inline instruction if we get here
++    return true;
++}
++
+ /* Convert the reg id from the callee to the original id passed by the caller */
+ static inline u4 convertRegId(const DecodedInstruction *invoke,
+                               const Method *calleeMethod,
+@@ -34,573 +246,1124 @@ static inline u4 convertRegId(const DecodedInstruction *invoke,
+     }
+ }
+ 
+-static bool inlineGetter(CompilationUnit *cUnit,
+-                         const Method *calleeMethod,
+-                         MIR *invokeMIR,
+-                         BasicBlock *invokeBB,
+-                         bool isPredicted,
+-                         bool isRange)
++/**
++ * @brief Used to check whether an invoke opcode is a range variant
++ * @param opcode The opcode to check
++ * @return Returns whether the opcode is a range invoke
++ */
++static inline bool isRangeInvoke (Opcode opcode)
+ {
+-    //Suppose the move result is the next MIR
+-    MIR *moveResultMIR = invokeMIR->next;
+-    //Suppose the move result BB is the same as the invoke
+-    BasicBlock *moveResultBB = invokeBB;
+-
+-    //If the invokeMIR is not the last MIR, the move result should be the next MIR
+-    if (moveResultMIR == 0)
++    switch (opcode)
+     {
+-        moveResultBB = invokeBB->fallThrough;
++        //Return true for all range invokes
++        case OP_INVOKE_SUPER_RANGE:
++        case OP_INVOKE_DIRECT_RANGE:
++        case OP_INVOKE_STATIC_RANGE:
++        case OP_INVOKE_SUPER_QUICK_RANGE:
++        case OP_INVOKE_VIRTUAL_RANGE:
++        case OP_INVOKE_VIRTUAL_QUICK_RANGE:
++        case OP_INVOKE_INTERFACE_RANGE:
++            return true;
++        default:
++            break;
++    }
+ 
+-        //Paranoid, in case we don't have it
+-        if (moveResultBB == 0) {
+-            return false;
+-        }
++    //If we get here we do not have a range invoke
++    return false;
++}
+ 
+-        //Get the first instruction: testing whether it is a move result is done below
+-        moveResultMIR = moveResultBB->firstMIRInsn;
++/**
++ * @brief Used to check whether an opcode is a return.
++ * @param opcode The opcode to check
++ * @return Returns whether the opcode is a return
++ */
++static inline bool isReturn (Opcode opcode)
++{
++    switch (opcode)
++    {
++        //Return true for all return bytecodes
++        case OP_RETURN:
++        case OP_RETURN_OBJECT:
++        case OP_RETURN_WIDE:
++        case OP_RETURN_VOID:
++        case OP_RETURN_VOID_BARRIER:
++            return true;
++        default:
++            break;
+     }
+ 
+-    DecodedInstruction getterInsn;
++    //If we get here we do not have a return
++    return false;
++}
+ 
+-    /*
+-     * Not all getter instructions have vC but vC will be read by
+-     * dvmCompilerGetDalvikDisassembly unconditionally.
+-     * Initialize it here to get Valgrind happy.
+-     */
+-    getterInsn.vC = 0;
++/**
++ * @brief Used to check whether an opcode is a move-result.
++ * @param opcode The opcode to check
++ * @return Returns whether the opcode is a move-result
++ */
++static inline bool isMoveResult (Opcode opcode)
++{
++    switch (opcode)
++    {
++        //Return true for all move-result bytecodes
++        case OP_MOVE_RESULT:
++        case OP_MOVE_RESULT_OBJECT:
++        case OP_MOVE_RESULT_WIDE:
++            return true;
++        default:
++            break;
++    }
+ 
+-    dexDecodeInstruction(calleeMethod->insns, &getterInsn);
++    //If we get here we do not have a move-result
++    return false;
++}
+ 
+-    if (dvmCompilerCheckResolvedReferences (calleeMethod, &getterInsn) == false)
++/**
++ * @brief Used to get the block that follows invoke. If move-result is provided, it gets block after that.
++ * @details May cause block splits if invoke or move-result are in middle of block.
++ * @param callerBasicBlocks The list of basic blocks of caller
++ * @param invoke The invoke MIR
++ * @param moveResult The move-result MIR
++ * @return Returns the basic block which follows invoke.
++ */
++static BasicBlock *getBlockAfterInvoke (GrowableList &callerBasicBlocks, MIR *invoke, MIR *moveResult = 0)
++{
++    //Assume that the block after invoke is its fallthrough
++    BasicBlock *afterInvokeBB = invoke->bb->fallThrough;
++
++    //If invoke wasn't the last MIR of its block, we may need to split the block so we check now.
++    if (invoke != invoke->bb->lastMIRInsn)
+     {
+-        return false;
++        assert (invoke->next != 0);
++
++        //If we don't have a move-result, then split after invoke
++        if (moveResult == 0)
++        {
++            afterInvokeBB = dvmCompilerSplitBlock (&callerBasicBlocks, invoke->next, invoke->bb);
++        }
++        else
++        {
++            //If the move-result is the last instruction then we don't need to split, just take fallthrough
++            if (moveResult == invoke->bb->lastMIRInsn)
++            {
++                afterInvokeBB = invoke->bb->fallThrough;
++            }
++            //If we do have a move-result then split after it
++            else
++            {
++                assert (moveResult == invoke->next);
++                assert (moveResult->next != 0);
++
++                afterInvokeBB = dvmCompilerSplitBlock (&callerBasicBlocks, moveResult->next, invoke->bb);
++            }
++        }
+     }
++    else
++    {
++        //Invoke is the last MIR of its block so now check to see if we have a move-result
++        if (moveResult != 0)
++        {
++            //If the move-result is not the last of its BB, then we must split
++            if (moveResult != moveResult->bb->lastMIRInsn)
++            {
++                assert (moveResult->next != 0);
+ 
+-    /*
+-     * Some getters (especially invoked through interface) are not followed
+-     * by a move result.
+-     */
+-    if ((moveResultMIR == NULL) ||
+-        (moveResultMIR->dalvikInsn.opcode != OP_MOVE_RESULT &&
+-         moveResultMIR->dalvikInsn.opcode != OP_MOVE_RESULT_OBJECT &&
+-         moveResultMIR->dalvikInsn.opcode != OP_MOVE_RESULT_WIDE)) {
+-        return false;
++                afterInvokeBB = dvmCompilerSplitBlock (&callerBasicBlocks, moveResult->next, moveResult->bb);
++            }
++            else
++            {
++                //move-result is the last in its BB so the BB after invoke
++                afterInvokeBB = moveResult->bb->fallThrough;
++            }
++        }
+     }
+ 
+-    int dfFlags = dvmCompilerDataFlowAttributes[getterInsn.opcode];
++    return afterInvokeBB;
++}
+ 
+-    /* Expecting vA to be the destination register */
+-    if (dfFlags & (DF_UA | DF_UA_WIDE)) {
+-        ALOGE("opcode %d has DF_UA set (not expected)", getterInsn.opcode);
+-        dvmAbort();
+-    }
++/**
++ * @brief Tries to remove the invoke and move-result.
++ * @details If removal fails, it guarantees that the CFG will be in a valid state.
++ * @param callerBasicBlocks The basic blocks of caller
++ * @param invoke The invoke MIR to remove
++ * @param moveResult The move-result MIR to remove
++ * @return Returns inlining success/failure
++ */
++static InliningFailure removeInvokeAndMoveResult (GrowableList &callerBasicBlocks, MIR *invoke, MIR *moveResult)
++{
++    //Remember the BB which holds the invoke
++    BasicBlock *invokeBB = invoke->bb;
+ 
+-    if (dfFlags & DF_UB) {
+-        getterInsn.vB = convertRegId(&invokeMIR->dalvikInsn, calleeMethod,
+-                                     getterInsn.vB, isRange);
++    //Remember MIR previous to the invoke
++    MIR *beforeInvoke = invoke->prev;
++
++    //Try to remove the invoke
++    bool removed = dvmCompilerRemoveMIR (invoke);
++
++    //In assert world, removal should never fail because it means bad CFG
++    assert (removed == true);
++
++    //If we removed the invoke, we try to remove the move-result
++    if (removed == true && moveResult != 0)
++    {
++        //Try to remove move-result
++        removed = dvmCompilerRemoveMIR (moveResult);
++
++        //In assert world, removal should never fail because it means bad CFG
++        assert (removed == true);
++
++        //If we failed the removal of the move-result, we must restore the invoke
++        if (removed == false)
++        {
++            //We insert it back in its original location
++            dvmCompilerInsertMIRAfter (invokeBB, beforeInvoke, invoke);
++        }
+     }
+ 
+-    if (dfFlags & DF_UC) {
+-        getterInsn.vC = convertRegId(&invokeMIR->dalvikInsn, calleeMethod,
+-                                     getterInsn.vC, isRange);
++    //If we failed to remove the bytecodes, we reverted CFG but we still fail
++    if (removed == false)
++    {
++        return kInliningMirRemovalFailed;
+     }
+ 
+-    getterInsn.vA = moveResultMIR->dalvikInsn.vA;
++#ifndef ARCH_IA32
++    //Now we want to fix fallthrough branch because some backends need this information to be correct
++    MIR *lastMir = invokeBB->lastMIRInsn;
+ 
+-    /* Now setup the Dalvik instruction with converted src/dst registers */
+-    MIR *newGetterMIR = static_cast <MIR *> (dvmCompilerNew(sizeof(MIR), true));
+-    newGetterMIR->dalvikInsn = getterInsn;
++    if (lastMir != 0)
++    {
++        int flags = dvmCompilerGetOpcodeFlags (lastMir->dalvikInsn.opcode);
+ 
+-    newGetterMIR->width = dexGetWidthFromOpcode(getterInsn.opcode);
++        //If bytecode can continue, it may fall through in which case branch is needed
++        if (flags & kInstrCanContinue != 0)
++        {
++            invokeBB->needFallThroughBranch = true;
++        }
++    }
++#endif
+ 
+-    newGetterMIR->OptimizationFlags |= MIR_CALLEE;
++    //Everything went well
++    return kInliningNoError;
++}
+ 
+-    /*
+-     * If the getter instruction is about to raise any exception, punt to the
+-     * interpreter and re-execute the invoke.
+-     */
+-    newGetterMIR->offset = invokeMIR->offset;
++/**
++ * @brief Used to create extended MIR that does prediction check.
++ * @param invoke The virtual/interface invoke whose method call is being inlined
++ * @return The newly created MIR for prediction check
++ */
++static MIR *createPredictionCheck (MIR *invoke)
++{
++    //Make a copy of the invoke
++    MIR *checkPrediction = dvmCompilerCopyMIR (invoke);
+ 
+-    newGetterMIR->meta.calleeMethod = calleeMethod;
++    //Get reference to decoded instruction so we can update it
++    DecodedInstruction &newInstr = checkPrediction->dalvikInsn;
+ 
+-    dvmCompilerInsertMIRAfter(invokeBB, invokeMIR, newGetterMIR);
++    //Update the Opcode of the invoke check
++    newInstr.opcode = static_cast<Opcode> (kMirOpCheckInlinePrediction);
+ 
+-    if (isPredicted) {
+-        MIR *invokeMIRSlow = (MIR *)dvmCompilerNew(sizeof(MIR), true);
+-        *invokeMIRSlow = *invokeMIR;
+-        invokeMIR->dalvikInsn.opcode = (Opcode)kMirOpCheckInlinePrediction;
++    //Put the "this" argument in vC
++    newInstr.vC = invoke->dalvikInsn.vC;
+ 
+-        /* Use vC to denote the first argument (ie this) */
+-        if (!isRange) {
+-            invokeMIR->dalvikInsn.vC = invokeMIRSlow->dalvikInsn.arg[0];
+-        }
++    //Get the callsite info to use to find class
++    CallsiteInfo *callsiteInfo = invoke->meta.callsiteInfo;
+ 
+-        moveResultMIR->OptimizationFlags |= MIR_INLINED_PRED;
++    //Find named class using loader from meta information
++    ClassObject *clazz = dvmFindClassNoInit (callsiteInfo->classDescriptor, callsiteInfo->classLoader);
+ 
+-        dvmCompilerInsertMIRAfter(invokeBB, newGetterMIR, invokeMIRSlow);
+-        invokeMIRSlow->OptimizationFlags |= MIR_INLINED_PRED;
+-#if defined(WITH_JIT_TUNING)
+-        gDvmJit.invokePolyGetterInlined++;
+-#endif
+-    } else {
+-#ifndef ARCH_IA32
+-        invokeMIR->OptimizationFlags |= MIR_INLINED;
+-        moveResultMIR->OptimizationFlags |= MIR_INLINED;
+-#else
+-        //In the x86 world, we prefer removing the MIR to clean up the Middle-End
+-        //This makes it cleaner when traversing, dumping, etc.
+-        //It adds nothing to keep it
++    //Get the class literal since there is a unique instance of the class
++    assert (sizeof (clazz) == sizeof (u4));
++    u4 clazzLiteral = reinterpret_cast<u4> (clazz);
+ 
+-        //Remember prev/next
+-        MIR *prev = invokeMIR->prev;
+-        MIR *next = invokeMIR->next;
++    //Put the class literal in vB
++    newInstr.vB = clazzLiteral;
+ 
+-        bool res = dvmCompilerRemoveMIR (invokeBB, invokeMIR);
++    return checkPrediction;
++}
+ 
+-        //If we removed the invoke, we try to remove the moveResult
+-        if (res == true)
+-        {
+-            res = dvmCompilerRemoveMIR (moveResultBB, moveResultMIR);
+-        }
++/**
++ * @brief Detaches the chaining cell associated with invoke and returns a pointer to it.
++ * @param invokeBB The invoke BB to which the chaining cell should be attached to.
++ * @param ccType The chaining cell type to look for in order to detach.
++ * @return Returns the detached chaining cell if one is found.
++ */
++static BasicBlock *detachInvokeCC (BasicBlock *invokeBB, BBType ccType)
++{
++    //Find the chaining cell associated with invoke
++    BasicBlock *chainingCell = 0;
+ 
+-        if (res == false)
+-        {
+-            //If it failed, we should insert it back
+-            invokeMIR->prev = prev;
+-            //Was the invoke the first instruction?
+-            if (prev == 0)
+-            {
+-                invokeBB->firstMIRInsn = invokeMIR;
+-            }
+-            else
+-            {
+-                //Otherwise just set next for prev
+-                prev->next = invokeMIR;
+-            }
++    //Check whether we actually have one in the taken branch
++    if (invokeBB->taken != 0 && invokeBB->taken->blockType == ccType)
++    {
++        chainingCell = invokeBB->taken;
+ 
+-            //Set the next back
+-            invokeMIR->next = next;
+-            //Was the invoke the last instruction?
+-            if (next == 0)
+-            {
+-                invokeBB->lastMIRInsn = invokeMIR;
+-            }
+-            else
+-            {
+-                //Otherwise just set prev for next
+-                next->prev = invokeMIR;
+-            }
+-            ALOGD ("Inlining failed in inlineGetter");
+-            return false;
+-        }
+-#endif
+-#if defined(WITH_JIT_TUNING)
+-        gDvmJit.invokeMonoGetterInlined++;
+-#endif
++        //Remove the CC from the invoke's BB taken so we can use it later
++        dvmCompilerReplaceChildBasicBlock (0, invokeBB, kChildTypeTaken);
+     }
+ 
+-    return true;
++    return chainingCell;
+ }
+ 
+-static bool inlineSetter(CompilationUnit *cUnit,
+-                         const Method *calleeMethod,
+-                         MIR *invokeMIR,
+-                         BasicBlock *invokeBB,
+-                         bool isPredicted,
+-                         bool isRange)
++/**
++ * @brief Sets up CFG being able to do prediction inlining by creating a devirtualization split.
++ * @details From the invokeBB it creates two paths: one for the slow invoke (that itself falls through
++ * to afterInvokeBB) and one that goes directly to afterInvokeBB. This split is done before the method
++ * body is inlined.
++ * @param callerBasicBlocks The basic blocks of caller method
++ * @param invokeBB The basic block which holds invoke
++ * @param invoke The invoke MIR
++ * @param afterInvokeBB The basic block which follows invoke MIR
++ * @param predictedCC The predicted chaining cell for virtual invoke
++ * @param moveResult The move-result associated with invoke
++ * @return Returns inlining success/failure
++ */
++static InliningFailure manipulateCFGForPrediction (GrowableList &callerBasicBlocks, BasicBlock *invokeBB, MIR *invoke,
++        BasicBlock *afterInvokeBB, BasicBlock *predictedCC, MIR *moveResult)
+ {
+-    MIR *newSetterMIR = (MIR *)dvmCompilerNew(sizeof(MIR), true);
+-    DecodedInstruction setterInsn;
++    assert (invokeBB != 0 && afterInvokeBB != 0 && predictedCC != 0);
+ 
+-    /*
+-     * Not all setter instructions have vC but vC will be read by
+-     * dvmCompilerGetDalvikDisassembly unconditionally.
+-     * Initialize it here to get Valgrind happy.
+-     */
+-    setterInsn.vC = 0;
++    //Remember MIR previous to the invoke
++    MIR *beforeInvoke = invoke->prev;
+ 
+-    dexDecodeInstruction(calleeMethod->insns, &setterInsn);
++    //Remove the invoke and move-result from their BBs
++    InliningFailure removed = removeInvokeAndMoveResult (callerBasicBlocks, invoke, moveResult);
+ 
+-    if (dvmCompilerCheckResolvedReferences (calleeMethod, &setterInsn) == false)
++    if (removed != kInliningNoError)
+     {
+-        return false;
++        //Removal failed so we just pass along error
++        return removed;
+     }
+ 
+-    int dfFlags = dvmCompilerDataFlowAttributes[setterInsn.opcode];
++    //Create prediction check
++    MIR *checkPrediction = createPredictionCheck (invoke);
++
++    //We insert our check in place of the invoke
++    dvmCompilerInsertMIRAfter (invokeBB, beforeInvoke, checkPrediction);
+ 
+-    if (dfFlags & (DF_UA | DF_UA_WIDE)) {
+-        setterInsn.vA = convertRegId(&invokeMIR->dalvikInsn, calleeMethod,
+-                                     setterInsn.vA, isRange);
++    //In case of misprediction we need to actually do the invoke so create that BB right now
++    BasicBlock *mispredictBB = dvmCompilerNewBBinList (callerBasicBlocks, kDalvikByteCode);
+ 
++    //Add the invoke to the path for misprediction
++    dvmCompilerAppendMIR (mispredictBB, invoke);
++    invoke->OptimizationFlags |= MIR_INLINED_PRED;
++
++    //Do the same for move-result as was done for invoke
++    if (moveResult != 0)
++    {
++        dvmCompilerAppendMIR (mispredictBB, moveResult);
++        moveResult->OptimizationFlags |= MIR_INLINED_PRED;
+     }
+ 
+-    if (dfFlags & DF_UB) {
+-        setterInsn.vB = convertRegId(&invokeMIR->dalvikInsn, calleeMethod,
+-                                     setterInsn.vB, isRange);
++    //Now make the taken of invokeBB be the path with invoke in case of misprediction
++    dvmCompilerReplaceChildBasicBlock (mispredictBB, invokeBB, kChildTypeTaken);
+ 
++    //In case prediction works correctly we need to go to inlined body but we let someone else do that.
++    //We still want to guarantee that invokeBB's fallthrough is afterInvokeBB
++    dvmCompilerReplaceChildBasicBlock (afterInvokeBB, invokeBB, kChildTypeFallthrough);
++
++    //Now make the fallthrough of BB that holds the invoke have correct fallthrough
++    dvmCompilerReplaceChildBasicBlock (afterInvokeBB, mispredictBB, kChildTypeFallthrough);
++
++    //If we have a move-result, then in order to be able to attach predicted CC to invoke we need to split mispredictBB
++    if (moveResult != 0)
++    {
++        //Split the mispredictBB so that moveResult ends up in second block
++        dvmCompilerSplitBlock (&callerBasicBlocks, moveResult, mispredictBB);
+     }
+ 
+-    if (dfFlags & DF_UC) {
+-        setterInsn.vC = convertRegId(&invokeMIR->dalvikInsn, calleeMethod,
+-                                     setterInsn.vC, isRange);
++    //Move the predicted CC to correct place
++    dvmCompilerReplaceChildBasicBlock (predictedCC, mispredictBB, kChildTypeTaken);
++
++    //Everything went well if we get here
++    return kInliningNoError;
++}
++
++/**
++ * @brief Given a type of return bytecode, finds the matching move-result.
++ * @param returnOpcode The opcode of return bytecode
++ * @return Returns the matching move-result. If return bytecode doesn't return a value,
++ * OP_NOP is returned because no move-result is needed.
++ */
++static Opcode findMatchingMoveResult (Opcode returnOpcode)
++{
++    Opcode moveResultOpcode;
++
++    switch (returnOpcode)
++    {
++        case OP_RETURN:
++            moveResultOpcode = OP_MOVE_RESULT;
++            break;
++        case OP_RETURN_OBJECT:
++            moveResultOpcode = OP_MOVE_RESULT_OBJECT;
++            break;
++        case OP_RETURN_WIDE:
++            moveResultOpcode = OP_MOVE_RESULT_WIDE;
++            break;
++        default:
++            moveResultOpcode = OP_NOP;
++            break;
+     }
+ 
+-    /* Now setup the Dalvik instruction with converted src/dst registers */
+-    newSetterMIR->dalvikInsn = setterInsn;
++    return moveResultOpcode;
++}
+ 
+-    newSetterMIR->width = dexGetWidthFromOpcode(setterInsn.opcode);
++/**
++ * @brief Tags an MIR as being inlined
++ * @param mir The MIR to tag
++ * @param sourceMethod The source method for this MIR
++ */
++static inline void tagMirInlined (MIR *mir, const Method *sourceMethod)
++{
++    //Mark it as having been inlined which means we tag it with MIR_CALLEE flag.
++    //The MIR_INLINED flag is not appropriate because that tag is solely for the invokes and move-results,
++    //and that flag means that the bytecode should be treated as nop.
++    mir->OptimizationFlags |= MIR_CALLEE;
+ 
+-    newSetterMIR->OptimizationFlags |= MIR_CALLEE;
++    //Mark the parent method for this new MIR
++    mir->meta.calleeMethod = sourceMethod;
++}
++
++/**
++ * @brief Inserts the callee basic blocks between two others from caller.
++ * @param callerBasicBlocks The basic blocks of caller
++ * @param method The method that is being inlined
++ * @param topBB Basic block from caller that will serve as entry into callee
++ * @param bottomBB Basic block from caller that will server as exit from callee
++ * @param calleeEntry The callee's entry basic block
++ * @param calleeExit The callee's exit basic block
++ * @param calleeBasicBlocks The list of callee basic blocks
++ */
++static void insertCalleeBetweenBasicBlocks (GrowableList &callerBasicBlocks, const Method *method, BasicBlock *topBB,
++        BasicBlock *bottomBB, BasicBlock *calleeEntry, BasicBlock *calleeExit, GrowableList &calleeBasicBlocks)
++{
++    //In case the entry and exit are not bytecode blocks, we make them that now since we are inserting in middle of trace
++    calleeEntry->blockType = kDalvikByteCode;
++    calleeExit->blockType = kDalvikByteCode;
+ 
+-    /*
+-     * If the setter instruction is about to raise any exception, punt to the
+-     * interpreter and re-execute the invoke.
+-     */
+-    newSetterMIR->offset = invokeMIR->offset;
++    //First make the fallthrough of callee's exit block be the invoke's fallthrough
++    dvmCompilerReplaceChildBasicBlock (bottomBB, calleeExit, kChildTypeFallthrough);
+ 
+-    newSetterMIR->meta.calleeMethod = calleeMethod;
++    //Now replace the fallthough child of invokeBB to be the calleeEntry
++    dvmCompilerReplaceChildBasicBlock (calleeEntry, topBB, kChildTypeFallthrough);
+ 
+-    dvmCompilerInsertMIRAfter(invokeBB, invokeMIR, newSetterMIR);
++    //Now walk through the basic blocks
++    GrowableListIterator iterator;
++    dvmGrowableListIteratorInit (&calleeBasicBlocks, &iterator);
+ 
+-    if (isPredicted) {
+-        MIR *invokeMIRSlow = (MIR *)dvmCompilerNew(sizeof(MIR), true);
+-        *invokeMIRSlow = *invokeMIR;
+-        invokeMIR->dalvikInsn.opcode = (Opcode)kMirOpCheckInlinePrediction;
++    while (true)
++    {
++        //Get the basic block
++        BasicBlock *bb = reinterpret_cast<BasicBlock *> (dvmGrowableListIteratorNext (&iterator));
+ 
+-        /* Use vC to denote the first argument (ie this) */
+-        if (!isRange) {
+-            invokeMIR->dalvikInsn.vC = invokeMIRSlow->dalvikInsn.arg[0];
++        //When we reach the end we stop
++        if (bb == 0)
++        {
++            break;
+         }
+ 
+-        dvmCompilerInsertMIRAfter(invokeBB, newSetterMIR, invokeMIRSlow);
+-        invokeMIRSlow->OptimizationFlags |= MIR_INLINED_PRED;
+-#if defined(WITH_JIT_TUNING)
+-        gDvmJit.invokePolySetterInlined++;
+-#endif
+-    } else {
+-#ifndef ARCH_IA32
+-        /*
+-         * The invoke becomes no-op so it needs an explicit branch to jump to
+-         * the chaining cell.
+-         */
+-        invokeBB->needFallThroughBranch = true;
+-        invokeMIR->OptimizationFlags |= MIR_INLINED;
+-#else
+-        bool res = dvmCompilerRemoveMIR (invokeBB, invokeMIR);
++        //Update its id to be unique for the cUnit
++        bb->id = dvmGrowableListSize (&callerBasicBlocks);
++
++        //Add it to the cUnit
++        dvmInsertGrowableList (&callerBasicBlocks, (intptr_t) bb);
+ 
+-        if (res == false)
++        //The start offset of this block does not make sense in context of inlining because it is
++        //relative to the inlined method. In order to early catch errors due to this, we set an invalid offset
++        bb->startOffset = 0xdeadc0de;
++
++        //Update the method for this BB
++        bb->containingMethod = method;
++
++        //Walk through the MIRs so we can add information to them
++        for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
+         {
+-            ALOGD ("Inlining failed in inlineSetter");
+-            return false;
++            tagMirInlined (mir, method);
+         }
+-#endif
+-#if defined(WITH_JIT_TUNING)
+-        gDvmJit.invokeMonoSetterInlined++;
+-#endif
+     }
+-
+-    return true;
+ }
+ 
+-static bool tryInlineSingletonCallsite(CompilationUnit *cUnit,
+-                                       const Method *calleeMethod,
+-                                       MIR *invokeMIR,
+-                                       BasicBlock *invokeBB,
+-                                       bool isRange)
++/**
++ * @brief Updates the caller's CFG so that callee's CFG is integrated.
++ * @param callerBasicBlocks List of caller's blocks
++ * @param method The method being inlined
++ * @param invoke The invoke of method being inlined
++ * @param moveResult The move-result matching invoke (may be null)
++ * @param calleeEntry The callee's entry block (cannot be null)
++ * @param calleeExit The callee's exit block (cannot be null)
++ * @param calleeBasicBlocks List of callee blocks
++ * @param isPredicted Whether method being invoked is predicted
++ * @return Returns inlining success/failure
++ */
++static InliningFailure insertMethodBodyIntoCFG (GrowableList &callerBasicBlocks, const Method *method, MIR *invoke,
++        MIR *moveResult, BasicBlock *calleeEntry, BasicBlock *calleeExit, GrowableList &calleeBasicBlocks,
++        bool isPredicted)
+ {
+-    /* Not a Java method */
+-    if (dvmIsNativeMethod(calleeMethod)) return false;
+-
+-    CompilerMethodStats *methodStats =
+-        dvmCompilerAnalyzeMethodBody(calleeMethod, true);
+-
+-    /* Empty callee - do nothing */
+-    if (methodStats->attributes & METHOD_IS_EMPTY) {
+-        /* The original invoke instruction is effectively turned into NOP */
+-        invokeMIR->OptimizationFlags |= MIR_INLINED;
+-        /*
+-         * Need to insert an explicit branch to catch the falling knife (into
+-         * the PC reconstruction or chaining cell).
+-         */
+-        invokeBB->needFallThroughBranch = true;
+-        return true;
+-    }
+-
+-    if (methodStats->attributes & METHOD_IS_GETTER) {
+-        return inlineGetter(cUnit, calleeMethod, invokeMIR, invokeBB, false,
+-                            isRange);
+-    } else if (methodStats->attributes & METHOD_IS_SETTER) {
+-        return inlineSetter(cUnit, calleeMethod, invokeMIR, invokeBB, false,
+-                            isRange);
++    //We need to have entry and exit for callee
++    assert (calleeEntry != 0 && calleeExit != 0);
++
++    //Save invoke's BB
++    BasicBlock *invokeBB = invoke->bb;
++
++    //Find the predicted chaining cell possibly associated with invoke
++    BasicBlock *predictedCC = 0;
++
++    if (isPredicted == true)
++    {
++        predictedCC = detachInvokeCC (invokeBB, kChainingCellInvokePredicted);
++
++        if (predictedCC == 0)
++        {
++            return kInliningNoPredictedCC;
++        }
+     }
+-    return false;
++
++    //Find the singleton CC possibly associated with invoke
++    BasicBlock *singletonCC = detachInvokeCC (invokeBB, kChainingCellInvokeSingleton);
++
++    //We need to insert between invoke's BB and BB after invoke
++    //Determine the block following invoke's BB
++    BasicBlock *afterInvokeBB = getBlockAfterInvoke (callerBasicBlocks, invoke, moveResult);
++
++    //If we fail we need to reattach chaining cells. But we assume first that we won't have issues.
++    InliningFailure trackProblem = kInliningNoError;
++
++    if (afterInvokeBB == 0)
++    {
++        trackProblem = kInliningInvokeBBNoChild;
++    }
++    else
++    {
++        if (isPredicted == true)
++        {
++            //Manipulate CFG for prediction mechanism
++            trackProblem = manipulateCFGForPrediction (callerBasicBlocks, invokeBB, invoke, afterInvokeBB,
++                    predictedCC, moveResult);
++        }
++        else
++        {
++            //We remove the invoke and move-result if we don't have prediction
++            trackProblem = removeInvokeAndMoveResult (calleeBasicBlocks, invoke, moveResult);
++        }
++    }
++
++    //We need to fail if we had any errors
++    if (trackProblem != kInliningNoError)
++    {
++        //Since we will fail inlining, we must re-attach predicted CC to invoke
++        if (predictedCC != 0)
++        {
++            dvmCompilerReplaceChildBasicBlock (predictedCC, invokeBB, kChildTypeTaken);
++        }
++        //We must re-attach singleton CC since we fail inlining
++        else if (singletonCC != 0)
++        {
++            dvmCompilerReplaceChildBasicBlock (singletonCC, invokeBB, kChildTypeTaken);
++        }
++
++        return trackProblem;
++    }
++
++    //Now we insert the callee CFG between the two blocks we have decided on
++    insertCalleeBetweenBasicBlocks (callerBasicBlocks, method, invokeBB, afterInvokeBB, calleeEntry, calleeExit,
++            calleeBasicBlocks);
++
++    //If we had a singleton chaining cell with the invoke then we need to remove it right now since we got rid of the invoke
++    if (singletonCC != 0)
++    {
++        dvmCompilerHideBasicBlock (callerBasicBlocks, singletonCC);
++    }
++
++    //If we make it here, everything went okay
++    return kInliningNoError;
+ }
+ 
+-#ifndef ARCH_IA32
+-static bool inlineEmptyVirtualCallee(CompilationUnit *cUnit,
+-                                     const Method *calleeMethod,
+-                                     MIR *invokeMIR,
+-                                     BasicBlock *invokeBB)
++/**
++ * @brief Looks through the CFG for the move-result that follows invoke.
++ * @param invoke The MIR for the invoke.
++ * @return Returns pointer to MIR representing the move-result. Returns 0 if none is found.
++ */
++static MIR *findMoveResult (MIR *invoke)
+ {
+-    MIR *invokeMIRSlow = (MIR *)dvmCompilerNew(sizeof(MIR), true);
+-    *invokeMIRSlow = *invokeMIR;
+-    invokeMIR->dalvikInsn.opcode = (Opcode)kMirOpCheckInlinePrediction;
++    //We must have an invoke
++    assert(invoke != 0 && invoke->bb != 0);
+ 
+-    dvmCompilerInsertMIRAfter(invokeBB, invokeMIR, invokeMIRSlow);
+-    invokeMIRSlow->OptimizationFlags |= MIR_INLINED_PRED;
+-    return true;
++    //Try getting the next because move-result should follow invoke
++    MIR *afterInvoke = invoke->next;
++
++    //If we do not have a next MIR, then try to look for it in successor block
++    if (afterInvoke == 0 && invoke->bb->fallThrough != 0)
++    {
++        //If move-result exists, it must be the first mir of fallthrough block
++        afterInvoke = invoke->bb->fallThrough->firstMIRInsn;
++    }
++
++    //If we did not find a MIR, then return 0
++    if (afterInvoke == 0)
++    {
++        return 0;
++    }
++
++    //Check whether we actually have a move-result
++    if (isMoveResult (afterInvoke->dalvikInsn.opcode) == false)
++    {
++        return 0;
++    }
++
++    //Return the move-result
++    return afterInvoke;
+ }
+ 
+-static bool tryInlineVirtualCallsite(CompilationUnit *cUnit,
+-                                     const Method *calleeMethod,
+-                                     MIR *invokeMIR,
+-                                     BasicBlock *invokeBB,
+-                                     bool isRange)
++/**
++ * @brief Used to find the return instruction of a basic block.
++ * @param blockList The complete list of basic blocks
++ * @param exit The single basic block that represents exit
++ * @return Returns the MIR if a return bytecode is found.
++ */
++static MIR *findReturn (GrowableList &blockList, BasicBlock *exit)
+ {
+-    /* Not a Java method */
+-    if (dvmIsNativeMethod(calleeMethod)) return false;
++    //Paranoid
++    assert (exit != 0);
++
++    BasicBlock *bbToSearch = exit;
++
++    //If the exit block has no MIRs, we search its predecessor
++    if (exit->lastMIRInsn == 0)
++    {
++        assert (exit->firstMIRInsn == 0);
++
++        //If we have no predecessors then we cannot find any return. Also if we have more than one
++        //predecessor we may have multiple returns and we don't know which one to return;
++        if (dvmCountSetBits (exit->predecessors) != 1)
++        {
++            return 0;
++        }
+ 
+-    CompilerMethodStats *methodStats =
+-        dvmCompilerAnalyzeMethodBody(calleeMethod, true);
++        //Get the basic block that is predecessor of exit block
++        int blockIdx = dvmHighestBitSet (exit->predecessors);
++        bbToSearch = reinterpret_cast<BasicBlock *> (dvmGrowableListGetElement (&blockList, blockIdx));
+ 
+-    /* Empty callee - do nothing by checking the clazz pointer */
+-    if (methodStats->attributes & METHOD_IS_EMPTY) {
+-        return inlineEmptyVirtualCallee(cUnit, calleeMethod, invokeMIR,
+-                                        invokeBB);
++        assert (bbToSearch != 0);
+     }
+ 
+-    if (methodStats->attributes & METHOD_IS_GETTER) {
+-        return inlineGetter(cUnit, calleeMethod, invokeMIR, invokeBB, true,
+-                            isRange);
+-    } else if (methodStats->attributes & METHOD_IS_SETTER) {
+-        return inlineSetter(cUnit, calleeMethod, invokeMIR, invokeBB, true,
+-                            isRange);
++    MIR *returnMir = 0;
++
++    //If the BB has MIRs, the last one must be a return
++    MIR *lastMir = bbToSearch->lastMIRInsn;
++    if (lastMir != 0)
++    {
++        //Check to make sure the opcode is return
++        if (isReturn (lastMir->dalvikInsn.opcode) == true)
++        {
++            returnMir = lastMir;
++        }
+     }
+-    return false;
++
++    //Return the mir if we found it
++    return returnMir;
+ }
+-#endif
+ 
+ /**
+- * @brief Help inline the instruction
+- * @param cUnit the CompilationUnit
+- * @param info the JitTranslationInfo
+- * @param bb the BasicBlock containing the instruction
+- * @param mir the instruction
+- * @return whether or not the inlining succeeded
++ * @brief For one bytecode short methods, this is used to rewrite the virtual registers.
++ * @param calleeMethod The method we are inlining.
++ * @param invoke The MIR for the invoke.
++ * @param moveResult The MIR for the move-result.
++ * @param newMir The MIR that we are inlining
++ * @return Returns inlining success/failure
+  */
+-static bool handleInliningHelper (CompilationUnit *cUnit, JitTranslationInfo *info, BasicBlock *bb, MIR *mir)
++static InliningFailure rewriteInlinedMIR (const Method *calleeMethod, MIR *invoke, MIR *moveResult, MIR *newMir)
+ {
+-    Opcode opcode = mir->dalvikInsn.opcode;
+-    int flags = dvmCompilerGetOpcodeFlags (opcode);
++    //Determine if the current invoke is a range variant
++    bool isRange = isRangeInvoke (invoke->dalvikInsn.opcode);
+ 
+-    /* No invoke - continue */
+-    if ((flags & kInstrInvoke) == 0)
+-        return false;
++    //Get reference to the decoded instruction
++    DecodedInstruction &newInsn = newMir->dalvikInsn;
+ 
+-    /* Disable inlining when doing method tracing */
+-    if (gDvmJit.methodTraceSupport)
+-        return false;
++    //Get the dataflow flags for the instruction we are inlining
++    int dfFlags = dvmCompilerDataFlowAttributes[newInsn.opcode];
+ 
+-    /*
+-     * If the invoke itself is selected for single stepping, don't bother
+-     * to inline it.
+-     */
+-    if (SINGLE_STEP_OP(opcode))
+-        return false;
++    //If we have an overlapping use with define, then don't inline
++    if ((dfFlags & DF_A_IS_USED_REG) != 0 && (dfFlags & DF_A_IS_DEFINED_REG) != 0)
++    {
++        return kInliningOverlapUseWithDef;
++    }
++
++    //Now rewrite the virtual registers
++    if ((dfFlags & DF_A_IS_USED_REG) != 0)
++    {
++        newInsn.vA = convertRegId (&invoke->dalvikInsn, calleeMethod, newInsn.vA, isRange);
++    }
++    else if ((dfFlags & DF_A_IS_DEFINED_REG) != 0)
++    {
++        //Since we have a single bytecode with a definition, it must the case that we have a move-result
++        assert (moveResult != 0);
+ 
+-    const Method *calleeMethod;
+-    bool isRange = false;
++        //Because we are looking at a simple bytecode, we write directly into register desired by move-result
++        newInsn.vA = moveResult->dalvikInsn.vA;
++    }
+ 
+-    //Get a local version
+-    DecodedInstruction &insn = mir->dalvikInsn;
++    if ((dfFlags & DF_B_IS_REG) != 0)
++    {
++        newInsn.vB = convertRegId (&invoke->dalvikInsn, calleeMethod, newInsn.vB, isRange);
+ 
+-    //Paranoid
+-    assert (cUnit != 0 && cUnit->method != 0 && cUnit->method->clazz != 0);
++    }
+ 
+-    if (cUnit->jitMode == kJitLoop)
++    if ((dfFlags & DF_C_IS_REG) != 0)
+     {
+-        //In loop mode, we go via the DvmDex system
+-        // This is because the meta system only works for one call per trace but we might have more
+-        // However it might not be filled entirely so we might not be able to resolve it
+-        // Whereas in the trace system, the frontend does the job to at least fill that
++        newInsn.vC = convertRegId (&invoke->dalvikInsn, calleeMethod, newInsn.vC, isRange);
++    }
+ 
+-        //Get DvmDex and method index
+-        DvmDex *pDvmDex = cUnit->method->clazz->pDvmDex;
++    //If the getter instruction is about to raise any exception, we want to punt to the interpreter
++    //and re-execute the invoke. Thus we set the newMir's offset to match the invoke's offset.
++    newMir->offset = invoke->offset;
+ 
+-        //Paranoid
+-        assert (pDvmDex != 0);
++    //We finished initializing the new MIR
++    return kInliningNoError;
++}
+ 
+-        //Method index is in vB
+-        u4 methodIdx = insn.vB;
++/**
++ * @brief Used to inline small methods (one bytecode).
++ * @param callerBasicBlocks The basic blocks from caller.
++ * @param calleeMethod The method being invoked.
++ * @param invoke The MIR for the invoke
++ * @param isPredicted Whether method being invoked is predicted
++ * @return Returns inlining success/failure
++ */
++static InliningFailure doInline (GrowableList &callerBasicBlocks, const Method *calleeMethod, MIR *invoke,
++        bool isPredicted)
++{
++    //Keep track of BBs of callee
++    BasicBlock *calleeEntry = 0, *calleeExit = 0;
+ 
+-        switch (opcode) {
+-            case OP_INVOKE_SUPER:
+-            case OP_INVOKE_DIRECT:
+-            case OP_INVOKE_STATIC:
+-            case OP_INVOKE_SUPER_QUICK:
+-                calleeMethod = dvmDexGetResolvedMethod (pDvmDex, methodIdx);
+-                break;
+-            case OP_INVOKE_SUPER_RANGE:
+-            case OP_INVOKE_DIRECT_RANGE:
+-            case OP_INVOKE_STATIC_RANGE:
+-            case OP_INVOKE_SUPER_QUICK_RANGE:
+-                isRange = true;
+-                calleeMethod = dvmDexGetResolvedMethod (pDvmDex, methodIdx);
+-                break;
+-            default:
+-                calleeMethod = NULL;
+-                break;
+-        }
++    //We set up a growable list that can be used to insert the blocks
++    const int initialSize = 3;
++    GrowableList calleeBasicBlocks;
++    dvmInitGrowableList (&calleeBasicBlocks, initialSize);
++
++    //We create the CFG for the method
++    bool didCreateCfg = dvmCompilerBuildCFG (calleeMethod, &calleeBasicBlocks, &calleeEntry, &calleeExit, 0,
++            canInlineBytecode);
++
++    if (didCreateCfg == false)
++    {
++        //We failed to build CFG so we return false. We failed because our "canInlineBytecode"
++        //filter found an unsupported case.
++        return kInliningUnsupportedBytecodes;
+     }
+-    else
++
++    //If we do not have the entry and exit for the callee method CFG, we cannot inline
++    if (calleeEntry == 0 || calleeExit == 0 || calleeEntry == calleeExit || calleeEntry->fallThrough == 0)
+     {
+-        //In trace mode, we go via the meta callsite information
+-        switch (opcode) {
+-            case OP_INVOKE_SUPER:
+-            case OP_INVOKE_DIRECT:
+-            case OP_INVOKE_STATIC:
+-            case OP_INVOKE_SUPER_QUICK:
+-                calleeMethod = mir->meta.callsiteInfo->method;
+-                break;
+-            case OP_INVOKE_SUPER_RANGE:
+-            case OP_INVOKE_DIRECT_RANGE:
+-            case OP_INVOKE_STATIC_RANGE:
+-            case OP_INVOKE_SUPER_QUICK_RANGE:
+-                isRange = true;
+-                calleeMethod = mir->meta.callsiteInfo->method;
+-                break;
+-            default:
+-                calleeMethod = NULL;
+-                break;
++        return kInliningBadCalleeCFG;
++    }
++
++    MIR *returnMir = findReturn (calleeBasicBlocks, calleeExit);
++
++    //If we do not have a return, we cannot inline
++    if (returnMir == 0)
++    {
++        return kInliningCannotFindReturn;
++    }
++
++    //Look to see if we need to find a move-result
++    Opcode desiredMoveResult = findMatchingMoveResult (returnMir->dalvikInsn.opcode);
++
++    MIR *moveResult = 0;
++
++    if (desiredMoveResult != OP_NOP)
++    {
++        moveResult = findMoveResult (invoke);
++
++        //If we do not find a move-result and we want one, then reject inlining
++        if (moveResult == 0)
++        {
++            return kInliningCannotFindMoveResult;
++        }
++
++        //If we do find a move-result but it doesn't match our return, then reject inlining
++        if (moveResult->dalvikInsn.opcode != desiredMoveResult)
++        {
++            return kInliningMoveResultNoMatchReturn;
+         }
+     }
+ 
+-    if (calleeMethod) {
+-        bool inlined = tryInlineSingletonCallsite(cUnit, calleeMethod, mir, bb, isRange);
++    //We are getting ready to inline, so remove the return bytecode because it is no longer needed
++    if (dvmCompilerRemoveMIR (returnMir) == false)
++    {
++        //We failed to remove return. Inlining won't go well.
++        return kInliningMirRemovalFailed;
++    }
+ 
+-#ifdef ARCH_IA32
+-            if (inlined)
+-               cUnit->singletonInlined = true;
+-#endif
++    MIR *mirToInline = 0;
+ 
+-        if (!inlined && !(gDvmJit.disableOpt & (1 << kMethodJit)) && !dvmIsNativeMethod(calleeMethod) && info != 0) {
++    //Search the callee CFG for the MIR to rewrite
++    GrowableListIterator calleeIter;
++    dvmGrowableListIteratorInit (&calleeBasicBlocks, &calleeIter);
+ 
+-            CompilerMethodStats *methodStats = dvmCompilerAnalyzeMethodBody(calleeMethod, true);
++    while (true)
++    {
++        //Get the basic block
++        BasicBlock *bb = reinterpret_cast<BasicBlock *> (dvmGrowableListIteratorNext (&calleeIter));
+ 
+-            if ((methodStats->attributes & METHOD_IS_LEAF) && !(methodStats->attributes & METHOD_CANNOT_COMPILE)) {
+-                /* Callee has been previously compiled */
+-                if (dvmJitGetMethodAddr(calleeMethod->insns)) {
+-                    mir->OptimizationFlags |= MIR_INVOKE_METHOD_JIT;
+-                } else {
+-                    /* Compile the callee first */
+-                    dvmCompileMethod(calleeMethod, info);
++        //When we reach the end we stop
++        if (bb == 0)
++        {
++            break;
++        }
+ 
+-                    if (dvmJitGetMethodAddr(calleeMethod->insns)) {
+-                        mir->OptimizationFlags |= MIR_INVOKE_METHOD_JIT;
+-                    } else {
+-                        methodStats->attributes |= METHOD_CANNOT_COMPILE;
+-                    }
+-                }
++        //We found a bytecode
++        if (bb->firstMIRInsn != 0)
++        {
++            if (mirToInline != 0)
++            {
++                return kInliningMoreThanOneBytecode;
++            }
++
++            mirToInline = bb->firstMIRInsn;
++
++            if (mirToInline->next != 0)
++            {
++                return kInliningMoreThanOneBytecode;
+             }
+         }
++    }
++
++    if (mirToInline != 0)
++    {
++        //Now we need to rewrite the VRs for the MIR we wish to inline
++        InliningFailure rewriting = rewriteInlinedMIR (calleeMethod, invoke, moveResult, mirToInline);
+ 
+-        //Return whether it was inlined or not
+-        return inlined;
++        if (rewriting != kInliningNoError)
++        {
++            //If we fail, then don't inline
++            return rewriting;
++        }
+     }
+ 
+-    switch (opcode) {
+-        case OP_INVOKE_VIRTUAL:
+-        case OP_INVOKE_VIRTUAL_QUICK:
+-        case OP_INVOKE_INTERFACE:
+-            isRange = false;
+-            calleeMethod = mir->meta.callsiteInfo->method;
+-            break;
+-        case OP_INVOKE_VIRTUAL_RANGE:
+-        case OP_INVOKE_VIRTUAL_QUICK_RANGE:
+-        case OP_INVOKE_INTERFACE_RANGE:
+-            isRange = true;
+-            calleeMethod = mir->meta.callsiteInfo->method;
+-            break;
+-        default:
+-            break;
++    //Try to insert the method's body into the CFG
++    InliningFailure inlined = insertMethodBodyIntoCFG (callerBasicBlocks, calleeMethod, invoke, moveResult, calleeEntry,
++            calleeExit, calleeBasicBlocks, isPredicted);
++
++    //Return the result of the inlining
++    return inlined;
++}
++
++/**
++ * @brief Given a method, it tries to inline it.
++ * @param cUnit The compilation unit
++ * @param calleeMethod The method to inline
++ * @param invoke The MIR for the invoke
++ * @param isPredicted Whether the desired inlining is of a predicted method.
++ * @return Returns inlining success/failure
++ */
++static InliningFailure tryInline (CompilationUnit *cUnit, const Method *calleeMethod, MIR *invoke,
++        bool isPredicted)
++{
++    //Paranoid
++    assert (calleeMethod != 0 && invoke != 0 && invoke->bb != 0);
++
++    //Check that we do not have a native method
++    if (dvmIsNativeMethod (calleeMethod) == true)
++    {
++        return kInliningNativeMethod;
+     }
+ 
+-    // TODO Temporarily disable this code path until x86 JIT adds support
+-    // for inlining virtual invokes
++    //Analyze the body of the method
++    CompilerMethodStats *methodStats = dvmCompilerAnalyzeMethodBody (calleeMethod, true);
++
++    //Assume we will not succeed inlining
++    InliningFailure inlined = kInliningMethodComplicated;
++
++    if ((methodStats->attributes & METHOD_CANNOT_INLINE) != 0)
++    {
++        inlined = kInliningFailedBefore;
++    }
++    else if ((methodStats->attributes & METHOD_IS_GETTER) != 0
++            || (methodStats->attributes & METHOD_IS_SETTER) != 0
++            || (methodStats->attributes & METHOD_IS_EMPTY) != 0)
++    {
+ #ifndef ARCH_IA32
+-    if (calleeMethod) {
+-        bool inlined = tryInlineVirtualCallsite(cUnit, calleeMethod,
+-                lastMIRInsn, bb, isRange);
+-        if (!inlined && !(gDvmJit.disableOpt & (1 << kMethodJit)) && !dvmIsNativeMethod(calleeMethod)) {
+-
+-            CompilerMethodStats *methodStats = dvmCompilerAnalyzeMethodBody(calleeMethod, true);
+-
+-            if ((methodStats->attributes & METHOD_IS_LEAF) && !(methodStats->attributes & METHOD_CANNOT_COMPILE)) {
+-                /* Callee has been previously compiled */
+-                if (dvmJitGetMethodAddr(calleeMethod->insns)) {
+-                    lastMIRInsn->OptimizationFlags |= MIR_INVOKE_METHOD_JIT;
+-                } else {
+-                    /* Compile the callee first */
+-                    dvmCompileMethod(calleeMethod, info);
+-                    if (dvmJitGetMethodAddr(calleeMethod->insns)) {
+-                        mir->OptimizationFlags |= MIR_INVOKE_METHOD_JIT;
+-                    } else {
+-                        methodStats->attributes |= METHOD_CANNOT_COMPILE;
+-                    }
+-                }
++        //Getters and setters have a single bytecode and a return
++        inlined = doInline (cUnit->blockList, calleeMethod, invoke, isPredicted);
++#else
++        if (isPredicted == false)
++        {
++            inlined = doInline (cUnit->blockList, calleeMethod, invoke, isPredicted);
++        }
++        else
++        {
++            inlined = kInliningNoVirtualSupport;
++        }
++#endif
++
++#if defined(WITH_JIT_TUNING)
++        //When we are trying to tune JIT, keep track of how many getters/setters we inlined
++        if (inlined == kInliningSuccess && (methodStats->attributes & METHOD_IS_GETTER) != 0)
++        {
++            if (isPredicted == true)
++            {
++                gDvmJit.invokePolyGetterInlined++;
++            }
++            else
++            {
++                gDvmJit.invokeMonoGetterInlined++;
++            }
++
++        }
++        else if (inlined == kInliningSuccess && (methodStats->attributes & METHOD_IS_SETTER) != 0)
++        {
++            if (isPredicted == true)
++            {
++                gDvmJit.invokePolySetterInlined++;
++            }
++            else
++            {
++                gDvmJit.invokeMonoSetterInlined++;
+             }
+         }
+-        return inlined;
+-    }
+ #endif
++    }
+ 
+-    //We did not inline anything
+-    return false;
++    //We may have inserted basic blocks so update cUnit's value right now
++    cUnit->numBlocks = dvmGrowableListSize (&cUnit->blockList);
++
++    //If we have inlined then we may have added new basic blocks so calculate predecessors
++    if (inlined == kInliningSuccess)
++    {
++        dvmCompilerCalculatePredecessors (cUnit);
++    }
++    //If we failed to inline then remember it so we don't retry in future
++    else
++    {
++        methodStats->attributes = methodStats->attributes & METHOD_CANNOT_INLINE;
++    }
++
++    //Return the result of the inlining
++    return inlined;
+ }
+ 
+-bool dvmCompilerHandleInlining (CompilationUnit *cUnit, JitTranslationInfo *info, BasicBlock *bb, MIR *mir)
++/**
++ * @brief Given a MIR, it checks if it is an inlinable invoke and then tries to inline it.
++ * @param cUnit The compilation unit
++ * @param info The description of the trace
++ * @param bb The parent BB of the bytecode
++ * @param invoke The invoke to try to inline
++ * @return Returns whether inlining is successful.
++ */
++bool dvmCompilerHandleInlining (CompilationUnit *cUnit, JitTranslationInfo *info, BasicBlock *bb, MIR *invoke)
+ {
+-    bool res = handleInliningHelper (cUnit, info, bb, mir);
++    //Get the opcode
++    Opcode opcode = invoke->dalvikInsn.opcode;
+ 
+-    if (res == true)
++    //Paranoid
++    assert (invoke != 0);
++    assert ((static_cast<int> (dvmCompilerGetOpcodeFlags (opcode)) & kInstrInvoke) != 0);
++
++    //Assume we will successfully inline
++    InliningFailure inlined = kInliningSuccess;
++
++    //Initially we don't know what we're invoking until we figure it out
++    const Method *calleeMethod = 0;
++
++    //Check first if method inlining is disabled
++    if ((gDvmJit.disableOpt & (1 << kMethodInlining)) != 0)
++    {
++        inlined = kInliningDisabled;
++    }
++    //Disable inlining when doing method tracing
++    else if (gDvmJit.methodTraceSupport)
++    {
++        inlined = kInliningMethodTraceEnabled;
++    }
++    //If the invoke itself is selected for single stepping, don't bother to inline it.
++    else if (SINGLE_STEP_OP (opcode))
+     {
+-        //If we succeeded, we might have a singleton chaining cell to remove
+-        BasicBlock *taken = bb->taken;
++        inlined = kInliningSingleStepInvoke;
++    }
++    //The given BB should match what the invoke believes is its parent
++    else if (invoke->bb != bb)
++    {
++       inlined = kInliningInvokeBBProblem;
++    }
++    else if ((invoke->OptimizationFlags & MIR_CALLEE) != 0)
++    {
++        //For now we only accept one level of inlining so do not accept invokes that come from callee methods
++        inlined = kInliningNestedInlining;
++    }
++    else if ((invoke->OptimizationFlags & MIR_INLINED) != 0 || (invoke->OptimizationFlags & MIR_INLINED_PRED) != 0)
++    {
++        //We have already inlined this invoke
++        inlined = kInliningAlreadyInlined;
++    }
++
++    //If we haven't found a problem yet, then we continue with trying to inline
++    if (inlined == kInliningNoError)
++    {
++        //Keep track of whether the invoke is of polymorphic method
++        bool isPredicted = false;
++
++        //If we have callsite information from the trace building, then we try to use that.
++        //For virtual and interface invokes, the callsite information will be the method called
++        //during building so it is just a guess.
++        if (invoke->meta.callsiteInfo != 0)
++        {
++            calleeMethod = invoke->meta.callsiteInfo->method;
++        }
++
++        //Now see if there is anything else we can do depending on the invoke.
++        switch (opcode) {
++            case OP_INVOKE_DIRECT:
++            case OP_INVOKE_STATIC:
++            case OP_INVOKE_DIRECT_RANGE:
++            case OP_INVOKE_STATIC_RANGE:
++            case OP_INVOKE_OBJECT_INIT_RANGE:
++                //We can try to resolve the method if needed since it is non-virtual
++                if (calleeMethod == 0)
++                {
++                    //Method index is in vB
++                    u4 methodIdx = invoke->dalvikInsn.vB;
++
++                    //Paranoid
++                    if (cUnit->method != 0 && cUnit->method->clazz != 0 && cUnit->method->clazz->pDvmDex != 0)
++                    {
++                        //Try to resolve the method
++                        calleeMethod = dvmDexGetResolvedMethod (cUnit->method->clazz->pDvmDex, methodIdx);
++                    }
++                }
++                break;
++            case OP_INVOKE_VIRTUAL:
++            case OP_INVOKE_INTERFACE:
++            case OP_INVOKE_VIRTUAL_RANGE:
++            case OP_INVOKE_INTERFACE_RANGE:
++            case OP_INVOKE_VIRTUAL_QUICK:
++            case OP_INVOKE_VIRTUAL_QUICK_RANGE:
++                //We have a polymorphic call so we must make a prediction. However, for now we just use the
++                //callsite information.
++                isPredicted = true;
++
++                //If logic is added here to try to resolve a guess in case we don't have callsite information,
++                //then "quick" versions should be excluded.
++                break;
++            default:
++                break;
++        }
+ 
+-        if (taken != 0 && taken->blockType == kChainingCellInvokeSingleton)
++        if (calleeMethod != 0)
+         {
+-            //Mark the taken as a dalvik byte code, it's no longer a chaining cell anymore
+-            taken->blockType = kDalvikByteCode;
++            //If we know which method we want, then try to inline it
++            inlined = tryInline (cUnit, calleeMethod, invoke, isPredicted);
+ 
+-            //Remove it, we don't need it anymore
+-            bb->taken = 0;
++            //If inlining failed and method JIT is enabled, we try to compile non-native method
++            if (inlined != kInliningSuccess && (gDvmJit.disableOpt & (1 << kMethodJit)) == 0
++                    && dvmIsNativeMethod (calleeMethod) == false && info != 0)
++            {
++                //Get statistics by analyzing method
++                CompilerMethodStats *methodStats = dvmCompilerAnalyzeMethodBody (calleeMethod, true);
++
++                //If method is leaf and not tagged as cannot compile, then we try to compile it first
++                if ((methodStats->attributes & METHOD_IS_LEAF) != 0
++                        && (methodStats->attributes & METHOD_CANNOT_COMPILE) == 0)
++                {
++                    //First check to see if we previously compiled it.
++                    bool previouslyCompiled = dvmJitGetMethodAddr (calleeMethod->insns) != 0;
++
++                    if (previouslyCompiled == true)
++                    {
++                        //If callee has been previously compiled, we simply tag the invoke
++                        invoke->OptimizationFlags |= MIR_INVOKE_METHOD_JIT;
++                    }
++                    else
++                    {
++                        //Compile the callee first
++                        dvmCompileMethod (calleeMethod, info);
++
++                        //Now check whether we successfully compiled it
++                        if (dvmJitGetMethodAddr (calleeMethod->insns) != 0)
++                        {
++                            invoke->OptimizationFlags |= MIR_INVOKE_METHOD_JIT;
++                        }
++                        else
++                        {
++                            methodStats->attributes |= METHOD_CANNOT_COMPILE;
++                        }
++                    }
++                }
++            }
++        }
++        else
++        {
++            inlined = kInliningUnknownMethod;
+         }
+     }
+ 
+-    return res;
++    //If we have have verbosity enabled then we print a message
++    if (cUnit->printMe == true)
++    {
++        //Decode the MIR
++        char *decoded = dvmCompilerGetDalvikDisassembly (&(invoke->dalvikInsn), 0);
++
++        //Print a message depending on success
++        const char *success = (inlined == kInliningSuccess) ? "Successfully inlined" : "Failed to inline";
++
++        //We only print a because message if we fail
++        const char *because = (inlined == kInliningSuccess) ? "" : "because ";
++
++        const char *failureMessage = getFailureMessage (inlined);
++
++        //We print some information about method if we have it
++        const char *methodInfo1 = calleeMethod != 0 ? "of " : "";
++        const char *methodInfo2 = calleeMethod != 0 ? calleeMethod->clazz->descriptor : "";
++        const char *methodInfo3 = calleeMethod != 0 ? "." : "";
++        const char *methodInfo4 = calleeMethod != 0 ? calleeMethod->name : "";
++
++        ALOGD ("%s %s %s%s%s%s %s%s", success, decoded, methodInfo1, methodInfo2, methodInfo3, methodInfo4,
++                because, failureMessage);
++    }
++
++    if (isInliningFailureFatal (inlined) == true)
++    {
++        ALOGD ("JIT_INFO: Aborting trace because inliner reached an unrecoverable error");
++        //If we have a fatal failure, that means we cannot recover
++        dvmCompilerAbort (cUnit);
++    }
++
++    //Return whether we have successfully inlined
++    return (inlined == kInliningSuccess);
+ }
+ 
+-void dvmCompilerInlineMIR(CompilationUnit *cUnit, JitTranslationInfo *info)
++/**
++ * @brief Walks through the basic blocks looking for BB's with instructions in order to try to possibly inline an invoke
++ * @param cUnit The compilation unit
++ * @param info The description of the trace
++ */
++void dvmCompilerInlineMIR (CompilationUnit *cUnit, JitTranslationInfo *info)
+ {
+-    GrowableListIterator iterator;
+-    dvmGrowableListIteratorInit(&cUnit->blockList, &iterator);
++    const GrowableList *blockList = &cUnit->blockList;
+ 
+-    /*
+-     * Analyze the basic block containing an invoke to see if it can be inlined
+-     */
+-    while (true) {
+-        BasicBlock *bb = (BasicBlock *) dvmGrowableListIteratorNext(&iterator);
+-        if (bb == NULL) break;
+-        if (bb->blockType != kDalvikByteCode)
+-            continue;
++    //We add basic blocks when we inline so we don't use growable list iterator
++    for (size_t idx = 0; idx < dvmGrowableListSize (blockList); idx++)
++    {
++        BasicBlock *bb = reinterpret_cast<BasicBlock *> (dvmGrowableListGetElement (blockList, idx));
+ 
++        //Stop looking if we have no more basic blocks
++        if (bb == NULL)
++        {
++            break;
++        }
++
++        //Invoke should be last instruction
+         MIR *lastMIRInsn = bb->lastMIRInsn;
+ 
+         //If we have a last instruction
+         if (lastMIRInsn != 0)
+         {
+-            //Try to inline the last instruction
+-            dvmCompilerHandleInlining (cUnit, info, bb, lastMIRInsn);
++            int flags = dvmCompilerGetOpcodeFlags (lastMIRInsn->dalvikInsn.opcode);
++
++            //Check if it really is an invoke
++            if ((flags & kInstrInvoke) != 0)
++            {
++                //Try to inline the instruction
++                dvmCompilerHandleInlining (cUnit, info, bb, lastMIRInsn);
++            }
+         }
+     }
+ }
+diff --git a/vm/compiler/codegen/x86/AnalysisO1.cpp b/vm/compiler/codegen/x86/AnalysisO1.cpp
+index df2a11d..bbd420f 100644
+--- a/vm/compiler/codegen/x86/AnalysisO1.cpp
++++ b/vm/compiler/codegen/x86/AnalysisO1.cpp
+@@ -1471,6 +1471,12 @@ int codeGenBasicBlock(const Method* method, BasicBlock_O1* bb)
+         offsetPC = mir->seqNum;
+         rPC = const_cast<u2 *>(method->insns) + mir->offset;
+ 
++        //Skip mirs tagged as being no-ops
++        if ((mir->OptimizationFlags & MIR_INLINED) != 0)
++        {
++            continue;
++        }
++
+         // Handle extended MIRs whose implementation uses NcgO0 mode
+         if ( isExtendedMir(mir->dalvikInsn.opcode) == true &&
+              skipExtendedMir(mir->dalvikInsn.opcode) == true) {
+diff --git a/vm/compiler/codegen/x86/BytecodeVisitor.cpp b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+index e59b091..2342613 100644
+--- a/vm/compiler/codegen/x86/BytecodeVisitor.cpp
++++ b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+@@ -611,12 +611,10 @@ int getConstInfo(BasicBlock_O1* bb, const MIR * currentMIR) {
+ 
+     clearConstKills ();
+ 
+-#ifdef WITH_JIT_INLINING
+     /* A bytecode with the MIR_INLINED op will be treated as
+      * no-op during codegen */
+     if (currentMIR->OptimizationFlags & MIR_INLINED)
+         return 0; // does NOT generate a constant
+-#endif
+ 
+     // Check if we need to handle an extended MIR
+     if (currentMIR->dalvikInsn.opcode >= static_cast<Opcode> (kMirOpFirst)) {
+@@ -1485,14 +1483,12 @@ int getVirtualRegInfo (VirtualRegInfo* infoArray, const MIR * currentMIR, bool u
+         }
+     }
+ 
+-#ifdef WITH_JIT_INLINING
+     //A bytecode with the inlined flag is treated as a nop so therefore simply return
+     //that we have 0 regs for this bytecode
+     if (currentMIR->OptimizationFlags & MIR_INLINED)
+     {
+         return 0;
+     }
+-#endif
+ 
+     bool isExtended = false;
+ 
+@@ -3619,12 +3615,10 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+     s2 tmp_s2;
+     int tmpvalue, isConst;
+ 
+-#ifdef WITH_JIT_INLINING
+     /* A bytecode with the MIR_INLINED op will be treated as
+      * no-op during codegen */
+     if (currentMIR->OptimizationFlags & MIR_INLINED)
+         return 0; // No temporaries accessed
+-#endif
+ 
+     // Check if we need to handle an extended MIR
+     if (currentMIR->dalvikInsn.opcode >= static_cast<Opcode> (kMirOpFirst)) {
+diff --git a/vm/compiler/codegen/x86/CodegenInterface.cpp b/vm/compiler/codegen/x86/CodegenInterface.cpp
+index 2c7f12a..49ee049 100644
+--- a/vm/compiler/codegen/x86/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/CodegenInterface.cpp
+@@ -2003,11 +2003,8 @@ static void compilerMIR2LIRJit(CompilationUnit_O1 *cUnit, JitTranslationInfo *in
+                 dvmInsertGrowableList(&chainingListByType[kChainingCellNormal], i);
+                 break;
+             case kChainingCellInvokeSingleton:
+-                    if (!cUnit->singletonInlined) {
+-                        /* Handle the codegen later */
+-                        dvmInsertGrowableList(
+-                            &chainingListByType[kChainingCellInvokeSingleton], i);
+-                    }
++                /* Handle the codegen later */
++                dvmInsertGrowableList (&chainingListByType[kChainingCellInvokeSingleton], i);
+                 break;
+             case kChainingCellInvokePredicted:
+                 /* Handle the codegen later */
+diff --git a/vm/compiler/codegen/x86/Lower.cpp b/vm/compiler/codegen/x86/Lower.cpp
+index ff5b037..73d22f0 100644
+--- a/vm/compiler/codegen/x86/Lower.cpp
++++ b/vm/compiler/codegen/x86/Lower.cpp
+@@ -615,44 +615,17 @@ int lowerByteCode(const Method* method, const MIR * mir, const u2 * dalvikPC) {
+                                 //! bytecode. This WILL break mapping from BC to NCG
+                                 //! if more than one bytecode is inlined.
+ 
+-    if (dump_x86_inst) {
+-        char * decodedString = dvmCompilerGetDalvikDisassembly(&mir->dalvikInsn,
+-                NULL);
+-        const char * note;
+-        if (mir->OptimizationFlags & MIR_INLINED) {
+-            note = " (no-op)";
+-        } else if (mir->OptimizationFlags & MIR_INLINED_PRED) {
+-            note = " (prediction inline)";
+-        } else if (mir->OptimizationFlags & MIR_CALLEE) {
+-            note = " (inlined)";
+-        } else {
+-            note = "";
+-        }
+-
+-        const char * extraNote = "";
++    if (dump_x86_inst == true)
++    {
++        const int maxDecodedLen = 256;
++        char decodedString[maxDecodedLen];
+ 
+-        if ( (mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK) && (mir->OptimizationFlags & MIR_IGNORE_RANGE_CHECK) )
+-        {
+-            extraNote = " (N | B)";
+-        }
+-        else
+-        {
+-            if (mir->OptimizationFlags & MIR_IGNORE_RANGE_CHECK)
+-            {
+-                extraNote = " (B)";
+-            }
+-            else
+-            {
+-                if (mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK)
+-                {
+-                    extraNote = " (N)";
+-                }
+-            }
+-        }
++        //We want to decode the current instruction but we pass a null cUnit because we don't
++        //care to have any ssa information printed.
++        dvmCompilerExtendedDisassembler (0, mir, &(mir->dalvikInsn), decodedString, maxDecodedLen);
+ 
+-        ALOGI("LOWER %s%s%s with offsetPC %x offsetNCG %x @%p\n",
+-                decodedString, note, extraNote, offsetPC, stream - streamMethodStart,
+-                stream);
++        ALOGI ("LOWER %s with offsetPC %x offsetNCG %x @%p\n", decodedString, offsetPC,
++                stream - streamMethodStart, stream);
+     }
+ 
+     //update mapFromBCtoNCG
+diff --git a/vm/compiler/codegen/x86/Lower.h b/vm/compiler/codegen/x86/Lower.h
+index 84918af..44c8923 100644
+--- a/vm/compiler/codegen/x86/Lower.h
++++ b/vm/compiler/codegen/x86/Lower.h
+@@ -26,7 +26,6 @@
+ // comment out for phase 1 porting
+ #define PREDICTED_CHAINING
+ #define JIT_CHAIN
+-#define WITH_JIT_INLINING
+ 
+ #define NCG_O1
+ //compilaton flags used by NCG O1
+@@ -595,7 +594,7 @@ extern char* streamCode;
+ 
+ extern char* streamMethodStart; //start of the method
+ extern char* stream; //current stream pointer
+-extern char* streamMisPred;
++
+ extern Method* currentMethod;
+ extern int currentExceptionBlockIdx;
+ 
+@@ -1358,6 +1357,14 @@ void endOfTrace (CompilationUnit *cUnit);
+ //Initiates all worklists to do their work
+ void performWorklistWork (void);
+ 
++/**
++ * @brief Generates a conditional jump to taken child of current BB being generated.
++ * @details Implements semantics of "if" bytecode.
++ * @param takenCondition The condition for the taken branch
++ * @return Returns value >= 0 when successful and negative otherwise.
++ */
++int generateConditionalJumpToTakenBlock (ConditionCode takenCondition);
++
+ LowOp* jumpToBasicBlock(char* instAddr, int targetId, bool targetIsChainingCell = false);
+ LowOp* condJumpToBasicBlock(char* instAddr, ConditionCode cc, int targetId, bool immediateNeedsAligned = false);
+ bool jumpToException(const char* target);
+diff --git a/vm/compiler/codegen/x86/LowerGetPut.cpp b/vm/compiler/codegen/x86/LowerGetPut.cpp
+index 13f27fe..e5b8f1d 100644
+--- a/vm/compiler/codegen/x86/LowerGetPut.cpp
++++ b/vm/compiler/codegen/x86/LowerGetPut.cpp
+@@ -825,16 +825,13 @@ int iget_iput_common_nohelper(u2 referenceIndex, InstanceAccess flag, int vA,
+     if (insertLabel(".iget_iput_resolved", true) == -1)
+         return -1;
+ #else
+-#ifdef WITH_JIT_INLINING
++
+     const Method *method =
+             (mir->OptimizationFlags & MIR_CALLEE) ?
+                     mir->meta.calleeMethod : currentMethod;
+     InstField *pInstField =
+             (InstField *) method->clazz->pDvmDex->pResFields[referenceIndex];
+-#else
+-    InstField *pInstField = (InstField *)
+-            currentMethod->clazz->pDvmDex->pResFields[referenceIndex];
+-#endif
++
+     int fieldOffset;
+ 
+     assert(pInstField != NULL);
+@@ -1268,16 +1265,12 @@ int sget_sput_common(StaticAccess flag, int vA, u2 referenceIndex, bool isObj,
+         if (insertLabel(".sget_sput_resolved", true) == -1)
+             return -1;
+ #else
+-#ifdef WITH_JIT_INLINING
++
+         const Method *method =
+                 (mir->OptimizationFlags & MIR_CALLEE) ?
+                         mir->meta.calleeMethod : currentMethod;
+         void *fieldPtr =
+                 (void*) (method->clazz->pDvmDex->pResFields[referenceIndex]);
+-#else
+-        void *fieldPtr = (void*)
+-              (currentMethod->clazz->pDvmDex->pResFields[referenceIndex]);
+-#endif
+ 
+         /* Usually, fieldPtr should not be null. The interpreter should resolve
+          * it before we come here, or not allow this opcode in a trace. However,
+diff --git a/vm/compiler/codegen/x86/LowerInvoke.cpp b/vm/compiler/codegen/x86/LowerInvoke.cpp
+index cf0170b..d2143ba 100644
+--- a/vm/compiler/codegen/x86/LowerInvoke.cpp
++++ b/vm/compiler/codegen/x86/LowerInvoke.cpp
+@@ -423,11 +423,11 @@ int common_invoke_interface(bool isRange, u2 tmp, int vD, const MIR *mir) {
+ //!
+ int op_invoke_virtual(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_INVOKE_VIRTUAL);
+-#ifdef WITH_JIT_INLINING
++
+     /* An invoke with the MIR_INLINED is effectively a no-op */
+     if (mir->OptimizationFlags & MIR_INLINED)
+         return 0;
+-#endif
++
+     // A|G|op BBBB F|E|D|C
+     // C: the first argument, which is the "this" pointer
+     // A: argument count
+@@ -447,11 +447,11 @@ int op_invoke_virtual(const MIR * mir) {
+ //!
+ int op_invoke_super(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_INVOKE_SUPER);
+-#ifdef WITH_JIT_INLINING
++
+     /* An invoke with the MIR_INLINED is effectively a no-op */
+     if (mir->OptimizationFlags & MIR_INLINED)
+         return 0;
+-#endif
++
+     // A|G|op BBBB F|E|D|C
+     // C: the first argument, which is the "this" pointer
+     // A: argument count
+@@ -468,11 +468,11 @@ int op_invoke_super(const MIR * mir) {
+ //!
+ int op_invoke_direct(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_INVOKE_DIRECT);
+-#ifdef WITH_JIT_INLINING
++
+     /* An invoke with the MIR_INLINED is effectively a no-op */
+     if (mir->OptimizationFlags & MIR_INLINED)
+         return 0;
+-#endif
++
+     // A|G|op BBBB F|E|D|C
+     // C: the first argument, which is the "this" pointer
+     // A: argument count
+@@ -492,11 +492,11 @@ int op_invoke_direct(const MIR * mir) {
+ //!
+ int op_invoke_static(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_INVOKE_STATIC);
+-#ifdef WITH_JIT_INLINING
++
+     /* An invoke with the MIR_INLINED is effectively a no-op */
+     if (mir->OptimizationFlags & MIR_INLINED)
+         return 0;
+-#endif
++
+     // A|G|op BBBB F|E|D|C
+     // C: the first argument, which is the "this" pointer
+     // A: argument count
+@@ -513,11 +513,11 @@ int op_invoke_static(const MIR * mir) {
+ //!
+ int op_invoke_interface(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_INVOKE_INTERFACE);
+-#ifdef WITH_JIT_INLINING
++
+     /* An invoke with the MIR_INLINED is effectively a no-op */
+     if (mir->OptimizationFlags & MIR_INLINED)
+         return 0;
+-#endif
++
+     // A|G|op BBBB F|E|D|C
+     // C: the first argument, which is the "this" pointer
+     // A: argument count
+@@ -537,11 +537,11 @@ int op_invoke_interface(const MIR * mir) {
+ //!
+ int op_invoke_virtual_range(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_INVOKE_VIRTUAL_RANGE);
+-#ifdef WITH_JIT_INLINING
++
+     /* An invoke with the MIR_INLINED is effectively a no-op */
+     if (mir->OptimizationFlags & MIR_INLINED)
+         return 0;
+-#endif
++
+     //AA|op BBBB CCCC
+     //CCCC: the first argument, which is the "this" pointer
+     //AA: argument count
+@@ -560,11 +560,11 @@ int op_invoke_virtual_range(const MIR * mir) {
+ //!
+ int op_invoke_super_range(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_INVOKE_SUPER_RANGE);
+-#ifdef WITH_JIT_INLINING
++
+     /* An invoke with the MIR_INLINED is effectively a no-op */
+     if (mir->OptimizationFlags & MIR_INLINED)
+         return 0;
+-#endif
++
+     u2 tmp = mir->dalvikInsn.vB; //BBBB, method index
+     int retval = common_invoke_super(true/*range*/, tmp, mir->dalvikInsn);
+ #if defined(ENABLE_TRACING) && !defined(TRACING_OPTION2)
+@@ -577,11 +577,11 @@ int op_invoke_super_range(const MIR * mir) {
+ //!
+ int op_invoke_direct_range(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_INVOKE_DIRECT_RANGE);
+-#ifdef WITH_JIT_INLINING
++
+     /* An invoke with the MIR_INLINED is effectively a no-op */
+     if (mir->OptimizationFlags & MIR_INLINED)
+         return 0;
+-#endif
++
+     int vD = mir->dalvikInsn.vC; /* Note: variable is still named vD because
+                                                of historical reasons. In reality, first
+                                                argument is in vCCCC */
+@@ -597,11 +597,11 @@ int op_invoke_direct_range(const MIR * mir) {
+ //!
+ int op_invoke_static_range(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_INVOKE_STATIC_RANGE);
+-#ifdef WITH_JIT_INLINING
++
+     /* An invoke with the MIR_INLINED is effectively a no-op */
+     if (mir->OptimizationFlags & MIR_INLINED)
+         return 0;
+-#endif
++
+     u2 tmp = mir->dalvikInsn.vB; //BBBB, method index
+     int retval = common_invoke_static(true/*range*/, tmp, mir->dalvikInsn);
+ #if defined(ENABLE_TRACING) && !defined(TRACING_OPTION2)
+@@ -614,11 +614,11 @@ int op_invoke_static_range(const MIR * mir) {
+ //!
+ int op_invoke_interface_range(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_INVOKE_INTERFACE_RANGE);
+-#ifdef WITH_JIT_INLINING
++
+     /* An invoke with the MIR_INLINED is effectively a no-op */
+     if (mir->OptimizationFlags & MIR_INLINED)
+         return 0;
+-#endif
++
+     int vD = mir->dalvikInsn.vC; /* Note: variable is still named vD because
+                                                of historical reasons. In reality, first
+                                                argument is in vCCCC */
+@@ -1620,11 +1620,11 @@ int common_invoke_virtual_quick(bool hasRange, int vD, u2 IMMC, const MIR *mir)
+ //!
+ int op_invoke_virtual_quick(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_INVOKE_VIRTUAL_QUICK);
+-#ifdef WITH_JIT_INLINING
++
+     /* An invoke with the MIR_INLINED is effectively a no-op */
+     if (mir->OptimizationFlags & MIR_INLINED)
+         return 0;
+-#endif
++
+     int vD = mir->dalvikInsn.vC;
+     u2 IMMC = 4 * mir->dalvikInsn.vB;
+     int retval = common_invoke_virtual_quick(false, vD, IMMC, mir);
+@@ -1638,11 +1638,11 @@ int op_invoke_virtual_quick(const MIR * mir) {
+ //!
+ int op_invoke_virtual_quick_range(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_INVOKE_VIRTUAL_QUICK_RANGE);
+-#ifdef WITH_JIT_INLINING
++
+     /* An invoke with the MIR_INLINED is effectively a no-op */
+     if (mir->OptimizationFlags & MIR_INLINED)
+         return 0;
+-#endif
++
+     int vD = mir->dalvikInsn.vC;
+     u2 IMMC = 4 * mir->dalvikInsn.vB;
+     int retval = common_invoke_virtual_quick(true, vD, IMMC, mir);
+@@ -1686,11 +1686,11 @@ int common_invoke_super_quick(bool hasRange, int vD, u2 IMMC,
+ //!
+ int op_invoke_super_quick(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_INVOKE_SUPER_QUICK);
+-#ifdef WITH_JIT_INLINING
++
+     /* An invoke with the MIR_INLINED is effectively a no-op */
+     if (mir->OptimizationFlags & MIR_INLINED)
+         return 0;
+-#endif
++
+     int vD = mir->dalvikInsn.vC;
+     u2 IMMC = 4 * mir->dalvikInsn.vB;
+     int retval = common_invoke_super_quick(false, vD, IMMC, mir->dalvikInsn);
+@@ -1704,11 +1704,11 @@ int op_invoke_super_quick(const MIR * mir) {
+ //!
+ int op_invoke_super_quick_range(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_INVOKE_SUPER_QUICK_RANGE);
+-#ifdef WITH_JIT_INLINING
++
+     /* An invoke with the MIR_INLINED is effectively a no-op */
+     if (mir->OptimizationFlags & MIR_INLINED)
+         return 0;
+-#endif
++
+     int vD = mir->dalvikInsn.vC;
+     u2 IMMC = 4 * mir->dalvikInsn.vB;
+     int retval = common_invoke_super_quick(true, vD, IMMC, mir->dalvikInsn);
+diff --git a/vm/compiler/codegen/x86/LowerJump.cpp b/vm/compiler/codegen/x86/LowerJump.cpp
+index df27236..b932a4b 100644
+--- a/vm/compiler/codegen/x86/LowerJump.cpp
++++ b/vm/compiler/codegen/x86/LowerJump.cpp
+@@ -1206,11 +1206,8 @@ int common_goto(s4 targetBlockId) {
+     return 1;
+ }
+ 
+-int common_if(s4 tmp, ConditionCode cc_next, ConditionCode cc) {
+-    bool unknown;
+-    OpndSize size = OpndSize_Null;
+-    int relativeNCG;
+-
++int generateConditionalJumpToTakenBlock (ConditionCode takenCondition)
++{
+     // A basic block whose last bytecode is "if" must have two children
+     assert (traceCurrentBB->taken != NULL);
+     assert (traceCurrentBB->fallThrough != NULL);
+@@ -1306,15 +1303,17 @@ int common_if(s4 tmp, ConditionCode cc_next, ConditionCode cc) {
+ 
+     if (gDvmJit.scheduling)
+     {
+-        conditional_jump_block (cc, takenBB->id,
+-                doesJumpToBBNeedAlignment (takenBB));
++        conditional_jump_block (takenCondition, takenBB->id, doesJumpToBBNeedAlignment (takenBB));
+     }
+     else
+     {
++        //Conditional jumps in x86 are 2 bytes
+         alignOffset (2);
+-        relativeNCG = getRelativeNCG (takenBB->id, JmpCall_cond, &unknown,
+-                &size);
+-        conditional_jump_int (cc, relativeNCG, size);
++
++        bool unknown;
++        OpndSize size = OpndSize_Null;
++        int relativeNCG = getRelativeNCG (takenBB->id, JmpCall_cond, &unknown, &size);
++        conditional_jump_int (takenCondition, relativeNCG, size);
+     }
+ 
+     // Now sync with the fallthrough child
+@@ -1810,10 +1809,11 @@ int op_if_eq(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_IF_EQ);
+     int vA = mir->dalvikInsn.vA;
+     int vB = mir->dalvikInsn.vB;
+-    s2 tmp = mir->dalvikInsn.vC;
++
+     get_virtual_reg(vA, OpndSize_32, 1, false);
+     compare_VR_reg(OpndSize_32, vB, 1, false);
+-    return common_if(tmp, Condition_NE, Condition_E);
++
++    return generateConditionalJumpToTakenBlock (Condition_E);
+ }
+ 
+ /**
+@@ -1825,10 +1825,11 @@ int op_if_ne(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_IF_NE);
+     int vA = mir->dalvikInsn.vA;
+     int vB = mir->dalvikInsn.vB;
+-    s2 tmp = mir->dalvikInsn.vC;
++
+     get_virtual_reg(vA, OpndSize_32, 1, false);
+     compare_VR_reg(OpndSize_32, vB, 1, false);
+-    return common_if(tmp, Condition_E, Condition_NE);
++
++    return generateConditionalJumpToTakenBlock (Condition_NE);
+ }
+ 
+ /**
+@@ -1840,10 +1841,11 @@ int op_if_lt(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_IF_LT);
+     int vA = mir->dalvikInsn.vA;
+     int vB = mir->dalvikInsn.vB;
+-    s2 tmp = mir->dalvikInsn.vC;
++
+     get_virtual_reg(vA, OpndSize_32, 1, false);
+     compare_VR_reg(OpndSize_32, vB, 1, false);
+-    return common_if(tmp, Condition_GE, Condition_L);
++
++    return generateConditionalJumpToTakenBlock (Condition_L);
+ }
+ 
+ /**
+@@ -1855,10 +1857,11 @@ int op_if_ge(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_IF_GE);
+     int vA = mir->dalvikInsn.vA;
+     int vB = mir->dalvikInsn.vB;
+-    s2 tmp = mir->dalvikInsn.vC;
++
+     get_virtual_reg(vA, OpndSize_32, 1, false);
+     compare_VR_reg(OpndSize_32, vB, 1, false);
+-    return common_if(tmp, Condition_L, Condition_GE);
++
++    return generateConditionalJumpToTakenBlock (Condition_GE);
+ }
+ 
+ /**
+@@ -1870,10 +1873,11 @@ int op_if_gt(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_IF_GT);
+     int vA = mir->dalvikInsn.vA;
+     int vB = mir->dalvikInsn.vB;
+-    s2 tmp = mir->dalvikInsn.vC;
++
+     get_virtual_reg(vA, OpndSize_32, 1, false);
+     compare_VR_reg(OpndSize_32, vB, 1, false);
+-    return common_if(tmp, Condition_LE, Condition_G);
++
++    return generateConditionalJumpToTakenBlock (Condition_G);
+ }
+ 
+ /**
+@@ -1885,10 +1889,11 @@ int op_if_le(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_IF_LE);
+     int vA = mir->dalvikInsn.vA;
+     int vB = mir->dalvikInsn.vB;
+-    s2 tmp = mir->dalvikInsn.vC;
++
+     get_virtual_reg(vA, OpndSize_32, 1, false);
+     compare_VR_reg(OpndSize_32, vB, 1, false);
+-    return common_if(tmp, Condition_G, Condition_LE);
++
++    return generateConditionalJumpToTakenBlock (Condition_LE);
+ }
+ #undef P_GPR_1
+ 
+@@ -1900,9 +1905,10 @@ int op_if_le(const MIR * mir) {
+ int op_if_eqz(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_IF_EQZ);
+     int vA = mir->dalvikInsn.vA;
+-    s2 tmp = mir->dalvikInsn.vB;
++
+     compare_imm_VR(OpndSize_32, 0, vA);
+-    return common_if(tmp, Condition_NE, Condition_E);
++
++    return generateConditionalJumpToTakenBlock (Condition_E);
+ }
+ 
+ /**
+@@ -1913,9 +1919,10 @@ int op_if_eqz(const MIR * mir) {
+ int op_if_nez(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_IF_NEZ);
+     int vA = mir->dalvikInsn.vA;
+-    s2 tmp = mir->dalvikInsn.vB;
++
+     compare_imm_VR(OpndSize_32, 0, vA);
+-    return common_if(tmp, Condition_E, Condition_NE);
++
++    return generateConditionalJumpToTakenBlock (Condition_NE);
+ }
+ 
+ /**
+@@ -1926,9 +1933,10 @@ int op_if_nez(const MIR * mir) {
+ int op_if_ltz(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_IF_LTZ);
+     int vA = mir->dalvikInsn.vA;
+-    s2 tmp = mir->dalvikInsn.vB;
++
+     compare_imm_VR(OpndSize_32, 0, vA);
+-    return common_if(tmp, Condition_GE, Condition_L);
++
++    return generateConditionalJumpToTakenBlock (Condition_L);
+ }
+ 
+ /**
+@@ -1939,9 +1947,10 @@ int op_if_ltz(const MIR * mir) {
+ int op_if_gez(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_IF_GEZ);
+     int vA = mir->dalvikInsn.vA;
+-    s2 tmp = mir->dalvikInsn.vB;
++
+     compare_imm_VR(OpndSize_32, 0, vA);
+-    return common_if(tmp, Condition_L, Condition_GE);
++
++    return generateConditionalJumpToTakenBlock (Condition_GE);
+ }
+ 
+ /**
+@@ -1952,9 +1961,10 @@ int op_if_gez(const MIR * mir) {
+ int op_if_gtz(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_IF_GTZ);
+     int vA = mir->dalvikInsn.vA;
+-    s2 tmp = mir->dalvikInsn.vB;
++
+     compare_imm_VR(OpndSize_32, 0, vA);
+-    return common_if(tmp, Condition_LE, Condition_G);
++
++    return generateConditionalJumpToTakenBlock (Condition_G);
+ }
+ 
+ /**
+@@ -1965,9 +1975,10 @@ int op_if_gtz(const MIR * mir) {
+ int op_if_lez(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_IF_LEZ);
+     int vA = mir->dalvikInsn.vA;
+-    s2 tmp = mir->dalvikInsn.vB;
++
+     compare_imm_VR(OpndSize_32, 0, vA);
+-    return common_if(tmp, Condition_G, Condition_LE);
++
++    return generateConditionalJumpToTakenBlock (Condition_LE);
+ }
+ 
+ #define P_GPR_1 PhysicalReg_ECX
+diff --git a/vm/compiler/codegen/x86/LowerMove.cpp b/vm/compiler/codegen/x86/LowerMove.cpp
+index 03c69e6..df3d07c 100644
+--- a/vm/compiler/codegen/x86/LowerMove.cpp
++++ b/vm/compiler/codegen/x86/LowerMove.cpp
+@@ -125,11 +125,11 @@ int op_move_wide_16(const MIR * mir) {
+ int op_move_result(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_MOVE_RESULT
+             || mir->dalvikInsn.opcode == OP_MOVE_RESULT_OBJECT);
+-#ifdef WITH_JIT_INLINING
++
+     /* An inlined move result is effectively no-op */
+     if (mir->OptimizationFlags & MIR_INLINED)
+         return 0;
+-#endif
++
+     int vA = mir->dalvikInsn.vA;
+     scratchRegs[0] = PhysicalReg_SCRATCH_1;
+     get_return_value(OpndSize_32, 1, false);
+@@ -144,11 +144,11 @@ int op_move_result(const MIR * mir) {
+  */
+ int op_move_result_wide(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_MOVE_RESULT_WIDE);
+-#ifdef WITH_JIT_INLINING
++
+     /* An inlined move result is effectively no-op */
+     if (mir->OptimizationFlags & MIR_INLINED)
+         return 0;
+-#endif
++
+     int vA = mir->dalvikInsn.vA;
+     scratchRegs[0] = PhysicalReg_SCRATCH_1;
+     get_return_value(OpndSize_64, 1, false);
+-- 
+1.7.4.1
+

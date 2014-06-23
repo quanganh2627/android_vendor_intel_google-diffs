@@ -1,0 +1,178 @@
+From 900a8062a5252bd5ceb0c6ca907364a83a6b5973 Mon Sep 17 00:00:00 2001
+From: Udayan Banerji <udayan.banerji@intel.com>
+Date: Tue, 11 Jun 2013 19:51:30 -0700
+Subject: Dalvik: Skip integer division if numerator is 0
+
+BZ: 113952
+
+This patch checks the numerator for 0 and skips division, setting quotient
+and remainder to 0.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I312395c0ed20aa7bff4b489245178ea8c4c39ed5
+Orig-MCG-Change-Id: Id80e4ae2de4dabc0034e50f5f1ed898706824284
+Signed-off-by: Udayan Banerji <udayan.banerji@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/codegen/x86/BytecodeVisitor.cpp |   10 +++---
+ vm/compiler/codegen/x86/LowerAlu.cpp        |   47 ++++++++++++--------------
+ 2 files changed, 27 insertions(+), 30 deletions(-)
+
+diff --git a/vm/compiler/codegen/x86/BytecodeVisitor.cpp b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+index f8ca18e..a36cfa8 100644
+--- a/vm/compiler/codegen/x86/BytecodeVisitor.cpp
++++ b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+@@ -2576,7 +2576,7 @@ int getVirtualRegInfo(VirtualRegInfo* infoArray, const MIR * currentMIR) {
+         v2 = currentMIR->dalvikInsn.vC;
+         codeSize = 2;
+         infoArray[2].regNum = vA;
+-        infoArray[2].refCount = 2;
++        infoArray[2].refCount = 1;
+         infoArray[2].accessType = REGACCESS_D;
+         infoArray[2].physicalType = LowOpndRegType_gp;
+         infoArray[0].regNum = v1;
+@@ -5412,11 +5412,11 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+         infoArray[5].refCount = 2; //define, use
+         infoArray[5].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
+         if(inst_op == OP_DIV_INT || inst_op == OP_DIV_INT_2ADDR) {
+-            infoArray[1].refCount = 10;
+-            infoArray[2].refCount = 8;
++            infoArray[1].refCount = 11;
++            infoArray[2].refCount = 9;
+         } else {
+-            infoArray[1].refCount = 9;
+-            infoArray[2].refCount = 11;
++            infoArray[1].refCount = 10;
++            infoArray[2].refCount = 12;
+         }
+         return 6;
+ 
+diff --git a/vm/compiler/codegen/x86/LowerAlu.cpp b/vm/compiler/codegen/x86/LowerAlu.cpp
+index fdffce7..d9b13bd 100644
+--- a/vm/compiler/codegen/x86/LowerAlu.cpp
++++ b/vm/compiler/codegen/x86/LowerAlu.cpp
+@@ -812,46 +812,56 @@ int op_ushr_int_2addr(const MIR * mir) {
+ //!make sure the reg. alloc. state is the same at merge points by calling transferToState
+ int common_div_rem_int(bool isRem, int vA, int v1, int v2) {
+     get_virtual_reg(v1, OpndSize_32, PhysicalReg_EAX, true);
++    move_imm_to_reg(OpndSize_32, 0, PhysicalReg_EDX, true);
+     get_virtual_reg(v2, OpndSize_32, 2, false);
+     compare_imm_reg(OpndSize_32, 0, 2, false);
+     handlePotentialException(
+                                        Condition_E, Condition_NE,
+                                        1, "common_errDivideByZero");
+ 
++    //Check if numerator is 0
++    compare_imm_reg(OpndSize_32, 0, PhysicalReg_EAX, true);
++    rememberState(2);
++    conditional_jump(Condition_Z, ".common_div_rem_int_divdone", true);
++
++    transferToState(1);
+     //Find out Numerator | Denominator
+     move_reg_to_reg(OpndSize_32, PhysicalReg_EAX, true, 3, false);
+     alu_binary_reg_reg(OpndSize_32, or_opc, 2, false, 3, false);
+ 
+     //If both arguments are less than 8-bits (and positive), do 8-bit divide
+-    rememberState(1);
+     test_imm_reg(OpndSize_32, 0xFFFFFF00, 3, false);
++
++    rememberState(3);
+     conditional_jump(Condition_Z, ".common_div_rem_int_8", true);
+ 
+     //If both arguments are less than 16-bits (and positive), do 16-bit divide
+     test_imm_reg(OpndSize_32, 0xFFFF0000, 3, false);
+     conditional_jump(Condition_Z, ".common_div_rem_int_16", true);
+ 
+-    //32-bit case:
+-    goToState(1);
+-
+     //Handle special cases:
+     //0x80000000 / -1 should result in a quotient of 0x80000000
+     //and a remainder of 0.
+     //Check for -1:
+     compare_imm_reg(OpndSize_32, -1, 2, false);
+-    rememberState(2);
++    rememberState(4);
+     conditional_jump(Condition_NE, ".common_div_rem_int_32", true);
+     //Check for 0x80000000 (MinInt)
+     compare_imm_reg(OpndSize_32, 0x80000000, PhysicalReg_EAX, true);
++    //Special case, no division is needed.
++    //We set the quotient to 0x800000000 (EAX is already that),
++    //and remainder to 0
+     transferToState(2);
+-    conditional_jump(Condition_E, ".common_div_rem_int_special", true);
++    conditional_jump(Condition_E, ".common_div_rem_int_divdone", true);
+ 
++
++    goToState(4);
+     if (insertLabel(".common_div_rem_int_32", true) == -1) //merge point
+         return -1;
+     convert_integer(OpndSize_32, OpndSize_64); //cdq
+     //idiv: dividend in edx:eax; quotient in eax; remainder in edx
+     alu_unary_reg(OpndSize_32, idiv_opc, 2, false);
+-    rememberState(3);
++    transferToState(2);
+     unconditional_jump(".common_div_rem_int_divdone", true);
+ 
+     //Do 8-bit unsigned divide:
+@@ -859,7 +869,7 @@ int common_div_rem_int(bool isRem, int vA, int v1, int v2) {
+     //We are forced to use a hard-coded register, since the register allocator
+     //can allocate a register not capable of 8-bit operation, like ESI,
+     //which will cause undefined behaviour.
+-    goToState(1);
++    goToState(3);
+     if (insertLabel(".common_div_rem_int_8", true) == -1)
+         return -1;
+     move_reg_to_reg(OpndSize_32, 2, false, PhysicalReg_EBX, true);
+@@ -869,39 +879,26 @@ int common_div_rem_int(bool isRem, int vA, int v1, int v2) {
+         alu_binary_imm_reg(OpndSize_32, shr_opc, 8, PhysicalReg_EDX, true);
+     } else
+         alu_binary_imm_reg(OpndSize_32, and_opc, 0x000000FF, PhysicalReg_EAX, true);
+-    transferToState(3);
++    transferToState(2);
+     unconditional_jump(".common_div_rem_int_divdone", true);
+ 
+     //Do 16-bit divide:
+     //div: dividend in dx:ax; quotient in ax; remainder in dx
+-    goToState(1);
++    goToState(3);
+     if (insertLabel(".common_div_rem_int_16", true) == -1)
+         return -1;
+-    move_imm_to_reg(OpndSize_32, 0, PhysicalReg_EDX, true);  //clearing out.
+     alu_unary_reg(OpndSize_16, div_opc, 2, false);
+ 
+ 
+-    transferToState(3);
++    transferToState(2);
+     if (insertLabel(".common_div_rem_int_divdone", true) == -1)
+         return -1;
+     if(isRem)
+         set_virtual_reg(vA, OpndSize_32, PhysicalReg_EDX, true);
+     else //divide: quotient in %eax
+         set_virtual_reg(vA, OpndSize_32, PhysicalReg_EAX, true);
+-    rememberState(4);
+-    unconditional_jump(".common_div_rem_int_okay", true);
+-
+-    goToState(2);
+-    if (insertLabel(".common_div_rem_int_special", true) == -1)
+-        return -1;
+-
+-    if(isRem)
+-        set_VR_to_imm(vA, OpndSize_32, 0);
+-    else
+-        set_VR_to_imm(vA, OpndSize_32, 0x80000000);
+ 
+-    transferToState(4);
+-    if (insertLabel(".common_div_rem_int_okay", true) == -1) //merge point 2
++    if (insertLabel(".common_div_rem_int_okay", true) == -1)
+         return -1;
+ 
+     return 0;
+-- 
+1.7.4.1
+

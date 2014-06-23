@@ -1,0 +1,284 @@
+From e52b08d24a180dbb923270e3a5b37d1fd165aa3a Mon Sep 17 00:00:00 2001
+From: Serguei Katkov <serguei.i.katkov@intel.com>
+Date: Tue, 17 Sep 2013 18:30:11 +0700
+Subject: Dalvik: Invariant Removal should replace VR at the start of BB as well
+
+BZ: 138823
+
+Invariant Removal optimization replaces all uses of the hoisting MIR.
+However the utility function stops on the Phi node. As a result
+if hoisting instruction reaches end of the loop the uses in the
+beginning of the loop should be replaced as well.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Ic5572a63fef5b78e2329ece18c0282650daaeb95
+Orig-MCG-Change-Id: I36a0466876927827f3f8b0a6a9edb5ce568c585e
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+Reviewed-on: http://android.intel.com:8080/132641
+Reviewed-by: Banerji, Udayan <udayan.banerji@intel.com>
+Reviewed-by: Hartley, Timothy D <timothy.d.hartley@intel.com>
+Reviewed-by: lab_aqa <lab_aqa@intel.com>
+Reviewed-by: Provodin, Vitaly A <vitaly.a.provodin@intel.com>
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: Beyler, Jean Christophe <jean.christophe.beyler@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+---
+ vm/compiler/CompilerIR.h         |   11 ++--
+ vm/compiler/IntermediateRep.cpp  |  134 ++++++++++++++++++++++----------------
+ vm/compiler/InvariantRemoval.cpp |   14 ++++
+ 3 files changed, 99 insertions(+), 60 deletions(-)
+
+diff --git a/vm/compiler/CompilerIR.h b/vm/compiler/CompilerIR.h
+index d8002da..82b3f48 100644
+--- a/vm/compiler/CompilerIR.h
++++ b/vm/compiler/CompilerIR.h
+@@ -660,17 +660,18 @@ void dvmCompilerDumpCompilationUnit(CompilationUnit *cUnit);
+  * @param shouldRewriteUses Since we are changing the def register, when this is set to true
+  * it will walk to the uses and change those to match the new register.
+  * @return Returns true if successfully rewrote with the given rewrite rules.
+- */bool dvmCompilerRewriteMirDef (MIR *mir, int oldVR, int newVR, bool shouldRewriteUses = true);
++ */
++bool dvmCompilerRewriteMirDef (MIR *mir, int oldVR, int newVR, bool shouldRewriteUses = true);
+ 
+ /**
+- * @brief Rewrite the uses of a MIR.
++ * @brief Rewrite the uses of def specified by a MIR.
+  * @details This is guaranteed to not rewrite unless it will succeed.
+- * @param dalvikInsn The dalvik instruction to update.
++ * @param mir The MIR to rewrite uses of its def
+  * @param oldVR the old VR that we want to rewrite
+  * @param newVR the new VR we want to use
+  * @return whether the rewrite was successful
+- */bool dvmCompilerRewriteMirUses (DecodedInstruction &dalvikInsn, int oldVR,
+-        int newVR);
++ */
++bool dvmCompilerRewriteMirUses (MIR *mir, int oldVR, int newVR);
+ 
+ /**
+  * @brief Given a dalvik Opcode or an extended opcode, it returns the flags.
+diff --git a/vm/compiler/IntermediateRep.cpp b/vm/compiler/IntermediateRep.cpp
+index 30efd84..31ed34a 100644
+--- a/vm/compiler/IntermediateRep.cpp
++++ b/vm/compiler/IntermediateRep.cpp
+@@ -1094,7 +1094,14 @@ bool dvmCompilerCheckVariant (MIR *elem, BitVector *variants, int skipUses)
+     return (dvmCompilerUsesAreInvariant (elem, variants, skipUses) == false);
+ }
+ 
+-bool dvmCompilerRewriteMirUses (DecodedInstruction &dalvikInsn, int oldVR,
++/**
++ * @brief Rewrite the uses of a Dalvik instruction structure.
++ * @param dalvikInsn The dalvik instruction to update.
++ * @param oldVR the old VR that we want to rewrite
++ * @param newVR the new VR we want to use
++ * @return whether the rewrite was successful
++ */
++static bool rewriteUses (DecodedInstruction &dalvikInsn, int oldVR,
+         int newVR)
+ {
+     //Phi nodes get recomputed automatically and thus we don't need to rewrite the uses.
+@@ -1212,7 +1219,7 @@ static bool rewriteUses (int oldVR, int newVR, SUsedChain *chain,
+         DecodedInstruction dalvikInsn = mir->dalvikInsn;
+ 
+         //Call the rewrite helper function
+-        bool res = dvmCompilerRewriteMirUses (dalvikInsn, oldVR, newVR);
++        bool res = rewriteUses (dalvikInsn, oldVR, newVR);
+ 
+         //If we failed, fail everything
+         if (res == false)
+@@ -1228,12 +1235,77 @@ static bool rewriteUses (int oldVR, int newVR, SUsedChain *chain,
+     return true;
+ }
+ 
+-//Rewrite Mir for one instruction
+-bool dvmCompilerRewriteMirDef (MIR *mir, int oldVR, int newVR, bool shouldRewriteUses)
++//Rewrite uses of the def specified by mir
++bool dvmCompilerRewriteMirUses (MIR *mir, int oldVR, int newVR)
+ {
+     //Used to keep track of the rewritten instruction before we commit it
+     std::map<MIR *, DecodedInstruction> newDecodedInst;
+ 
++    if (mir == 0)
++    {
++        return false;
++    }
++
++    //Get local copy of ssa representation
++    SSARepresentation *ssaRep = mir->ssaRep;
++
++    //We want to be able to find the uses
++    if (ssaRep == 0 || ssaRep->numDefs == 0 || ssaRep->usedNext == 0)
++    {
++        return false;
++    }
++
++    //Follow the uses of the first def. When we get here we know we have
++    //at least one def.
++    SUsedChain *chain = ssaRep->usedNext[0];
++
++    //Now fix the uses of this updated define
++    bool success = rewriteUses (oldVR, newVR, chain, newDecodedInst);
++
++    //No use to keep going if we failed
++    if (success == false)
++    {
++        return false;
++    }
++
++    //If we have a wide VR, check whether we can rewrite the uses.
++    //Technically we need to fail rewriting the uses because the
++    //wide part of the VR should never appear as an operand. But we can
++    //be nice and even if this scenario happens, we can fix the uses.
++    if (ssaRep->numDefs >= 2)
++    {
++        //Prepare the wide part of the old and new VRs
++        int oldVRWide = oldVR + 1;
++        int newVRWide = newVR + 1;
++
++        //Get the chain for the wide define
++        chain = ssaRep->usedNext[1];
++
++        //Now try to rewrite the uses of the wide part.
++        //Don't affect success whether or not we fail here.
++        rewriteUses (oldVRWide, newVRWide, chain, newDecodedInst);
++    }
++
++    //We can commit our rewrites if we succeed all of them. We only make it
++    //to this point if we have succeeded.
++    std::map<MIR *, DecodedInstruction>::const_iterator updateIter;
++    for (updateIter = newDecodedInst.begin ();
++            updateIter != newDecodedInst.end (); updateIter++)
++    {
++        MIR *mir = updateIter->first;
++        const DecodedInstruction &dalvikInsn = updateIter->second;
++
++        //Rewrite the decoded instruction for the mir
++        mir->dalvikInsn = dalvikInsn;
++    }
++
++    //If we make it here, we succeeded
++    return true;
++}
++
++//Rewrite Mir for one instruction
++bool dvmCompilerRewriteMirDef (MIR *mir, int oldVR, int newVR, bool shouldRewriteUses)
++{
+     //Paranoid
+     assert (mir != 0);
+ 
+@@ -1266,65 +1338,17 @@ bool dvmCompilerRewriteMirDef (MIR *mir, int oldVR, int newVR, bool shouldRewrit
+     //Now that we know we are fine to do the replacement, let's do it
+     dalvikInsn.vA = static_cast<u4> (newVR);
+ 
+-    //Keep track of this rewrite in order to commit it later
+-    newDecodedInst[mir] = dalvikInsn;
+-
+     //Check if we need to rewrite the uses now that use the new def
+     if (shouldRewriteUses == true)
+     {
+-        //Get local copy of ssa representation
+-        SSARepresentation *ssaRep = mir->ssaRep;
+-
+-        //We want to be able to find the uses
+-        if (ssaRep == 0 || ssaRep->numDefs == 0 || ssaRep->usedNext == 0)
++        if (dvmCompilerRewriteMirUses (mir, oldVR, newVR) == false)
+         {
+             return false;
+         }
+-
+-        //Follow the uses of the first def. When we get here we know we have
+-        //at least one def.
+-        SUsedChain *chain = ssaRep->usedNext[0];
+-
+-        //Now fix the uses of this updated define
+-        bool success = rewriteUses (oldVR, newVR, chain, newDecodedInst);
+-
+-        //No use to keep going if we failed
+-        if (success == false)
+-        {
+-            return false;
+-        }
+-
+-        //If we have a wide VR, check whether we can rewrite the uses.
+-        //Technically we need to fail rewriting the uses because the
+-        //wide part of the VR should never appear as an operand. But we can
+-        //be nice and even if this scenario happens, we can fix the uses.
+-        if (ssaRep->numDefs >= 2)
+-        {
+-            //Prepare the wide part of the old and new VRs
+-            int oldVRWide = oldVR + 1;
+-            int newVRWide = newVR + 1;
+-
+-            //Get the chain for the wide define
+-            chain = ssaRep->usedNext[1];
+-
+-            //Now try to rewrite the uses of the wide part.
+-            //Don't affect success whether or not we fail here.
+-            rewriteUses (oldVRWide, newVRWide, chain, newDecodedInst);
+-        }
+     }
+ 
+-    //We can commit our rewrites if we succeed all of them. We only make it
+-    //to this point if we have succeeded.
+-    std::map<MIR *, DecodedInstruction>::const_iterator updateIter;
+-    for (updateIter = newDecodedInst.begin ();
+-            updateIter != newDecodedInst.end (); updateIter++)
+-    {
+-        MIR *mir = updateIter->first;
+-        const DecodedInstruction &dalvikInsn = updateIter->second;
+-
+-        //Rewrite the decoded instruction for the mir
+-        mir->dalvikInsn = dalvikInsn;
+-    }
++    //Now we can commit update of def
++    mir->dalvikInsn = dalvikInsn;
+ 
+     //If we make it here, we succeeded
+     return true;
+diff --git a/vm/compiler/InvariantRemoval.cpp b/vm/compiler/InvariantRemoval.cpp
+index 4194140..f6aa6a2 100644
+--- a/vm/compiler/InvariantRemoval.cpp
++++ b/vm/compiler/InvariantRemoval.cpp
+@@ -496,6 +496,18 @@ static void hoistInvariants (CompilationUnit *cUnit, LoopInformation *loopInfo,
+                 newReg = replacements[oldSsa];
+ 
+                 rewriteSuccess = dvmCompilerRewriteMirDef (copy, oldReg, newReg);
++
++                if (rewriteSuccess == true && needMove == true)
++                {
++                    //Now if there is a Phi node for our oldReg we should update its uses
++                    //with new reg as well
++                    MIR *phi = loopInfo->getPhiInstruction (cUnit, oldReg);
++
++                    if (phi != 0)
++                    {
++                        rewriteSuccess = dvmCompilerRewriteMirUses (phi, oldReg, newReg);
++                    }
++                }
+             }
+         }
+ 
+@@ -1082,6 +1094,7 @@ static bool checkIfNoClobberMemory (CompilationUnit *cUnit, BasicBlock *bb, void
+  * @details this function checks whether given virtual register is not change up
+  * to the beginning of the given basic block. It is true if SSA subscript is the same
+  * on the entrance to the BasicBlock.
++ * @param cUnit Compilation context
+  * @param bb The basic block where reg to check
+  * @param data STL (reg, subscript) pair
+  * @return Returns true if SSA subscript is same in use and start of BB
+@@ -1104,6 +1117,7 @@ static bool whetherSSARegIsTheSameOnEnter (CompilationUnit *cUnit, BasicBlock *b
+  * @brief check whether basic block with id represented by data dominates bb
+  * @details If there is no domination information for the given Basickblock we consider
+  * that there is no domination. To use this function domination information should be avaiable.
++ * @param cUnit Compilation context
+  * @param bb The dominated basic block
+  * @param data id of the block which dominates bb
+  * @return Returns true basic block with id represented by data dominates bb.
+-- 
+1.7.4.1
+

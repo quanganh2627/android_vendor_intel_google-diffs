@@ -1,0 +1,167 @@
+From 2ecddfb4020ec2f68db8c6b0a6a7f2980d035f15 Mon Sep 17 00:00:00 2001
+From: Daniel Leung <daniel.leung@intel.com>
+Date: Fri, 29 Jun 2012 11:24:33 -0700
+Subject: Look for new rfkill sysfs nodes after suspend/resume
+
+When the device goes through suspend/resume cycles, the bluetooth
+hci core requests a new rfkill number and new sysfs nodes are
+created. The issue is that bluedroid always looks at number 0. If
+it cannot find rfkill0, it simply bails out. Therefore, after
+suspend/resume, it will never be able to find a working sysfs node.
+
+This change makes bluedroid to go through all the directories under
+/sys/class/rfkill/ to look for the rfkill node associated with
+bluetooth. This gets past the re-numbering issue.
+
+Change-Id: I9354b7d4584ed7157ae5b15c01c5bc23ff9275b0
+Original-Issue: AXIA-83
+Original-Change-Id: Ibcfbab022a86c60f16801bac44d8de35b032cac1
+Original-Depends-Change-Id: Ib33e0305ef9a741b9bca16a8c31633694dede680
+Signed-off-by: Daniel Leung <daniel.leung@intel.com>
+---
+ bluedroid/bluetooth.c |   85 ++++++++++++++++++++++++++++++++++++++-----------
+ 1 files changed, 66 insertions(+), 19 deletions(-)
+
+diff --git a/bluedroid/bluetooth.c b/bluedroid/bluetooth.c
+index 1eef5dc..ab9daf5 100644
+--- a/bluedroid/bluetooth.c
++++ b/bluedroid/bluetooth.c
+@@ -16,6 +16,7 @@
+ 
+ #define LOG_TAG "bluedroid"
+ 
++#include <dirent.h>
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <stdlib.h>
+@@ -42,7 +43,6 @@
+ #define MIN(x,y) (((x)<(y))?(x):(y))
+ 
+ 
+-static int rfkill_id = -1;
+ static char *rfkill_state_path = NULL;
+ 
+ #ifndef BLUETOOTH_DOES_NOT_USE_RFKILL
+@@ -51,33 +51,48 @@ static int init_rfkill() {
+     char buf[16];
+     int fd;
+     int sz;
+-    int id;
+-    for (id = 0; ; id++) {
+-        snprintf(path, sizeof(path), "/sys/class/rfkill/rfkill%d/type", id);
+-        fd = open(path, O_RDONLY);
+-        if (fd < 0) {
+-            ALOGW("open(%s) failed: %s (%d)\n", path, strerror(errno), errno);
+-            return -1;
+-        }
+-        sz = read(fd, &buf, sizeof(buf));
+-        close(fd);
+-        if (sz >= 9 && memcmp(buf, "bluetooth", 9) == 0) {
+-            rfkill_id = id;
+-            break;
++
++    DIR *rfkill_dir;
++    struct dirent *de;
++
++    rfkill_dir = opendir("/sys/class/rfkill/");
++    if (!rfkill_dir) {
++        ALOGW("cannot find /sys/class/rfkill");
++    } else {
++        while ((de = readdir(rfkill_dir))) {
++            // need "rfkill*"
++            if(de->d_name[0] != 'r') {
++                continue;
++            }
++
++            snprintf(path, sizeof(path), "/sys/class/rfkill/%s/type", de->d_name);
++            fd = open(path, O_RDONLY);
++            if (fd < 0) {
++                ALOGW("open(%s) failed: %s (%d)\n", path, strerror(errno), errno);
++                continue;
++            }
++            sz = read(fd, &buf, sizeof(buf));
++            close(fd);
++            if (sz >= 9 && memcmp(buf, "bluetooth", 9) == 0) {
++                asprintf(&rfkill_state_path, "/sys/class/rfkill/%s/state", de->d_name);
++                break;
++            }
+         }
+     }
+ 
+-    asprintf(&rfkill_state_path, "/sys/class/rfkill/rfkill%d/state", rfkill_id);
++    if (rfkill_dir) {
++        closedir(rfkill_dir);
++    }
+     return 0;
+ }
+ 
+-static int check_bluetooth_power() {
++static int __check_bluetooth_power() {
+     int sz;
+     int fd = -1;
+     int ret = -1;
+     char buffer;
+ 
+-    if (rfkill_id == -1) {
++    if (rfkill_state_path == NULL) {
+         if (init_rfkill()) goto out;
+     }
+ 
+@@ -108,13 +123,29 @@ out:
+     return ret;
+ }
+ 
+-static int set_bluetooth_power(int on) {
++static int check_bluetooth_power() {
++    int ret = -1;
++
++    ret = __check_bluetooth_power();
++    if ((ret == -1) && (rfkill_state_path != NULL)) {
++        // if first check fails, assume that the sysfs node
++        // has moved so we need to find it again.
++        // though only try again if we have previously
++        // working node.
++        free(rfkill_state_path);
++        rfkill_state_path = NULL;
++        ret = __check_bluetooth_power();
++    }
++    return ret;
++}
++
++static int __set_bluetooth_power(int on) {
+     int sz;
+     int fd = -1;
+     int ret = -1;
+     const char buffer = (on ? '1' : '0');
+ 
+-    if (rfkill_id == -1) {
++    if (rfkill_state_path == NULL) {
+         if (init_rfkill()) goto out;
+     }
+ 
+@@ -138,6 +169,22 @@ out:
+ }
+ #endif
+ 
++static int set_bluetooth_power(int on) {
++    int ret = -1;
++
++    ret = __set_bluetooth_power(on);
++    if ((ret == -1) && (rfkill_state_path != NULL)) {
++        // if first check fails, assume that the sysfs node
++        // has moved so we need to find it again.
++        // though only try again if we have previously
++        // working node.
++        free(rfkill_state_path);
++        rfkill_state_path = NULL;
++        ret = __set_bluetooth_power(on);
++    }
++    return ret;
++}
++
+ static inline int create_hci_sock() {
+     int sk = socket(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI);
+     if (sk < 0) {
+-- 
+1.7.4.1
+

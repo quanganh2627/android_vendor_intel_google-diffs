@@ -1,0 +1,2611 @@
+From 66a504b7e9f47652e581eb623609e71af20658d5 Mon Sep 17 00:00:00 2001
+From: Dong-Yuan Chen <dong-yuan.chen@intel.com>
+Date: Mon, 11 Feb 2013 11:08:14 -0800
+Subject: Dalvik: Added support for x86 JIT self verification (off by default)
+
+BZ: 71715
+
+This patch adds support for x86 JIT self verification mode. Change FI
+framework to enable the use of shadow copy of the stack before switching
+to the JITted code. Change the GET/ PUT bytecode lowering functions to
+have JITted code operates on a shadow copy of the heap. For every trace
+the JITted code uses the shadow copy of stack and heap. During interpretation,
+when sync point in the trace is hit, the shadow copy of stack and heap
+updated by JITted code is compared with the FI stack and Java heap to
+verify JITted code correctness.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Interpreter; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I83825cba2cad6f368ae13a4f77262059e3169092
+Orig-MCG-Change-Id: I8cdaa60cbb1920a0c8ae853d158540fb758c47a4
+Signed-off-by: sathvikl <sathvik.laxminarayan@intel.com>
+Signed-off-by: Tim Hartley <timothy.d.hartley@intel.com>
+Signed-off-by: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/Android.mk                                |    3 +
+ vm/Init.cpp                                  |   10 +
+ vm/compiler/codegen/x86/AnalysisO1.cpp       |    3 +
+ vm/compiler/codegen/x86/BytecodeVisitor.cpp  |  451 +++++++++++++++++++--
+ vm/compiler/codegen/x86/CodegenInterface.cpp |   51 +++
+ vm/compiler/codegen/x86/Lower.h              |   17 +
+ vm/compiler/codegen/x86/LowerGetPut.cpp      |  554 +++++++++++++++++++++++++-
+ vm/compiler/codegen/x86/LowerHelper.cpp      |  306 ++++++++++++++-
+ vm/compiler/codegen/x86/LowerJump.cpp        |    6 +
+ vm/compiler/codegen/x86/NcgHelper.h          |    1 +
+ vm/interp/Jit.cpp                            |   17 +-
+ vm/mterp/out/InterpAsm-x86.S                 |  197 +++++++++-
+ vm/mterp/x86/entry.S                         |    9 +
+ vm/mterp/x86/footer.S                        |  188 +++++++++-
+ 14 files changed, 1746 insertions(+), 67 deletions(-)
+
+diff --git a/vm/Android.mk b/vm/Android.mk
+index 3ca6366..61fea0f 100644
+--- a/vm/Android.mk
++++ b/vm/Android.mk
+@@ -165,6 +165,9 @@ ifeq ($(WITH_HOST_DALVIK),true)
+     # To enable assert in host mode, uncomment the following line
+     # LOCAL_CFLAGS += -UNDEBUG -DDEBUG=1 -DLOG_NDEBUG=1 -DWITH_DALVIK_ASSERT -DWITH_JIT_TUNING
+     LOCAL_CFLAGS += -Wa,--noexecstack
++    ifeq ($(HOST_ARCH),x86)
++        LOCAL_CFLAGS += -mmmx -msse
++    endif
+     LOCAL_MODULE_TAGS := optional
+     LOCAL_MODULE := libdvm
+ 
+diff --git a/vm/Init.cpp b/vm/Init.cpp
+index c151564..09142a3 100644
+--- a/vm/Init.cpp
++++ b/vm/Init.cpp
+@@ -164,6 +164,9 @@ static void usage(const char* progName)
+     dvmFprintf(stderr, "  -Xjitprofile\n");
+     dvmFprintf(stderr, "  -Xjitdisableopt\n");
+     dvmFprintf(stderr, "  -Xjitsuspendpoll\n");
++#if defined(WITH_SELF_VERIFICATION)
++    dvmFprintf(stderr, "  -Xjitselfverificationspin\n");
++#endif
+ #endif
+     dvmFprintf(stderr, "\n");
+     dvmFprintf(stderr, "Configured with:"
+@@ -1235,6 +1238,10 @@ static int processOptions(int argc, const char* const argv[],
+           }
+         } else if (strncmp(argv[i], "-Xjitsuspendpoll", 16) == 0) {
+           gDvmJit.genSuspendPoll = true;
++#if defined(WITH_SELF_VERIFICATION)
++        } else if (strncmp(argv[i], "-Xjitselfverificationspin", 25) == 0) {
++          gDvmJit.selfVerificationSpin = true;
++#endif
+ #endif
+ 
+         } else if (strncmp(argv[i], "-Xstacktracefile:", 17) == 0) {
+@@ -1383,6 +1390,9 @@ static void setCommandLineDefaults()
+     gDvm.constInit = false;
+     gDvm.commonInit = false;
+     gDvmJit.disableOpt = 1<<kMethodJit;
++#if defined(WITH_SELF_VERIFICATION)
++    gDvmJit.selfVerificationSpin = false;
++#endif
+ #endif
+ #else
+     gDvm.executionMode = kExecutionModeInterpFast;
+diff --git a/vm/compiler/codegen/x86/AnalysisO1.cpp b/vm/compiler/codegen/x86/AnalysisO1.cpp
+index 4687199..868ff39 100644
+--- a/vm/compiler/codegen/x86/AnalysisO1.cpp
++++ b/vm/compiler/codegen/x86/AnalysisO1.cpp
+@@ -3944,6 +3944,9 @@ int beforeCall(const char* target) { //spill all live registers
+        || (!strcmp(target, "dvmJitToPatchPredictedChain"))
+        || (!strcmp(target, "dvmJitHandlePackedSwitch"))
+        || (!strcmp(target, "dvmJitHandleSparseSwitch"))
++#if defined(WITH_SELF_VERIFICATION)
++       || (!strcmp(target, "selfVerificationLoad"))
++#endif
+        ) {
+         touchEax();
+     }
+diff --git a/vm/compiler/codegen/x86/BytecodeVisitor.cpp b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+index 245deb1..42fb8b3 100644
+--- a/vm/compiler/codegen/x86/BytecodeVisitor.cpp
++++ b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+@@ -1921,6 +1921,12 @@ int getVirtualRegInfo(VirtualRegInfo* infoArray, const MIR * currentMIR) {
+         vA = currentMIR->dalvikInsn.vA;
+         vB = currentMIR->dalvikInsn.vB;
+         codeSize = 2;
++        infoArray[0].regNum = vB; //object instance
++        infoArray[0].refCount = 1;
++        infoArray[0].accessType = REGACCESS_U;
++        infoArray[0].physicalType = LowOpndRegType_gp;
++        num_regs_per_bytecode = 2;
++#ifndef WITH_SELF_VERIFICATION
+         if(inst_op == OP_IGET_WIDE || inst_op == OP_IGET_WIDE_QUICK) {
+             infoArray[1].regNum = vA;
+             infoArray[1].refCount = 1;
+@@ -1935,22 +1941,30 @@ int getVirtualRegInfo(VirtualRegInfo* infoArray, const MIR * currentMIR) {
+             infoArray[2].refCount = 1;
+             infoArray[2].accessType = REGACCESS_D;
+             infoArray[2].physicalType = LowOpndRegType_gp;
++            ///Update num regs per bytecode in this case
++            num_regs_per_bytecode = 3;
+         } else {
+             infoArray[1].regNum = vA;
+             infoArray[1].refCount = 1;
+             infoArray[1].accessType = REGACCESS_D;
+             infoArray[1].physicalType = LowOpndRegType_gp;
+         }
+-        infoArray[0].regNum = vB; //object instance
+-        infoArray[0].refCount = 1;
+-        infoArray[0].accessType = REGACCESS_U;
+-        infoArray[0].physicalType = LowOpndRegType_gp;
++#else
++        if(inst_op == OP_IGET_WIDE || inst_op == OP_IGET_WIDE_QUICK ||
++           inst_op == OP_IGET_WIDE_VOLATILE) {
++            infoArray[1].regNum = vA;
++            infoArray[1].refCount = 1;
++            infoArray[1].accessType = REGACCESS_D;
++            infoArray[1].physicalType = LowOpndRegType_xmm; //64
++        } else {
++            infoArray[1].regNum = vA;
++            infoArray[1].refCount = 1;
++            infoArray[1].accessType = REGACCESS_D;
++            infoArray[1].physicalType = LowOpndRegType_gp;
++        }
++#endif
+         updateCurrentBBWithConstraints(PhysicalReg_EAX);
+         updateCurrentBBWithConstraints(PhysicalReg_EDX);
+-        if(inst_op == OP_IGET_WIDE_VOLATILE)
+-            num_regs_per_bytecode = 3;
+-        else
+-            num_regs_per_bytecode = 2;
+         break;
+     case OP_IPUT:
+     case OP_IPUT_WIDE:
+@@ -1999,6 +2013,7 @@ int getVirtualRegInfo(VirtualRegInfo* infoArray, const MIR * currentMIR) {
+     case OP_SGET_SHORT:
+         vA = currentMIR->dalvikInsn.vA;
+         codeSize = 2;
++#ifndef WITH_SELF_VERIFICATION
+         if(inst_op == OP_SGET_WIDE) {
+             infoArray[0].regNum = vA;
+             infoArray[0].refCount = 1;
+@@ -2025,6 +2040,22 @@ int getVirtualRegInfo(VirtualRegInfo* infoArray, const MIR * currentMIR) {
+             num_regs_per_bytecode = 1;
+         updateCurrentBBWithConstraints(PhysicalReg_EAX);
+         break;
++#else
++        if(inst_op == OP_SGET_WIDE || inst_op == OP_SGET_WIDE_VOLATILE) {
++            infoArray[0].regNum = vA;
++            infoArray[0].refCount = 1;
++            infoArray[0].accessType = REGACCESS_D;
++            infoArray[0].physicalType = LowOpndRegType_xmm; //64
++        }  else {
++            infoArray[0].regNum = vA;
++            infoArray[0].refCount = 1;
++            infoArray[0].accessType = REGACCESS_D;
++            infoArray[0].physicalType = LowOpndRegType_gp;
++        }
++        num_regs_per_bytecode = 1;
++        updateCurrentBBWithConstraints(PhysicalReg_EAX);
++        break;
++#endif
+     case OP_SPUT:
+     case OP_SPUT_WIDE:
+     case OP_SPUT_OBJECT:
+@@ -3926,12 +3957,33 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+         infoArray[3].refCount = 2; //DU
+         infoArray[3].physicalType = LowOpndRegType_gp;
+         infoArray[3].linkageToVR = vA;
++
++        infoArray[4].regNum = PhysicalReg_EDX;
++        infoArray[4].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++#ifndef WITH_SELF_VERIFICATION
+         if(inst_op == OP_AGET_BYTE || inst_op == OP_AGET_BOOLEAN)
+             infoArray[3].is8Bit = true;
+-        infoArray[4].regNum = PhysicalReg_EDX;
+         infoArray[4].refCount = 2;
+-        infoArray[4].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
+         return 5;
++#else
++        infoArray[4].refCount = 4;
++        // Use temp 5 to store address of heap access
++        infoArray[5].regNum = 5;
++        infoArray[5].refCount = 2; //DU
++        infoArray[5].physicalType = LowOpndRegType_gp;
++        // Return value from calling loadFromShadowHeap will be in EAX
++        infoArray[6].regNum = PhysicalReg_EAX;
++        infoArray[6].refCount = 4;
++        infoArray[6].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++        // Scratch for calling loadFromShadowHeap
++        infoArray[7].regNum = 1;
++        infoArray[7].refCount = 2; //DU
++        infoArray[7].physicalType = LowOpndRegType_scratch;
++        infoArray[8].regNum = PhysicalReg_ECX;
++        infoArray[8].refCount = 2;
++        infoArray[8].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++        return 9;
++#endif
+     case OP_AGET_WIDE:
+         infoArray[0].regNum = 1;
+         infoArray[0].refCount = 4; //DU
+@@ -3945,10 +3997,33 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+         infoArray[3].regNum = 1;
+         infoArray[3].refCount = 2; //DU
+         infoArray[3].physicalType = LowOpndRegType_xmm;
++
+         infoArray[4].regNum = PhysicalReg_EDX;
+-        infoArray[4].refCount = 2;
+         infoArray[4].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++#ifndef WITH_SELF_VERIFICATION
++        infoArray[4].refCount = 2;
+         return 5;
++#else
++        infoArray[4].refCount = 4;
++        infoArray[5].regNum = PhysicalReg_XMM7;
++        infoArray[5].refCount = 1; //U
++        infoArray[5].physicalType = LowOpndRegType_xmm | LowOpndRegType_hard;
++        // Use temp 5 to store address of heap access
++        infoArray[6].regNum = 5;
++        infoArray[6].refCount = 2; //DU
++        infoArray[6].physicalType = LowOpndRegType_gp;
++        // Scratch for calling loadFromShadowHeap
++        infoArray[7].regNum = 1;
++        infoArray[7].refCount = 2; //DU
++        infoArray[7].physicalType = LowOpndRegType_scratch;
++        infoArray[8].regNum = PhysicalReg_EAX;
++        infoArray[8].refCount = 2;
++        infoArray[8].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++        infoArray[9].regNum = PhysicalReg_ECX;
++        infoArray[9].refCount = 2;
++        infoArray[9].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++        return 10;
++#endif
+     case OP_APUT_BYTE:
+         for(k = 0; k < MAX_TEMP_REG_PER_BYTECODE; k++)
+             infoArray[k].shareWithVR = true; //false;
+@@ -3969,12 +4044,32 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+         infoArray[3].regNum = 4;
+         infoArray[3].refCount = 2; //DU
+         infoArray[3].physicalType = LowOpndRegType_gp;
++
++        infoArray[4].regNum = PhysicalReg_EDX;
++        infoArray[4].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++#ifndef WITH_SELF_VERIFICATION
+         if(inst_op == OP_APUT_BYTE || inst_op == OP_APUT_BOOLEAN)
+             infoArray[3].is8Bit = true;
+-        infoArray[4].regNum = PhysicalReg_EDX;
+         infoArray[4].refCount = 2;
+-        infoArray[4].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
+         return 5;
++#else
++        infoArray[4].refCount = 4;
++        // Use temp 5 to store address of heap access
++        infoArray[5].regNum = 5;
++        infoArray[5].refCount = 2; //DU
++        infoArray[5].physicalType = LowOpndRegType_gp;
++        // Scratch for calling storeToShadowHeap
++        infoArray[6].regNum = 1;
++        infoArray[6].refCount = 2; //DU
++        infoArray[6].physicalType = LowOpndRegType_scratch;
++        infoArray[7].regNum = PhysicalReg_ECX;
++        infoArray[7].refCount = 2;
++        infoArray[7].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++        infoArray[8].regNum = PhysicalReg_EAX;
++        infoArray[8].refCount = 2;
++        infoArray[8].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++        return 9;
++#endif
+     case OP_APUT_WIDE:
+         infoArray[0].regNum = 1;
+         infoArray[0].refCount = 4; //DU
+@@ -3988,10 +4083,30 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+         infoArray[3].regNum = 1;
+         infoArray[3].refCount = 2; //DU
+         infoArray[3].physicalType = LowOpndRegType_xmm;
++
+         infoArray[4].regNum = PhysicalReg_EDX;
+-        infoArray[4].refCount = 2;
+         infoArray[4].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++#ifndef WITH_SELF_VERIFICATION
++        infoArray[4].refCount = 2;
+         return 5;
++#else
++        infoArray[4].refCount = 4;
++        // Use temp 4 to store address of heap access
++        infoArray[5].regNum = 4;
++        infoArray[5].refCount = 2; //DU
++        infoArray[5].physicalType = LowOpndRegType_gp;
++        // Scratch for calling storeToShadowHeap
++        infoArray[6].regNum = 1;
++        infoArray[6].refCount = 2; //DU
++        infoArray[6].physicalType = LowOpndRegType_scratch;
++        infoArray[7].regNum = PhysicalReg_EAX;
++        infoArray[7].refCount = 2;
++        infoArray[7].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++        infoArray[8].regNum = PhysicalReg_ECX;
++        infoArray[8].refCount = 2;
++        infoArray[8].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++        return 9;
++#endif
+     case OP_APUT_OBJECT:
+         infoArray[0].regNum = 1;
+         infoArray[0].refCount = 5+1; //DU
+@@ -4013,17 +4128,39 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+         infoArray[5].physicalType = LowOpndRegType_gp;
+ 
+         infoArray[6].regNum = PhysicalReg_EDX;
+-        infoArray[6].refCount = 2; //DU
+         infoArray[6].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
+         infoArray[7].regNum = PhysicalReg_EAX;
+-        infoArray[7].refCount = 2; //DU
+         infoArray[7].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++#ifndef WITH_SELF_VERIFICATION
++        infoArray[6].refCount = 2; //DU
++        infoArray[7].refCount = 2; //DU
++#else
++        infoArray[6].refCount = 4+2; //DU
++        infoArray[7].refCount = 4+2;
++#endif
+         infoArray[8].regNum = 1;
+         infoArray[8].refCount = 2; //DU
+         infoArray[8].physicalType = LowOpndRegType_scratch;
+         infoArray[0].shareWithVR = false;
++
++#ifndef WITH_SELF_VERIFICATION
+         return updateMarkCard_notNull(infoArray,
+                                       0/*index for tgtAddrReg*/, 9);
++#else
++        // Use temp 7 to store address of heap access
++        infoArray[9].regNum = 7;
++        infoArray[9].refCount = 4; //DU
++        infoArray[9].physicalType = LowOpndRegType_gp;
++        // Scratch for calling storeToShadowHeap
++        infoArray[10].regNum = 1;
++        infoArray[10].refCount = 6; //DU
++        infoArray[10].physicalType = LowOpndRegType_scratch;
++        infoArray[11].regNum = PhysicalReg_ECX;
++        infoArray[11].refCount = 2+2;
++        infoArray[11].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++        return updateMarkCard_notNull(infoArray,
++                                      0/*index for tgtAddrReg*/, 12);
++#endif
+ 
+     case OP_IGET:
+     case OP_IGET_OBJECT:
+@@ -4041,12 +4178,17 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+         infoArray[1].physicalType = LowOpndRegType_scratch;
+ 
+         infoArray[2].regNum = PhysicalReg_EDX;
+-        infoArray[2].refCount = 2; //DU
+         infoArray[2].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
+         infoArray[3].regNum = PhysicalReg_EAX;
+-        infoArray[3].refCount = 3; //DU
+         infoArray[3].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
+-
++#ifndef WITH_SELF_VERIFICATION
++        infoArray[2].refCount = 2; //DU
++        infoArray[3].refCount = 3; //DU
++#else
++        infoArray[2].refCount = 4; //DU
++        // Return value from calling loadFromShadowHeap will be in EAX
++        infoArray[3].refCount = 6; //DU
++#endif
+         infoArray[4].regNum = 3;
+         infoArray[4].refCount = 3; //DU
+         infoArray[4].physicalType = LowOpndRegType_gp;
+@@ -4078,7 +4220,21 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+         infoArray[7].regNum = 9;
+         infoArray[7].refCount = 2; //DU
+         infoArray[7].physicalType = LowOpndRegType_gp;
++#ifndef WITH_SELF_VERIFICATION
+         return 8;
++#else
++        // Use temp 10 to store address of heap access
++        infoArray[8].regNum = 10;
++        infoArray[8].refCount = 2; //DU
++        infoArray[8].physicalType = LowOpndRegType_gp;
++        infoArray[9].regNum = 5;
++        infoArray[9].refCount = 2; //DU
++        infoArray[9].physicalType = LowOpndRegType_scratch;
++        infoArray[10].regNum = PhysicalReg_ECX;
++        infoArray[10].refCount = 2;
++        infoArray[10].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++        return 11;
++#endif
+     case OP_IPUT:
+     case OP_IPUT_OBJECT:
+     case OP_IPUT_VOLATILE:
+@@ -4095,12 +4251,16 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+         infoArray[1].physicalType = LowOpndRegType_scratch;
+ 
+         infoArray[2].regNum = PhysicalReg_EDX;
+-        infoArray[2].refCount = 2; //DU
+         infoArray[2].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
+         infoArray[3].regNum = PhysicalReg_EAX;
+-        infoArray[3].refCount = 3; //DU
+         infoArray[3].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
+-
++#ifndef WITH_SELF_VERIFICATION
++        infoArray[2].refCount = 2; //DU
++        infoArray[3].refCount = 3; //DU
++#else
++        infoArray[2].refCount = 4; //DU
++        infoArray[3].refCount = 5; //DU
++#endif
+         infoArray[4].regNum = 3;
+         infoArray[4].refCount = 3; //DU
+         infoArray[4].physicalType = LowOpndRegType_gp;
+@@ -4113,12 +4273,32 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+         infoArray[7].regNum = 9;
+         infoArray[7].refCount = 2; //DU
+         infoArray[7].physicalType = LowOpndRegType_gp;
++#ifndef WITH_SELF_VERIFICATION
+         if(inst_op == OP_IPUT_OBJECT || inst_op == OP_IPUT_OBJECT_VOLATILE) {
+             infoArray[5].shareWithVR = false;
+             return updateMarkCard(infoArray, 7/*index for valReg*/,
+                                   5/*index for tgtAddrReg*/, 8);
+         }
+         return 8;
++#else
++        // Use temp 10 to store address of heap access
++        infoArray[8].regNum = 10;
++        infoArray[8].refCount = 2; //DU
++        infoArray[8].physicalType = LowOpndRegType_gp;
++        infoArray[9].regNum = 5;
++        infoArray[9].refCount = 2; //DU
++        infoArray[9].physicalType = LowOpndRegType_scratch;
++        infoArray[10].regNum = PhysicalReg_ECX;
++        infoArray[10].refCount = 2;
++        infoArray[10].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++        if(inst_op == OP_IPUT_OBJECT || inst_op == OP_IPUT_OBJECT_VOLATILE) {
++            infoArray[5].shareWithVR = false;
++            return updateMarkCard(infoArray, 7/*index for valReg*/,
++                                  5/*index for tgtAddrReg*/, 11);
++        }
++        return 11;
++#endif
++
+     case OP_IGET_WIDE:
+     case OP_IGET_WIDE_VOLATILE:
+     case OP_IPUT_WIDE:
+@@ -4131,12 +4311,16 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+         infoArray[1].physicalType = LowOpndRegType_scratch;
+ 
+         infoArray[2].regNum = PhysicalReg_EDX;
+-        infoArray[2].refCount = 2; //DU
+         infoArray[2].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
+         infoArray[3].regNum = PhysicalReg_EAX;
+-        infoArray[3].refCount = 3; //DU
+         infoArray[3].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
+-
++#ifndef WITH_SELF_VERIFICATION
++        infoArray[2].refCount = 2; //DU
++        infoArray[3].refCount = 3; //DU
++#else
++        infoArray[2].refCount = 4;
++        infoArray[3].refCount = 5;
++#endif
+         infoArray[4].regNum = 3;
+         infoArray[4].refCount = 3; //DU
+         infoArray[4].physicalType = LowOpndRegType_gp;
+@@ -4149,7 +4333,7 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+         infoArray[7].regNum = 1;
+         infoArray[7].refCount = 2; //DU
+         infoArray[7].physicalType = LowOpndRegType_xmm;
+-
++#ifndef WITH_SELF_VERIFICATION
+         if(inst_op == OP_IPUT_WIDE_VOLATILE || inst_op == OP_IGET_WIDE_VOLATILE) {
+             infoArray[8].regNum = 3;
+             infoArray[8].refCount = 2; //DU
+@@ -4161,6 +4345,31 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+         }
+         return 8;
+ 
++#else
++        infoArray[8].regNum = PhysicalReg_XMM7;
++        infoArray[8].refCount = 1; //U
++        infoArray[8].physicalType = LowOpndRegType_xmm | LowOpndRegType_hard;
++        // Use temp 10 to store address of heap access
++        infoArray[9].regNum = 10;
++        infoArray[9].refCount = 4; //DU
++        infoArray[9].physicalType = LowOpndRegType_gp;
++        infoArray[10].regNum = 5;
++        infoArray[10].refCount = 4; //DU
++        infoArray[10].physicalType = LowOpndRegType_scratch;
++        infoArray[11].regNum = PhysicalReg_ECX;
++        infoArray[11].refCount = 2;
++        infoArray[11].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++        if(inst_op == OP_IPUT_WIDE_VOLATILE || inst_op == OP_IGET_WIDE_VOLATILE) {
++            infoArray[12].regNum = 3;
++            infoArray[12].refCount = 4; //DU
++            infoArray[12].physicalType = LowOpndRegType_scratch;
++            infoArray[13].regNum = 9;
++            infoArray[13].refCount = 2; //DU
++            infoArray[13].physicalType = LowOpndRegType_gp;
++            return 14;
++        }
++        return 12;
++#endif
+     case OP_SGET:
+     case OP_SGET_OBJECT:
+     case OP_SGET_VOLATILE:
+@@ -4177,7 +4386,12 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+         infoArray[1].physicalType = LowOpndRegType_scratch;
+ 
+         infoArray[2].regNum = PhysicalReg_EAX;
++#if defined(WITH_SELF_VERIFICATION)
++        // Return value from calling loadFromShadowHeap will be in EAX
++        infoArray[2].refCount = 6;
++#else
+         infoArray[2].refCount = 2;
++#endif
+         infoArray[2].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
+         infoArray[3].regNum = 3;
+         infoArray[3].refCount = 2; //DU
+@@ -4185,10 +4399,28 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+         infoArray[4].regNum = 7;
+         infoArray[4].refCount = 2; //DU
+         infoArray[4].physicalType = LowOpndRegType_gp;
++
+         infoArray[5].regNum = PhysicalReg_EDX;
+-        infoArray[5].refCount = 2; //DU
+         infoArray[5].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++#ifndef WITH_SELF_VERIFICATION
++        infoArray[5].refCount = 2; //DU
+         return 6;
++#else
++        infoArray[5].refCount = 4; //DU
++        // Use temp 8 to store address of heap access
++        infoArray[6].regNum = 8;
++        infoArray[6].refCount = 2; //DU
++        infoArray[6].physicalType = LowOpndRegType_gp;
++        // Scratch for calling loadFromShadowHeap
++        infoArray[7].regNum = 5;
++        infoArray[7].refCount = 2; //DU
++        infoArray[7].physicalType = LowOpndRegType_scratch;
++        infoArray[8].regNum = PhysicalReg_ECX;
++        infoArray[8].refCount = 2;
++        infoArray[8].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++        return 9;
++#endif
++
+     case OP_SPUT:
+     case OP_SPUT_OBJECT:
+     case OP_SPUT_VOLATILE:
+@@ -4205,7 +4437,11 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+         infoArray[1].physicalType = LowOpndRegType_scratch;
+ 
+         infoArray[2].regNum = PhysicalReg_EAX;
++#ifndef WITH_SELF_VERIFICATION
+         infoArray[2].refCount = 2+1; //access clazz of the field
++#else
++        infoArray[2].refCount = 4+2;
++#endif
+         infoArray[2].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
+         infoArray[3].regNum = 3;
+         infoArray[3].refCount = 2; //DU
+@@ -4213,9 +4449,11 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+         infoArray[4].regNum = 7;
+         infoArray[4].refCount = 2; //DU
+         infoArray[4].physicalType = LowOpndRegType_gp;
++
+         infoArray[5].regNum = PhysicalReg_EDX;
+-        infoArray[5].refCount = 2; //DU
+         infoArray[5].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++#ifndef WITH_SELF_VERIFICATION
++        infoArray[5].refCount = 2; //DU
+         if(inst_op == OP_SPUT_OBJECT || inst_op == OP_SPUT_OBJECT_VOLATILE) {
+             infoArray[2].shareWithVR = false;
+             infoArray[6].regNum = 12;
+@@ -4225,6 +4463,29 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+                                   6/*index for tgtAddrReg */, 7);
+         }
+         return 6;
++#else
++        infoArray[5].refCount = 4; //DU
++        // Use temp 8 to store address of heap access
++        infoArray[6].regNum = 8;
++        infoArray[6].refCount = 2; //DU
++        infoArray[6].physicalType = LowOpndRegType_gp;
++        // Scratch for calling storeToShadowHeap
++        infoArray[7].regNum = 5;
++        infoArray[7].refCount = 2; //DU
++        infoArray[7].physicalType = LowOpndRegType_scratch;
++        infoArray[8].regNum = PhysicalReg_ECX;
++        infoArray[8].refCount = 2;
++        infoArray[8].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++        if(inst_op == OP_SPUT_OBJECT || inst_op == OP_SPUT_OBJECT_VOLATILE) {
++            infoArray[2].shareWithVR = false;
++            infoArray[9].regNum = 12;
++            infoArray[9].refCount = 3; //1 def, 2 uses in updateMarkCard
++            infoArray[9].physicalType = LowOpndRegType_gp;
++            return updateMarkCard(infoArray, 4/*index for valReg*/,
++                                  6/*index for tgtAddrReg */, 10);
++        }
++        return 9;
++#endif
+     case OP_SGET_WIDE:
+     case OP_SGET_WIDE_VOLATILE:
+     case OP_SPUT_WIDE:
+@@ -4237,7 +4498,11 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+         infoArray[1].physicalType = LowOpndRegType_scratch;
+ 
+         infoArray[2].regNum = PhysicalReg_EAX;
++#ifndef WITH_SELF_VERIFICATION
+         infoArray[2].refCount = 2;
++#else
++        infoArray[2].refCount = 4;
++#endif
+         infoArray[2].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
+         infoArray[3].regNum = 3;
+         infoArray[3].refCount = 2; //DU
+@@ -4245,10 +4510,11 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+         infoArray[4].regNum = 1;
+         infoArray[4].refCount = 2; //DU
+         infoArray[4].physicalType = LowOpndRegType_xmm;
++
+         infoArray[5].regNum = PhysicalReg_EDX;
+-        infoArray[5].refCount = 2; //DU
+         infoArray[5].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
+-
++#ifndef WITH_SELF_VERIFICATION
++        infoArray[5].refCount = 2; //DU
+         if(inst_op == OP_SPUT_WIDE_VOLATILE || inst_op == OP_SGET_WIDE_VOLATILE) {
+             infoArray[6].regNum = 3;
+             infoArray[6].refCount = 2; //DU
+@@ -4259,6 +4525,34 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+             return 8;
+         }
+         return 6;
++#else
++        infoArray[5].refCount = 4; //DU
++        // use temp 4 to store address of shadow heap access
++        infoArray[6].regNum = 4;
++        infoArray[6].refCount = 2; //DU
++        infoArray[6].physicalType = LowOpndRegType_gp;
++        // Scratch for calling storeToShadowHeap
++        infoArray[7].regNum = 5;
++        infoArray[7].refCount = 2; //DU
++        infoArray[7].physicalType = LowOpndRegType_scratch;
++        infoArray[8].regNum = PhysicalReg_XMM7;
++        infoArray[8].refCount = 1; //U
++        infoArray[8].physicalType = LowOpndRegType_xmm | LowOpndRegType_hard;
++        infoArray[9].regNum = PhysicalReg_ECX;
++        infoArray[9].refCount = 2;
++        infoArray[9].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++        if(inst_op == OP_SPUT_WIDE_VOLATILE || inst_op == OP_SGET_WIDE_VOLATILE) {
++            infoArray[10].regNum = 3;
++            infoArray[10].refCount = 2; //DU
++            infoArray[10].physicalType = LowOpndRegType_scratch;
++            infoArray[11].regNum = 9;
++            infoArray[11].refCount = 2; //DU
++            infoArray[11].physicalType = LowOpndRegType_gp;
++            return 12;
++        }
++        return 10;
++#endif
++
+ 
+     case OP_IGET_QUICK:
+     case OP_IGET_OBJECT_QUICK:
+@@ -4268,10 +4562,31 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+         infoArray[1].regNum = 2;
+         infoArray[1].refCount = 2; //DU
+         infoArray[1].physicalType = LowOpndRegType_gp;
++
+         infoArray[2].regNum = PhysicalReg_EDX;
+-        infoArray[2].refCount = 2; //DU
+         infoArray[2].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++#ifndef WITH_SELF_VERIFICATION
++        infoArray[2].refCount = 2; //DU
+         return 3;
++#else
++        infoArray[2].refCount = 4; //DU
++        // Use temp 3 to store address of heap access
++        infoArray[3].regNum = 3;
++        infoArray[3].refCount = 2; //DU
++        infoArray[3].physicalType = LowOpndRegType_gp;
++        // Return value from calling loadFromShadowHeap will be in EAX
++        infoArray[4].regNum = PhysicalReg_EAX;
++        infoArray[4].refCount = 4;
++        infoArray[4].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++        infoArray[5].regNum = PhysicalReg_ECX;
++        infoArray[5].refCount = 2;
++        infoArray[5].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++        // Scratch for calling loadFromShadowHeap
++        infoArray[6].regNum = 1;
++        infoArray[6].refCount = 2; //DU
++        infoArray[6].physicalType = LowOpndRegType_scratch;
++        return 7;
++#endif
+     case OP_IPUT_QUICK:
+     case OP_IPUT_OBJECT_QUICK:
+         infoArray[0].regNum = 1;
+@@ -4280,15 +4595,40 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+         infoArray[1].regNum = 2;
+         infoArray[1].refCount = 2; //DU
+         infoArray[1].physicalType = LowOpndRegType_gp;
++
+         infoArray[2].regNum = PhysicalReg_EDX;
+-        infoArray[2].refCount = 2; //DU
+         infoArray[2].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++#ifndef WITH_SELF_VERIFICATION
++        infoArray[2].refCount = 2; //DU
+         if(inst_op == OP_IPUT_OBJECT_QUICK) {
+             infoArray[0].shareWithVR = false;
+             return updateMarkCard(infoArray, 1/*index for valReg*/,
+                                   0/*index for tgtAddrReg*/, 3);
+         }
+         return 3;
++#else
++        infoArray[2].refCount = 4; //DU
++        // Use temp 3 to store address of heap access
++        infoArray[3].regNum = 3;
++        infoArray[3].refCount = 2; //DU
++        infoArray[3].physicalType = LowOpndRegType_gp;
++        // Scratch for calling storeToShadowHeap
++        infoArray[4].regNum = 1;
++        infoArray[4].refCount = 2; //DU
++        infoArray[4].physicalType = LowOpndRegType_scratch;
++        infoArray[5].regNum = PhysicalReg_EAX;
++        infoArray[5].refCount = 2;
++        infoArray[5].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++        infoArray[6].regNum = PhysicalReg_ECX;
++        infoArray[6].refCount = 2;
++        infoArray[6].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++        if(inst_op == OP_IPUT_OBJECT_QUICK) {
++            infoArray[0].shareWithVR = false;
++            return updateMarkCard(infoArray, 1/*index for valReg*/,
++                                  0/*index for tgtAddrReg*/, 7/*ScratchReg*/);
++        }
++        return 7;
++#endif
+     case OP_IGET_WIDE_QUICK:
+         infoArray[0].regNum = 1;
+         infoArray[0].refCount = 3; //DU
+@@ -4296,10 +4636,33 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+         infoArray[1].regNum = 1;
+         infoArray[1].refCount = 2; //DU
+         infoArray[1].physicalType = LowOpndRegType_xmm;
++
+         infoArray[2].regNum = PhysicalReg_EDX;
+-        infoArray[2].refCount = 2; //DU
+         infoArray[2].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++#ifndef WITH_SELF_VERIFICATION
++        infoArray[2].refCount = 2; //DU
+         return 3;
++#else
++        infoArray[2].refCount = 4; //DU
++        // use temp 3 to store address of heap access
++        infoArray[3].regNum = 3;
++        infoArray[3].refCount = 2; //DU
++        infoArray[3].physicalType = LowOpndRegType_gp;
++        // Scratch for calling storeToShadowHeap
++        infoArray[4].regNum = 1;
++        infoArray[4].refCount = 2; //DU
++        infoArray[4].physicalType = LowOpndRegType_scratch;
++        infoArray[5].regNum = PhysicalReg_XMM7;
++        infoArray[5].refCount = 1; //U
++        infoArray[5].physicalType = LowOpndRegType_xmm | LowOpndRegType_hard;
++        infoArray[6].regNum = PhysicalReg_EAX;
++        infoArray[6].refCount = 2;
++        infoArray[6].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++        infoArray[7].regNum = PhysicalReg_ECX;
++        infoArray[7].refCount = 2;
++        infoArray[7].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++        return 8;
++#endif
+     case OP_IPUT_WIDE_QUICK:
+         infoArray[0].regNum = 1;
+         infoArray[0].refCount = 3; //DU
+@@ -4307,10 +4670,30 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+         infoArray[1].regNum = 1;
+         infoArray[1].refCount = 2; //DU
+         infoArray[1].physicalType = LowOpndRegType_xmm;
++
+         infoArray[2].regNum = PhysicalReg_EDX;
+-        infoArray[2].refCount = 2; //DU
+         infoArray[2].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++#ifndef WITH_SELF_VERIFICATION
++        infoArray[2].refCount = 2; //DU
+         return 3;
++#else
++        infoArray[2].refCount = 4; //DU
++        // use temp 3 to store address of heap access
++        infoArray[3].regNum = 3;
++        infoArray[3].refCount = 2; //DU
++        infoArray[3].physicalType = LowOpndRegType_gp;
++        // Scratch for calling storeToShadowHeap
++        infoArray[4].regNum = 1;
++        infoArray[4].refCount = 2; //DU
++        infoArray[4].physicalType = LowOpndRegType_scratch;
++        infoArray[5].regNum = PhysicalReg_EAX;
++        infoArray[5].refCount = 2;
++        infoArray[5].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++        infoArray[6].regNum = PhysicalReg_ECX;
++        infoArray[6].refCount = 2;
++        infoArray[6].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++        return 7;
++#endif
+ 
+     case OP_RETURN_VOID:
+     case OP_RETURN_VOID_BARRIER:
+diff --git a/vm/compiler/codegen/x86/CodegenInterface.cpp b/vm/compiler/codegen/x86/CodegenInterface.cpp
+index 82ca0b7..f10fe00 100644
+--- a/vm/compiler/codegen/x86/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/CodegenInterface.cpp
+@@ -36,6 +36,53 @@
+ bool jitOpcodeTable[kNumPackedOpcodes];
+ Opcode jitNotSupportedOpcode[] = {
+     OP_INVOKE_OBJECT_INIT_RANGE,
++#if defined (WITH_SELF_VERIFICATION)
++    OP_MONITOR_ENTER,
++    OP_MONITOR_EXIT,
++    OP_NEW_INSTANCE,
++    OP_NEW_ARRAY,
++    OP_CHECK_CAST,
++    OP_MOVE_EXCEPTION,
++    OP_FILL_ARRAY_DATA,
++    OP_EXECUTE_INLINE,
++    OP_EXECUTE_INLINE_RANGE,
++
++    //TODO: fix for the test case
++    /* const does not generate assembly instructions
++     * so a divergence will falsely occur when interp executes and sets
++     * the virtual registers (in memory ).
++     *
++     * const/*
++     * return
++     *
++     * const/*
++     * invoke_*
++     */
++    OP_CONST_4,
++    OP_CONST_16,
++    OP_CONST,
++    OP_CONST_HIGH16,
++    OP_CONST_WIDE_16,
++    OP_CONST_WIDE_32,
++    OP_CONST_WIDE,
++    OP_CONST_WIDE_HIGH16,
++    OP_CONST_STRING,
++    OP_CONST_STRING_JUMBO,
++
++    OP_RETURN,
++    OP_RETURN_VOID, //const and return
++    OP_RETURN_OBJECT,
++    OP_INVOKE_VIRTUAL_QUICK_RANGE,
++    OP_INVOKE_VIRTUAL_QUICK,
++    OP_INVOKE_INTERFACE,
++    OP_INVOKE_STATIC,
++
++    //occurs with threaded apps
++    OP_APUT_CHAR,
++    OP_APUT_BOOLEAN,
++    OP_APUT_BYTE,
++
++#endif
+ };
+ 
+ /* Init values when a predicted chain is initially assembled */
+@@ -820,7 +867,11 @@ static int handleNormalChainingCell(CompilationUnit *cUnit,
+     int nop_size = insertJumpHelp();
+     move_imm_to_reg(OpndSize_32, (int) (cUnit->method->insns + offset), P_GPR_1, true);
+     scratchRegs[0] = PhysicalReg_EAX;
++#ifndef WITH_SELF_VERIFICATION
+     call_dvmJitToInterpNormal();
++#else
++    call_dvmJitToInterpBackwardBranch();
++#endif
+     //move_imm_to_reg(OpndSize_32, (int) (cUnit->method->insns + offset), P_GPR_1, true); /* used when unchaining */
+     return nop_size;
+ }
+diff --git a/vm/compiler/codegen/x86/Lower.h b/vm/compiler/codegen/x86/Lower.h
+index f851900..ecd8f31 100644
+--- a/vm/compiler/codegen/x86/Lower.h
++++ b/vm/compiler/codegen/x86/Lower.h
+@@ -749,6 +749,13 @@ void load_effective_addr(int disp, int base_reg, bool isBasePhysical,
+ void load_effective_addr_scale(int base_reg, bool isBasePhysical,
+                                 int index_reg, bool isIndexPhysical, int scale,
+                                 int reg, bool isPhysical);
++//! lea reg, [base_reg + index_reg*scale + disp]
++void load_effective_addr_scale_disp(int base_reg, bool isBasePhysical, int disp,
++                int index_reg, bool isIndexPhysical, int scale,
++                int reg, bool isPhysical);
++//! Loads a 16-bit value into the x87 FPU control word. Typically used to
++//! establish or change the FPU's operational mode. Can cause exceptions to
++//! be thrown if not cleared beforehand.
+ void load_fpu_cw(int disp, int base_reg, bool isBasePhysical);
+ void store_fpu_cw(bool checkException, int disp, int base_reg, bool isBasePhysical);
+ void convert_integer(OpndSize srcSize, OpndSize dstSize);
+@@ -999,6 +1006,7 @@ int call_dvmJitHandleSparseSwitch();
+ int call_dvmJitToInterpTraceSelectNoChain();
+ int call_dvmJitToPatchPredictedChain();
+ int call_dvmJitToInterpNormal();
++int call_dvmJitToInterpBackwardBranch(void);
+ int call_dvmJitToInterpTraceSelect();
+ int call_dvmQuasiAtomicSwap64();
+ int call_dvmQuasiAtomicRead64();
+@@ -1008,6 +1016,12 @@ int call_dvmHandleStackOverflow();
+ int call_dvmResolveString();
+ int call_dvmResolveInstField();
+ int call_dvmResolveStaticField();
++#ifdef WITH_SELF_VERIFICATION
++int call_selfVerificationLoad(void);
++int call_selfVerificationStore(void);
++int call_selfVerificationLoadDoubleword(void);
++int call_selfVerificationStoreDoubleword(void);
++#endif
+ 
+ //labels and branches
+ //shared branch to resolve class: 2 specialized versions
+@@ -1401,3 +1415,6 @@ int preprocessingBB(BasicBlock* bb);
+ int preprocessingTrace();
+ void dump_nop(int size);
+ #endif
++
++void pushCallerSavedRegs(void);
++void popCallerSavedRegs(void);
+diff --git a/vm/compiler/codegen/x86/LowerGetPut.cpp b/vm/compiler/codegen/x86/LowerGetPut.cpp
+index 4dd70b6..7bb302a 100644
+--- a/vm/compiler/codegen/x86/LowerGetPut.cpp
++++ b/vm/compiler/codegen/x86/LowerGetPut.cpp
+@@ -72,23 +72,161 @@ int aget_common_nohelper(ArrayAccess flag, u2 vA, u2 vref, u2 vindex, int mirOpt
+     }
+ 
+     if(flag == AGET) {
++#ifndef WITH_SELF_VERIFICATION
+         move_mem_disp_scale_to_reg(OpndSize_32, 1, false, offArrayObject_contents, 2, false, 4, 4, false);
++#else
++        // Load address into temp 5
++        load_effective_addr_scale_disp(1, false, offArrayObject_contents, 2, false, 4, 5, false);
++        // push caller saved registers
++        pushCallerSavedRegs();
++        // Set up arguments
++        load_effective_addr(-8, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++        // Move value in temp 5 to (esp)
++        move_reg_to_mem(OpndSize_32, 5, false, 0, PhysicalReg_ESP, true);
++        // Mov opnd size to 4(esp)
++        move_imm_to_mem(OpndSize_32, int(OpndSize_32), 4, PhysicalReg_ESP, true);
++        // In order to call, the scratch reg must be set
++        scratchRegs[0] = PhysicalReg_SCRATCH_1;
++        // Load from shadow heap
++        call_selfVerificationLoad();
++        // Restore ESP
++        load_effective_addr(8, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++        // Move result of self verification load into temp4
++        move_reg_to_reg(OpndSize_32, PhysicalReg_EAX, true, 4, false);
++        // pop caller saved registers
++        popCallerSavedRegs();
++#endif
+     }
+     else if(flag == AGET_WIDE) {
++#ifndef WITH_SELF_VERIFICATION
+         move_mem_disp_scale_to_reg(OpndSize_64, 1, false, offArrayObject_contents, 2, false, 8, 1, false);
++#else
++        // Load address into temp 5 (scale of 8 due to opnd size 64), temp 1 is base gp
++        load_effective_addr_scale_disp(1, false, offArrayObject_contents, 2, false, 8, 5, false);
++        // push caller saved registers
++        pushCallerSavedRegs();
++        // Set up arguments
++        load_effective_addr(-4, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++        // Move value in temp 5 to (esp)
++        move_reg_to_mem(OpndSize_32, 5, false, 0, PhysicalReg_ESP, true);
++        // In order to call, the scratch reg must be set
++        scratchRegs[0] = PhysicalReg_SCRATCH_1;
++        // Load from shadow heap
++        call_selfVerificationLoadDoubleword();
++        // Restore ESP
++        load_effective_addr(4, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++        // Move result of self verification load into temp 1(XMM)
++        move_reg_to_reg(OpndSize_64, PhysicalReg_XMM7, true, 1, false);
++        // pop caller saved registers
++        popCallerSavedRegs();
++#endif
+     }
+     else if(flag == AGET_CHAR) {
++#ifndef WITH_SELF_VERIFICATION
+         movez_mem_disp_scale_to_reg(OpndSize_16, 1, false, offArrayObject_contents, 2, false, 2, 4, false);
++#else
++        // Load address into temp 5
++        load_effective_addr_scale_disp(1, false, offArrayObject_contents, 2, false, 2, 5, false);
++        // push caller saved registers
++        pushCallerSavedRegs();
++        // Set up arguments
++        load_effective_addr(-8, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++        // Move value in temp 5 to (esp) //address
++        move_reg_to_mem(OpndSize_32, 5, false, 0, PhysicalReg_ESP, true);
++        // Mov opnd size to 4(esp)  // op_size
++        move_imm_to_mem(OpndSize_32, int(OpndSize_16), 4, PhysicalReg_ESP, true);
++        // In order to call, the scratch reg must be set
++        scratchRegs[0] = PhysicalReg_SCRATCH_1;
++        // Load from shadow heap
++        call_selfVerificationLoad();
++        // Restore ESP
++        load_effective_addr(8, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++        // Move result of self verification load into temp 4
++        move_reg_to_reg(OpndSize_32, PhysicalReg_EAX, true, 4, false);
++        // pop caller saved registers
++        popCallerSavedRegs();
++#endif
+     }
+     else if(flag == AGET_SHORT) {
++#ifndef WITH_SELF_VERIFICATION
+         moves_mem_disp_scale_to_reg(OpndSize_16, 1, false, offArrayObject_contents, 2, false, 2, 4, false);
++#else
++        // Load address into temp 5
++        load_effective_addr_scale_disp(1, false, offArrayObject_contents, 2, false, 2, 5, false);
++        // push caller saved registers
++        pushCallerSavedRegs();
++        // Set up arguments
++        load_effective_addr(-8, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++        // Move value in temp 5 to (esp) //address
++        move_reg_to_mem(OpndSize_32, 5, false, 0, PhysicalReg_ESP, true);
++        // Mov opnd size to 4(esp)  // op_size
++        move_imm_to_mem(OpndSize_32, int(0x22), 4, PhysicalReg_ESP, true);
++        // In order to call, the scratch reg must be set
++        scratchRegs[0] = PhysicalReg_SCRATCH_1;
++        // Load from shadow heap
++        call_selfVerificationLoad();
++        // Restore ESP
++        load_effective_addr(8, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++        // Move result of self verification load into temp 4
++        move_reg_to_reg(OpndSize_32, PhysicalReg_EAX, true, 4, false);
++        // pop caller saved registers
++        popCallerSavedRegs();
++#endif
+     }
+     else if(flag == AGET_BOOLEAN) {
++
++#ifndef WITH_SELF_VERIFICATION
+         movez_mem_disp_scale_to_reg(OpndSize_8, 1, false, offArrayObject_contents, 2, false, 1, 4, false);
++#else
++        // Load address into temp 5
++        load_effective_addr_scale_disp(1, false, offArrayObject_contents, 2, false, 1, 5, false);
++        // push caller saved registers
++        pushCallerSavedRegs();
++        // Set up arguments
++        load_effective_addr(-8, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++        // Move value in temp 5 to (esp) //address
++        move_reg_to_mem(OpndSize_32, 5, false, 0, PhysicalReg_ESP, true);
++        // Mov opnd size to 4(esp)  // op_size
++        move_imm_to_mem(OpndSize_32, int(OpndSize_8), 4, PhysicalReg_ESP, true);
++        // In order to call, the scratch reg must be set
++        scratchRegs[0] = PhysicalReg_SCRATCH_1;
++        // Load from shadow heap
++        call_selfVerificationLoad();
++        // Restore ESP
++        load_effective_addr(8, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++        // Move result of self verification load into temp 4
++        move_reg_to_reg(OpndSize_32, PhysicalReg_EAX, true, 4, false);
++        // pop caller saved registers
++        popCallerSavedRegs();
++#endif
+     }
+     else if(flag == AGET_BYTE) {
++#ifndef WITH_SELF_VERIFICATION
+         moves_mem_disp_scale_to_reg(OpndSize_8, 1, false, offArrayObject_contents, 2, false, 1, 4, false);
++#else
++        // Load address into temp 5
++        load_effective_addr_scale_disp(1, false, offArrayObject_contents, 2, false, 1, 5, false);
++        // push caller saved registers
++        pushCallerSavedRegs();
++        // Set up arguments
++        load_effective_addr(-8, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++        // Move value in temp 5 to (esp) //address
++        move_reg_to_mem(OpndSize_32, 5, false, 0, PhysicalReg_ESP, true);
++        // Mov opnd size to 4(esp)  // op_size
++        move_imm_to_mem(OpndSize_32, int(0x11), 4, PhysicalReg_ESP, true);
++        // In order to call, the scratch reg must be set
++        scratchRegs[0] = PhysicalReg_SCRATCH_1;
++        // Load from shadow heap
++        call_selfVerificationLoad();
++        // Restore ESP
++        load_effective_addr(8, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++        // Move result of self verification load into temp 4
++        move_reg_to_reg(OpndSize_32, PhysicalReg_EAX, true, 4, false);
++        // pop caller saved registers
++        popCallerSavedRegs();
++#endif
+     }
++
+     if(flag == AGET_WIDE) {
+         set_virtual_reg(vA, OpndSize_64, 1, false);
+     }
+@@ -268,14 +406,107 @@ int aput_common_nohelper(ArrayAccess flag, u2 vA, u2 vref, u2 vindex, int mirOpt
+     else {
+         get_virtual_reg(vA, OpndSize_32, 4, false);
+     }
+-    if(flag == APUT)
++    if(flag == APUT) {
++#ifndef WITH_SELF_VERIFICATION
+         move_reg_to_mem_disp_scale(OpndSize_32, 4, false, 1, false, offArrayObject_contents, 2, false, 4);
+-    else if(flag == APUT_WIDE)
++#else
++        // Load address into temp 5
++        load_effective_addr_scale_disp(1, false, offArrayObject_contents, 2, false, 4, 5, false);
++        // push caller saved registers
++        pushCallerSavedRegs();
++        // Set up arguments
++        load_effective_addr(-12, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++        // Move value in temp 5 namely the address to (esp)
++        move_reg_to_mem(OpndSize_32, 5, false, 0, PhysicalReg_ESP, true);
++        // Store value from temp 4 namely the data to 4(esp)
++        move_reg_to_mem(OpndSize_32, 4, false, 4, PhysicalReg_ESP, true);
++        // Mov opnd size to 8(esp)
++        move_imm_to_mem(OpndSize_32, int(OpndSize_32), 8, PhysicalReg_ESP, true);
++        // In order to call, the scratch reg must be set
++        scratchRegs[0] = PhysicalReg_SCRATCH_1;
++        // Load from shadow heap
++        call_selfVerificationStore();
++        // Restore ESP
++        load_effective_addr(12, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++        // pop caller saved registers
++        popCallerSavedRegs();
++#endif
++    } else if(flag == APUT_WIDE) {
++#ifndef WITH_SELF_VERIFICATION
+         move_reg_to_mem_disp_scale(OpndSize_64, 1, false, 1, false, offArrayObject_contents, 2, false, 8);
+-    else if(flag == APUT_CHAR || flag == APUT_SHORT)
++#else
++        // Load address into temp 4
++        load_effective_addr_scale_disp(1, false, offArrayObject_contents, 2, false, 8, 4, false);
++        // push caller saved registers
++        pushCallerSavedRegs();
++        // Set up arguments
++        load_effective_addr(-12, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++        // Move value in temp 4 namely the address to (esp)
++        move_reg_to_mem(OpndSize_32, 4, false, 0, PhysicalReg_ESP, true);
++        // Store value from temp 1(XMM) namely the data to 4(esp)
++        move_reg_to_mem(OpndSize_64, 1, false, 4, PhysicalReg_ESP, true);
++        // In order to call, the scratch reg must be set
++        scratchRegs[0] = PhysicalReg_SCRATCH_1;
++        // Load from shadow heap
++        call_selfVerificationStoreDoubleword();
++        // Restore ESP
++        load_effective_addr(12, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++        // pop caller saved registers
++        popCallerSavedRegs();
++#endif
++    }
++    else if(flag == APUT_CHAR || flag == APUT_SHORT) {
++#ifndef WITH_SELF_VERIFICATION
+         move_reg_to_mem_disp_scale(OpndSize_16, 4, false, 1, false, offArrayObject_contents, 2, false, 2);
+-    else if(flag == APUT_BOOLEAN || flag == APUT_BYTE)
++#else
++        // Load address into temp 5
++        load_effective_addr_scale_disp(1, false, offArrayObject_contents, 2, false, 2, 5, false);
++        // push caller saved registers
++        pushCallerSavedRegs();
++        // Set up arguments
++        load_effective_addr(-12, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++        // Move value in temp 5 namely the address to (esp)
++        move_reg_to_mem(OpndSize_32, 5, false, 0, PhysicalReg_ESP, true);
++        // Store value from temp 4 namely the data to 4(esp)
++        move_reg_to_mem(OpndSize_32, 4, false, 4, PhysicalReg_ESP, true);
++        // Mov opnd size to 8(esp)
++        move_imm_to_mem(OpndSize_32, int(OpndSize_16), 8, PhysicalReg_ESP, true);
++        // In order to call, the scratch reg must be set
++        scratchRegs[0] = PhysicalReg_SCRATCH_1;
++        // Load from shadow heap
++        call_selfVerificationStore();
++        // Restore ESP
++        load_effective_addr(12, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++        // pop caller saved registers
++        popCallerSavedRegs();
++#endif
++    }
++    else if(flag == APUT_BOOLEAN || flag == APUT_BYTE) {
++#ifndef WITH_SELF_VERIFICATION
+         move_reg_to_mem_disp_scale(OpndSize_8, 4, false, 1, false, offArrayObject_contents, 2, false, 1);
++#else
++        // Load address into temp 5
++        load_effective_addr_scale_disp(1, false, offArrayObject_contents, 2, false, 1, 5, false);
++        // push caller saved registers
++        pushCallerSavedRegs();
++        // Set up arguments
++        load_effective_addr(-12, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++        // Move value in temp 5 namely the address to (esp)
++        move_reg_to_mem(OpndSize_32, 5, false, 0, PhysicalReg_ESP, true);
++        // Store value from temp 4 namely the data to 4(esp)
++        move_reg_to_mem(OpndSize_32, 4, false, 4, PhysicalReg_ESP, true);
++        // Mov opnd size to 8(esp)
++        move_imm_to_mem(OpndSize_32, int(OpndSize_8), 8, PhysicalReg_ESP, true);
++        // In order to call, the scratch reg must be set
++        scratchRegs[0] = PhysicalReg_SCRATCH_1;
++        // Load from shadow heap
++        call_selfVerificationStore();
++        // Restore ESP
++        load_effective_addr(12, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++        // pop caller saved registers
++        popCallerSavedRegs();
++#endif
++    }
+     //////////////////////////////////
+     return 0;
+ }
+@@ -466,8 +697,23 @@ int op_aput_object(const MIR * mir) { //type checking
+     compare_imm_reg(OpndSize_32, 0, PhysicalReg_EAX, true);
+     conditional_jump_global_API(Condition_E, "common_errArrayStore", false);
+ 
++#ifndef WITH_SELF_VERIFICATION
+     //NOTE: "2, false" is live through function call
+     move_reg_to_mem_disp_scale(OpndSize_32, 4, false, 1, false, offArrayObject_contents, 2, false, 4);
++#else
++    // lea to temp 7, temp 4 contains the data
++    load_effective_addr_scale_disp(1, false, offArrayObject_contents, 2, false, 4, 7, false);
++    pushCallerSavedRegs();
++    // make space on the stack and push 3 args (address, data, operand size)
++    load_effective_addr(-12, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++    move_reg_to_mem(OpndSize_32, 7, false, 0, PhysicalReg_ESP, true);  // address
++    move_reg_to_mem(OpndSize_32, 4, false, 4, PhysicalReg_ESP, true);  //data
++    move_imm_to_mem(OpndSize_32, int(OpndSize_32), 8, PhysicalReg_ESP, true);
++    scratchRegs[0] = PhysicalReg_SCRATCH_1;
++    call_selfVerificationStore();
++    load_effective_addr(12, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++    popCallerSavedRegs();
++#endif
+     markCard_notNull(1, 11, false);
+     rememberState(2);
+     ////TODO NCG O1 + code cache
+@@ -476,9 +722,23 @@ int op_aput_object(const MIR * mir) { //type checking
+     if (insertLabel(".aput_object_skip_check", true) == -1)
+         return -1;
+     goToState(1);
++#ifndef WITH_SELF_VERIFICATION
+     //NOTE: "2, false" is live through function call
+     move_reg_to_mem_disp_scale(OpndSize_32, 4, false, 1, false, offArrayObject_contents, 2, false, 4);
+-
++#else
++    // lea to temp 7, temp 4 contains the data
++    load_effective_addr_scale_disp(1, false, offArrayObject_contents, 2, false, 4, 7, false);
++    pushCallerSavedRegs();
++    // make space on the stack and push 3 args (address, data, operand size)
++    load_effective_addr(-12, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++    move_reg_to_mem(OpndSize_32, 7, false, 0, PhysicalReg_ESP, true); //address
++    move_reg_to_mem(OpndSize_32, 4, false, 4, PhysicalReg_ESP, true); //data
++    move_imm_to_mem(OpndSize_32, int(OpndSize_32), 8, PhysicalReg_ESP, true);
++    scratchRegs[0] = PhysicalReg_SCRATCH_1;
++    call_selfVerificationStore();
++    load_effective_addr(12, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++    popCallerSavedRegs();
++#endif
+     transferToState(2);
+     if (insertLabel(".aput_object_after_check", true) == -1)
+         return -1;
+@@ -605,8 +865,33 @@ int iget_iput_common_nohelper(u2 referenceIndex, InstanceAccess flag, u2 vA,
+     move_mem_to_reg(OpndSize_32, offInstField_byteOffset, PhysicalReg_EAX, true, 8, false); //byte offest
+ #endif
+     if(flag == IGET) {
++#ifndef WITH_SELF_VERIFICATION
+         move_mem_scale_to_reg(OpndSize_32, 7, false, 8, false, 1, 9, false);
+         set_virtual_reg(vA, OpndSize_32, 9, false);
++#else
++        // Load address into temp reg 10
++        load_effective_addr_scale(7, false, 8, false, 1, 10, false);
++        // push caller saved registers
++        pushCallerSavedRegs();
++        // Set up arguments
++        load_effective_addr(-8, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++        // Move value in temp reg 10 to (esp)
++        move_reg_to_mem(OpndSize_32, 10, false, 0, PhysicalReg_ESP, true);
++        // Mov opnd size to 4(esp)
++        move_imm_to_mem(OpndSize_32, int(OpndSize_32), 4, PhysicalReg_ESP, true);
++        // In order to call, the scratch reg must be set
++        scratchRegs[0] = PhysicalReg_SCRATCH_1;
++        // Load from shadow heap
++        call_selfVerificationLoad();
++        // Restore ESP
++        load_effective_addr(8, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++        // Move result of self verification load into tenp9
++        move_reg_to_reg(OpndSize_32, PhysicalReg_EAX, true, 9, false);
++        // pop caller saved registers
++        popCallerSavedRegs();
++        set_virtual_reg(vA, OpndSize_32, 9, false);
++#endif
++
+ #ifdef DEBUG_IGET_OBJ
+         if(isObj > 0) {
+             pushAllRegs();
+@@ -621,6 +906,7 @@ int iget_iput_common_nohelper(u2 referenceIndex, InstanceAccess flag, u2 vA,
+         }
+ #endif
+     } else if(flag == IGET_WIDE) {
++#ifndef WITH_SELF_VERIFICATION
+         if(isVolatile) {
+             /* call dvmQuasiAtomicRead64(addr) */
+             load_effective_addr(fieldOffset, 7, false, 9, false);
+@@ -638,14 +924,63 @@ int iget_iput_common_nohelper(u2 referenceIndex, InstanceAccess flag, u2 vA,
+             move_mem_scale_to_reg(OpndSize_64, 7, false, 8, false, 1, 1, false); //access field
+             set_virtual_reg(vA, OpndSize_64, 1, false);
+         }
++#else
++        // Load address into temp 10
++        if(isVolatile) {
++            load_effective_addr(fieldOffset, 7, false, 10, false);
++        } else {
++            load_effective_addr_scale(7, false, 8, false, 1, 10, false);
++        }
++        // push caller saved registers
++        pushCallerSavedRegs();
++        // Set up arguments
++        load_effective_addr(-4, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++        // Move value in temp 10 to (esp)
++        move_reg_to_mem(OpndSize_32, 10, false, 0, PhysicalReg_ESP, true);
++        // In order to call, the scratch reg must be set
++        scratchRegs[0] = PhysicalReg_SCRATCH_5;
++        // Load from shadow heap
++        call_selfVerificationLoadDoubleword();
++        // Restore ESP
++        load_effective_addr(4, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++        // Move result of self verification load into temp 1(XMM)
++        move_reg_to_reg(OpndSize_64, PhysicalReg_XMM7, true, 1, false);
++        // pop caller saved registers
++        popCallerSavedRegs();
++        set_virtual_reg(vA, OpndSize_64, 1, false);
++#endif
+     } else if(flag == IPUT) {
+         get_virtual_reg(vA, OpndSize_32, 9, false);
++#ifndef WITH_SELF_VERIFICATION
+         move_reg_to_mem_scale(OpndSize_32, 9, false, 7, false, 8, false, 1); //access field
++#else
++        // Load address into temp 10; reg temp 9 will contain the data
++        load_effective_addr_scale(7, false, 8, false, 1, 10, false);
++        // push caller saved registers
++        pushCallerSavedRegs();
++        // Set up arguments
++        load_effective_addr(-12, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++        // Move value in temp 10 namely the address to (esp)
++        move_reg_to_mem(OpndSize_32, 10, false, 0, PhysicalReg_ESP, true);
++        // Store value from temp 9 namely the data to 4(esp)
++        move_reg_to_mem(OpndSize_32, 9, false, 4, PhysicalReg_ESP, true);
++        // Mov opnd size to 8(esp)
++        move_imm_to_mem(OpndSize_32, int(OpndSize_32), 8, PhysicalReg_ESP, true);
++        // In order to call, the scratch reg must be set
++        scratchRegs[0] = PhysicalReg_SCRATCH_1;
++        // Load from shadow heap
++        call_selfVerificationStore();
++        // Restore ESP
++        load_effective_addr(12, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++        // pop caller saved registers
++        popCallerSavedRegs();
++#endif
+         if(isObj) {
+             markCard(9, 7, false, 11, false);
+         }
+     } else if(flag == IPUT_WIDE) {
+         get_virtual_reg(vA, OpndSize_64, 1, false);
++#ifndef WITH_SELF_VERIFICATION
+         if(isVolatile) {
+             /* call dvmQuasiAtomicSwap64(val, addr) */
+             load_effective_addr(fieldOffset, 7, false, 9, false);
+@@ -659,6 +994,31 @@ int iget_iput_common_nohelper(u2 referenceIndex, InstanceAccess flag, u2 vA,
+         else {
+             move_reg_to_mem_scale(OpndSize_64, 1, false, 7, false, 8, false, 1);
+         }
++#else
++        //TODO: handle the volatile type correctly..
++        // Load address into temp 10
++        if(isVolatile) {
++            load_effective_addr(fieldOffset, 7, false, 10, false);
++        } else {
++            load_effective_addr_scale(7, false, 8, false, 1, 10, false);
++        }
++        // push caller saved registers
++        pushCallerSavedRegs();
++        // Set up arguments
++        load_effective_addr(-12, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++        // Move value in temp 10 namely the address to (esp)
++        move_reg_to_mem(OpndSize_32, 10, false, 0, PhysicalReg_ESP, true);
++        // Store value from temp 1(XMM) namely the data to 4(esp)
++        move_reg_to_mem(OpndSize_64, 1, false, 4, PhysicalReg_ESP, true);
++        // In order to call, the scratch reg must be set
++        scratchRegs[0] = PhysicalReg_SCRATCH_5;
++        // Load from shadow heap
++        call_selfVerificationStoreDoubleword();
++        // Restore ESP
++        load_effective_addr(12, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++        // pop caller saved registers
++        popCallerSavedRegs();
++#endif
+     }
+     ///////////////////////////
+     return 0;
+@@ -939,9 +1299,34 @@ int sget_sput_common(StaticAccess flag, u2 vA, u2 referenceIndex, bool isObj,
+     move_imm_to_reg(OpndSize_32, (int)fieldPtr, PhysicalReg_EAX, true);
+ #endif
+     if(flag == SGET) {
++#ifndef WITH_SELF_VERIFICATION
+         move_mem_to_reg(OpndSize_32, offStaticField_value, PhysicalReg_EAX, true, 7, false); //access field
+         set_virtual_reg(vA, OpndSize_32, 7, false);
++#else
++            // Load address into temp reg 8
++            load_effective_addr(offStaticField_value, PhysicalReg_EAX, true, 8, false);
++            // push caller saved registers
++            pushCallerSavedRegs();
++            // Set up arguments
++            load_effective_addr(-8, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++            // Move value in temp reg 8 to (esp)
++            move_reg_to_mem(OpndSize_32, 8, false, 0, PhysicalReg_ESP, true);
++            // Mov opnd size to 4(esp)
++            move_imm_to_mem(OpndSize_32, int(OpndSize_32), 4, PhysicalReg_ESP, true);
++            // In order to call, the scratch reg must be set
++            scratchRegs[0] = PhysicalReg_SCRATCH_5;
++            // Load from shadow heap
++            call_selfVerificationLoad();
++            // Restore ESP
++            load_effective_addr(8, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++            // Move result of self verification load into temp 7
++            move_reg_to_reg(OpndSize_32, PhysicalReg_EAX, true, 7, false);
++            // pop caller saved registers
++            popCallerSavedRegs();
++            set_virtual_reg(vA, OpndSize_32, 7, false);
++#endif
+     } else if(flag == SGET_WIDE) {
++#ifndef WITH_SELF_VERIFICATION
+         if(isVolatile) {
+             /* call dvmQuasiAtomicRead64(addr) */
+             load_effective_addr(offStaticField_value, PhysicalReg_EAX, true, 9, false);
+@@ -960,9 +1345,55 @@ int sget_sput_common(StaticAccess flag, u2 vA, u2 referenceIndex, bool isObj,
+             move_mem_to_reg(OpndSize_64, offStaticField_value, PhysicalReg_EAX, true, 1, false); //access field
+             set_virtual_reg(vA, OpndSize_64, 1, false);
+         }
++#else
++            // TODO: the volatile 64 bit type is not handled;
++            // write a C function to only return the mapped shadow address(Read)
++            // Load address into temp 4
++            load_effective_addr(offStaticField_value, PhysicalReg_EAX, true, 4, false);
++            // push caller saved registers
++            pushCallerSavedRegs();
++            // Set up arguments
++            load_effective_addr(-4, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++            // Move value in temp 4 (address) to 0(esp)
++            move_reg_to_mem(OpndSize_32, 4, false, 0, PhysicalReg_ESP, true);
++            // In order to call, the scratch reg must be set
++            scratchRegs[0] = PhysicalReg_SCRATCH_5;
++            // Load from shadow heap
++            call_selfVerificationLoadDoubleword();
++            // Restore ESP
++            load_effective_addr(4, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++            // Move result of self verification load from XMM7 to temp 1(XMM)
++            move_reg_to_reg(OpndSize_64, PhysicalReg_XMM7, true, 1, false);
++            // pop caller saved registers
++            popCallerSavedRegs();
++            set_virtual_reg(vA, OpndSize_64, 1, false);
++#endif
+     } else if(flag == SPUT) {
+         get_virtual_reg(vA, OpndSize_32, 7, false);
++#ifndef WITH_SELF_VERIFICATION
+         move_reg_to_mem(OpndSize_32, 7, false, offStaticField_value, PhysicalReg_EAX, true); //access field
++#else
++            // Load address into temp 8; reg temp 7 will contain the data
++            load_effective_addr(offStaticField_value, PhysicalReg_EAX, true, 8, false);
++            // push caller saved registers
++            pushCallerSavedRegs();
++            // Set up arguments
++            load_effective_addr(-12, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++            // Move value in temp 8 namely the address to (esp)
++            move_reg_to_mem(OpndSize_32, 8, false, 0, PhysicalReg_ESP, true);
++            // Store value from temp 7 namely the data to 4(esp)
++            move_reg_to_mem(OpndSize_32, 7, false, 4, PhysicalReg_ESP, true);
++            // Mov opnd size to 8(esp)
++            move_imm_to_mem(OpndSize_32, int(OpndSize_32), 8, PhysicalReg_ESP, true);
++            // In order to call, the scratch reg must be set
++            scratchRegs[0] = PhysicalReg_SCRATCH_5;
++            // Load from shadow heap
++            call_selfVerificationStore();
++            // Restore ESP
++            load_effective_addr(12, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++            // pop caller saved registers
++            popCallerSavedRegs();
++#endif
+         if(isObj) {
+             /* get clazz object, then use clazz object to mark card */
+             move_mem_to_reg(OpndSize_32, offField_clazz, PhysicalReg_EAX, true, 12, false);
+@@ -970,6 +1401,7 @@ int sget_sput_common(StaticAccess flag, u2 vA, u2 referenceIndex, bool isObj,
+         }
+     } else if(flag == SPUT_WIDE) {
+         get_virtual_reg(vA, OpndSize_64, 1, false);
++#ifndef WITH_SELF_VERIFICATION
+         if(isVolatile) {
+             /* call dvmQuasiAtomicSwap64(val, addr) */
+             load_effective_addr(offStaticField_value, PhysicalReg_EAX, true, 9, false);
+@@ -983,7 +1415,27 @@ int sget_sput_common(StaticAccess flag, u2 vA, u2 referenceIndex, bool isObj,
+         else {
+             move_reg_to_mem(OpndSize_64, 1, false, offStaticField_value, PhysicalReg_EAX, true); //access field
+         }
+-    }
++#else
++            // Load address into temp 4; reg temp 1 will contain the data
++            load_effective_addr(offStaticField_value, PhysicalReg_EAX, true, 4, false);
++            // push caller saved registers
++            pushCallerSavedRegs();
++            // Set up arguments
++            load_effective_addr(-12, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++            // Move value in temp 4 namely the address to (esp)
++            move_reg_to_mem(OpndSize_32, 4, false, 0, PhysicalReg_ESP, true);
++            // Store value from temp 1(XMM) namely the data to 4(esp)
++            move_reg_to_mem(OpndSize_64, 1, false, 4, PhysicalReg_ESP, true);
++            // In order to call, the scratch reg must be set
++            scratchRegs[0] = PhysicalReg_SCRATCH_5;
++            // Load from shadow heap
++            call_selfVerificationStoreDoubleword();
++            // Restore ESP
++            load_effective_addr(12, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++            // pop caller saved registers
++            popCallerSavedRegs();
++#endif
++        }
+     //////////////////////////////////////////////
+   }
+   return 0;
+@@ -1198,8 +1650,32 @@ int op_iget_quick(const MIR * mir) {
+         cancelVRFreeDelayRequest(vB,VRDELAY_NULLCHECK);
+     }
+ 
++#ifndef WITH_SELF_VERIFICATION
+     move_mem_to_reg(OpndSize_32, fieldByteOffset, 1, false, 2, false);
+     set_virtual_reg(vA, OpndSize_32, 2, false);
++#else
++    // Load address into temp reg 3
++    load_effective_addr(fieldByteOffset, 1, false, 3, false);
++    // push caller saved registers
++    pushCallerSavedRegs();
++    // Set up arguments
++    load_effective_addr(-8, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++    // Move value in temp reg 3 to (esp)
++    move_reg_to_mem(OpndSize_32, 3, false, 0, PhysicalReg_ESP, true);
++    // Mov opnd size to 4(esp)
++    move_imm_to_mem(OpndSize_32, int(OpndSize_32), 4, PhysicalReg_ESP, true);
++    // In order to call, the scratch reg must be set
++    scratchRegs[0] = PhysicalReg_SCRATCH_1;
++    // Load from shadow heap
++    call_selfVerificationLoad();
++    // Restore ESP
++    load_effective_addr(8, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++    // Move result of self verification load into temp 2
++    move_reg_to_reg(OpndSize_32, PhysicalReg_EAX, true, 2, false);
++    // pop caller saved registers
++    popCallerSavedRegs();
++    set_virtual_reg(vA, OpndSize_32, 2, false);
++#endif
+     return 0;
+ }
+ #undef P_GPR_1
+@@ -1231,7 +1707,28 @@ int op_iget_wide_quick(const MIR * mir) {
+         cancelVRFreeDelayRequest(vB,VRDELAY_NULLCHECK);
+     }
+ 
++#ifndef WITH_SELF_VERIFICATION
+     move_mem_to_reg(OpndSize_64, fieldByteOffset, 1, false, 1, false);
++#else
++    // Load address into temp 3
++    load_effective_addr(fieldByteOffset, 1, false, 3, false);
++    // push caller saved registers
++    pushCallerSavedRegs();
++    // Set up arguments
++    load_effective_addr(-4, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++    // Move value in temp 3 (address) to 0(esp)
++    move_reg_to_mem(OpndSize_32, 3, false, 0, PhysicalReg_ESP, true);
++    // In order to call, the scratch reg must be set
++    scratchRegs[0] = PhysicalReg_SCRATCH_1;
++    // Load from shadow heap
++    call_selfVerificationLoadDoubleword();
++    // Restore ESP
++    load_effective_addr(4, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++    // Move result of self verification load from XMM7 to temp 1(XMM)
++    move_reg_to_reg(OpndSize_64, PhysicalReg_XMM7, true, 1, false);
++    // pop caller saved registers
++    popCallerSavedRegs();
++#endif
+     set_virtual_reg(vA, OpndSize_64, 1, false);
+     return 0;
+ }
+@@ -1278,7 +1775,30 @@ int iput_quick_common(const MIR * mir, bool isObj) {
+     }
+ 
+     get_virtual_reg(vA, OpndSize_32, 2, false);
++#ifndef WITH_SELF_VERIFICATION
+     move_reg_to_mem(OpndSize_32, 2, false, fieldByteOffset, 1, false);
++#else
++    // Load address into temp 3; reg temp 2 will contain the data
++    load_effective_addr(fieldByteOffset, 1, false, 3, false);
++    // push caller saved registers
++    pushCallerSavedRegs();
++    // Set up arguments
++    load_effective_addr(-12, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++    // Move value in temp 3 namely the address to (esp)
++    move_reg_to_mem(OpndSize_32, 3, false, 0, PhysicalReg_ESP, true);
++    // Store value from temp 2 namely the data to 4(esp)
++    move_reg_to_mem(OpndSize_32, 2, false, 4, PhysicalReg_ESP, true);
++    // Mov opnd size to 8(esp)
++    move_imm_to_mem(OpndSize_32, int(OpndSize_32), 8, PhysicalReg_ESP, true);
++    // In order to call, the scratch reg must be set
++    scratchRegs[0] = PhysicalReg_SCRATCH_1;
++    // Load from shadow heap
++    call_selfVerificationStore();
++    // Restore ESP
++    load_effective_addr(12, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++    // pop caller saved registers
++    popCallerSavedRegs();
++#endif
+     if(isObj) {
+         markCard(2/*valReg*/, 1, false, 11, false);
+     }
+@@ -1326,7 +1846,29 @@ int op_iput_wide_quick(const MIR * mir) {
+     }
+ 
+     get_virtual_reg(vA, OpndSize_64, 1, false);
++
++#ifndef WITH_SELF_VERIFICATION
+     move_reg_to_mem(OpndSize_64, 1, false, fieldByteOffset, 1, false);
++#else
++    // Load address into temp 3; reg temp 1 will contain the data
++    load_effective_addr(fieldByteOffset, 1, false, 3, false);
++    // push caller saved registers
++    pushCallerSavedRegs();
++    // Set up arguments
++    load_effective_addr(-12, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++    // Move value in temp 3 namely the address to (esp)
++    move_reg_to_mem(OpndSize_32, 3, false, 0, PhysicalReg_ESP, true);
++    // Store value from temp 1(XMM) namely the data to 4(esp)
++    move_reg_to_mem(OpndSize_64, 1, false, 4, PhysicalReg_ESP, true);
++    // In order to call, the scratch reg must be set
++    scratchRegs[0] = PhysicalReg_SCRATCH_1;
++    // Load from shadow heap
++    call_selfVerificationStoreDoubleword();
++    // Restore ESP
++    load_effective_addr(12, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++    // pop caller saved registers
++    popCallerSavedRegs();
++#endif
+     return 0;
+ }
+ #undef P_GPR_1
+diff --git a/vm/compiler/codegen/x86/LowerHelper.cpp b/vm/compiler/codegen/x86/LowerHelper.cpp
+index 9d71b78..8958b20 100644
+--- a/vm/compiler/codegen/x86/LowerHelper.cpp
++++ b/vm/compiler/codegen/x86/LowerHelper.cpp
+@@ -1160,7 +1160,8 @@ void load_effective_addr(int disp, int base_reg, bool isBasePhysical,
+ }
+ //! generate a native instruction lea
+ 
+-//!
++//! Computes the effective address of the source operand and stores it in the
++//! first operand. (lea reg, [base_reg + index_reg*scale])
+ void load_effective_addr_scale(int base_reg, bool isBasePhysical,
+                 int index_reg, bool isIndexPhysical, int scale,
+                 int reg, bool isPhysical) {
+@@ -1169,6 +1170,15 @@ void load_effective_addr_scale(int base_reg, bool isBasePhysical,
+                               base_reg, isBasePhysical, 0/*disp*/, index_reg, isIndexPhysical, scale,
+                               reg, isPhysical, LowOpndRegType_gp);
+ }
++
++//! lea reg, [base_reg + index_reg*scale + disp]
++void load_effective_addr_scale_disp(int base_reg, bool isBasePhysical, int disp,
++                int index_reg, bool isIndexPhysical, int scale,
++                int reg, bool isPhysical) {
++    dump_mem_scale_reg(Mnemonic_LEA, OpndSize_32, base_reg, isBasePhysical, disp,
++            index_reg, isIndexPhysical, scale, reg, isPhysical,
++            LowOpndRegType_gp);
++}
+ //!fldcw
+ 
+ //!
+@@ -2816,6 +2826,24 @@ int call_dvmJitToInterpNormal() {
+     return 0;
+ }
+ 
++//! Generate a call out to dvmJitToInterpBackwardBranch.
++//! This transition to the interpreter is required for
++//! self-verification, in particular, in order to check
++//! for control or data divergence for each loop iteration.
++int call_dvmJitToInterpBackwardBranch(void) {
++    if(gDvm.executionMode == kExecutionModeNcgO1) {
++        beforeCall("dvmJitToInterpBackwardBranch");
++    }
++    typedef void (*vmHelper)(int);
++    vmHelper funcPtr = dvmJitToInterpBackwardBranch;
++    callFuncPtr((int)funcPtr, "dvmJitToInterpBackwardBranch");
++    if(gDvm.executionMode == kExecutionModeNcgO1) {
++        afterCall("dvmJitToInterpBackwardBranch");
++    }
++    if(gDvm.executionMode == kExecutionModeNcgO1) touchEbx();
++    return 0;
++}
++
+ int call_dvmJitToInterpTraceSelectNoChain() {
+     typedef void (*vmHelper)(int);
+     vmHelper funcPtr = dvmJitToInterpTraceSelectNoChain;
+@@ -3518,3 +3546,279 @@ void dump_nop(int size) {
+     }
+     stream += size;
+ }
++
++#ifdef WITH_SELF_VERIFICATION
++int selfVerificationLoad(int addr, int opndSize) {
++    assert (opndSize != OpndSize_64);
++    assert(addr != 0);
++
++    Thread *self = dvmThreadSelf();
++    ShadowSpace *shadowSpace = self->shadowSpace;
++    ShadowHeap *heapSpacePtr;
++
++    assert(shadowSpace != 0);
++    assert(shadowSpace->heapSpace != 0);
++    int data = 0;
++
++    for (heapSpacePtr = shadowSpace->heapSpace;
++        heapSpacePtr != shadowSpace->heapSpaceTail; heapSpacePtr++) {
++        if (heapSpacePtr->addr == addr) {
++            addr = (unsigned int)(&(heapSpacePtr->data));
++            break;
++        }
++    }
++
++    /* load addr from the shadow heap, native addr-> shadow heap addr
++     * if not found load the data from the native heap
++     */
++    switch (opndSize) {
++        case OpndSize_8:
++            data = *(reinterpret_cast<u1*> (addr));
++            break;
++        case OpndSize_16:
++            data = *(reinterpret_cast<u2*> (addr));
++            break;
++        //signed versions
++        case 0x11:  //signed OpndSize_8
++            data = *(reinterpret_cast<s1*> (addr));
++            break;
++        case 0x22:  //signed OpndSize_16
++            data = *(reinterpret_cast<s2*> (addr));
++            break;
++        case OpndSize_32:
++            data = *(reinterpret_cast<u4*> (addr));
++            break;
++        default:
++            ALOGE("*** ERROR: BAD SIZE IN selfVerificationLoad: %d", opndSize);
++            data = 0;
++            dvmAbort();
++            break;
++    }
++
++#if defined(SELF_VERIFICATION_LOG)
++    ALOGD("*** HEAP LOAD: Addr: %#x Data: %d Size: %d", addr, data, opndSize);
++#endif
++    return data;
++}
++
++void selfVerificationStore(int addr, int data, int opndSize)
++{
++    assert(addr != 0);
++    Thread *self = dvmThreadSelf();
++    ShadowSpace *shadowSpace = self->shadowSpace;
++    ShadowHeap *heapSpacePtr;
++
++    assert(shadowSpace != 0);
++    assert(shadowSpace->heapSpace != 0);
++#if defined(SELF_VERIFICATION_LOG)
++    ALOGD("*** HEAP STORE: Addr: %#x Data: %d Size: %d", addr, data, opndSize);
++#endif
++    for (heapSpacePtr = shadowSpace->heapSpace;
++         heapSpacePtr != shadowSpace->heapSpaceTail; heapSpacePtr++) {
++        if (heapSpacePtr->addr == addr) {
++            break;
++        }
++    }
++
++    //If the store addr is requested for the first time, its not present in the
++    //heap so add it to the shadow heap.
++    if (heapSpacePtr == shadowSpace->heapSpaceTail) {
++        heapSpacePtr->addr = addr;
++        shadowSpace->heapSpaceTail++;
++        // shadow heap can contain HEAP_SPACE(JIT_MAX_TRACE_LEN) number of entries
++        if(shadowSpace->heapSpaceTail > &(shadowSpace->heapSpace[HEAP_SPACE])) {
++            ALOGD("*** Shadow HEAP store ran out of space, aborting VM");
++            dvmAbort();
++        }
++    }
++
++    addr = ((unsigned int) &(heapSpacePtr->data));
++    switch (opndSize) {
++        case OpndSize_8:
++            *(reinterpret_cast<u1*>(addr)) = data;
++            break;
++        case OpndSize_16:
++            *(reinterpret_cast<u2*>(addr)) = data;
++            break;
++        case OpndSize_32:
++            *(reinterpret_cast<u4*>(addr)) = data;
++            break;
++        default:
++            ALOGE("*** ERROR: BAD SIZE IN selfVerificationSave: %d", opndSize);
++            dvmAbort();
++            break;
++    }
++}
++
++void selfVerificationLoadDoubleword(int addr)
++{
++    assert(addr != 0);
++    Thread *self = dvmThreadSelf();
++    ShadowSpace* shadowSpace = self->shadowSpace;
++    ShadowHeap* heapSpacePtr;
++    int byte_count = 0;
++
++    assert(shadowSpace != 0);
++    assert(shadowSpace->heapSpace != 0);
++    //TODO: do a volatile GET_WIDE implementation
++
++    int addr2 = addr+4;
++    /* load data and data2 from the native heap
++     * so in case this address is not stored in the shadow heap
++     * the value loaded from the native heap is used, else
++     * it is overwritten with the value from the shadow stack
++     */
++    unsigned int data = *(reinterpret_cast<unsigned int*> (addr));
++    unsigned int data2 = *(reinterpret_cast<unsigned int*> (addr2));
++
++    for (heapSpacePtr = shadowSpace->heapSpace;
++         heapSpacePtr != shadowSpace->heapSpaceTail; heapSpacePtr++) {
++        if (heapSpacePtr->addr == addr) {
++            data = heapSpacePtr->data;
++            byte_count++;
++        } else if (heapSpacePtr->addr == addr2) {
++            data2 = heapSpacePtr->data;
++            byte_count++;
++        }
++        if(byte_count == 2) break;
++    }
++
++#if defined(SELF_VERIFICATION_LOG)
++    ALOGD("*** HEAP LOAD DOUBLEWORD: Addr: %#x Data: %#x Data2: %#x",
++        addr, data, data2);
++#endif
++
++    // xmm6 is scratch; passing value back to aget_common_nohelper in xmm7
++    asm volatile (
++            "movd %0, %%xmm6\n\t"
++            "movd %1, %%xmm7\n\t"
++            "psllq $32, %%xmm6\n\t"
++            "paddq %%xmm6, %%xmm7"
++            :
++            : "rm" (data2), "rm" (data)
++            : "xmm6", "xmm7");
++}
++
++void selfVerificationStoreDoubleword(int addr, s8 double_data)
++{
++    assert(addr != 0);
++
++    Thread *self = dvmThreadSelf();
++    ShadowSpace *shadowSpace = self->shadowSpace;
++    ShadowHeap *heapSpacePtr;
++
++    assert(shadowSpace != 0);
++    assert(shadowSpace->heapSpace != 0);
++
++    int addr2 = addr+4;
++    int data = double_data;
++    int data2 = double_data >> 32;
++    bool store1 = false, store2 = false;
++
++#if defined(SELF_VERIFICATION_LOG)
++    ALOGD("*** HEAP STORE DOUBLEWORD: Addr: %#x Data: %#x, Data2: %#x",
++        addr, data, data2);
++#endif
++
++    //data++; data2++;  // test case for SV detection
++
++    for (heapSpacePtr = shadowSpace->heapSpace;
++         heapSpacePtr != shadowSpace->heapSpaceTail; heapSpacePtr++) {
++        if (heapSpacePtr->addr == addr) {
++            heapSpacePtr->data = data;
++            store1 = true;
++        } else if (heapSpacePtr->addr == addr2) {
++            heapSpacePtr->data = data2;
++            store2 = true;
++        }
++        if(store1 && store2) {
++            break;
++        }
++    }
++
++    // shadow heap can contain HEAP_SPACE(JIT_MAX_TRACE_LEN) number of entries
++    int additions = store1 ? 1 : 0;
++    additions += store2 ? 1 : 0;
++    if((shadowSpace->heapSpaceTail + additions) >= &(shadowSpace->heapSpace[HEAP_SPACE])) {
++        ALOGD("*** Shadow HEAP store ran out of space, aborting VM");
++        dvmAbort();
++    }
++
++    if (store1 == false) {
++        shadowSpace->heapSpaceTail->addr = addr;
++        shadowSpace->heapSpaceTail->data = data;
++        shadowSpace->heapSpaceTail++;
++    }
++    if (store2 == false) {
++        shadowSpace->heapSpaceTail->addr = addr2;
++        shadowSpace->heapSpaceTail->data = data2;
++        shadowSpace->heapSpaceTail++;
++    }
++}
++
++int call_selfVerificationLoad(void) {
++    if(gDvm.executionMode == kExecutionModeNcgO1) {
++        beforeCall("selfVerificationLoad");
++    }
++    typedef int (*vmHelper)(int, int);
++    vmHelper funcPtr = selfVerificationLoad;
++    callFuncPtr((int)funcPtr, "selfVerificationLoad");
++    if(gDvm.executionMode == kExecutionModeNcgO1) {
++        afterCall("selfVerificationLoad");
++    }
++    return 0;
++}
++
++int call_selfVerificationLoadDoubleword(void) {
++    if(gDvm.executionMode == kExecutionModeNcgO1) {
++        beforeCall("selfVerificationLoadDoubleword");
++    }
++    typedef void (*vmHelper)(int);
++    vmHelper funcPtr = selfVerificationLoadDoubleword;
++    callFuncPtr((int)funcPtr, "selfVerificationLoadDoubleword");
++    if(gDvm.executionMode == kExecutionModeNcgO1) {
++        afterCall("selfVerificationLoadDoubleword");
++    }
++    return 0;
++}
++
++int call_selfVerificationStore(void) {
++    if(gDvm.executionMode == kExecutionModeNcgO1) {
++        beforeCall("selfVerificationStore");
++    }
++    typedef void (*vmHelper)(int, int, int);
++    vmHelper funcPtr = selfVerificationStore;
++    callFuncPtr((int)funcPtr, "selfVerificationStore");
++    if(gDvm.executionMode == kExecutionModeNcgO1) {
++        afterCall("selfVerificationStore");
++    }
++    return 0;
++}
++
++int call_selfVerificationStoreDoubleword(void) {
++    if(gDvm.executionMode == kExecutionModeNcgO1) {
++        beforeCall("selfVerificationStoreDoubleword");
++    }
++    typedef void (*vmHelper)(int, s8);
++    vmHelper funcPtr = selfVerificationStoreDoubleword;
++    callFuncPtr((int)funcPtr, "selfVerificationStoreDoubleword");
++    if(gDvm.executionMode == kExecutionModeNcgO1) {
++        afterCall("selfVerificationStoreDoubleword");
++    }
++    return 0;
++}
++#endif
++
++void pushCallerSavedRegs(void) {
++    load_effective_addr(-12, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++    move_reg_to_mem(OpndSize_32, PhysicalReg_EAX, true, 8, PhysicalReg_ESP, true);
++    move_reg_to_mem(OpndSize_32, PhysicalReg_ECX, true, 4, PhysicalReg_ESP, true);
++    move_reg_to_mem(OpndSize_32, PhysicalReg_EDX, true, 0, PhysicalReg_ESP, true);
++}
++
++void popCallerSavedRegs(void) {
++    move_mem_to_reg(OpndSize_32, 8, PhysicalReg_ESP, true,  PhysicalReg_EAX, true);
++    move_mem_to_reg(OpndSize_32, 4, PhysicalReg_ESP, true,  PhysicalReg_ECX, true);
++    move_mem_to_reg(OpndSize_32, 0, PhysicalReg_ESP, true,  PhysicalReg_EDX, true);
++    load_effective_addr(12, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++}
+diff --git a/vm/compiler/codegen/x86/LowerJump.cpp b/vm/compiler/codegen/x86/LowerJump.cpp
+index bc5949b..1cccf6e 100644
+--- a/vm/compiler/codegen/x86/LowerJump.cpp
++++ b/vm/compiler/codegen/x86/LowerJump.cpp
+@@ -532,6 +532,12 @@ int getRelativeOffset(const char* target, bool isShortTerm, JmpCall_type type, b
+             } else {
+                 *immSize = OpndSize_8;
+             }
++#ifdef WITH_SELF_VERIFICATION
++            if(!strcmp(target, ".aput_object_skip_check") ||
++               !strcmp(target, ".aput_object_after_check") ) {
++                *immSize = OpndSize_32;
++            }
++#endif
+ #ifdef DEBUG_NCG_JUMP
+             ALOGI("Insert to short worklist %s %d", target, *immSize);
+ #endif
+diff --git a/vm/compiler/codegen/x86/NcgHelper.h b/vm/compiler/codegen/x86/NcgHelper.h
+index 6c97b43..d53a761 100644
+--- a/vm/compiler/codegen/x86/NcgHelper.h
++++ b/vm/compiler/codegen/x86/NcgHelper.h
+@@ -32,6 +32,7 @@ extern "C" void dvmJitToInterpTraceSelect(int targetpc); //in %ebx
+ extern "C" void dvmJitToInterpTraceSelectNoChain(int targetpc); //in %ebx
+ extern "C" void dvmJitToInterpNoChain(int targetpc); //in %eax
+ extern "C" void dvmJitToInterpNoChainNoProfile(int targetpc); //in %eax
++extern "C" void dvmJitToInterpBackwardBranch(int targetpc); //in %ebx
+ extern "C" void dvmJitToInterpPunt(int targetpc); //in currentPc
+ extern "C" void dvmJitToExceptionThrown(int targetpc); //in currentPc
+ #endif
+diff --git a/vm/interp/Jit.cpp b/vm/interp/Jit.cpp
+index 6d53954..8ed474c 100644
+--- a/vm/interp/Jit.cpp
++++ b/vm/interp/Jit.cpp
+@@ -237,6 +237,7 @@ static void selfVerificationDumpTrace(const u2* pc, Thread* self)
+ static void selfVerificationSpinLoop(ShadowSpace *shadowSpace)
+ {
+     const u2 *startPC = shadowSpace->startPC;
++    ALOGD("******  SV SPIN LOOP Entry  ******");
+     JitTraceDescription* desc = dvmCopyTraceDescriptor(startPC, NULL);
+     if (desc) {
+         dvmCompilerWorkEnqueue(startPC, kWorkOrderTraceDebug, desc);
+@@ -245,8 +246,8 @@ static void selfVerificationSpinLoop(ShadowSpace *shadowSpace)
+          * freeing the desc pointer when the enqueuing fails is acceptable.
+          */
+     }
+-    gDvmJit.selfVerificationSpin = true;
+-    while(gDvmJit.selfVerificationSpin) sleep(10);
++    volatile bool spin = gDvmJit.selfVerificationSpin;
++    while(spin) sleep(10);
+ }
+ 
+ /*
+@@ -306,7 +307,8 @@ void dvmCheckSelfVerification(const u2* pc, Thread* self)
+             if (state == kSVSBackwardBranch) {
+                 /* State mismatch on backward branch - try one more iteration */
+                 shadowSpace->selfVerificationState = kSVSDebugInterp;
+-                goto log_and_continue;
++                if (!gDvmJit.selfVerificationSpin)
++                    goto log_and_continue;
+             }
+             ALOGD("~~~ DbgIntp(%d): REGISTERS DIVERGENCE!", self->threadId);
+             selfVerificationDumpState(pc, self);
+@@ -339,7 +341,8 @@ void dvmCheckSelfVerification(const u2* pc, Thread* self)
+                      * iteration.
+                      */
+                     shadowSpace->selfVerificationState = kSVSDebugInterp;
+-                    goto log_and_continue;
++                    if (!gDvmJit.selfVerificationSpin)
++                        goto log_and_continue;
+                 }
+                 ALOGD("~~~ DbgIntp(%d): REGISTERS (FRAME2) DIVERGENCE!",
+                     self->threadId);
+@@ -372,10 +375,11 @@ void dvmCheckSelfVerification(const u2* pc, Thread* self)
+                      * iteration.
+                      */
+                     shadowSpace->selfVerificationState = kSVSDebugInterp;
+-                    goto log_and_continue;
++                    if (!gDvmJit.selfVerificationSpin)
++                        goto log_and_continue;
+                 }
+                 ALOGD("~~~ DbgIntp(%d): MEMORY DIVERGENCE!", self->threadId);
+-                ALOGD("Addr: %#x Intrp Data: %#x Jit Data: %#x",
++                ALOGD("Addr: %#x Intrp Data: %d Jit Data: %d",
+                     heapSpacePtr->addr, memData, heapSpacePtr->data);
+                 selfVerificationDumpState(pc, self);
+                 selfVerificationDumpTrace(pc, self);
+@@ -409,6 +413,7 @@ void dvmCheckSelfVerification(const u2* pc, Thread* self)
+ log_and_continue:
+     /* If end not been reached, make sure max length not exceeded */
+     if (shadowSpace->traceLength >= JIT_MAX_TRACE_LEN) {
++        ALOGD("~~~ DbgIntp JIT_MAX_TRACE_LEN(%d) exceeded", JIT_MAX_TRACE_LEN);
+         ALOGD("~~~ DbgIntp(%d): CONTROL DIVERGENCE!", self->threadId);
+         ALOGD("startPC: %#x endPC: %#x currPC: %#x",
+             (int)shadowSpace->startPC, (int)shadowSpace->endPC, (int)pc);
+diff --git a/vm/mterp/out/InterpAsm-x86.S b/vm/mterp/out/InterpAsm-x86.S
+index 07d976e..9c91010 100644
+--- a/vm/mterp/out/InterpAsm-x86.S
++++ b/vm/mterp/out/InterpAsm-x86.S
+@@ -16162,9 +16162,18 @@ dvmMterpStdRun:
+     GET_JIT_PROF_TABLE %ecx %eax
+     movl        $0, offThread_inJitCodeCache(%ecx)
+     cmpl        $0, %eax
++
++#if !defined(WITH_SELF_VERIFICATION)
++                                     # profiling is enabled
+     jne         common_updateProfile # set up %ebx & %edx & rPC
++#else
++    je          1f                   # profiling is disabled
++    jmp         common_updateProfile # collect profiles
++#endif
++
+ #endif
+ 
++1:
+    /* Normal case: start executing the instruction at rPC */
+     GOTO_NEXT
+ 
+@@ -16248,6 +16257,116 @@ dvmNcgInvokeInterpreter:
+  * should be reached via a direct jump and rPC set beforehand.
+  */
+ 
++    .global     dvmJitToExceptionThrown
++dvmJitToExceptionThrown: //rPC in
++    movl   rSELF, %edx
++    GET_PC
++    movl   $0, offThread_inJitCodeCache(%edx)
++    jmp common_exceptionThrown
++
++#if defined(WITH_SELF_VERIFICATION)
++/*
++ * Interpreter entry point from JIT.
++ * Each entry point does rSELF.inJitCodeCache = 0
++ * passes the arguments (rPC, rFP, JITexit state, rSELF) to jitShadowRunEnd,
++ * after which the state is restored and interpretation continues.
++ * only the Jit exit state differs in each entry point which is used by the C
++ * code which performs the SV check
++ * On entry : rPC, rFP, rSELF - what they should contain.
++ * Invokes jitShadowRunEnd
++ */
++    .global dvmJitToInterpSingleStep
++dvmJitToInterpSingleStep:
++    /* TODO: Implement it as part of Single step enabling */
++    call     dvmAbort
++
++    .global dvmJitToInterpPunt
++dvmJitToInterpPunt:
++    GET_PC
++    movl   rPC, OUT_ARG0(%esp)
++    movl   rFP, OUT_ARG1(%esp)
++    movl   $kSVSPunt,  OUT_ARG2(%esp)
++    movl   rSELF, %ecx
++    movl   offThread_curHandlerTable(%ecx), rIBASE
++    movl   $0, offThread_inJitCodeCache(%ecx)
++    movl   %ecx, OUT_ARG3(%esp)
++    jmp    jitSVShadowRunEnd                    # doesn't return
++
++    .global dvmJitToInterpTraceSelectNoChain
++dvmJitToInterpTraceSelectNoChain:
++    movl   %ebx, rPC
++    lea    4(%esp), %esp            #to recover the esp update due to function call
++    movl   rSELF, %eax
++    movl   rPC, OUT_ARG0(%esp)
++    movl   rFP, OUT_ARG1(%esp)
++    movl   $kSVSTraceSelect, OUT_ARG2(%esp)
++    movl   $0, offThread_inJitCodeCache(%eax)  # 0 means !inJitCodeCache
++    movl   %eax, OUT_ARG3(%esp)
++    jmp    jitSVShadowRunEnd                    # doesn't return
++
++    .global dvmJitToInterpTraceSelect
++dvmJitToInterpTraceSelect:
++    movl   %ebx, rPC              # get first argument (target rPC)
++    lea    4(%esp), %esp          #to recover the esp update due to function call
++    #lea   -4(%esp), %esp         # Do not worry about signal handling now..
++    movl   rSELF, %eax
++    movl   $0, offThread_inJitCodeCache(%eax)  # 0 means !inJitCodeCache
++    movl   rPC, OUT_ARG0(%esp)
++    movl   rFP, OUT_ARG1(%esp)
++    movl   $kSVSTraceSelect, OUT_ARG2(%esp)
++    movl   %eax, OUT_ARG3(%esp)
++    jmp    jitSVShadowRunEnd                    # doesn't return
++
++    .global dvmJitToInterpBackwardBranch
++dvmJitToInterpBackwardBranch:
++    movl   %ebx, rPC              # get first argument (target rPC)
++    lea    4(%esp), %esp
++    movl   rSELF, %ecx
++    movl   $0, offThread_inJitCodeCache(%ecx)  # 0 means !inJitCodeCache
++    movl   rPC, OUT_ARG0(%esp)
++    movl   rFP, OUT_ARG1(%esp)
++    movl   $kSVSBackwardBranch, OUT_ARG2(%esp)
++    movl   %ecx, OUT_ARG3(%esp)
++    jmp    jitSVShadowRunEnd                    # doesn't return
++
++    # turn off JIT chaining by not invoking dvmJitChain and setting the
++    # value of %ebx/ rINST
++    .global dvmJitToInterpNormal
++dvmJitToInterpNormal:
++    movl   %ebx, rPC              # get first argument (target rPC)
++    lea    4(%esp), %esp
++    movl   rSELF, %ecx
++    movl   $0, offThread_inJitCodeCache(%ecx)  # 0 means !inJitCodeCache
++    movl   rPC, OUT_ARG0(%esp)
++    movl   rFP, OUT_ARG1(%esp)
++    movl   $kSVSNormal, OUT_ARG2(%esp)
++    movl   %ecx, OUT_ARG3(%esp)
++    jmp    jitSVShadowRunEnd                    # doesn't return
++
++    .global dvmJitToInterpNoChain
++dvmJitToInterpNoChain:
++    movl   %eax, rPC
++    movl   rPC, OUT_ARG0(%esp)
++    movl   rFP, OUT_ARG1(%esp)
++    movl   $kSVSNoChain, OUT_ARG2(%esp)
++    movl   rSELF, %ecx
++    movl   $0, offThread_inJitCodeCache(%ecx)  # 0 means !inJitCodeCache
++    movl   %ecx, OUT_ARG3(%esp)
++    jmp    jitSVShadowRunEnd                    # doesn't return
++
++        .global dvmJitToInterpNoChainNoProfile
++dvmJitToInterpNoChainNoProfile:
++    movl   %eax, rPC
++    movl   rPC, OUT_ARG0(%esp)
++    movl   rFP, OUT_ARG1(%esp)
++    movl   $kSVSNoProfile, OUT_ARG2(%esp)
++    movl   rSELF, %ecx
++    movl   $0, offThread_inJitCodeCache(%ecx)  # 0 means !inJitCodeCache
++    movl   %ecx, OUT_ARG3(%esp)
++    jmp    jitSVShadowRunEnd                    # doesn't return
++
++#else
++
+     .global dvmJitToInterpPunt
+ /*
+  * The compiler will generate a jump to this entry point when it is
+@@ -16399,13 +16518,6 @@ dvmJitToInterpTraceSelect:
+     .global dvmJitToInterpBackwardBranch
+ dvmJitToInterpBackwardBranch:
+ 
+-    .global     dvmJitToExceptionThrown
+-dvmJitToExceptionThrown: //rPC in
+-    movl   rSELF, %edx
+-    GET_PC
+-    movl   $0, offThread_inJitCodeCache(%edx)
+-    jmp common_exceptionThrown
+-
+     .global dvmJitToInterpNormal
+ dvmJitToInterpNormal:
+ /* one input: the target rPC value */
+@@ -16462,6 +16574,8 @@ dvmJitToInterpNoChain: #rPC in eax
+     je          toInterpreter
+     jmp         *%eax                   #to native address
+ 
++#endif /*WITH_SELF_VERIFICATION */
++
+ toInterpreter:
+     EXPORT_PC
+     movl        rSELF, %ecx
+@@ -16514,11 +16628,17 @@ common_Profile:
+     UNSPILL_TMP1(rINST)
+     cmpl   $0,%eax
+     #jmp    1f # remove
++#if !defined(WITH_SELF_VERIFICATION)
+     jz     1f
+     jmp   *%eax        # TODO: decide call vs/ jmp!.  No return either way
+ 1:
+     movl   $kJitTSelectRequest,%eax
+-    # On entry, eax<- jitState, rPC valid
++#else
++    jne    jitSVShadowRunStart         # set up self verification shadow space, translation address is in %eax
++    movl   $kJitTSelectRequest,%eax
++#endif
++
++ # On entry, eax<- jitState, rPC valid
+ common_selectTrace:
+     SPILL_TMP1(%ebx)
+     movl        rSELF, %ebx
+@@ -16574,13 +16694,70 @@ common_selectTrace2:
+ 4:
+    GOTO_NEXT
+ 
+-#endif
++#if defined(WITH_SELF_VERIFICATION)
++/*
++ * Save PC and registers to shadow memory for self verification mode
++ * before jumping to native translation.
++ * On entry:
++ *    rPC, rFP, rSELF: the values that they should contain
++ *    %eax: the address of the target translation.
++ */
++jitSVShadowRunStart:
++    SPILL_TMP1(%eax)
++    movl   rPC,OUT_ARG0(%esp)      # program counter
++    movl   rFP,OUT_ARG1(%esp)      # frame pointer
++    movl   rSELF, %ecx
++    movl   %ecx,OUT_ARG2(%esp)    # self (Thread) pointer
++    movl   %eax,OUT_ARG3(%esp)     # %eax <- target translation
++    call   dvmSelfVerificationSaveState  # save registers to shadow space (pc, fp, self, targetTrace)
++    movl   offShadowSpace_shadowFP(%eax), rFP # rFP<- fp in shadow space
++    UNSPILL_TMP1(%eax)
++    jmp    *%eax                      # jump to the translation
++
++/*
++ * Restore PC, registers, and interpreter state to original values
++ * before jumping back to the interpreter.
++ * On entry:
++ *   ARG0:  dPC
++ *   ARG2:  self verification state
++ *   ARG1:  dFP
++ *   ARG3:  rSELF
++ */
++jitSVShadowRunEnd:
++    call dvmSelfVerificationRestoreState # restore pc and fp values (pc, fp, exitState, rSELF)
++    movl    rSELF, %ecx                     # get incoming rSELF
++    movl    offThread_pc(%ecx),rPC
++    movl    offThread_curFrame(%ecx),rFP
++
++    movl    offShadowSpace_jitExitState(%eax), %ecx  # get self verification state
++    movl    $kSVSPunt, %eax
++    cmpl    %ecx, %eax                               # check if punt condition is true
++    je      1f
++
++    # Set up SV single-stepping
++    movl   rSELF, %ecx
++    movl   $kJitSelfVerification, offThread_jitState(%ecx)   # set the Jit state to self verification
++    movl   %ecx, OUT_ARG0(%esp)    # self (Thread) pointer
++    movl   $kSubModeJitSV, OUT_ARG1(%esp)
++    call   dvmEnableSubMode              # (self, subMode)  # set the interpreter break submode to SV state
++
++    # intentional fallthrough; Continue interpreting
++1:
++    EXPORT_PC
++    movl    rSELF, %ecx
++    movl    offThread_curHandlerTable(%ecx),rIBASE
++    FETCH_INST_R %ecx
++    GOTO_NEXT_R %ecx
++#endif /* WITH_SELF_VERIFICATION */
++
++
++#endif  /*WITH_JIT*/
+ 
+ /*
+  * For the invoke codes we need to know what register holds the "this" pointer. However
+  * it seems the this pointer is assigned consistently most times it is in %ecx but other
+  * times it is in OP_INVOKE_INTERFACE, OP_INVOKE_SUPER_QUICK, or OP_INVOKE_VIRTUAL_QUICK.
+-*/
++ */
+ 
+ /*
+  * Common code for method invocation with range.
+diff --git a/vm/mterp/x86/entry.S b/vm/mterp/x86/entry.S
+index 37e7dfb..81a1be6 100644
+--- a/vm/mterp/x86/entry.S
++++ b/vm/mterp/x86/entry.S
+@@ -55,9 +55,18 @@ dvmMterpStdRun:
+     GET_JIT_PROF_TABLE %ecx %eax
+     movl        $$0, offThread_inJitCodeCache(%ecx)
+     cmpl        $$0, %eax
++
++#if !defined(WITH_SELF_VERIFICATION)
++                                     # profiling is enabled
+     jne         common_updateProfile # set up %ebx & %edx & rPC
++#else
++    je          1f                   # profiling is disabled
++    jmp         common_updateProfile # collect profiles
++#endif
++
+ #endif
+ 
++1:
+    /* Normal case: start executing the instruction at rPC */
+     GOTO_NEXT
+ 
+diff --git a/vm/mterp/x86/footer.S b/vm/mterp/x86/footer.S
+index 2da775f..1d18e12 100644
+--- a/vm/mterp/x86/footer.S
++++ b/vm/mterp/x86/footer.S
+@@ -27,6 +27,116 @@
+  * should be reached via a direct jump and rPC set beforehand.
+  */
+ 
++    .global     dvmJitToExceptionThrown
++dvmJitToExceptionThrown: //rPC in
++    movl   rSELF, %edx
++    GET_PC
++    movl   $$0, offThread_inJitCodeCache(%edx)
++    jmp common_exceptionThrown
++
++#if defined(WITH_SELF_VERIFICATION)
++/*
++ * Interpreter entry point from JIT.
++ * Each entry point does rSELF.inJitCodeCache = 0
++ * passes the arguments (rPC, rFP, JITexit state, rSELF) to jitShadowRunEnd,
++ * after which the state is restored and interpretation continues.
++ * only the Jit exit state differs in each entry point which is used by the C
++ * code which performs the SV check
++ * On entry : rPC, rFP, rSELF - what they should contain.
++ * Invokes jitShadowRunEnd
++ */
++    .global dvmJitToInterpSingleStep
++dvmJitToInterpSingleStep:
++    /* TODO: Implement it as part of Single step enabling */
++    call     dvmAbort
++
++    .global dvmJitToInterpPunt
++dvmJitToInterpPunt:
++    GET_PC
++    movl   rPC, OUT_ARG0(%esp)
++    movl   rFP, OUT_ARG1(%esp)
++    movl   $$kSVSPunt,  OUT_ARG2(%esp)
++    movl   rSELF, %ecx
++    movl   offThread_curHandlerTable(%ecx), rIBASE
++    movl   $$0, offThread_inJitCodeCache(%ecx)
++    movl   %ecx, OUT_ARG3(%esp)
++    jmp    jitSVShadowRunEnd                    # doesn't return
++
++    .global dvmJitToInterpTraceSelectNoChain
++dvmJitToInterpTraceSelectNoChain:
++    movl   %ebx, rPC
++    lea    4(%esp), %esp            #to recover the esp update due to function call
++    movl   rSELF, %eax
++    movl   rPC, OUT_ARG0(%esp)
++    movl   rFP, OUT_ARG1(%esp)
++    movl   $$kSVSTraceSelect, OUT_ARG2(%esp)
++    movl   $$0, offThread_inJitCodeCache(%eax)  # 0 means !inJitCodeCache
++    movl   %eax, OUT_ARG3(%esp)
++    jmp    jitSVShadowRunEnd                    # doesn't return
++
++    .global dvmJitToInterpTraceSelect
++dvmJitToInterpTraceSelect:
++    movl   %ebx, rPC              # get first argument (target rPC)
++    lea    4(%esp), %esp          #to recover the esp update due to function call
++    #lea   -4(%esp), %esp         # Do not worry about signal handling now..
++    movl   rSELF, %eax
++    movl   $$0, offThread_inJitCodeCache(%eax)  # 0 means !inJitCodeCache
++    movl   rPC, OUT_ARG0(%esp)
++    movl   rFP, OUT_ARG1(%esp)
++    movl   $$kSVSTraceSelect, OUT_ARG2(%esp)
++    movl   %eax, OUT_ARG3(%esp)
++    jmp    jitSVShadowRunEnd                    # doesn't return
++
++    .global dvmJitToInterpBackwardBranch
++dvmJitToInterpBackwardBranch:
++    movl   %ebx, rPC              # get first argument (target rPC)
++    lea    4(%esp), %esp
++    movl   rSELF, %ecx
++    movl   $$0, offThread_inJitCodeCache(%ecx)  # 0 means !inJitCodeCache
++    movl   rPC, OUT_ARG0(%esp)
++    movl   rFP, OUT_ARG1(%esp)
++    movl   $$kSVSBackwardBranch, OUT_ARG2(%esp)
++    movl   %ecx, OUT_ARG3(%esp)
++    jmp    jitSVShadowRunEnd                    # doesn't return
++
++    # turn off JIT chaining by not invoking dvmJitChain and setting the
++    # value of %ebx/ rINST
++    .global dvmJitToInterpNormal
++dvmJitToInterpNormal:
++    movl   %ebx, rPC              # get first argument (target rPC)
++    lea    4(%esp), %esp
++    movl   rSELF, %ecx
++    movl   $$0, offThread_inJitCodeCache(%ecx)  # 0 means !inJitCodeCache
++    movl   rPC, OUT_ARG0(%esp)
++    movl   rFP, OUT_ARG1(%esp)
++    movl   $$kSVSNormal, OUT_ARG2(%esp)
++    movl   %ecx, OUT_ARG3(%esp)
++    jmp    jitSVShadowRunEnd                    # doesn't return
++
++    .global dvmJitToInterpNoChain
++dvmJitToInterpNoChain:
++    movl   %eax, rPC
++    movl   rPC, OUT_ARG0(%esp)
++    movl   rFP, OUT_ARG1(%esp)
++    movl   $$kSVSNoChain, OUT_ARG2(%esp)
++    movl   rSELF, %ecx
++    movl   $$0, offThread_inJitCodeCache(%ecx)  # 0 means !inJitCodeCache
++    movl   %ecx, OUT_ARG3(%esp)
++    jmp    jitSVShadowRunEnd                    # doesn't return
++
++        .global dvmJitToInterpNoChainNoProfile
++dvmJitToInterpNoChainNoProfile:
++    movl   %eax, rPC
++    movl   rPC, OUT_ARG0(%esp)
++    movl   rFP, OUT_ARG1(%esp)
++    movl   $$kSVSNoProfile, OUT_ARG2(%esp)
++    movl   rSELF, %ecx
++    movl   $$0, offThread_inJitCodeCache(%ecx)  # 0 means !inJitCodeCache
++    movl   %ecx, OUT_ARG3(%esp)
++    jmp    jitSVShadowRunEnd                    # doesn't return
++
++#else
++
+     .global dvmJitToInterpPunt
+ /*
+  * The compiler will generate a jump to this entry point when it is
+@@ -178,13 +288,6 @@ dvmJitToInterpTraceSelect:
+     .global dvmJitToInterpBackwardBranch
+ dvmJitToInterpBackwardBranch:
+ 
+-    .global     dvmJitToExceptionThrown
+-dvmJitToExceptionThrown: //rPC in
+-    movl   rSELF, %edx
+-    GET_PC
+-    movl   $$0, offThread_inJitCodeCache(%edx)
+-    jmp common_exceptionThrown
+-
+     .global dvmJitToInterpNormal
+ dvmJitToInterpNormal:
+ /* one input: the target rPC value */
+@@ -241,6 +344,8 @@ dvmJitToInterpNoChain: #rPC in eax
+     je          toInterpreter
+     jmp         *%eax                   #to native address
+ 
++#endif /*WITH_SELF_VERIFICATION */
++
+ toInterpreter:
+     EXPORT_PC
+     movl        rSELF, %ecx
+@@ -293,11 +398,17 @@ common_Profile:
+     UNSPILL_TMP1(rINST)
+     cmpl   $$0,%eax
+     #jmp    1f # remove
++#if !defined(WITH_SELF_VERIFICATION)
+     jz     1f
+     jmp   *%eax        # TODO: decide call vs/ jmp!.  No return either way
+ 1:
+     movl   $$kJitTSelectRequest,%eax
+-    # On entry, eax<- jitState, rPC valid
++#else
++    jne    jitSVShadowRunStart         # set up self verification shadow space, translation address is in %eax
++    movl   $$kJitTSelectRequest,%eax
++#endif
++
++ # On entry, eax<- jitState, rPC valid
+ common_selectTrace:
+     SPILL_TMP1(%ebx)
+     movl        rSELF, %ebx
+@@ -353,13 +464,70 @@ common_selectTrace2:
+ 4:
+    GOTO_NEXT
+ 
+-#endif
++#if defined(WITH_SELF_VERIFICATION)
++/*
++ * Save PC and registers to shadow memory for self verification mode
++ * before jumping to native translation.
++ * On entry:
++ *    rPC, rFP, rSELF: the values that they should contain
++ *    %eax: the address of the target translation.
++ */
++jitSVShadowRunStart:
++    SPILL_TMP1(%eax)
++    movl   rPC,OUT_ARG0(%esp)      # program counter
++    movl   rFP,OUT_ARG1(%esp)      # frame pointer
++    movl   rSELF, %ecx
++    movl   %ecx,OUT_ARG2(%esp)    # self (Thread) pointer
++    movl   %eax,OUT_ARG3(%esp)     # %eax <- target translation
++    call   dvmSelfVerificationSaveState  # save registers to shadow space (pc, fp, self, targetTrace)
++    movl   offShadowSpace_shadowFP(%eax), rFP # rFP<- fp in shadow space
++    UNSPILL_TMP1(%eax)
++    jmp    *%eax                      # jump to the translation
++
++/*
++ * Restore PC, registers, and interpreter state to original values
++ * before jumping back to the interpreter.
++ * On entry:
++ *   ARG0:  dPC
++ *   ARG2:  self verification state
++ *   ARG1:  dFP
++ *   ARG3:  rSELF
++ */
++jitSVShadowRunEnd:
++    call dvmSelfVerificationRestoreState # restore pc and fp values (pc, fp, exitState, rSELF)
++    movl    rSELF, %ecx                     # get incoming rSELF
++    movl    offThread_pc(%ecx),rPC
++    movl    offThread_curFrame(%ecx),rFP
++
++    movl    offShadowSpace_jitExitState(%eax), %ecx  # get self verification state
++    movl    $$kSVSPunt, %eax
++    cmpl    %ecx, %eax                               # check if punt condition is true
++    je      1f
++
++    # Set up SV single-stepping
++    movl   rSELF, %ecx
++    movl   $$kJitSelfVerification, offThread_jitState(%ecx)   # set the Jit state to self verification
++    movl   %ecx, OUT_ARG0(%esp)    # self (Thread) pointer
++    movl   $$kSubModeJitSV, OUT_ARG1(%esp)
++    call   dvmEnableSubMode              # (self, subMode)  # set the interpreter break submode to SV state
++
++    # intentional fallthrough; Continue interpreting
++1:
++    EXPORT_PC
++    movl    rSELF, %ecx
++    movl    offThread_curHandlerTable(%ecx),rIBASE
++    FETCH_INST_R %ecx
++    GOTO_NEXT_R %ecx
++#endif /* WITH_SELF_VERIFICATION */
++
++
++#endif  /*WITH_JIT*/
+ 
+ /*
+  * For the invoke codes we need to know what register holds the "this" pointer. However
+  * it seems the this pointer is assigned consistently most times it is in %ecx but other
+  * times it is in OP_INVOKE_INTERFACE, OP_INVOKE_SUPER_QUICK, or OP_INVOKE_VIRTUAL_QUICK.
+-*/
++ */
+ 
+ /*
+  * Common code for method invocation with range.
+-- 
+1.7.4.1
+

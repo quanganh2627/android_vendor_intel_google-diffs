@@ -1,0 +1,600 @@
+From 95148f18c76c87148b18aa95177900034f5e031d Mon Sep 17 00:00:00 2001
+From: Qiming Shi <qiming.shi@intel.com>
+Date: Sat, 1 Jun 2013 14:43:14 +0800
+Subject: Dalvik: Support short method (simple getter/setter) inlining for non-virtual invokes
+
+BZ: 75820
+
+Inlining of getters, setters, and empty methods is now supported for
+non-virtual invokes. Supported empty methods have a single return-void
+bytecode. Supported setters have a single put bytecode (aput*, sput*,
+iput*) and a return. Supported getters have a single get bytecode (aget*,
+sget*, iget*) and a return. No other forms of setters and getters are
+supported.
+
+The non-virtual invokes supported are invoke-static, invoke-direct,
+invoke-super, invoke-super-quick, and all range variants of the listed
+invokes. In the codegen, after inlining, the invoke and the move-result
+(following only a getter) are treated as nops. The getter or setter
+bytecode is artificially inserted into the MIR and code is generated
+for it as part of the trace.
+
+In order to clearly understand effect of inlining on trace, jit verbosity
+has been updated. When jit verbosity is enabled, the message when lowering
+each bytecode changes. This is an example of before:
+LOWER bytecode xe at offsetPC 9 offsetNCG 0 @0x652dd2c0
+and after:
+LOWER return v4, (#0), (#0) with offsetPC 9 offsetNCG 0 @0x652dd2c0
+
+Additionally, when a bytecode is treated as nop, the text "no-op" gets
+appended after the bytecode printout. When the bytecode is inlined
+(getter and setter bytecode), the text "inlined" gets appended to the
+bytecode printout.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Ic87c9c6ca596533c96886f15f65b420d2058e4cc
+Orig-MCG-Change-Id: Iff6587c00725a7c4460349dad04ab802733e4b34
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/Init.cpp                                  |    3 +
+ vm/compiler/InlineTransformation.cpp         |    4 ++
+ vm/compiler/codegen/x86/AnalysisO1.cpp       |    6 +-
+ vm/compiler/codegen/x86/BytecodeVisitor.cpp  |   22 ++++++++++
+ vm/compiler/codegen/x86/CodegenInterface.cpp |    4 +-
+ vm/compiler/codegen/x86/Lower.cpp            |   27 ++++++++++--
+ vm/compiler/codegen/x86/Lower.h              |    1 +
+ vm/compiler/codegen/x86/LowerGetPut.cpp      |   44 +++++++++++---------
+ vm/compiler/codegen/x86/LowerInvoke.cpp      |   57 +++++++++++++++++---------
+ 9 files changed, 119 insertions(+), 49 deletions(-)
+
+diff --git a/vm/Init.cpp b/vm/Init.cpp
+index 9d8dd89..56e48cc 100644
+--- a/vm/Init.cpp
++++ b/vm/Init.cpp
+@@ -1311,6 +1311,7 @@ static void setCommandLineDefaults()
+      */
+ #if defined(WITH_JIT)
+     gDvm.executionMode = kExecutionModeJit;
++#if defined(ARCH_IA32)
+     gDvmJit.num_entries_pcTable = 0;
+     gDvmJit.scheduling = true;
+     gDvmJit.includeSelectedMethod = false; //uninitialized variable may not be zero
+@@ -1325,6 +1326,8 @@ static void setCommandLineDefaults()
+ 
+     gDvm.constInit = false;
+     gDvm.commonInit = false;
++    gDvmJit.disableOpt = 1<<kMethodJit;
++#endif
+ #else
+     gDvm.executionMode = kExecutionModeInterpFast;
+ #endif
+diff --git a/vm/compiler/InlineTransformation.cpp b/vm/compiler/InlineTransformation.cpp
+index 650340c..2f0d054 100644
+--- a/vm/compiler/InlineTransformation.cpp
++++ b/vm/compiler/InlineTransformation.cpp
+@@ -398,6 +398,9 @@ void dvmCompilerInlineMIR(CompilationUnit *cUnit, JitTranslationInfo *info)
+                 break;
+         }
+ 
++        // TODO Temporarily disable this code path until x86 JIT adds support
++        // for inlining virtual invokes
++#ifndef ARCH_IA32
+         if (calleeMethod) {
+             bool inlined = tryInlineVirtualCallsite(cUnit, calleeMethod,
+                                                     lastMIRInsn, bb, isRange);
+@@ -425,5 +428,6 @@ void dvmCompilerInlineMIR(CompilationUnit *cUnit, JitTranslationInfo *info)
+             }
+             return;
+         }
++#endif
+     }
+ }
+diff --git a/vm/compiler/codegen/x86/AnalysisO1.cpp b/vm/compiler/codegen/x86/AnalysisO1.cpp
+index 78abc37..429cd28 100644
+--- a/vm/compiler/codegen/x86/AnalysisO1.cpp
++++ b/vm/compiler/codegen/x86/AnalysisO1.cpp
+@@ -685,10 +685,10 @@ int collectInfoOfBasicBlock(Method* method, BasicBlock_O1* bb) {
+     for(MIR * mir = bb->jitBasicBlock->firstMIRInsn; mir; mir = mir->next) {
+         offsetPC = seqNum;
+         mir->seqNum = seqNum++;
+-#ifdef WITH_JIT_INLINING
++#ifdef WITH_JIT_INLINING_PHASE2
+         if(mir->dalvikInsn.opcode >= kMirOpFirst &&
+            mir->dalvikInsn.opcode != kMirOpCheckInlinePrediction) continue;
+-        if(ir->dalvikInsn.opcode == kMirOpCheckInlinePrediction) { //TODO
++        if(mir->dalvikInsn.opcode == kMirOpCheckInlinePrediction) { //TODO
+         }
+ #else
+         if(mir->dalvikInsn.opcode >= kNumPackedOpcodes) continue;
+@@ -790,7 +790,7 @@ int codeGenBasicBlock(const Method* method, BasicBlock_O1* bb) {
+     for(MIR * mir = bb->jitBasicBlock->firstMIRInsn; mir; mir = mir->next) {
+         offsetPC = mir->seqNum;
+         rPC = const_cast<u2 *>(method->insns) + mir->offset;
+-#ifdef WITH_JIT_INLINING
++#ifdef WITH_JIT_INLINING_PHASE2
+         if(mir->dalvikInsn.opcode >= kMirOpFirst &&
+            mir->dalvikInsn.opcode != kMirOpCheckInlinePrediction) {
+ #else
+diff --git a/vm/compiler/codegen/x86/BytecodeVisitor.cpp b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+index fbacd81..03601b4 100644
+--- a/vm/compiler/codegen/x86/BytecodeVisitor.cpp
++++ b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+@@ -547,6 +547,13 @@ bool getConstInfo(BasicBlock_O1* bb, const MIR * currentMIR) {
+     int entry, tmpValue[2], tmpValue2[2];
+     num_const_worklist = 0;
+ 
++#ifdef WITH_JIT_INLINING
++    /* A bytecode with the MIR_INLINED op will be treated as
++     * no-op during codegen */
++    if (currentMIR->OptimizationFlags & MIR_INLINED)
++        return false; // does NOT generate a constant
++#endif
++
+     switch(inst_op) {
+         //for other opcode, if update the register, set isConst to false
+     case OP_MOVE:
+@@ -1213,6 +1220,13 @@ int getVirtualRegInfo(VirtualRegInfo* infoArray, const MIR * currentMIR) {
+         }
+     }
+ 
++#ifdef WITH_JIT_INLINING
++    /* A bytecode with the MIR_INLINED op will be treated as
++     * no-op during codegen */
++    if (currentMIR->OptimizationFlags & MIR_INLINED)
++        return currentMIR->width;
++#endif
++
+     switch (inst_op) {
+     case OP_NOP:
+         codeSize = 1;
+@@ -3340,6 +3354,14 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+     u2 vA, vB, v1, length, num, tmp;
+     Opcode inst_op = currentMIR->dalvikInsn.opcode;
+     s2 tmp_s2;
++
++#ifdef WITH_JIT_INLINING
++    /* A bytecode with the MIR_INLINED op will be treated as
++     * no-op during codegen */
++    if (currentMIR->OptimizationFlags & MIR_INLINED)
++        return 0; // No temporaries accessed
++#endif
++
+     switch (inst_op) {
+     case OP_NOP:
+         return 0;
+diff --git a/vm/compiler/codegen/x86/CodegenInterface.cpp b/vm/compiler/codegen/x86/CodegenInterface.cpp
+index 65ac3be..2934907 100644
+--- a/vm/compiler/codegen/x86/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/CodegenInterface.cpp
+@@ -952,7 +952,7 @@ static void genHoistedLowerBoundCheck(CompilationUnit *cUnit, MIR *mir)
+ }
+ #undef P_GPR_1
+ 
+-#ifdef WITH_JIT_INLINING
++#ifdef WITH_JIT_INLINING_PHASE2
+ static void genValidationForPredictedInline(CompilationUnit *cUnit, MIR *mir)
+ {
+     CallsiteInfo *callsiteInfo = mir->meta.callsiteInfo;
+@@ -1002,7 +1002,7 @@ void handleExtendedMIR(CompilationUnit *cUnit, MIR *mir)
+         case kMirOpPunt: {
+             break;
+         }
+-#ifdef WITH_JIT_INLINING
++#ifdef WITH_JIT_INLINING_PHASE2
+         case kMirOpCheckInlinePrediction: { //handled in ncg_o1_data.c
+             genValidationForPredictedInline(cUnit, mir);
+             break;
+diff --git a/vm/compiler/codegen/x86/Lower.cpp b/vm/compiler/codegen/x86/Lower.cpp
+index d67a7eb..96a5d41 100644
+--- a/vm/compiler/codegen/x86/Lower.cpp
++++ b/vm/compiler/codegen/x86/Lower.cpp
+@@ -504,11 +504,28 @@ void endOfTrace(bool freeOnly) {
+ int lowerByteCode(const Method* method, const MIR * mir, const u2 * dalvikPC) {
+     /* offsetPC is used in O1 code generator, where it is defined as the sequence number
+        use a local version to avoid overwriting */
+-    int offsetPC = mir->offset;
++    int offsetPC = mir->offset; //! \warning When doing method inlining, offsetPC
++                                //! will be the same for the invoke and the inlined
++                                //! bytecode. This WILL break mapping from BC to NCG
++                                //! if more than one bytecode is inlined.
+ 
+-    if(dump_x86_inst)
+-        LOGI("LOWER bytecode %x at offsetPC %x offsetNCG %x @%p\n",
+-             mir->dalvikInsn.opcode, offsetPC, stream - streamMethodStart, stream);
++    if (dump_x86_inst) {
++        char * decodedString = dvmCompilerGetDalvikDisassembly(&mir->dalvikInsn,
++                NULL);
++        const char * note;
++        if (mir->OptimizationFlags & MIR_INLINED) {
++            note = " (no-op)";
++        } else if (mir->OptimizationFlags & MIR_INLINED_PRED) {
++            note = " (prediction inline)";
++        } else if (mir->OptimizationFlags & MIR_CALLEE) {
++            note = " (inlined)";
++        } else {
++            note = "";
++        }
++        LOGI("LOWER %s%s with offsetPC %x offsetNCG %x @%p\n",
++                decodedString, note, offsetPC, stream - streamMethodStart,
++                stream);
++    }
+ 
+     //update mapFromBCtoNCG
+     offsetNCG = stream - streamMethodStart;
+diff --git a/vm/compiler/codegen/x86/Lower.h b/vm/compiler/codegen/x86/Lower.h
+index 088d02a..9abbfe2 100644
+--- a/vm/compiler/codegen/x86/Lower.h
++++ b/vm/compiler/codegen/x86/Lower.h
+@@ -26,6 +26,7 @@
+ // comment out for phase 1 porting
+ #define PREDICTED_CHAINING
+ #define JIT_CHAIN
++#define WITH_JIT_INLINING
+ 
+ #define NCG_O1
+ //compilaton flags used by NCG O1
+diff --git a/vm/compiler/codegen/x86/LowerGetPut.cpp b/vm/compiler/codegen/x86/LowerGetPut.cpp
+index 14cea48..2b5cbdc 100644
+--- a/vm/compiler/codegen/x86/LowerGetPut.cpp
++++ b/vm/compiler/codegen/x86/LowerGetPut.cpp
+@@ -540,10 +540,11 @@ void markCard_filled(int tgtAddrReg, bool isTgtPhysical, int scratchReg, bool is
+  * @param vB object register
+  * @param isObj true iff mnemonic is object variant
+  * @param isVolatile iff mnemonic is volatile variant
++ * @param mir bytecode representation
+  * @return value >= 0 when handled
+  */
+ int iget_iput_common_nohelper(u2 referenceIndex, InstanceAccess flag, u2 vA,
+-        u2 vB, bool isObj, bool isVolatile) {
++        u2 vB, bool isObj, bool isVolatile, const MIR * mir) {
+ #if !defined(WITH_JIT)
+     ///////////////////////////////
+     scratchRegs[2] = PhysicalReg_Null; scratchRegs[3] = PhysicalReg_Null;
+@@ -564,10 +565,11 @@ int iget_iput_common_nohelper(u2 referenceIndex, InstanceAccess flag, u2 vA,
+     insertLabel(".iget_iput_resolved", true);
+ #else
+ #ifdef WITH_JIT_INLINING
+-    const Method *method = (mir->OptimizationFlags & MIR_CALLEE) ?
+-        mir->meta.calleeMethod : currentMethod;
+-    InstField *pInstField = (InstField *)
+-            method->clazz->pDvmDex->pResFields[referenceIndex];
++    const Method *method =
++            (mir->OptimizationFlags & MIR_CALLEE) ?
++                    mir->meta.calleeMethod : currentMethod;
++    InstField *pInstField =
++            (InstField *) method->clazz->pDvmDex->pResFields[referenceIndex];
+ #else
+     InstField *pInstField = (InstField *)
+             currentMethod->clazz->pDvmDex->pResFields[referenceIndex];
+@@ -676,7 +678,7 @@ int op_iget(const MIR * mir) {
+     u2 vB = mir->dalvikInsn.vB;
+     u2 referenceIndex = mir->dalvikInsn.vC;
+     int retval = iget_iput_common_nohelper(referenceIndex, IGET, vA, vB, false,
+-            false);
++            false, mir);
+     return retval;
+ }
+ 
+@@ -693,7 +695,7 @@ int op_iget_wide(const MIR * mir, bool isVolatile) {
+     u2 vB = mir->dalvikInsn.vB;
+     u2 referenceIndex = mir->dalvikInsn.vC;
+     int retval = iget_iput_common_nohelper(referenceIndex, IGET_WIDE, vA, vB,
+-            false, isVolatile);
++            false, isVolatile, mir);
+     return retval;
+ }
+ 
+@@ -710,7 +712,7 @@ int op_iget_object(const MIR * mir) {
+     u2 vB = mir->dalvikInsn.vB;
+     u2 referenceIndex = mir->dalvikInsn.vC;
+     int retval = iget_iput_common_nohelper(referenceIndex, IGET, vA, vB, true,
+-            false);
++            false, mir);
+     return retval;
+ }
+ 
+@@ -771,7 +773,7 @@ int op_iput(const MIR * mir) {
+     u2 vB = mir->dalvikInsn.vB;
+     u2 referenceIndex = mir->dalvikInsn.vC;
+     int retval = iget_iput_common_nohelper(referenceIndex, IPUT, vA, vB, false,
+-            false);
++            false, mir);
+     return retval;
+ }
+ 
+@@ -788,7 +790,7 @@ int op_iput_wide(const MIR * mir, bool isVolatile) {
+     u2 vB = mir->dalvikInsn.vB;
+     u2 referenceIndex = mir->dalvikInsn.vC;
+     int retval = iget_iput_common_nohelper(referenceIndex, IPUT_WIDE, vA, vB,
+-            false, isVolatile);
++            false, isVolatile, mir);
+     return retval;
+ }
+ 
+@@ -805,7 +807,7 @@ int op_iput_object(const MIR * mir) {
+     u2 vB = mir->dalvikInsn.vB;
+     u2 referenceIndex = mir->dalvikInsn.vC;
+     int retval = iget_iput_common_nohelper(referenceIndex, IPUT, vA, vB, true,
+-            false);
++            false, mir);
+     return retval;
+ }
+ 
+@@ -861,9 +863,11 @@ int op_iput_short(const MIR * mir) {
+  * @param referenceIndex static field index
+  * @param isObj true iff mnemonic is object variant
+  * @param isVolatile iff mnemonic is volatile variant
++ * @param mir bytecode representation
+  * @return value >= 0 when handled
+  */
+-int sget_sput_common(StaticAccess flag, u2 vA, u2 referenceIndex, bool isObj, bool isVolatile) {
++int sget_sput_common(StaticAccess flag, u2 vA, u2 referenceIndex, bool isObj,
++        bool isVolatile, const MIR * mir) {
+ #ifdef INC_NCG_O0
+     if(gDvm.helper_switch[5]) {
+         return sget_sput_common_helper(flag, vA, referenceIndex, isObj);
+@@ -892,9 +896,11 @@ int sget_sput_common(StaticAccess flag, u2 vA, u2 referenceIndex, bool isObj, bo
+         insertLabel(".sget_sput_resolved", true);
+ #else
+ #ifdef WITH_JIT_INLINING
+-        const Method *method = (mir->OptimizationFlags & MIR_CALLEE) ? mir->meta.calleeMethod : currentMethod;
+-        void *fieldPtr = (void*)
+-              (method->clazz->pDvmDex->pResFields[referenceIndex]);
++        const Method *method =
++                (mir->OptimizationFlags & MIR_CALLEE) ?
++                        mir->meta.calleeMethod : currentMethod;
++        void *fieldPtr =
++                (void*) (method->clazz->pDvmDex->pResFields[referenceIndex]);
+ #else
+         void *fieldPtr = (void*)
+               (currentMethod->clazz->pDvmDex->pResFields[referenceIndex]);
+@@ -982,7 +988,7 @@ int op_sget(const MIR * mir) {
+             || mir->dalvikInsn.opcode == OP_SGET_VOLATILE);
+     u2 vA = mir->dalvikInsn.vA;
+     u2 referenceIndex = mir->dalvikInsn.vB;
+-    int retval = sget_sput_common(SGET, vA, referenceIndex, false, false);
++    int retval = sget_sput_common(SGET, vA, referenceIndex, false, false, mir);
+     return retval;
+ }
+ 
+@@ -998,7 +1004,7 @@ int op_sget_wide(const MIR * mir, bool isVolatile) {
+     u2 vA = mir->dalvikInsn.vA;
+     u2 referenceIndex = mir->dalvikInsn.vB;
+     int retval = sget_sput_common(SGET_WIDE, vA, referenceIndex, false,
+-            isVolatile);
++            isVolatile, mir);
+     return retval;
+ }
+ 
+@@ -1070,7 +1076,7 @@ int op_sput(const MIR * mir, bool isObj) {
+             || mir->dalvikInsn.opcode == OP_SPUT_VOLATILE);
+     u2 vA = mir->dalvikInsn.vA;
+     u2 referenceIndex = mir->dalvikInsn.vB;
+-    int retval = sget_sput_common(SPUT, vA, referenceIndex, isObj, false);
++    int retval = sget_sput_common(SPUT, vA, referenceIndex, isObj, false, mir);
+     return retval;
+ }
+ 
+@@ -1086,7 +1092,7 @@ int op_sput_wide(const MIR * mir, bool isVolatile) {
+     u2 vA = mir->dalvikInsn.vA;
+     u2 referenceIndex = mir->dalvikInsn.vB;
+     int retval = sget_sput_common(SPUT_WIDE, vA, referenceIndex, false,
+-            isVolatile);
++            isVolatile, mir);
+     return retval;
+ }
+ 
+diff --git a/vm/compiler/codegen/x86/LowerInvoke.cpp b/vm/compiler/codegen/x86/LowerInvoke.cpp
+index 15414c7..c23ba20 100644
+--- a/vm/compiler/codegen/x86/LowerInvoke.cpp
++++ b/vm/compiler/codegen/x86/LowerInvoke.cpp
+@@ -57,7 +57,7 @@ void gen_predicted_chain(bool isRange, u2 tmp, int IMMC, bool isInterface,
+ #define PP_GPR_3 PhysicalReg_EAX
+ #define PP_GPR_4 PhysicalReg_EDX
+ 
+-#ifdef WITH_JIT_INLINING
++#ifdef WITH_JIT_INLINING_PHASE2
+ /*
+  * The function here takes care the
+  * branch over if prediction is correct and the misprediction target for misPredBranchOver.
+@@ -84,14 +84,14 @@ static void genLandingPadForMispredictedCallee(MIR* mir) {
+ //!
+ int common_invoke_virtual_nohelper(bool isRange, u2 tmp, u2 vD,
+         const DecodedInstruction &decodedInst) {
+-#ifdef WITH_JIT_INLINING
++#ifdef WITH_JIT_INLINING_PHASE2
+     /*
+      * If the invoke has non-null misPredBranchOver, we need to generate
+      * the non-inlined version of the invoke here to handle the
+      * mispredicted case.
+      */
+     if (mir->meta.callsiteInfo->misPredBranchOver) {
+-        genLandingPadForMispredictedCallee(); //cUnit, mir, bb, labelList);
++        genLandingPadForMispredictedCallee (mir);
+     }
+ #endif
+     scratchRegs[2] = PhysicalReg_Null; scratchRegs[3] = PhysicalReg_Null;
+@@ -347,14 +347,14 @@ int common_invoke_static(bool isRange, u2 tmp,
+ //! It will use helper function if the switch is on
+ int common_invoke_interface(bool isRange, u2 tmp, u2 vD,
+         const DecodedInstruction &decodedInst) {
+-#ifdef WITH_JIT_INLINING
++#ifdef WITH_JIT_INLINING_PHASE2
+     /*
+      * If the invoke has non-null misPredBranchOver, we need to generate
+      * the non-inlined version of the invoke here to handle the
+      * mispredicted case.
+      */
+     if (mir->meta.callsiteInfo->misPredBranchOver) {
+-        genLandingPadForMispredictedCallee(); //cUnit, mir, bb, labelList);
++        genLandingPadForMispredictedCallee (mir);
+     }
+ #endif
+     export_pc(); //use %edx
+@@ -412,7 +412,7 @@ int op_invoke_virtual(const MIR * mir) {
+ #ifdef WITH_JIT_INLINING
+     /* An invoke with the MIR_INLINED is effectively a no-op */
+     if (mir->OptimizationFlags & MIR_INLINED)
+-        return false;
++        return 0;
+ #endif
+     // A|G|op BBBB F|E|D|C
+     // C: the first argument, which is the "this" pointer
+@@ -437,7 +437,7 @@ int op_invoke_super(const MIR * mir) {
+ #ifdef WITH_JIT_INLINING
+     /* An invoke with the MIR_INLINED is effectively a no-op */
+     if (mir->OptimizationFlags & MIR_INLINED)
+-        return false;
++        return 0;
+ #endif
+     // A|G|op BBBB F|E|D|C
+     // C: the first argument, which is the "this" pointer
+@@ -458,7 +458,7 @@ int op_invoke_direct(const MIR * mir) {
+ #ifdef WITH_JIT_INLINING
+     /* An invoke with the MIR_INLINED is effectively a no-op */
+     if (mir->OptimizationFlags & MIR_INLINED)
+-        return false;
++        return 0;
+ #endif
+     // A|G|op BBBB F|E|D|C
+     // C: the first argument, which is the "this" pointer
+@@ -483,7 +483,7 @@ int op_invoke_static(const MIR * mir) {
+ #ifdef WITH_JIT_INLINING
+     /* An invoke with the MIR_INLINED is effectively a no-op */
+     if (mir->OptimizationFlags & MIR_INLINED)
+-        return false;
++        return 0;
+ #endif
+     // A|G|op BBBB F|E|D|C
+     // C: the first argument, which is the "this" pointer
+@@ -504,7 +504,7 @@ int op_invoke_interface(const MIR * mir) {
+ #ifdef WITH_JIT_INLINING
+     /* An invoke with the MIR_INLINED is effectively a no-op */
+     if (mir->OptimizationFlags & MIR_INLINED)
+-        return false;
++        return 0;
+ #endif
+     // A|G|op BBBB F|E|D|C
+     // C: the first argument, which is the "this" pointer
+@@ -529,7 +529,7 @@ int op_invoke_virtual_range(const MIR * mir) {
+ #ifdef WITH_JIT_INLINING
+     /* An invoke with the MIR_INLINED is effectively a no-op */
+     if (mir->OptimizationFlags & MIR_INLINED)
+-        return false;
++        return 0;
+ #endif
+     //AA|op BBBB CCCC
+     //CCCC: the first argument, which is the "this" pointer
+@@ -553,7 +553,7 @@ int op_invoke_super_range(const MIR * mir) {
+ #ifdef WITH_JIT_INLINING
+     /* An invoke with the MIR_INLINED is effectively a no-op */
+     if (mir->OptimizationFlags & MIR_INLINED)
+-        return false;
++        return 0;
+ #endif
+     u2 tmp = mir->dalvikInsn.vB; //BBBB, method index
+     int retval = common_invoke_super(true/*range*/, tmp, mir->dalvikInsn);
+@@ -570,7 +570,7 @@ int op_invoke_direct_range(const MIR * mir) {
+ #ifdef WITH_JIT_INLINING
+     /* An invoke with the MIR_INLINED is effectively a no-op */
+     if (mir->OptimizationFlags & MIR_INLINED)
+-        return false;
++        return 0;
+ #endif
+     u2 vD = mir->dalvikInsn.vC; /* Note: variable is still named vD because
+                                                of historical reasons. In reality, first
+@@ -590,7 +590,7 @@ int op_invoke_static_range(const MIR * mir) {
+ #ifdef WITH_JIT_INLINING
+     /* An invoke with the MIR_INLINED is effectively a no-op */
+     if (mir->OptimizationFlags & MIR_INLINED)
+-        return false;
++        return 0;
+ #endif
+     u2 tmp = mir->dalvikInsn.vB; //BBBB, method index
+     int retval = common_invoke_static(true/*range*/, tmp, mir->dalvikInsn);
+@@ -607,7 +607,7 @@ int op_invoke_interface_range(const MIR * mir) {
+ #ifdef WITH_JIT_INLINING
+     /* An invoke with the MIR_INLINED is effectively a no-op */
+     if (mir->OptimizationFlags & MIR_INLINED)
+-        return false;
++        return 0;
+ #endif
+     u2 vD = mir->dalvikInsn.vC; /* Note: variable is still named vD because
+                                                of historical reasons. In reality, first
+@@ -1364,17 +1364,14 @@ int op_execute_inline(const MIR * mir, bool isRange) {
+ //! It uses helper function if the switch is on
+ int common_invoke_virtual_quick(bool hasRange, u2 vD, u2 IMMC,
+         const DecodedInstruction &decodedInst) {
+-#ifdef WITH_JIT_INLINING
+-    /* An invoke with the MIR_INLINED is effectively a no-op */
+-    if (mir->OptimizationFlags & MIR_INLINED)
+-        return false;
++#ifdef WITH_JIT_INLINING_PHASE2
+     /*
+      * If the invoke has non-null misPredBranchOver, we need to generate
+      * the non-inlined version of the invoke here to handle the
+      * mispredicted case.
+      */
+     if (mir->meta.callsiteInfo->misPredBranchOver) {
+-        genLandingPadForMispredictedCallee(); //cUnit, mir, bb, labelList);
++        genLandingPadForMispredictedCallee (mir);
+     }
+ #endif
+     export_pc();
+@@ -1412,6 +1409,11 @@ int common_invoke_virtual_quick(bool hasRange, u2 vD, u2 IMMC,
+ //!
+ int op_invoke_virtual_quick(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_INVOKE_VIRTUAL_QUICK);
++#ifdef WITH_JIT_INLINING
++    /* An invoke with the MIR_INLINED is effectively a no-op */
++    if (mir->OptimizationFlags & MIR_INLINED)
++        return 0;
++#endif
+     u2 vD = mir->dalvikInsn.vC;
+     u2 IMMC = 4 * mir->dalvikInsn.vB;
+     int retval = common_invoke_virtual_quick(false, vD, IMMC, mir->dalvikInsn);
+@@ -1425,6 +1427,11 @@ int op_invoke_virtual_quick(const MIR * mir) {
+ //!
+ int op_invoke_virtual_quick_range(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_INVOKE_VIRTUAL_QUICK_RANGE);
++#ifdef WITH_JIT_INLINING
++    /* An invoke with the MIR_INLINED is effectively a no-op */
++    if (mir->OptimizationFlags & MIR_INLINED)
++        return 0;
++#endif
+     u2 vD = mir->dalvikInsn.vC;
+     u2 IMMC = 4 * mir->dalvikInsn.vB;
+     int retval = common_invoke_virtual_quick(true, vD, IMMC, mir->dalvikInsn);
+@@ -1469,6 +1476,11 @@ int common_invoke_super_quick(bool hasRange, u2 vD, u2 IMMC,
+ //!
+ int op_invoke_super_quick(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_INVOKE_SUPER_QUICK);
++#ifdef WITH_JIT_INLINING
++    /* An invoke with the MIR_INLINED is effectively a no-op */
++    if (mir->OptimizationFlags & MIR_INLINED)
++        return 0;
++#endif
+     u2 vD = mir->dalvikInsn.vC;
+     u2 IMMC = 4 * mir->dalvikInsn.vB;
+     int retval = common_invoke_super_quick(false, vD, IMMC, mir->dalvikInsn);
+@@ -1482,6 +1494,11 @@ int op_invoke_super_quick(const MIR * mir) {
+ //!
+ int op_invoke_super_quick_range(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_INVOKE_SUPER_QUICK_RANGE);
++#ifdef WITH_JIT_INLINING
++    /* An invoke with the MIR_INLINED is effectively a no-op */
++    if (mir->OptimizationFlags & MIR_INLINED)
++        return 0;
++#endif
+     u2 vD = mir->dalvikInsn.vC;
+     u2 IMMC = 4 * mir->dalvikInsn.vB;
+     int retval = common_invoke_super_quick(true, vD, IMMC, mir->dalvikInsn);
+-- 
+1.7.4.1
+

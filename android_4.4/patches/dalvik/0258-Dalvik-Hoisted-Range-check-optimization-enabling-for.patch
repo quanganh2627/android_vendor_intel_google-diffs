@@ -1,0 +1,1124 @@
+From b232600a33279f26cec600e5fabeb0bd4ad547ae Mon Sep 17 00:00:00 2001
+From: aleksey.v.ignatenko <avignate@lab-dyn-116-248.ins.intel.com>
+Date: Wed, 19 Jun 2013 16:36:02 +0700
+Subject: Dalvik: Hoisted Range check optimization enabling for the new loop framework
+
+BZ: 112145
+
+The new loop framework does not support hoisted range check since its introduction.
+This patch is a port of the hoisted range check logic to a new loop framework.
+It additionally includes enabling of dependent IV detection mechanism.
+The current optimization is limited with simple loops (no continue/break cases).
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I63c73b573dbcab2d63ac36243a073f861c376dc6
+Orig-MCG-Change-Id: I5b5c3b3ba9cf3efcc941ec0e2fd266d4cb4ea770
+Signed-off-by: aleksey.v.ignatenko <avignate@lab-dyn-116-248.ins.intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Reviewed-on: http://android.intel.com:8080/123668
+Reviewed-by: Popov, Ivan G <ivan.g.popov@intel.com>
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/Dataflow.cpp        |  100 ++++++
+ vm/compiler/Dataflow.h          |    1 +
+ vm/compiler/Loop.cpp            |  655 +++++++++++++++++++++++++++++++++++----
+ vm/compiler/Loop.h              |   14 +
+ vm/compiler/LoopInformation.cpp |   38 ++-
+ vm/compiler/LoopInformation.h   |   91 +++++-
+ vm/compiler/LoopOpt.cpp         |    2 +
+ vm/compiler/LoopOpt.h           |    8 +
+ 8 files changed, 840 insertions(+), 69 deletions(-)
+
+diff --git a/vm/compiler/Dataflow.cpp b/vm/compiler/Dataflow.cpp
+index 0dc0bcf..3fefe8f 100644
+--- a/vm/compiler/Dataflow.cpp
++++ b/vm/compiler/Dataflow.cpp
+@@ -2418,6 +2418,7 @@ bool detectAndInitializeBasicIV(CompilationUnit *cUnit,
+             ivInfo->c = 0;         // N/A to basic iv
+             ivInfo->inc = deltaValue;
+             dvmInsertGrowableList (&ivList, (intptr_t) ivInfo);
++            info->setSSABIV(candidate->ssaRep->defs[0]);
+ 
+             foundBasicIV = true;
+         }
+@@ -2482,6 +2483,105 @@ bool dvmCompilerFindInductionVariablesHelper(CompilationUnit *cUnit,
+             }
+         }
+     }
++
++    /* Find dependent induction variable now */
++    GrowableListIterator iterator;
++    dvmGrowableListIteratorInit(&cUnit->blockList, &iterator);
++    BasicBlock * bb;
++    for (bb = (BasicBlock *) (dvmGrowableListIteratorNext(&iterator));
++        bb != NULL;
++        bb = (BasicBlock *) (dvmGrowableListIteratorNext(&iterator)))
++    {
++        for (MIR* mir = bb->firstMIRInsn; mir; mir = mir->next)
++        {
++            int dfAttributes =
++                dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
++
++            if ((dfAttributes & DF_IS_LINEAR) == 0) {
++                continue;
++            }
++
++            /* Skip already identified induction variables */
++            if (info->isAnInductionVariable(cUnit, mir->ssaRep->defs[0], true) == true) {
++                continue;
++            }
++
++            /* dependent IVs have 1 or 2 uses dependent on add/sub bytecode used */
++            assert (mir->ssaRep->numUses == 1 || mir->ssaRep->numUses == 2);
++
++            /*
++             * For a dependent induction variable:
++             *  1) use[0] should be an induction variable (basic/dependent)
++             *  2) operand2 should be a constant
++             */
++
++            if (info->isAnInductionVariable(cUnit, mir->ssaRep->uses[0], true) == true)
++            {
++                int srcDalvikReg = dvmConvertSSARegToDalvik(cUnit,
++                                                            mir->ssaRep->uses[0]);
++                int dstDalvikReg = dvmConvertSSARegToDalvik(cUnit,
++                                                            mir->ssaRep->defs[0]);
++
++                bool cIsConstant = false;
++                int c = 0;
++
++                switch (mir->dalvikInsn.opcode) {
++                    case OP_ADD_INT:
++                        if (dvmIsBitSet(cUnit->isConstantV,
++                                        mir->ssaRep->uses[1])) {
++                            c = -(*cUnit->constantValues)[mir->ssaRep->uses[1]];
++                            cIsConstant = true;
++                        }
++                        break;
++                    case OP_SUB_INT:
++                        if (dvmIsBitSet(cUnit->isConstantV,
++                                        mir->ssaRep->uses[1])) {
++                            c = (*cUnit->constantValues)[mir->ssaRep->uses[1]];
++                            cIsConstant = true;
++                        }
++                        break;
++                    case OP_ADD_INT_LIT8:
++                        c = mir->dalvikInsn.vC;
++                        cIsConstant = true;
++                        break;
++                    default:
++                        break;
++                }
++
++                /* Ignore the update to the basic induction variable itself */
++                if (DECODE_REG(srcDalvikReg) == DECODE_REG(dstDalvikReg))  {
++                    info->setSSABIV(mir->ssaRep->defs[0]);
++                    continue;
++                }
++
++                if (cIsConstant == true) {
++                    unsigned int i;
++                    // in the new framework we don't use bit vector but liner scan on the ivList instead
++                    InductionVariableInfo *ivInfo = (InductionVariableInfo *)
++                        dvmCompilerNew(sizeof(InductionVariableInfo), false);
++                    InductionVariableInfo *ivInfoOld = NULL;
++
++                    for (i = 0; i < ivList.numUsed; i++) {
++                        ivInfoOld = (InductionVariableInfo *) ivList.elemList[i];
++                        if (ivInfoOld->ssaReg == mir->ssaRep->uses[0]) {
++                            break;
++                        }
++                    }
++
++                    /* Guaranteed to find an element */
++                    assert(i < ivList->numUsed);
++
++                    ivInfo->ssaReg = mir->ssaRep->defs[0];
++                    ivInfo->basicSSAReg = ivInfoOld->basicSSAReg;
++                    ivInfo->m = ivInfoOld->m;
++                    ivInfo->c = c + ivInfoOld->c;
++                    ivInfo->inc = ivInfoOld->inc;
++                    dvmInsertGrowableList(&ivList, (intptr_t) ivInfo);
++                }
++            }
++        }
++    }
++
+     return true;
+ }
+ 
+diff --git a/vm/compiler/Dataflow.h b/vm/compiler/Dataflow.h
+index 518c44e..ce5cc3f 100644
+--- a/vm/compiler/Dataflow.h
++++ b/vm/compiler/Dataflow.h
+@@ -176,6 +176,7 @@ typedef struct ArrayAccessInfo {
+     int ivReg;
+     int maxC;                   // For DIV - will affect upper bound checking
+     int minC;                   // For DIV - will affect lower bound checking
++    int inc;                    // For DIV - will affect bound checking
+ } ArrayAccessInfo;
+ 
+ #define ENCODE_REG_SUB(r,s)             ((s<<16) | r)
+diff --git a/vm/compiler/Loop.cpp b/vm/compiler/Loop.cpp
+index 324d052..b22e97b 100644
+--- a/vm/compiler/Loop.cpp
++++ b/vm/compiler/Loop.cpp
+@@ -344,6 +344,7 @@ static void updateRangeCheckInfo(CompilationUnit *cUnit, int arrayReg,
+                 arrayAccessInfo->arrayReg = arrayReg;
+                 arrayAccessInfo->maxC = (ivInfo->c > 0) ? ivInfo->c : 0;
+                 arrayAccessInfo->minC = (ivInfo->c < 0) ? ivInfo->c : 0;
++                arrayAccessInfo->inc = ivInfo->inc;
+                 dvmInsertGrowableList(loopAnalysis->arrayAccessInfo,
+                                       (intptr_t) arrayAccessInfo);
+             }
+@@ -467,6 +468,7 @@ static void genHoistedChecks(CompilationUnit *cUnit)
+         rangeCheckMIR->dalvikInsn.arg[0] = arrayAccessInfo->maxC;
+         rangeCheckMIR->dalvikInsn.arg[1] = arrayAccessInfo->minC;
+         rangeCheckMIR->dalvikInsn.arg[2] = loopAnalysis->loopBranchOpcode;
++        rangeCheckMIR->dalvikInsn.arg[3] = arrayAccessInfo->inc;
+         // set offset to the start offset of entry block
+         // this will set rPC in case of bail to interpreter
+         rangeCheckMIR->offset = entry->startOffset;
+@@ -538,7 +540,599 @@ static void genHoistedChecks(CompilationUnit *cUnit)
+         }
+     }
+ }
+-#endif
++
++#else //IA32
++
++/**
++ * @brief Used to flip the condition of an "if" bytecode
++ * @param opcode Dalvik opcode to negate
++ * @param negatedOpcode Updated by function to contain negated
++ * opcode. Only valid if function returns true.
++ * @return Returns true if successfully negated.
++ */
++static bool negateOpcode(Opcode opcode, Opcode & negatedOpcode)
++{
++    //Eagerly assume we will succeed
++    bool success = true;
++
++    switch (opcode) {
++        /* reg/reg cmp */
++        case OP_IF_EQ:
++            negatedOpcode = OP_IF_NE;
++            break;
++        case OP_IF_NE:
++            negatedOpcode = OP_IF_EQ;
++            break;
++        case OP_IF_LT:
++            negatedOpcode = OP_IF_GE;
++            break;
++        case OP_IF_GE:
++            negatedOpcode = OP_IF_LT;
++            break;
++        case OP_IF_GT:
++            negatedOpcode = OP_IF_LE;
++            break;
++        case OP_IF_LE:
++            negatedOpcode = OP_IF_GT;
++            break;
++        /* reg/zero cmp */
++        case OP_IF_EQZ:
++            negatedOpcode = OP_IF_NEZ;
++            break;
++        case OP_IF_NEZ:
++            negatedOpcode = OP_IF_EQZ;
++            break;
++        case OP_IF_LTZ:
++            negatedOpcode = OP_IF_GEZ;
++            break;
++        case OP_IF_GEZ:
++            negatedOpcode = OP_IF_LTZ;
++            break;
++        case OP_IF_GTZ:
++            negatedOpcode = OP_IF_LEZ;
++            break;
++        case OP_IF_LEZ:
++            negatedOpcode = OP_IF_GTZ;
++            break;
++        default:
++            success = false;
++            break;
++    }
++
++    return success;
++}
++
++/*
++ * A loop is considered optimizable if:
++ * 1) It has one basic induction variable.
++ * 2) The loop back branch compares the BIV with a constant.
++ * 3) We need to normalize the loop exit condition so that the loop is exited
++ *    via the taken path.
++ * 4) If it is a count-up loop, the condition is GE/GT. Otherwise it is
++ *    LE/LT/LEZ/LTZ for a count-down loop.
++*/
++
++/**
++  * @brief Checks if the loops is suitable for hoisting range/null checks
++  * @param cUnit the CompilationUnit
++  * @param pass the Pass
++  * @return false for loops that fail the above tests.
++  */
++static bool isSimpleCountedLoop(CompilationUnit *cUnit)
++{
++    unsigned int i;
++    BasicBlock *loopBackBlock = NULL;
++    LoopInformation *loopInfo = cUnit->loopInformation;
++    GrowableList* ivList = &cUnit->loopInformation->getInductionVariableList ();
++
++    /* This either counted up or down loop, 2 BIVs could bring complication
++       to detect that. Potentially we can enhance the algorithm to utilize > 1
++       BIV in case inc for all BIVs > 0 ( or < 0)
++    */
++    if (loopInfo->getNumBasicIV(cUnit) != 1) {
++        return false;
++    }
++
++    for (i = 0; i < ivList->numUsed; i++) {
++        InductionVariableInfo *ivInfo;
++
++        ivInfo = GET_ELEM_N(ivList, InductionVariableInfo*, i);
++        /* Count up or down loop? */
++        if (ivInfo->ssaReg == ivInfo->basicSSAReg) {
++            /* Infinite loop */
++            if (ivInfo->inc == 0) {
++                return false;
++            }
++            loopInfo->setCountUpLoop(ivInfo->inc > 0);
++            break;
++        }
++    }
++
++    // Get Back branch bb, need to find loop exit condition
++    // the main hypotethis is that Back branch bb is a
++    // predecessor of a loop exit bb.
++
++    BasicBlock *bb = NULL;
++    BitVectorIterator bvIterator;
++    BitVector *exitbbs = const_cast<BitVector *> (loopInfo->getExitLoops());
++    int nexitbbs = dvmCountSetBits(exitbbs);
++
++    // We limit the optimization to cases where just 1 exit bb
++    // due to unpredictable behaviour in other cases
++    if (nexitbbs != 1) {
++        return false;
++    }
++
++    /* Get loopBack branch bb */
++
++    // 1. Get exit bb
++    dvmBitVectorIteratorInit (exitbbs, &bvIterator);
++    int bIdx = dvmBitVectorIteratorNext (&bvIterator);
++    assert (bIdx != -1);
++    bb = (BasicBlock *) dvmGrowableListGetElement(&cUnit->blockList, bIdx);
++    if (bb == NULL) {
++        return false;
++    }
++
++    // 2. Get loop exit bb predecessor
++    dvmBitVectorIteratorInit(bb->predecessors, &bvIterator);
++    bIdx = dvmBitVectorIteratorNext(&bvIterator);
++    assert (bIdx != -1);
++
++    // 3. Finally get loopBack branch bb
++    loopBackBlock = (BasicBlock*) (dvmGrowableListGetElement(&cUnit->blockList, bIdx));
++    // paranoid, didn't find loopBack bb
++    if (loopBackBlock == NULL) {
++        return false;
++    }
++
++    // Find exit block which contains loop exit condition
++    MIR *branch = loopBackBlock->lastMIRInsn;
++    if (branch == NULL) {
++        return false;
++    }
++
++    Opcode op = branch->dalvikInsn.opcode;
++    Opcode opcode = op;
++
++    // Paranoid: Check this is not extendent MIR because
++    // dexGetFlagsFromOpcode call is not safe then
++    if (opcode >= kNumPackedOpcodes) {
++        return false;
++    }
++    /* Last instruction is not a conditional branch - bail */
++    if (dexGetFlagsFromOpcode(opcode) != (kInstrCanContinue|kInstrCanBranch)) {
++        return false;
++    }
++
++    int endSSAReg;
++    int endDalvikReg;
++
++    /* Detect end condition register
++       As soon as we found loop back branch we can
++       get the condition and a loop limit from it
++    */
++    if (branch->ssaRep->numUses == 2)
++    {
++        if (branch->ssaRep->uses[0] == loopInfo->getSSABIV()) {
++            endSSAReg = branch->ssaRep->uses[1];
++        } else if (branch->ssaRep->uses[1] == loopInfo->getSSABIV()) {
++            endSSAReg = branch->ssaRep->uses[0];
++            negateOpcode(op, opcode);
++        } else {
++            return false;
++        }
++        endDalvikReg = dvmConvertSSARegToDalvik(cUnit, endSSAReg);
++        /*
++         * If the comparison is not between the BIV and a loop invariant,
++         * return false. endDalvikReg is loop invariant if one of the
++         * following is true:
++         * - It is not defined in the loop (ie DECODE_SUB returns 0)
++         * - It is reloaded with a constant
++         */
++        if ((DECODE_SUB(endDalvikReg) != 0) &&
++            dvmIsBitSet(cUnit->isConstantV, endSSAReg) == false) {
++            return false;
++        }
++    } else {
++        return false;
++    }
++
++    if (loopInfo->isCountUpLoop() == true) {
++        /*
++         * If the normalized condition op is not > or >=, this is not an
++         * optimization candidate.
++         */
++        switch (opcode) {
++            case OP_IF_GT:
++            case OP_IF_GE:
++                break;
++            default:
++                return false;
++        }
++        loopInfo->setEndConditionReg(DECODE_REG(endDalvikReg));
++    } else  {
++        /*
++         * If the normalized condition op is not < or <=, this is not an
++         * optimization candidate.
++         */
++        switch (opcode) {
++            case OP_IF_LT:
++            case OP_IF_LE:
++                loopInfo->setEndConditionReg(DECODE_REG(endDalvikReg));
++                break;
++            case OP_IF_LTZ:
++            case OP_IF_LEZ:
++                break;
++            default:
++                return false;
++        }
++    }
++
++    /*
++     * Remember the normalized opcode, which will be used to determine the end
++     * value used for the yanked range checks.
++     */
++    loopInfo->setLoopBranchOpcode(opcode);
++
++    return true;
++}
++
++
++/**
++  * @brief Record the upper and lower bound information for range checks for each IV
++  * @param cUnit the CompilationUnit
++  * @param arrayReg the array register
++  * @param idxReg the array index register
++  */
++// If array A is accessed by index "i+5", the upper and
++// lower bound will be len(A)-5 and -5, respectively.
++
++static void updateRangeCheckInfo(CompilationUnit *cUnit, int arrayReg,
++                                 int idxReg)
++{
++    InductionVariableInfo *ivInfo;
++    //Get the IV list
++    GrowableList* ivList = &cUnit->loopInformation->getInductionVariableList ();
++    LoopInformation *loopInfo = cUnit->loopInformation;
++    assert (loopInfo != NULL);
++    unsigned int i, j;
++
++    // when the tested idxReg is found to be an IV this is an array access point.
++    // As soon as such point is found we create array access info or update existing one.
++    // The update means identification of maxC and minC which are the min/max of the same index.
++    // E.g. A[i], A[i+1], ..., A[i+N] will result in maxC = N. It will be used to aggregate
++    // several range checks into a single hoisted one.
++    for (i = 0; i < ivList->numUsed; i++) {
++        ivInfo = GET_ELEM_N(ivList, InductionVariableInfo*, i);
++        if (ivInfo->ssaReg == idxReg) {
++            ArrayAccessInfo *arrayAccessInfo = NULL;
++            for (j = 0; j < loopInfo->getArrayAccessInfo()->numUsed; j++) {
++                ArrayAccessInfo *existingArrayAccessInfo =
++                    GET_ELEM_N(loopInfo->getArrayAccessInfo(),
++                               ArrayAccessInfo*,
++                               j);
++                if (existingArrayAccessInfo->arrayReg == arrayReg) {
++                    if (ivInfo->c > existingArrayAccessInfo->maxC) {
++                        existingArrayAccessInfo->maxC = ivInfo->c;
++                    }
++                    if (ivInfo->c < existingArrayAccessInfo->minC) {
++                        existingArrayAccessInfo->minC = ivInfo->c;
++                    }
++                    arrayAccessInfo = existingArrayAccessInfo;
++                    break;
++                }
++            }
++            if (arrayAccessInfo == NULL) {
++                arrayAccessInfo =
++                    (ArrayAccessInfo *)dvmCompilerNew(sizeof(ArrayAccessInfo),
++                                                      false);
++                arrayAccessInfo->ivReg = ivInfo->basicSSAReg;
++                arrayAccessInfo->arrayReg = arrayReg;
++                arrayAccessInfo->maxC = (ivInfo->c > 0) ? ivInfo->c : 0;
++                arrayAccessInfo->minC = (ivInfo->c < 0) ? ivInfo->c : 0;
++                arrayAccessInfo->inc = ivInfo->inc;
++                dvmInsertGrowableList(cUnit->loopInformation->getArrayAccessInfo(),
++                                      (intptr_t) arrayAccessInfo);
++            }
++            break;
++        }
++    }
++}
++
++/* Returns true if the loop body cannot throw any exceptions */
++void dvmCompilerBodyCodeMotion (CompilationUnit *cUnit, Pass *currentPass)
++{
++    //Get the BasicBlock vector for this loop
++    BitVector *blocks = const_cast<BitVector *> (cUnit->loopInformation->getBasicBlocks ());
++    BasicBlock *loopBody = NULL;
++    MIR *mir;
++    //Iterate through basic blocks
++    BitVectorIterator bvIterator;
++    dvmBitVectorIteratorInit (blocks, &bvIterator);
++    while (true)
++    {
++        //Get block index
++        int blockIdx = dvmBitVectorIteratorNext (&bvIterator);
++        //If done, bail
++        if (blockIdx == -1)
++        {
++            break;
++        }
++        BasicBlock *loopBody = (BasicBlock*) (dvmGrowableListGetElement(&cUnit->blockList, blockIdx));
++        //Paranoid
++        if (loopBody == 0)
++        {
++            break;
++        }
++
++        for (mir = loopBody->firstMIRInsn; mir; mir = mir->next) {
++            DecodedInstruction *dInsn = &mir->dalvikInsn;
++            int dfAttributes =
++                dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
++
++            /* Skip extended MIR instructions */
++            if (dInsn->opcode >= kNumPackedOpcodes) {
++                continue;
++            }
++
++            int instrFlags = dexGetFlagsFromOpcode(dInsn->opcode);
++
++            /* Instruction is clean */
++            if ((instrFlags & kInstrCanThrow) == 0) {
++                continue;
++            }
++
++            /*
++             * Currently we can only optimize away null and range checks.
++             */
++            if ((dfAttributes & DF_HAS_NR_CHECKS) == 0) {
++                continue;
++            }
++
++            /*
++             * This comparison is redundant now, but we will have more than one
++             * group of flags to check soon.
++             */
++            if (dfAttributes & DF_HAS_NR_CHECKS) {
++                /*
++                 * Check if the null check is applied on a loop invariant register?
++                 * If the register's SSA id is less than the number of Dalvik
++                 * registers, then it is loop invariant.
++                 */
++                int refIdx;
++                switch (dfAttributes & DF_HAS_NR_CHECKS) {
++                    case DF_NULL_N_RANGE_CHECK_0:
++                        refIdx = 0;
++                        break;
++                    case DF_NULL_N_RANGE_CHECK_1:
++                        refIdx = 1;
++                        break;
++                    case DF_NULL_N_RANGE_CHECK_2:
++                        refIdx = 2;
++                        break;
++                    default:
++                        refIdx = 0;
++                        ALOGE("Jit: bad case in dvmCompilerBodyCodeMotion");
++                        // bail - should not reach here
++                        dvmCompilerAbort(cUnit);
++                        return;
++                }
++
++                int useIdx = refIdx + 1;
++                int subNRegArray =
++                    dvmConvertSSARegToDalvik(cUnit, mir->ssaRep->uses[refIdx]);
++                int arraySub = DECODE_SUB(subNRegArray);
++
++                /*
++                 * If the register is never updated in the loop (ie subscript == 0),
++                 * it is an optimization candidate.
++                 */
++                if (arraySub != 0) {
++                    continue;
++                }
++
++                /*
++                 * Then check if the range check can be hoisted out of the loop if
++                 * it is basic or dependent induction variable.
++                 */
++                if (cUnit->loopInformation->isAnInductionVariable(cUnit, mir->ssaRep->uses[useIdx], true)) {
++                    mir->OptimizationFlags |=
++                        MIR_IGNORE_RANGE_CHECK | MIR_IGNORE_NULL_CHECK;
++                    updateRangeCheckInfo(cUnit, mir->ssaRep->uses[refIdx],
++                                     mir->ssaRep->uses[useIdx]);
++                }
++            }
++        }
++    }
++
++    //Unused argument
++    (void) currentPass;
++}
++
++bool dvmCompilerHoistedChecksGate(const CompilationUnit* cUnit, const Pass* pass)
++{
++    if (cUnit->loopInformation != NULL && isSimpleCountedLoop((CompilationUnit*)cUnit)) {
++        return true;
++    }
++
++    //Unused argument
++    (void) pass;
++
++    return false;
++}
++
++/**
++  * @brief Dump hoisted checks debugging info
++  * @param cUnit is the CompilationUnit
++  */
++static void dvmDumpHoistedRangeCheckInfo(CompilationUnit* cUnit)
++{
++    LoopInformation* loopInfo = cUnit->loopInformation;
++    InductionVariableInfo *ivInfo;
++    //Get the IV list
++    GrowableList* ivList = &loopInfo->getInductionVariableList ();
++    unsigned int i;
++
++    /* dump IV info */
++    ALOGE("BASIC_IV_NUMBER_INFO: number of basic IV: %d", loopInfo->getNumBasicIV(cUnit));
++    for (i = 0; i < ivList->numUsed; i++) {
++        ivInfo = GET_ELEM_N(ivList, InductionVariableInfo*, i);
++        if (ivInfo->ssaReg == ivInfo->basicSSAReg) {
++            /* Basic IV */
++            ALOGE("BASIC_IV_INFO: ssaReg: %d, basicSSAReg: %d, inc: %d, VR: %d_%dn", ivInfo->ssaReg, ivInfo->basicSSAReg, ivInfo->inc,
++                               dvmExtractSSARegister (cUnit, ivInfo->ssaReg), dvmExtractSSASubscript (cUnit, ivInfo->ssaReg));
++        } else {
++            /* Dependent IV */
++            ALOGE("DEPENDENT_IV_INFO: ssaReg: %d, depSSAReg: %d, inc: %d, VR: %d_%d c=%d\n", ivInfo->ssaReg, ivInfo->basicSSAReg, ivInfo->inc,
++                               dvmExtractSSARegister (cUnit, ivInfo->ssaReg), dvmExtractSSASubscript (cUnit, ivInfo->ssaReg), ivInfo->c);
++        }
++    }
++
++    /* dump array access info */
++    for (i = 0; i < loopInfo->getArrayAccessInfo()->numUsed; i++) {
++        ArrayAccessInfo *arrayAccessInfo =
++            GET_ELEM_N(loopInfo->getArrayAccessInfo(),
++                       ArrayAccessInfo*, i);
++        ALOGE("ARRAYACCESS_INFO: arrayReg: %d, idxReg: %d, endConditionReg: %d, maxC: %d, minC: %d, inc: %d",
++                     arrayAccessInfo->arrayReg, arrayAccessInfo->ivReg, loopInfo->getEndConditionReg(),
++                         arrayAccessInfo->maxC, arrayAccessInfo->minC, arrayAccessInfo->inc);
++    }
++}
++
++
++// The main purpose of the function is to transform internal array access info into
++// hoisted checks extended MIRs at start of a loop which will be transformed to
++// assembly using special algorithm and data from hoisted checks MIR's
++// Terms: e.g. for (int i=0; i<=100; i+=2) {A[i]...}
++// A - array, i - index, end condition reg - 100 (reg), inc - 2(i+=2)
++// For loop body like {A[i-1] ...  a[i+N]} maxC = N, minC = -1
++// loopbranch opcode - >/>=/</<=, counted up/down cycle - ?inc >0 or <0
++void dvmCompilerGenHoistedChecks(CompilationUnit *cUnit, Pass* pass)
++{
++    unsigned int i;
++    if (cUnit->loopInformation == NULL) {
++        return;
++    }
++
++    BasicBlock *entry = cUnit->entryBlock;
++    LoopInformation* loopInfo = cUnit->loopInformation;
++    int globalMaxC = 0;
++    int globalMinC = 0;
++    /* Should be loop invariant */
++    int idxReg = 0;
++
++    // Go through array access elements and generate range checks
++    // Range check in the current implemntation is the upper border of the loop
++    // E.g. for count down loops it is lowest index
++    // Lower border check of a loop is done using Bound checks below
++    for (i = 0; i < loopInfo->getArrayAccessInfo()->numUsed; i++) {
++        ArrayAccessInfo *arrayAccessInfo =
++            GET_ELEM_N(loopInfo->getArrayAccessInfo(),
++                       ArrayAccessInfo*, i);
++        // get reg containing array ref
++        int arrayReg = DECODE_REG(
++            dvmConvertSSARegToDalvik(cUnit, arrayAccessInfo->arrayReg));
++        // get reg containing index
++        idxReg = DECODE_REG(
++            dvmConvertSSARegToDalvik(cUnit, arrayAccessInfo->ivReg));
++
++        // create new mir using the array access info
++        // see genHoistedChecks* to check with the hoisted check algorithm
++        MIR *rangeCheckMIR = dvmCompilerNewMIR ();
++        rangeCheckMIR->dalvikInsn.opcode = (loopInfo->isCountUpLoop()) ?
++            (Opcode)kMirOpNullNRangeUpCheck : (Opcode)kMirOpNullNRangeDownCheck;
++        rangeCheckMIR->dalvikInsn.vA = arrayReg;
++        rangeCheckMIR->dalvikInsn.vB = idxReg;
++        rangeCheckMIR->dalvikInsn.vC = loopInfo->getEndConditionReg();
++        rangeCheckMIR->dalvikInsn.arg[0] = arrayAccessInfo->maxC;
++        rangeCheckMIR->dalvikInsn.arg[1] = arrayAccessInfo->minC;
++        rangeCheckMIR->dalvikInsn.arg[2] = loopInfo->getLoopBranchOpcode();
++        rangeCheckMIR->dalvikInsn.arg[3] = arrayAccessInfo->inc;
++
++        // set offset to the start offset of entry block
++        // this will set rPC in case of bail to interpreter
++        rangeCheckMIR->offset = entry->startOffset;
++        dvmCompilerAppendMIR(entry, rangeCheckMIR);
++        // To do bound check we need to know globalMaxC/globalMinC value
++        // as soon as we're limited with just one BIV globalMaxC will contain
++        // the max/min index change inside a loop body
++        if (arrayAccessInfo->maxC > globalMaxC) {
++            globalMaxC = arrayAccessInfo->maxC;
++        }
++        if (arrayAccessInfo->minC < globalMinC) {
++            globalMinC = arrayAccessInfo->minC;
++        }
++    }
++
++    // Insert Bound check (lower loop border check)
++    // See the bound check algorithm in GenHoistedBoundCheck function
++    // Bound check values should be adjusted to meet loop branch condition
++    if (loopInfo->getArrayAccessInfo()->numUsed != 0) {
++        if (loopInfo->isCountUpLoop()) {
++            MIR *boundCheckMIR = (MIR *)dvmCompilerNew(sizeof(MIR), true);
++            boundCheckMIR->dalvikInsn.opcode = (Opcode)kMirOpLowerBound;
++            boundCheckMIR->dalvikInsn.vA = idxReg;
++            boundCheckMIR->dalvikInsn.vB = globalMinC;
++            // set offset to the start offset of entry block
++            // this will set rPC in case of bail to interpreter
++            boundCheckMIR->offset = entry->startOffset;
++            dvmCompilerAppendMIR(entry, boundCheckMIR);
++     } else {
++            if (loopInfo->getLoopBranchOpcode() == OP_IF_LT ||
++                loopInfo->getLoopBranchOpcode() == OP_IF_LE) {
++                MIR *boundCheckMIR = (MIR *)dvmCompilerNew(sizeof(MIR), true);
++                boundCheckMIR->dalvikInsn.opcode = (Opcode)kMirOpLowerBound;
++                boundCheckMIR->dalvikInsn.vA = loopInfo->getEndConditionReg();
++                boundCheckMIR->dalvikInsn.vB = globalMinC;
++                // set offset to the start offset of entry block
++                // this will set rPC in case of bail to interpreter
++                boundCheckMIR->offset = entry->startOffset;
++                /*
++                 * If the end condition is ">" in the source, the check in the
++                 * Dalvik bytecode is OP_IF_LE. In this case add 1 back to the
++                 * constant field to reflect the fact that the smallest index
++                 * value is "endValue + constant + 1".
++                 */
++                if (loopInfo->getLoopBranchOpcode() == OP_IF_LE) {
++                    boundCheckMIR->dalvikInsn.vB++;
++             }
++                dvmCompilerAppendMIR(entry, boundCheckMIR);
++            } else if (loopInfo->getLoopBranchOpcode() == OP_IF_LTZ) {
++                /* Array index will fall below 0 */
++                if (globalMinC < 0) {
++                    MIR *boundCheckMIR = (MIR *)dvmCompilerNew(sizeof(MIR),
++                                                               true);
++                    boundCheckMIR->dalvikInsn.opcode = (Opcode)kMirOpPunt;
++                    // set offset to the start offset of entry block
++                    // this will set rPC in case of bail to interpreter
++                    boundCheckMIR->offset = entry->startOffset;
++                    dvmCompilerAppendMIR(entry, boundCheckMIR);
++                }
++            } else if (loopInfo->getLoopBranchOpcode() == OP_IF_LEZ) {
++                /* Array index will fall below 0 */
++                if (globalMinC < -1) {
++                    MIR *boundCheckMIR = (MIR *)dvmCompilerNew(sizeof(MIR),
++                                                               true);
++                    boundCheckMIR->dalvikInsn.opcode = (Opcode)kMirOpPunt;
++                    // set offset to the start offset of entry block
++                    // this will set rPC in case of bail to interpreter
++                    boundCheckMIR->offset = entry->startOffset;
++                    dvmCompilerAppendMIR(entry, boundCheckMIR);
++                }
++            } else {
++                ALOGE("Jit: bad case in genHoistedChecks");
++                dvmCompilerAbort(cUnit);
++            }
++        }
++    }
++
++    DEBUG_LOOP(dvmDumpHoistedRangeCheckInfo(cUnit);)
++
++    (void) pass;
++}
++
++#endif //IA32
+ 
+ void resetBlockEdges(BasicBlock *bb)
+ {
+@@ -1666,65 +2260,6 @@ void dvmCompilerLoopMarkOffNonHeaderBlocks (CompilationUnit *cUnit)
+ }
+ 
+ /**
+- * @brief Used to flip the condition of an "if" bytecode
+- * @param opcode Dalvik opcode to negate
+- * @param negatedOpcode Updated by function to contain negated
+- * opcode. Only valid if function returns true.
+- * @return Returns true if successfully negated.
+- */
+-static bool negateOpcode(Opcode opcode, Opcode & negatedOpcode)
+-{
+-    //Eagerly assume we will succeed
+-    bool success = true;
+-
+-    switch (opcode) {
+-        /* reg/reg cmp */
+-        case OP_IF_EQ:
+-            negatedOpcode = OP_IF_NE;
+-            break;
+-        case OP_IF_NE:
+-            negatedOpcode = OP_IF_EQ;
+-            break;
+-        case OP_IF_LT:
+-            negatedOpcode = OP_IF_GE;
+-            break;
+-        case OP_IF_GE:
+-            negatedOpcode = OP_IF_LT;
+-            break;
+-        case OP_IF_GT:
+-            negatedOpcode = OP_IF_LE;
+-            break;
+-        case OP_IF_LE:
+-            negatedOpcode = OP_IF_GT;
+-            break;
+-        /* reg/zero cmp */
+-        case OP_IF_EQZ:
+-            negatedOpcode = OP_IF_NEZ;
+-            break;
+-        case OP_IF_NEZ:
+-            negatedOpcode = OP_IF_EQZ;
+-            break;
+-        case OP_IF_LTZ:
+-            negatedOpcode = OP_IF_GEZ;
+-            break;
+-        case OP_IF_GEZ:
+-            negatedOpcode = OP_IF_LTZ;
+-            break;
+-        case OP_IF_GTZ:
+-            negatedOpcode = OP_IF_LEZ;
+-            break;
+-        case OP_IF_LEZ:
+-            negatedOpcode = OP_IF_GTZ;
+-            break;
+-        default:
+-            success = false;
+-            break;
+-    }
+-
+-    return success;
+-}
+-
+-/**
+  * @brief Looks through backward's predecessors and inserts a new block in
+  * between. It also ensures that new block is the taken branch and flips
+  * condition in bytecode if needed.
+diff --git a/vm/compiler/Loop.h b/vm/compiler/Loop.h
+index f5e2ada..13d3929 100644
+--- a/vm/compiler/Loop.h
++++ b/vm/compiler/Loop.h
+@@ -91,6 +91,20 @@ void dvmCompilerDumpConstants (CompilationUnit *cUnit);
+  * @param cUnit the CompilationUnit
+  */
+ void dvmCompilerDumpHoistedChecks (CompilationUnit *cUnit);
++
++/**
++ * @brief do the body code motion including hoisting of checks
++ * @param cUnit the CompilationUnit
++ */
++void dvmCompilerBodyCodeMotion (CompilationUnit *cUnit, Pass *currentPass);
++
++/**
++ * @brief generate hoisted range and NULL checks
++ * @param cUnit the CompilationUnit
++ * @param pass the Compilation pass
++ */
++void dvmCompilerGenHoistedChecks(CompilationUnit *cUnit, Pass* pass);
++
+ #endif
+ 
+ /**
+diff --git a/vm/compiler/LoopInformation.cpp b/vm/compiler/LoopInformation.cpp
+index 3753684..6a34774 100644
+--- a/vm/compiler/LoopInformation.cpp
++++ b/vm/compiler/LoopInformation.cpp
+@@ -400,6 +400,9 @@ void LoopInformation::init (void)
+     preHeader = 0;
+     scratchRegisters = 0;
+     peeledBlocks = 0;
++    countUpLoop = false;
++    ssaBIV = NULL;
++    endConditionReg = -1; // -1 for validation reasons
+ 
+     if (interIterationVariables == 0)
+     {
+@@ -412,7 +415,8 @@ void LoopInformation::init (void)
+ 
+     // Initialize growable lists
+     dvmInitGrowableList (&inductionVariableList, 1);
+-
++    arrayAccessInfo = (GrowableList *)dvmCompilerNew(sizeof(GrowableList), true);
++    dvmInitGrowableList (arrayAccessInfo, 4);
+ 
+     //Initialize the BitVectors:
+     exitLoop = dvmCompilerAllocBitVector (1, true);
+@@ -695,7 +699,7 @@ bool LoopInformation::executedPerIteration (const CompilationUnit *cUnit, const
+     return executedPerIteration (cUnit, current);
+ }
+ 
+-bool LoopInformation::isAnInductionVariable (CompilationUnit *cUnit, unsigned int vr)
++bool LoopInformation::isAnInductionVariable (CompilationUnit *cUnit, unsigned int reg, bool isSSA)
+ {
+     //Go through the induction variable list
+     GrowableListIterator iterator;
+@@ -715,9 +719,14 @@ bool LoopInformation::isAnInductionVariable (CompilationUnit *cUnit, unsigned in
+         int ssaReg = info->ssaReg;
+ 
+         //Is it a match?
+-        if (dvmExtractSSARegister (cUnit, ssaReg) == vr)
+-        {
+-            return true;
++        if (isSSA == false) {
++            if (dvmExtractSSARegister (cUnit, ssaReg) == reg) {
++                return true;
++            }
++        } else {
++            if (ssaReg == reg) {
++                return true;
++            }
+         }
+     }
+ 
+@@ -1068,6 +1077,25 @@ bool LoopInformation::hasFreeScratchRegisters (CompilationUnit *cUnit, unsigned
+     return (currentlyUsing + howMany <= max);
+ }
+ 
++/* Get number of basic IVs */
++int LoopInformation::getNumBasicIV(CompilationUnit* cUnit) const
++{
++    LoopInformation* loopInfo = cUnit->loopInformation;
++    InductionVariableInfo *ivInfo;
++    //Get the IV list
++    GrowableList* ivList = &loopInfo->getInductionVariableList ();
++    unsigned int i;
++    unsigned int number = 0;
++    for (i = 0; i < ivList->numUsed; i++) {
++        ivInfo = GET_ELEM_N(ivList, InductionVariableInfo*, i);
++        if (ivInfo->ssaReg == ivInfo->basicSSAReg) {
++            number++;
++        }
++    }
++
++    return number;
++}
++
+ //Sink a vector of instructions
+ void LoopInformation::sinkInstructions (CompilationUnit *cUnit, std::vector<MIR *> &insns) const
+ {
+diff --git a/vm/compiler/LoopInformation.h b/vm/compiler/LoopInformation.h
+index 0cbfeef..98ec08f 100644
+--- a/vm/compiler/LoopInformation.h
++++ b/vm/compiler/LoopInformation.h
+@@ -74,12 +74,27 @@ class LoopInformation
+         /** @brief List of Induction Variables */
+         GrowableList inductionVariableList;
+ 
++        /** @brief Hoisted Checks for Array Accesses */
++        GrowableList *arrayAccessInfo;
++
++        /** @brief count up or down loop flag */
++        bool countUpLoop;
++
++        /** @brief OP_IF_XXX for the loop back branch */
++        Opcode loopBranchOpcode;
++
+         /** @brief Variants registers of the loop */
+         BitVector *variants;
+ 
+         /** @brief Does the loop contain invariant instructions? */
+         bool containsInvariantInstructions;
+ 
++        /** @brief basic IV in SSA name */
++        int ssaBIV;
++
++        /** @brief vB in "vA op vB" */
++        int endConditionReg;
++
+         /**
+          * @brief Fill the basicBlock vector with the BasicBlocks composing the loop
+          * @param current the current BasicBlock
+@@ -169,6 +184,11 @@ class LoopInformation
+         BasicBlock *getEntryBlock (void) const {return entry;}
+ 
+         /**
++         * @brief Get array access info
++         * @return the ArrayAcessInfo
++         */
++        GrowableList *getArrayAccessInfo (void) {return arrayAccessInfo;}
++        /**
+          * @brief Set entry block
+          * @param bb the entry block
+          */
+@@ -281,12 +301,13 @@ class LoopInformation
+          bool executedPerIteration (const CompilationUnit *cUnit, const BasicBlock *bb) const;
+ 
+          /**
+-          * @brief Is a VR an induction variable for the loop?
++          * @brief Is a register an induction variable for the loop?
+           * @param cUnit the CompilationUnit
+-          * @param vr the VR we are curious about
+-          * @return whether vr is an induction variable
++          * @param reg the register we are curious about
++          * @param isSSA if the reg is SSA or Virtual register
++          * @return whether reg is an induction variable
+           */
+-         bool isAnInductionVariable (CompilationUnit *cUnit, unsigned int vr);
++         bool isAnInductionVariable (CompilationUnit *cUnit, unsigned int reg, bool isSSA = false);
+ 
+          /**
+           * @brief Get the Phi node defining a given SSA register
+@@ -445,6 +466,68 @@ class LoopInformation
+           * @return false to stop iteration
+           */
+          bool iterate (bool (*func) (LoopInformation *, void *), void *data = 0);
++
++         /**
++          * @brief Checks if the loops is suitable for hoisting range/null checks
++          * @param cUnit the CompilationUnit
++          * @param pass the Pass
++          */
++         bool isSimpleCountedLoop (CompilationUnit *cUnit, const Pass *pass);
++
++         /**
++          * @brief get the basic IV for the loop
++          * @return the basic IV
++          */
++         int getSSABIV (void) {return ssaBIV;}
++
++         /**
++          * @brief set the basic IV for the cycle
++          * @param biv basic IV
++          */
++         void setSSABIV (int biv) {ssaBIV = biv;}
++
++         /**
++          * @brief get number of basic IV
++          * @return number of basic IV
++          */
++         int getNumBasicIV (CompilationUnit* cUnit) const;
++
++         /**
++          * @brief Check if the loop is counted up/down
++          * @return True if the loop is counted up, false - otherwise
++          */
++         bool isCountUpLoop (void) {return countUpLoop;}
++
++         /**
++          * @brief set if the loop is counted up/down
++          * @param up true for counted up loops
++          */
++         void setCountUpLoop (bool up) {countUpLoop = up;}
++
++         /**
++          * @brief Get loop condition end reg
++          * @return loop condition end reg
++          */
++         int getEndConditionReg (void) {return endConditionReg;}
++
++         /**
++          * @brief set loop condition end reg
++          * @param reg end condition reg
++          */
++         void setEndConditionReg (int reg) {endConditionReg = reg;}
++
++         /**
++          * @brief Get loop branch opcode
++          * @return loop branch opcode
++          */
++         Opcode getLoopBranchOpcode (void) {return loopBranchOpcode;}
++
++         /**
++          * @brief Set loop branch opcode
++          * @param op loop branch opcode
++          */
++         void setLoopBranchOpcode (Opcode op) {loopBranchOpcode = op;}
++
+ };
+ 
+ /**
+diff --git a/vm/compiler/LoopOpt.cpp b/vm/compiler/LoopOpt.cpp
+index 9aecc75..7a16804 100644
+--- a/vm/compiler/LoopOpt.cpp
++++ b/vm/compiler/LoopOpt.cpp
+@@ -83,6 +83,8 @@ START_PASSES
+               0, dvmCompilerVariant, 0, 0, 0),
+     NEW_PASS ("Iget_Iput_Removal", kAllNodes, 0, dvmCompilerInvariantRemovalGate,
+               dvmCompilerIgetIputRemoval, 0, 0, 0, kOptimizationBasicBlockChange),
++    NEW_PASS ("Hoisted_checks", kAllNodes, 0, dvmCompilerHoistedChecksGate,
++                             dvmCompilerBodyCodeMotion, dvmCompilerGenHoistedChecks, 0, 0, 0),
+     NEW_PASS ("Accumulation_Sinking", kAllNodes, 0, dvmCompilerSinkAccumulationsGate,
+             0, dvmCompilerAccumulationSinking, 0, 0, kOptimizationBasicBlockChange),
+     //This should be after the last optimization that changes instruction sequence or BB logic
+diff --git a/vm/compiler/LoopOpt.h b/vm/compiler/LoopOpt.h
+index e887b76..39430e0 100644
+--- a/vm/compiler/LoopOpt.h
++++ b/vm/compiler/LoopOpt.h
+@@ -88,6 +88,14 @@ bool dvmCompilerSinkAccumulationsGate (const CompilationUnit *cUnit, const Pass
+ bool dvmCompilerCheckLoops (const CompilationUnit *cUnit, const Pass *curPass);
+ 
+ /**
++ * @brief Verify that hoisted checks optimization is applicable
++ * @param cUnit the CompilationUnit
++ * @param curPass the Pass
++ * @return Whether to generate hoisted checks for the loop
++ */
++bool dvmCompilerHoistedChecksGate (const CompilationUnit *cUnit, const Pass *curPass);
++
++/**
+  * @brief Remove an optimization Pass
+  * @param name the name of the Pass
+  * @return whether removal was successful
+-- 
+1.7.4.1
+

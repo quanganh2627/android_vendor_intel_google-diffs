@@ -1,0 +1,1887 @@
+From af4cc9b549dc90bbc845f6a3d9813b02863f66c3 Mon Sep 17 00:00:00 2001
+From: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Date: Mon, 23 Sep 2013 18:28:45 -0700
+Subject: Dalvik: Unlimited scratch registers for PCG
+
+BZ: 142255
+
+PCG can now support more than just 4 scratch registers. This is done through
+the addition of middle-end API that manages the scratch registers and can
+query backend when one is needed. In order to simplify the middle-end,
+we actually deal with all scratch registers as normal virtual registers
+with just one exception: the backend makes a distinction between scratch and
+normal registers because the former does not have a home location. Thus the
+PCG implementation ensures that it registerizes all scratch registers and
+never writes back the pure local ones.
+
+The invariant removal and vectorization passes have been updated to log for
+pass verbosity whenever they ask for a scratch register.
+
+Additionally, a BitVector helper function has been added to deal with case of
+enlarging bit vector. This was done because when a method has 0 virtual registers,
+many BitVectors are enlarged incorrectly.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Ibae1fdde8453f815c9b93904ce1ec400d3e3f2dd
+Orig-MCG-Change-Id: I2cddcfedae6a2acc23cf413486865a346c3dca9d
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/BitVector.cpp                                   |   38 +++++++++
+ vm/BitVector.h                                     |   10 +++
+ vm/Dvm.mk                                          |    6 +-
+ vm/Globals.h                                       |    8 ++
+ vm/Init.cpp                                        |   29 ++++++-
+ vm/compiler/CompilerIR.h                           |   19 +++++
+ vm/compiler/Dataflow.cpp                           |   42 ++++------
+ vm/compiler/Frontend.cpp                           |    6 +-
+ vm/compiler/InvariantRemoval.cpp                   |   14 ++-
+ vm/compiler/LoopInformation.cpp                    |   37 ---------
+ vm/compiler/LoopInformation.h                      |   28 -------
+ vm/compiler/SSATransformation.cpp                  |   42 ++++------
+ vm/compiler/StackExtension.h                       |   21 ++++-
+ vm/compiler/Utility.cpp                            |   83 +++++++++++++++++++
+ vm/compiler/Utility.h                              |   31 +++++++
+ vm/compiler/Vectorization.cpp                      |    6 +-
+ vm/compiler/codegen/x86/BackEndEntry.cpp           |    2 +-
+ vm/compiler/codegen/x86/StackExtensionX86.cpp      |   85 ++++++++++++++++++++
+ vm/compiler/codegen/x86/StackExtensionX86.h        |   68 ++++++++++++++++
+ vm/compiler/codegen/x86/X86Common.cpp              |   69 ++++++++++++++++
+ vm/compiler/codegen/x86/X86Common.h                |   61 ++++++++++++++
+ .../codegen/x86/lightcg/CodegenInterface.cpp       |   19 ++---
+ vm/compiler/codegen/x86/lightcg/Lower.h            |   12 ++--
+ vm/compiler/codegen/x86/lightcg/LowerHelper.cpp    |    1 +
+ .../codegen/x86/lightcg/StackExtensionX86.cpp      |   63 ---------------
+ .../codegen/x86/lightcg/StackExtensionX86.h        |   68 ----------------
+ vm/compiler/codegen/x86/pcg/Analysis.cpp           |   19 +++-
+ .../codegen/x86/pcg/CompilationErrorPCG.cpp        |    1 +
+ vm/compiler/codegen/x86/pcg/CompilationErrorPCG.h  |    2 +
+ vm/compiler/codegen/x86/pcg/CompilationUnitPCG.cpp |   38 ++++++++-
+ vm/compiler/codegen/x86/pcg/CompilationUnitPCG.h   |    3 +-
+ vm/compiler/codegen/x86/pcg/LowerJump.cpp          |   10 ++-
+ vm/compiler/codegen/x86/pcg/PcgInterface.cpp       |   43 +++++++---
+ vm/compiler/codegen/x86/pcg/UtilityPCG.cpp         |    1 +
+ vm/compiler/codegen/x86/pcg/UtilityPCG.h           |    1 +
+ vm/compiler/codegen/x86/x86Specific.cpp            |   53 ------------
+ vm/compiler/codegen/x86/x86Specific.h              |   49 -----------
+ 37 files changed, 678 insertions(+), 410 deletions(-)
+ create mode 100644 vm/compiler/codegen/x86/StackExtensionX86.cpp
+ create mode 100644 vm/compiler/codegen/x86/StackExtensionX86.h
+ create mode 100644 vm/compiler/codegen/x86/X86Common.cpp
+ create mode 100644 vm/compiler/codegen/x86/X86Common.h
+ delete mode 100644 vm/compiler/codegen/x86/lightcg/StackExtensionX86.cpp
+ delete mode 100644 vm/compiler/codegen/x86/lightcg/StackExtensionX86.h
+ delete mode 100644 vm/compiler/codegen/x86/x86Specific.cpp
+ delete mode 100644 vm/compiler/codegen/x86/x86Specific.h
+
+diff --git a/vm/BitVector.cpp b/vm/BitVector.cpp
+index dc37d06..ec6cfa8 100644
+--- a/vm/BitVector.cpp
++++ b/vm/BitVector.cpp
+@@ -67,6 +67,12 @@ BitVector* dvmAllocBitVector(unsigned int startBits, bool expandable, bool fromC
+     BitVector* bv;
+     unsigned int count = (startBits + 31) >> 5;
+ 
++    //Always ensure that we allocate at least one block of space.
++    if (count == 0)
++    {
++        count = 1;
++    }
++
+     assert(sizeof(bv->storage[0]) == 4);        /* assuming 32-bit units */
+ 
+     //Decide on the allocation scheme
+@@ -160,6 +166,12 @@ retry:
+  */
+ bool dvmSetBit(BitVector* pBits, unsigned int num, bool abortOnFail)
+ {
++    //First we do some validation that the bit we are trying to set is valid.
++    //This assert makes sense because most parts of compiler don't work with bit vectors
++    //this large and we want to prevent any early problems. However, at some point it may
++    //be okay to remove this if use case is legitimate.
++    assert (static_cast<int> (num) >= 0);
++
+     if (num >= pBits->storageSize * sizeof(u4) * 8) {
+         if (pBits->expandable == false) {
+             ALOGE("Attempt to set bit outside valid range (%d, limit is %d)",
+@@ -217,6 +229,32 @@ void dvmClearAllBits(BitVector* pBits)
+     memset(pBits->storage, 0, count * sizeof(u4));
+ }
+ 
++/**
++ * @see BitVector.h
++ */
++bool dvmEnsureSizeAndClear (BitVector* pBits, int numBitsToExpandTo)
++{
++    //We can only handle positive (and 0) sizes
++    if (numBitsToExpandTo < 0)
++    {
++        return false;
++    }
++
++    //Start off assuming we will successfully expand
++    bool expanded = true;
++
++    if (numBitsToExpandTo > 0)
++    {
++        //Now try to expand by setting the last bit
++        expanded = dvmSetBit (pBits, numBitsToExpandTo - 1, false);
++    }
++
++    //We must clear all bits as per our specification
++    dvmClearAllBits (pBits);
++
++    return expanded;
++}
++
+ /*
+  * Mark specified number of bits as "set" and clear the rest.  Don't set all
+  * bits like ClearAll since there might be unused bits - setting those to one
+diff --git a/vm/BitVector.h b/vm/BitVector.h
+index 0a48f1b..d15ce41 100644
+--- a/vm/BitVector.h
++++ b/vm/BitVector.h
+@@ -67,6 +67,16 @@ void dvmClearAllBits(BitVector* pBits);
+ bool dvmSetInitialBits(BitVector* pBits, unsigned int numBits);
+ bool dvmIsBitSet(const BitVector* pBits, unsigned int num);
+ 
++/**
++ * @brief Used to expand a provided bit vector and all bits are ensured to be cleared
++ * @details Only expanded if current size is less than numBitsToExpandTo. If numBitsToExpandTo
++ * is 0, then no expansion happens.
++ * @param pBits The BitVector to expand
++ * @param numBitsToExpandTo The number of bits that the BitVector should be able to hold. Must be positive.
++ * @return True if expansion and clearing succeeded.
++ */
++bool dvmEnsureSizeAndClear (BitVector* pBits, int numBitsToExpandTo);
++
+ /* count the number of bits that have been set */
+ int dvmCountSetBits(const BitVector* pBits);
+ 
+diff --git a/vm/Dvm.mk b/vm/Dvm.mk
+index 3e03a43..ef6f72b 100644
+--- a/vm/Dvm.mk
++++ b/vm/Dvm.mk
+@@ -373,13 +373,13 @@ ifeq ($(dvm_arch),x86)
+               compiler/codegen/$(dvm_arch_variant)/lightcg/InstructionGeneration.cpp \
+               compiler/codegen/$(dvm_arch_variant)/lightcg/ExceptionHandling.cpp \
+               compiler/codegen/$(dvm_arch_variant)/lightcg/RegisterizationBE.cpp \
+-              compiler/codegen/$(dvm_arch_variant)/lightcg/StackExtensionX86.cpp \
+               compiler/codegen/$(dvm_arch_variant)/lightcg/CompileTable.cpp \
+               compiler/codegen/$(dvm_arch_variant)/lightcg/CompilationErrorLCG.cpp \
+               compiler/codegen/$(dvm_arch_variant)/lightcg/Profile.cpp \
+               compiler/codegen/$(dvm_arch_variant)/CompilationErrorX86.cpp \
+-              compiler/codegen/$(dvm_arch_variant)/x86Specific.cpp \
++              compiler/codegen/$(dvm_arch_variant)/X86Common.cpp \
+               compiler/codegen/$(dvm_arch_variant)/BackEndEntry.cpp \
++              compiler/codegen/$(dvm_arch_variant)/StackExtensionX86.cpp \
+               compiler/PassDriver.cpp \
+               compiler/CompilationError.cpp \
+               compiler/Checks.cpp \
+@@ -395,7 +395,6 @@ ifeq ($(dvm_arch),x86)
+               compiler/SinkCastOpt.cpp \
+               compiler/Vectorization.cpp
+ 
+-       # need apache harmony x86 encoder/decoder
+        LOCAL_C_INCLUDES += \
+               dalvik/vm/compiler \
+               dalvik/vm/compiler/codegen \
+@@ -403,6 +402,7 @@ ifeq ($(dvm_arch),x86)
+               dalvik/vm/compiler/codegen/x86/lightcg \
+               dalvik/vm/compiler/codegen/x86/lightcg/libenc \
+ 
++       # need apache harmony x86 encoder/decoder
+        LOCAL_SRC_FILES += \
+               compiler/codegen/x86/lightcg/libenc/enc_base.cpp \
+               compiler/codegen/x86/lightcg/libenc/dec_base.cpp \
+diff --git a/vm/Globals.h b/vm/Globals.h
+index 373fc09..345cd38 100644
+--- a/vm/Globals.h
++++ b/vm/Globals.h
+@@ -872,6 +872,9 @@ typedef struct sJitFramework
+ 
+     /** @brief Middle-end gate, do we want to process the trace? */
+     bool (*middleEndGate) (JitTraceDescription *, int, JitTranslationInfo *, jmp_buf *, int );
++
++    /** @brief What is maximum number of scratch registers allowed? */
++    unsigned int (*scratchRegAvail) (void);
+ }SJitFramework;
+ 
+ /*
+@@ -1076,6 +1079,11 @@ struct DvmJitGlobals {
+      */
+     unsigned int maximumInliningNumBytecodes;
+ 
++    /*
++     * Used to determine the maximum number of scratch registers that can be used by optimization passes
++     */
++    unsigned int maximumScratchRegisters;
++
+     /* Map to handle options for the backend */
+     std::map<std::string, std::string> backendOptions;
+ 
+diff --git a/vm/Init.cpp b/vm/Init.cpp
+index a5aaf1b..5c0c5bb 100644
+--- a/vm/Init.cpp
++++ b/vm/Init.cpp
+@@ -46,7 +46,7 @@
+ 
+ #ifdef ARCH_IA32
+ #include "compiler/codegen/x86/lightcg/Lower.h"
+-#include "compiler/codegen/x86/x86Specific.h"
++#include "compiler/codegen/x86/X86Common.h"
+ #include "compiler/CompilerUtility.h"
+ #include "compiler/PassDriver.h"
+ #endif
+@@ -186,6 +186,7 @@ static void usage(const char* progName)
+     dvmFprintf(stderr, "  -Xjitdisableinlining Disables all method inlining\n");
+     dvmFprintf(stderr, "  -Xjitinliningmethodsizemax:<value> The maximum number of bytecodes a method can have to be considered for inlining\n");
+     dvmFprintf(stderr, "  -Xjitdisablepredictedinlining Disable method inlining that is done on a predicted method");
++    dvmFprintf(stderr, "  -Xjitmaxscratch:<value> The maximum number of scratch registers that are allowed to be used in optimization passes\n");
+ #if defined(VTUNE_DALVIK)
+     dvmFprintf(stderr, "  -Xjitsepdalvik\n");
+     dvmFprintf(stderr, "  -Xjitvtuneinfo:{none,jit,dex,src}\n");
+@@ -1631,9 +1632,9 @@ int processOptions(int argc, const char* const argv[], bool ignoreUnrecognized)
+             const unsigned int sizeOfOption = strlen ("-Xjitinliningmethodsizemax:");
+             char *endptr = NULL;
+ 
+-            long maxBytecodes = strtoul (argv[i] + sizeOfOption, &endptr, 0);
++            long maxBytecodes = strtol (argv[i] + sizeOfOption, &endptr, 0);
+ 
+-            if (endptr != NULL && *endptr == '\0' && maxBytecodes > 0 && errno != ERANGE)
++            if (endptr != 0 && *endptr == '\0' && maxBytecodes > 0 && errno != ERANGE)
+             {
+                 gDvmJit.maximumInliningNumBytecodes = maxBytecodes;
+                 dvmFprintf (stderr, "Set inlining max number of bytecodes to: %u\n",
+@@ -1646,6 +1647,23 @@ int processOptions(int argc, const char* const argv[], bool ignoreUnrecognized)
+             }
+         } else if (strncmp(argv[i], "-Xjitdisablepredictedinlining", strlen ("-Xjitdisablepredictedinlining")) == 0) {
+             gDvmJit.disableOpt |= 1 << kPredictedMethodInlining;
++        } else if (strncmp(argv[i], "-Xjitmaxscratch:", strlen ("-Xjitmaxscratch:")) == 0) {
++            const unsigned int sizeOfOption = strlen ("-Xjitmaxscratch:");
++            char *endptr = 0;
++
++            long maxScratch = strtol (argv[i] + sizeOfOption, &endptr, 0);
++
++            if (endptr != 0 && *endptr == '\0' && maxScratch >= 0 && errno != ERANGE)
++            {
++                gDvmJit.maximumScratchRegisters = maxScratch;
++                dvmFprintf (stderr, "Setting maximum number of scratch registers to: %u\n",
++                        gDvmJit.maximumScratchRegisters);
++            }
++            else
++            {
++                dvmFprintf (stderr, "Refusing option for %s, it is not a valid number: "
++                        "must be 0 or positive\n", argv[i]);
++            }
+         } else if (strncmp(argv[i], "-Xjitoldloops", 13) == 0) {
+             gDvmJit.oldLoopDetection = true;
+         } else if (strncmp(argv[i], "-Xjitignorepasses:", strlen ("-Xjitignorepasses:")) == 0) {
+@@ -1904,6 +1922,7 @@ static void setJitFramework ()
+     jitFramework.backEndInvokeArgsDone = dvmCompilerHandleInvokeArgsHeader;
+     jitFramework.backendSupportExtendedOp = dvmCompilerArchSupportsExtendedOp;
+     jitFramework.backEndCompilationErrorHandlerAllocation = dvmCompilerLCGNewCompilationErrorHandler;
++    jitFramework.scratchRegAvail = dvmCompilerLcgGetMaxScratch;
+ }
+ #endif
+ 
+@@ -1996,6 +2015,10 @@ static void setCommandLineDefaults()
+    //Backend should allow two retries
+     gDvmJit.backEndRetries = 2;
+ 
++    //We want to be able to use unlimited number of scratch registers unless
++    //otherwise requested
++    gDvmJit.maximumScratchRegisters = UINT_MAX;
++
+     gDvmJit.ignorePasses = 0;
+     gDvmJit.debugPasses = 0;
+     gDvmJit.debugAllPasses = false;
+diff --git a/vm/compiler/CompilerIR.h b/vm/compiler/CompilerIR.h
+index e0b39bf..12becba 100644
+--- a/vm/compiler/CompilerIR.h
++++ b/vm/compiler/CompilerIR.h
+@@ -491,6 +491,17 @@ typedef struct CompilationUnit {
+      */
+     int numDalvikRegisters;
+ 
++    /**
++     * @brief Used to keep track of the number of pending scratch registers
++     * which are not yet counted in field numDalvikRegisters.
++     */
++    unsigned int pendingScratchRegisters;
++
++    /**
++     * @brief Used to keep track of the number of scratch registers currently being used.
++     */
++    unsigned int numUsedScratchRegisters;
++
+     BasicBlock *entryBlock;
+     BasicBlock *exitBlock;
+     BasicBlock *puntBlock;              // punting to interp for exceptions
+@@ -550,6 +561,14 @@ typedef struct CompilationUnit {
+ #define HEAP_ACCESS_SHADOW(_state)
+ #endif
+ 
++//Helper macro to only call logger in case cUnit->printPass field is true
++#define PASS_LOG(LOG_TYPE, cUnit, ...) \
++    do { \
++        if (cUnit->printPass == true) { \
++            LOG_TYPE (__VA_ARGS__); \
++        } \
++    } while (false)
++
+ /**
+  * @brief Creates a new block and adds its to the block list.
+  * @details If a cUnit block list is provided, this function does not ensure to update cUnit->numBlocks.
+diff --git a/vm/compiler/Dataflow.cpp b/vm/compiler/Dataflow.cpp
+index 9c45132..ea4f823 100644
+--- a/vm/compiler/Dataflow.cpp
++++ b/vm/compiler/Dataflow.cpp
+@@ -1003,10 +1003,16 @@ char *dvmCompilerGetDalvikDisassembly(const DecodedInstruction *insn,
+ 
+ char *getSSAName(const CompilationUnit *cUnit, int ssaReg, char *name)
+ {
+-    int ssa2DalvikValue = dvmConvertSSARegToDalvik(cUnit, ssaReg);
++    const char *printingTemplate = "v%d_%d";
++    int virtualReg = dvmExtractSSARegister (cUnit, ssaReg);
++    int subscript = dvmExtractSSASubscript (cUnit, ssaReg);
+ 
+-    sprintf(name, "v%d_%d",
+-            DECODE_REG(ssa2DalvikValue), DECODE_SUB(ssa2DalvikValue));
++    if (dvmCompilerIsPureLocalScratch (cUnit, virtualReg) == true)
++    {
++        printingTemplate = "t%d_%d";
++    }
++
++    sprintf(name, printingTemplate, virtualReg, subscript);
+     return name;
+ }
+ 
+@@ -1585,9 +1591,7 @@ bool dvmCompilerFindLocalLiveIn(CompilationUnit *cUnit, BasicBlock *bb)
+     }
+     else
+     {
+-        //Ensure that BitVector grows to the number of dalvik registers
+-        dvmCompilerSetBit (bb->dataFlowInfo->useV, cUnit->numDalvikRegisters - 1);
+-        dvmClearAllBits (bb->dataFlowInfo->useV);
++        dvmEnsureSizeAndClear (bb->dataFlowInfo->useV, cUnit->numDalvikRegisters);
+     }
+ 
+     //If not allocated yet
+@@ -1597,9 +1601,7 @@ bool dvmCompilerFindLocalLiveIn(CompilationUnit *cUnit, BasicBlock *bb)
+     }
+     else
+     {
+-        //Ensure that BitVector grows to the number of dalvik registers
+-        dvmCompilerSetBit (bb->dataFlowInfo->defV, cUnit->numDalvikRegisters - 1);
+-        dvmClearAllBits (bb->dataFlowInfo->defV);
++        dvmEnsureSizeAndClear (bb->dataFlowInfo->defV, cUnit->numDalvikRegisters);
+     }
+ 
+     //If not allocated yet
+@@ -1609,9 +1611,7 @@ bool dvmCompilerFindLocalLiveIn(CompilationUnit *cUnit, BasicBlock *bb)
+     }
+     else
+     {
+-        //Ensure that BitVector grows to the number of dalvik registers
+-        dvmCompilerSetBit (bb->dataFlowInfo->liveInV, cUnit->numDalvikRegisters - 1);
+-        dvmClearAllBits (bb->dataFlowInfo->liveInV);
++        dvmEnsureSizeAndClear (bb->dataFlowInfo->liveInV, cUnit->numDalvikRegisters);
+     }
+ 
+     //If not allocated yet
+@@ -1621,23 +1621,13 @@ bool dvmCompilerFindLocalLiveIn(CompilationUnit *cUnit, BasicBlock *bb)
+     }
+     else
+     {
+-        //Ensure that BitVector grows to the number of dalvik registers
+-        dvmCompilerSetBit (bb->dataFlowInfo->liveOutV, cUnit->numDalvikRegisters - 1);
+-        dvmClearAllBits (bb->dataFlowInfo->liveOutV);
++        dvmEnsureSizeAndClear (bb->dataFlowInfo->liveOutV, cUnit->numDalvikRegisters);
+     }
+ 
+     //Get local versions
+     BitVector *defV = bb->dataFlowInfo->defV;
+     BitVector *useV = bb->dataFlowInfo->useV;
+ 
+-    //When handling uses of registers for exceptions, we want to skip the scratch registers
+-    //because they are not live outside of trace.
+-    std::set<int> scratchRegisters;
+-    for (unsigned int scratch = 0; scratch < dvmArchSpecGetNumberOfScratch (); scratch++)
+-    {
+-        scratchRegisters.insert (dvmArchSpecGetScratchRegister (cUnit->method, scratch, cUnit->registerWindowShift));
+-    }
+-
+     for (MIR *mir = bb->firstMIRInsn; mir; mir = mir->next) {
+         int dfAttributes =
+             dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
+@@ -1663,9 +1653,9 @@ bool dvmCompilerFindLocalLiveIn(CompilationUnit *cUnit, BasicBlock *bb)
+             //Go through the dalvik registers and add them as explicit uses
+             for (int i = start; i < cUnit->numDalvikRegisters; i++)
+             {
+-                //Now check if the register we are looking at now is scratch.
+-                //If it is, then we don't add a use for it.
+-                if (scratchRegisters.find (i) == scratchRegisters.end ())
++                //If the register we are looking at now is scratch, then we don't add a use for it
++                //because as purely-scratch, it is not live out of trace.
++                if (dvmArchIsPureLocalScratchRegister (cUnit->method, i, cUnit->registerWindowShift) == false)
+                 {
+                     handleUse (useV, defV, i);
+                 }
+diff --git a/vm/compiler/Frontend.cpp b/vm/compiler/Frontend.cpp
+index 479fb58..4722953 100644
+--- a/vm/compiler/Frontend.cpp
++++ b/vm/compiler/Frontend.cpp
+@@ -1844,7 +1844,7 @@ bool dvmCompileMethod(const Method *method, JitTranslationInfo *info)
+     /* Now that we finished inserting blocks, let's update the number of blocks in cUnit */
+     cUnit.numBlocks = dvmGrowableListSize (&cUnit.blockList);
+ 
+-    const int numDalvikRegisters = cUnit.method->registersSize + dvmArchSpecGetNumberOfScratch ();
++    const int numDalvikRegisters = cUnit.method->registersSize;
+     dvmCompilerUpdateCUnitNumDalvikRegisters (&cUnit, numDalvikRegisters);
+ 
+     /* Verify if all blocks are connected as claimed */
+@@ -2155,7 +2155,7 @@ static bool compileLoop(CompilationUnit *cUnit, unsigned int startOffset,
+     }
+ #endif
+ 
+-    numDalvikRegisters = cUnit->method->registersSize + dvmArchSpecGetNumberOfScratch ();
++    numDalvikRegisters = cUnit->method->registersSize;
+     dvmCompilerUpdateCUnitNumDalvikRegisters (cUnit, numDalvikRegisters);
+ 
+     /* Verify if all blocks are connected as claimed */
+@@ -2886,7 +2886,7 @@ bool dvmCompileTrace(JitTraceDescription *desc, int numMaxInsts,
+     /* Set the instruction set to use (NOTE: later components may change it) */
+     cUnit.instructionSet = dvmCompilerInstructionSet();
+ 
+-    const int numDalvikRegisters = cUnit.method->registersSize + dvmArchSpecGetNumberOfScratch ();
++    const int numDalvikRegisters = cUnit.method->registersSize;
+     dvmCompilerUpdateCUnitNumDalvikRegisters (&cUnit, numDalvikRegisters);
+ 
+ #ifndef ARCH_IA32
+diff --git a/vm/compiler/InvariantRemoval.cpp b/vm/compiler/InvariantRemoval.cpp
+index 11dc4b36..f667ef3 100644
+--- a/vm/compiler/InvariantRemoval.cpp
++++ b/vm/compiler/InvariantRemoval.cpp
+@@ -196,7 +196,7 @@ static void findInvariantsInPeel (CompilationUnit *cUnit, std::vector<MIR *> &se
+  * @param available map sent by value denotes which scratch registers cannot be re-used
+  * @return did we find a replacement for the MIR instruction?
+  */
+-static bool findReplacement (CompilationUnit *cUnit, MIR* mir, int &current, int max,
++static bool findReplacement (CompilationUnit *cUnit, MIR* mir, unsigned int &current, unsigned int max,
+                              std::map<MIR *, bool> &chosen, std::map<int, int> &localValueNumberingDef,
+                              std::map<int, int> &replacements, std::map<int, bool> available)
+ {
+@@ -347,13 +347,15 @@ static bool findReplacement (CompilationUnit *cUnit, MIR* mir, int &current, int
+         else
+         {
+             //Get replacement
+-            replacement = cUnit->loopInformation->getFreeScratchRegisters (cUnit, defs);
++            replacement = dvmCompilerGetFreeScratchRegister (cUnit, defs);
+ 
+             //Mark it in
+             localValueNumberingDef[color] = replacement;
+ 
+             //Increase scratch number used
+             current += defs;
++
++            PASS_LOG (ALOGI, cUnit, "Obtained scratch register v%u for invariant hoisting", replacement);
+         }
+ 
+         //Mark each def with its replacement
+@@ -398,8 +400,8 @@ static void hoistInvariants (CompilationUnit *cUnit, LoopInformation *loopInfo,
+     std::map<int, int> localValueNumberingDef;
+     std::map<int, int> replacements;
+ 
+-    int max = dvmArchSpecGetNumberOfScratch ();
+-    int current = cUnit->loopInformation->getScratchRegisters ();
++    unsigned int max = dvmCompilerGetMaxScratchRegisters ();
++    unsigned int current = cUnit->numUsedScratchRegisters;
+ 
+     //Map of chosen instruction that have been finally hoisted
+     std::map<MIR *, bool> chosen;
+@@ -848,11 +850,13 @@ void dvmCompilerIgetIputRemoval (CompilationUnit *cUnit, Pass *curPass)
+         unsigned int width = iget->ssaRep->numDefs;
+ 
+         //First, do we have temporaries for it?
+-        int scratch = info->getFreeScratchRegisters (cUnit, width);
++        int scratch = dvmCompilerGetFreeScratchRegister (cUnit, width);
+ 
+         //Do we have some?
+         if (scratch > -1)
+         {
++            PASS_LOG (ALOGI, cUnit, "Obtained scratch register v%u for getter/setter pair", scratch);
++
+             //Hoist the iget
+             hoistIget (cUnit, info, iget, scratch);
+ 
+diff --git a/vm/compiler/LoopInformation.cpp b/vm/compiler/LoopInformation.cpp
+index 510774b..6f4299d 100644
+--- a/vm/compiler/LoopInformation.cpp
++++ b/vm/compiler/LoopInformation.cpp
+@@ -1392,43 +1392,6 @@ bool LoopInformation::hasInvoke (const CompilationUnit *cUnit) const
+     return false;
+ }
+ 
+-int LoopInformation::getFreeScratchRegisters (CompilationUnit *cUnit, int consecutives)
+-{
+-    //Do we have free registers?
+-    bool res = hasFreeScratchRegisters (cUnit, consecutives);
+-
+-    if (res == true)
+-    {
+-        //Remember how many we were using
+-        int res = getScratchRegisters ();
+-
+-        //Set new value
+-        setScratchRegisters (res + consecutives);
+-
+-        //Get the actual scratch register
+-        res = dvmArchSpecGetScratchRegister (cUnit->method, res, cUnit->registerWindowShift);
+-
+-        //Return first register
+-        return res;
+-    }
+-
+-    //We failed
+-    return -1;
+-}
+-
+-bool LoopInformation::hasFreeScratchRegisters (CompilationUnit *cUnit, unsigned int howMany)
+-{
+-    //Get the maximum number of scratch registers available
+-    unsigned int max = dvmArchSpecGetNumberOfScratch ();
+-
+-    //Now how many are we using
+-    unsigned int currentlyUsing = getScratchRegisters ();
+-
+-    //We should be smarter about this and be able to free/reuse temporaries
+-    //For the moment though, let's just be simple and see if we have space?
+-    return (currentlyUsing + howMany <= max);
+-}
+-
+ /* Get number of basic IVs */
+ int LoopInformation::getNumBasicIV(CompilationUnit* cUnit)
+ {
+diff --git a/vm/compiler/LoopInformation.h b/vm/compiler/LoopInformation.h
+index f99dc87..16c4b27 100644
+--- a/vm/compiler/LoopInformation.h
++++ b/vm/compiler/LoopInformation.h
+@@ -297,18 +297,6 @@ class LoopInformation
+          */
+         BasicBlock *getBackwardBranchBlock (const CompilationUnit *);
+ 
+-        /**
+-         * @brief Get the next scratch register
+-         * @return the next scratch register
+-         */
+-        unsigned int getScratchRegisters (void) const {return scratchRegisters;}
+-
+-        /**
+-         * @brief Set the next scratch register
+-         * @param value the new value for the scratch register
+-         */
+-         void setScratchRegisters (unsigned int value) {scratchRegisters = value;}
+-
+          /**
+           * @brief Get the list with induction variables.
+           * @return Returns the list containing IVs.
+@@ -443,22 +431,6 @@ class LoopInformation
+          void setContainsInvariantInstructions (bool b = true) {containsInvariantInstructions = b;}
+ 
+          /**
+-          * @brief Get a scratch register if possible
+-          * @param cUnit the CompilationUnit
+-          * @param consecutives how many consecutive registers do you want? This allows the request for consecutive VRs for wide or range cases (default: 1)
+-          * @return the lowest new VR scratch register allocated; if consecutives is > 1, suppose VR, VR + 1, ..., VR + consecutives - 1 are allocated; -1 if none found
+-          */
+-         int getFreeScratchRegisters (CompilationUnit *cUnit, int consecutives = 1);
+-
+-         /**
+-          * @brief Do we have scratch registers available?
+-          * @param cUnit the CompilationUnit
+-          * @param howMany how many consecutive registers do you want? This allows the request for consecutive VRs for wide or range cases (default: 1)
+-          * @return whether we have enough scratch registers or not
+-          */
+-         bool hasFreeScratchRegisters (CompilationUnit *cUnit, unsigned int howMany);
+-
+-         /**
+           * @brief Sink a vector of instructions
+           * @param cUnit the CompilationUnit
+           * @param insns the instructions to sink
+diff --git a/vm/compiler/SSATransformation.cpp b/vm/compiler/SSATransformation.cpp
+index 1e7d965..fee2a52 100644
+--- a/vm/compiler/SSATransformation.cpp
++++ b/vm/compiler/SSATransformation.cpp
+@@ -91,14 +91,12 @@ static bool fillDefBlockMatrix(CompilationUnit *cUnit, BasicBlock *bb)
+ 
+ static void computeDefBlockMatrix(CompilationUnit *cUnit)
+ {
+-    int numRegisters = cUnit->numDalvikRegisters;
+-
+     //At this point we need to determine if we need to allocate the defBlockMatrix.
+     //Since the size of it is always set to numRegisters + 1, in our comparison we subtract one
+     //in order to determine if it actually needs resized.
+-    if (cUnit->defBlockMatrixSize - 1 < numRegisters)
++    if (cUnit->defBlockMatrixSize - 1 < cUnit->numDalvikRegisters)
+     {
+-        cUnit->defBlockMatrixSize = numRegisters + 1;
++        cUnit->defBlockMatrixSize = cUnit->numDalvikRegisters + 1;
+         cUnit->defBlockMatrix = static_cast<BitVector **> (dvmCompilerNew(sizeof(BitVector *) * cUnit->defBlockMatrixSize, true));
+     }
+ 
+@@ -238,13 +236,9 @@ static bool initializeDominationInfo(CompilationUnit *cUnit, BasicBlock *bb)
+         bb->domFrontier = dvmCompilerAllocBitVector(numTotalBlocks,
+                                                    true /* expandable */);
+     } else {
+-        //Set the highest value to make sure it gets expanded
+-        dvmSetBit (bb->dominators, numTotalBlocks - 1);
+-        dvmSetBit (bb->iDominated, numTotalBlocks - 1);
+-        dvmSetBit (bb->domFrontier, numTotalBlocks - 1);
+-        dvmClearAllBits(bb->dominators);
+-        dvmClearAllBits(bb->iDominated);
+-        dvmClearAllBits(bb->domFrontier);
++        dvmEnsureSizeAndClear (bb->dominators, numTotalBlocks);
++        dvmEnsureSizeAndClear (bb->iDominated, numTotalBlocks);
++        dvmEnsureSizeAndClear (bb->domFrontier, numTotalBlocks);
+     }
+     /* Set all bits in the dominator vector */
+     dvmSetInitialBits(bb->dominators, numTotalBlocks);
+@@ -360,9 +354,7 @@ static void computeDominators(CompilationUnit *cUnit)
+         cUnit->tempBlockV = dvmCompilerAllocBitVector(numTotalBlocks,
+                                                   true /* expandable */);
+     } else {
+-        //Set higehst bit to expand it
+-        dvmSetBit (cUnit->tempBlockV, numTotalBlocks - 1);
+-        dvmClearAllBits(cUnit->tempBlockV);
++        dvmEnsureSizeAndClear (cUnit->tempBlockV, numTotalBlocks);
+     }
+     dvmCompilerDataFlowAnalysisDispatcher(cUnit, computeBlockDominators,
+                                           kPreOrderDFSTraversal,
+@@ -498,13 +490,9 @@ static void insertPhiNodes(CompilationUnit *cUnit)
+         //Have we ever allocated them?
+         if (cUnit->phi.phiBlocks != 0)
+         {
+-            int max = cUnit->numBlocks - 1;
+-            //They are expandable, so just set a bit for the last block
+-            dvmSetBit (cUnit->phi.phiBlocks, max);
+-            dvmSetBit (cUnit->phi.tmpBlocks, max);
+-            dvmSetBit (cUnit->phi.inputBlocks, max);
+-
+-            //They all get cleared/set below before any use
++            dvmEnsureSizeAndClear (cUnit->phi.phiBlocks, cUnit->numBlocks);
++            dvmEnsureSizeAndClear (cUnit->phi.tmpBlocks, cUnit->numBlocks);
++            dvmEnsureSizeAndClear (cUnit->phi.inputBlocks, cUnit->numBlocks);
+         }
+         else
+         {
+@@ -526,9 +514,7 @@ static void insertPhiNodes(CompilationUnit *cUnit)
+     }
+     else
+     {
+-        //Ensure that BitVector grows to the number of dalvik registers
+-        dvmCompilerSetBit (cUnit->tempDalvikRegisterV, cUnit->numDalvikRegisters - 1);
+-        dvmClearAllBits (cUnit->tempDalvikRegisterV);
++        dvmEnsureSizeAndClear (cUnit->tempDalvikRegisterV, cUnit->numDalvikRegisters);
+     }
+ 
+     dvmCompilerDataFlowAnalysisDispatcher(cUnit, computeBlockLiveIns,
+@@ -1045,6 +1031,10 @@ bool dvmCompilerCalculateBasicBlockInformation (CompilationUnit *cUnit, bool fil
+     //matches the actual count of basic blocks.
+     cUnit->numBlocks = dvmGrowableListSize (&(cUnit->blockList));
+ 
++    //We might have used scratch registers which we need to commit now to include them in
++    //total count of dalvik registers
++    dvmCompilerCommitPendingScratch (cUnit);
++
+     //Clear SSA information
+     clearPHIInformation (cUnit);
+ 
+@@ -1113,9 +1103,7 @@ bool dvmCompilerCalculateBasicBlockInformation (CompilationUnit *cUnit, bool fil
+     }
+     else
+     {
+-        //Set the highest SSA reg in order to expand the vector
+-        dvmSetBit (cUnit->tempSSARegisterV, cUnit->numSSARegs - 1);
+-        dvmClearAllBits (cUnit->tempSSARegisterV);
++        dvmEnsureSizeAndClear (cUnit->tempSSARegisterV, cUnit->numSSARegs);
+     }
+ 
+     /* Insert phi-operands with latest SSA names from predecessor blocks */
+diff --git a/vm/compiler/StackExtension.h b/vm/compiler/StackExtension.h
+index 5321773..f7b6751 100644
+--- a/vm/compiler/StackExtension.h
++++ b/vm/compiler/StackExtension.h
+@@ -31,11 +31,20 @@ unsigned int dvmArchSpecGetNumberOfScratch (void);
+  * for which we want to use scratch register. Whenever a scratch register
+  * with that index is not available, the return value will be -1.
+  */
+-int dvmArchSpecGetScratchRegister (const Method * method, unsigned int idx, int registerWindowShift);
++int dvmArchSpecGetPureLocalScratchRegister (const Method * method, unsigned int idx, int registerWindowShift);
++
++/**
++ * @brief Used to determine if a register is a pure local scratch that is only live within trace.
++ * @param method The method from which the virtual register is from
++ * @param virtualReg The virtual register to check
++ * @param registerWindowShift The register window shift from the CompilationUnit
++ * @return Returns true if the virtual register is a pure local scratch.
++ */
++bool dvmArchIsPureLocalScratchRegister (const Method * method, int virtualReg, int registerWindowShift);
+ 
+ #ifdef ARCH_IA32
+ 
+-#include "codegen/x86/lightcg/StackExtensionX86.h"
++#include "codegen/x86/StackExtensionX86.h"
+ 
+ #else
+ 
+@@ -45,11 +54,17 @@ unsigned int dvmArchSpecGetNumberOfScratch (void)
+     return 0;
+ }
+ 
+-int dvmArchSpecGetScratchRegister (const Method * method, unsigned int idx, int registerWindowShift)
++int dvmArchSpecGetPureLocalScratchRegister (const Method * method, unsigned int idx, int registerWindowShift)
+ {
+     //Non-x86 don't have scratch registers in their frames
+     return -1;
+ }
++
++bool dvmArchIsPureLocalScratchRegister (const Method * method, int virtualReg, int registerWindowShift)
++{
++    //Non-x86 don't support scratch registers and therefore no VR is scratch
++    return false;
++}
+ #endif
+ 
+ #endif /* STACKEXTENSION_H_ */
+diff --git a/vm/compiler/Utility.cpp b/vm/compiler/Utility.cpp
+index c0222d3..328b12e 100644
+--- a/vm/compiler/Utility.cpp
++++ b/vm/compiler/Utility.cpp
+@@ -931,6 +931,89 @@ void dvmCompilerUpdateCUnitNumDalvikRegisters (CompilationUnit *cUnit, int newNu
+     }
+ }
+ 
++unsigned int dvmCompilerGetMaxScratchRegisters (void)
++{
++    //Get the maximum number of scratch registers available
++    unsigned int max = dvmArchSpecGetNumberOfScratch ();
++
++    //We do not want to exceed the user configured maximum
++    if (max > gDvmJit.maximumScratchRegisters)
++    {
++        max = gDvmJit.maximumScratchRegisters;
++    }
++
++    return max;
++}
++
++/**
++ * @brief Do we have scratch registers available?
++ * @param cUnit The compilation unit
++ * @param howMany howMany how many consecutive registers do you want?
++ * This allows the request for consecutive VRs for wide or range cases (default: 1)
++ * @return Returns whether we have enough scratch registers or not
++ */
++static bool haveFreeScratchRegisters (CompilationUnit *cUnit, unsigned int howMany = 1)
++{
++    //Get the maximum number of scratch registers available
++    unsigned int max = dvmCompilerGetMaxScratchRegisters ();
++
++    //Return whether we have any more that we can use
++    return (cUnit->numUsedScratchRegisters + howMany <= max);
++}
++
++int dvmCompilerGetFreeScratchRegister (CompilationUnit *cUnit, unsigned int consecutives)
++{
++    //Do we have free registers?
++    bool haveFree = haveFreeScratchRegisters (cUnit, consecutives);
++
++    //If we do not have any free, then simply return -1
++    if (haveFree == false)
++    {
++        return -1;
++    }
++
++    //Now get a free scratch register
++    int freeScratch = dvmArchSpecGetPureLocalScratchRegister (cUnit->method, cUnit->numUsedScratchRegisters,
++            cUnit->registerWindowShift);
++
++    //We know that middle-end can only support 2^16 virtual registers since for SSA it also encodes
++    //the version in the same field. Thus, right now we check if the largest VR in this sequence
++    //actually exceeds that value. If it does, then we simply return -1.
++    if (freeScratch + consecutives > (1 << 16))
++    {
++        return -1;
++    }
++
++    //Keep track that we are giving out some scratch registers
++    cUnit->numUsedScratchRegisters += consecutives;
++
++    //The compilation unit cares about how many are pending in order to synchronize with numDalvikRegisters
++    cUnit->pendingScratchRegisters += consecutives;
++
++    return freeScratch;
++}
++
++bool dvmCompilerIsPureLocalScratch (const CompilationUnit *cUnit, int reg, bool isSsa)
++{
++    //Figure out the virtual register first
++    const int virtualReg = (isSsa == true ? dvmExtractSSARegister (cUnit, reg) : reg);
++
++    return dvmArchIsPureLocalScratchRegister (cUnit->method, virtualReg, cUnit->registerWindowShift);
++}
++
++void dvmCompilerCommitPendingScratch (CompilationUnit *cUnit)
++{
++    //First check if we have any pending scratch registers
++    if (cUnit->pendingScratchRegisters > 0)
++    {
++        //We have some pending scratch registers so include them in total number of dalvik registers
++        dvmCompilerUpdateCUnitNumDalvikRegisters (cUnit, cUnit->numDalvikRegisters + cUnit->pendingScratchRegisters);
++
++        //We have just counted them so reset the counter
++        cUnit->pendingScratchRegisters = 0;
++    }
++}
++
+ /**
+  * @brief Used to color during DFS traversal of CFG
+  */
+diff --git a/vm/compiler/Utility.h b/vm/compiler/Utility.h
+index a882539..7d00e26 100644
+--- a/vm/compiler/Utility.h
++++ b/vm/compiler/Utility.h
+@@ -69,6 +69,37 @@ bool dvmCompilerCheckResolvedReferences (const Method *method, const DecodedInst
+ void dvmCompilerUpdateCUnitNumDalvikRegisters (CompilationUnit *cUnit, int newNumberDalvikRegisters);
+ 
+ /**
++ * @brief Used the obtain the maximum number of scratch registers that can be used
++ * @return Returns the maximum number of scratch registers
++ */
++unsigned int dvmCompilerGetMaxScratchRegisters (void);
++
++/**
++ * @brief Get a scratch register if possible
++ * @param cUnit The compilation unit
++ * @param consecutives how many consecutive registers do you want?
++ * This allows the request for consecutive VRs for wide or range cases (default: 1)
++ * @return Returns the lowest new VR scratch register allocated; if consecutives is > 1,
++ * suppose VR, VR + 1, ..., VR + consecutives - 1 are allocated. Returns -1 if none found.
++ */
++int dvmCompilerGetFreeScratchRegister (CompilationUnit *cUnit, unsigned int consecutives = 1);
++
++/**
++ * @brief Used to determine whether a given virtual register is a pure local scratch
++ * @param cUnit The compilation unit
++ * @param reg The register to check (can be virtual register or ssa register)
++ * @param isSsa True if "reg" parameter is ssa register
++ * @return Returns if the the virtual register is actually scratch
++ */
++bool dvmCompilerIsPureLocalScratch (const CompilationUnit *cUnit, int reg, bool isSsa = false);
++
++/**
++ * @brief Used post-optimization pass to commit the pending scratch registers
++ * @param cUnit The compilation unit
++ */
++void dvmCompilerCommitPendingScratch (CompilationUnit *cUnit);
++
++/**
+  * @brief Returns whether there is a loop in the CFG
+  * @param blockList The blocks in the CFG
+  * @param entry The entry block into CFG
+diff --git a/vm/compiler/Vectorization.cpp b/vm/compiler/Vectorization.cpp
+index 805e3e0..c6f599c 100644
+--- a/vm/compiler/Vectorization.cpp
++++ b/vm/compiler/Vectorization.cpp
+@@ -1168,7 +1168,7 @@ static bool vectorizationGate (const CompilationUnit *cUnit, LoopInformation *lo
+     assert (bb != 0);
+ 
+     // Request a scratch virtual register to use for generating test in vectorization
+-    int scratchVrForTest = loopInfo->getFreeScratchRegisters (const_cast<CompilationUnit*>(cUnit), 1);
++    int scratchVrForTest = dvmCompilerGetFreeScratchRegister (const_cast<CompilationUnit*>(cUnit), 1);
+ 
+     // bail if no free scratch to use
+     if (scratchVrForTest == -1)
+@@ -1176,6 +1176,10 @@ static bool vectorizationGate (const CompilationUnit *cUnit, LoopInformation *lo
+         VECTORIZATION_LOG (cUnit, "No scratch VR left to generate test", reportFailure);
+         return false;
+     }
++    else
++    {
++        PASS_LOG (ALOGI, cUnit, "Obtained scratch register v%u for vectorization test", scratchVrForTest);
++    }
+ 
+     // Now we have a free scratch register to use, remember it in VectorizationInfo
+     info->scratchVrForTest = scratchVrForTest;
+diff --git a/vm/compiler/codegen/x86/BackEndEntry.cpp b/vm/compiler/codegen/x86/BackEndEntry.cpp
+index a954710..e24bbdc 100644
+--- a/vm/compiler/codegen/x86/BackEndEntry.cpp
++++ b/vm/compiler/codegen/x86/BackEndEntry.cpp
+@@ -17,7 +17,7 @@
+ #include "Dalvik.h"
+ #include "CompilationError.h"
+ #include "CompilationUnit.h"
+-#include "x86Specific.h"
++#include "X86Common.h"
+ 
+ void dvmCompilerMIR2LIR (CompilationUnit *cUnit, JitTranslationInfo *info)
+ {
+diff --git a/vm/compiler/codegen/x86/StackExtensionX86.cpp b/vm/compiler/codegen/x86/StackExtensionX86.cpp
+new file mode 100644
+index 0000000..4844c21
+--- /dev/null
++++ b/vm/compiler/codegen/x86/StackExtensionX86.cpp
+@@ -0,0 +1,85 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "Dalvik.h"
++#include "StackExtensionX86.h"
++
++/**
++ * @brief Gives number of available scratch registers for x86.
++ * @return Total number of scratch registers
++ */
++unsigned int dvmArchSpecGetNumberOfScratch (void)
++{
++    unsigned int (*fctPtr) (void) = gDvmJit.jitFramework.scratchRegAvail;
++
++    //If we have a function pointer, call it
++    if (fctPtr != 0)
++    {
++        return fctPtr ();
++    }
++
++    //If we did not find a function, just say the max is 0
++    return 0;
++}
++
++/**
++ * @brief Given a scratch register index, it gives the VR register number.
++ * @param method Method that contains the MIR for which we want to
++ * use scratch register.
++ * @param idx Index of scratch register. Must be in range [0 .. N-1] where
++ * N is the maximum number of scratch registers available.
++ * @param registerWindowShift If compilation unit uses a different register frame pointer
++ * base, it shifts the register window. This is the amount that register window has shifted.
++ * @return Return virtual register number when it finds one for the index.
++ * Otherwise, it returns -1.
++ */
++int dvmArchSpecGetPureLocalScratchRegister (const Method * method, unsigned int idx, int registerWindowShift)
++{
++    unsigned int maxScratch = dvmArchSpecGetNumberOfScratch ();
++
++    //Sanity check to make sure that requested index is in
++    //range [0 .. maxScratch-1]
++    if (idx > (maxScratch - 1))
++    {
++        return -1;
++    }
++
++    //We know the index is okay. Index of 0 corresponds to virtual register
++    //whose number is: 0 + locals + ins
++    int numLocals = method->registersSize - method->insSize;
++    int numIns = method->insSize;
++
++    //Calculate the regnum
++    int regnum = idx + numLocals + numIns;
++
++    //Take into account the register window shift
++    regnum += registerWindowShift;
++
++    return regnum;
++}
++
++bool dvmArchIsPureLocalScratchRegister (const Method * method, int virtualReg, int registerWindowShift)
++{
++    //For x86, we ensure that scratch registers are always in a continuous region and have a number
++    //greater than the compilation unit's total register numbers. Thus it is enough to get the virtual
++    //number of scratch at index 0 and then seeing if the provided register is number >= to that
++
++    //Get the scratch register at index 0
++    int minNum = dvmArchSpecGetPureLocalScratchRegister (method, 0, registerWindowShift);
++
++    //Return if the virtual reg asked about is at least the minimum number for scratch registers
++    return virtualReg >= minNum;
++}
+diff --git a/vm/compiler/codegen/x86/StackExtensionX86.h b/vm/compiler/codegen/x86/StackExtensionX86.h
+new file mode 100644
+index 0000000..2df5657
+--- /dev/null
++++ b/vm/compiler/codegen/x86/StackExtensionX86.h
+@@ -0,0 +1,68 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef STACKEXTENSIONX86_H_
++#define STACKEXTENSIONX86_H_
++
++/**
++ * @brief Space in frame to use for scratch registers.
++ */
++class StackTemporaries
++{
++public:
++    /**
++     * @brief Gives the total number of scratch VRs available for every frame.
++     * @return Maximum number of scratch VRs.
++     */
++    static unsigned int getTotalScratchVRs (void)
++    {
++        return numScratch;
++    }
++
++private:
++    /**
++     * @brief Hardcoded number of scratch registers per frame.
++     */
++#ifdef EXTRA_SCRATCH_VR
++    static const unsigned int numScratch = 4;
++#else
++    static const unsigned int numScratch = 0;
++#endif
++
++    /**
++     * @brief Allocated space for the scratch registers.
++     */
++    u4 scratchVirtualRegisters[numScratch];
++};
++
++/**
++ * @brief Stack frame extension for x86.
++ */
++struct ArchSpecificStackExtension
++{
++
++#ifdef EXTRA_SCRATCH_VR
++    /**
++     * @brief Allocated space for temporaries.
++     * @warning If this structure gets moved, dvmArchSpecGetScratchRegister
++     * must be updated to provide a new mapping.
++     */
++    StackTemporaries temps;
++#endif
++
++};
++
++#endif /* STACKEXTENSIONX86_H_ */
+diff --git a/vm/compiler/codegen/x86/X86Common.cpp b/vm/compiler/codegen/x86/X86Common.cpp
+new file mode 100644
+index 0000000..791b33c
+--- /dev/null
++++ b/vm/compiler/codegen/x86/X86Common.cpp
+@@ -0,0 +1,69 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#include "CompilerIR.h"
++#include "X86Common.h"
++
++BasicBlock *dvmCompilerArchSpecificNewBB(void)
++{
++    BasicBlock * (*fctPtr) (void) = gDvmJit.jitFramework.backEndBasicBlockAllocation;
++
++    //If we have a function pointer, call it
++    if (fctPtr != 0)
++    {
++        return fctPtr ();
++    }
++
++    return 0;
++}
++
++CompilationErrorHandler *dvmCompilerArchSpecificNewCompilationErrorHandler (void)
++{
++    CompilationErrorHandler* (*fctPtr) (void) = gDvmJit.jitFramework.backEndCompilationErrorHandlerAllocation;
++
++    //If we have a function pointer, call it
++    if (fctPtr != 0)
++    {
++        return fctPtr ();
++    }
++
++    return 0;
++}
++
++void dvmCompilerDumpArchSpecificBB(CompilationUnit *cUnit, BasicBlock *bb, FILE *file, bool beforeMIRs)
++{
++    void (*fctPtr) (CompilationUnit *, BasicBlock *, FILE *, bool) = gDvmJit.jitFramework.backEndDumpSpecificBB;
++
++    if (fctPtr != 0)
++    {
++        fctPtr (cUnit, bb, file, beforeMIRs);
++    }
++}
++
++bool dvmCompilerArchitectureSupportsSSE41 (void)
++{
++    const int sse41Mask = 1 << 19;
++    bool supportsSSE41 = ( (gDvmJit.featureInformation[0] & sse41Mask) != 0);
++
++    return supportsSSE41;
++}
++
++bool dvmCompilerArchitectureSupportsSSE42 (void)
++{
++    const int sse42Mask = 1 << 20;
++    bool supportsSSE42 = ( (gDvmJit.featureInformation[0] & sse42Mask) != 0);
++
++    return supportsSSE42;
++}
+diff --git a/vm/compiler/codegen/x86/X86Common.h b/vm/compiler/codegen/x86/X86Common.h
+new file mode 100644
+index 0000000..dd6b522
+--- /dev/null
++++ b/vm/compiler/codegen/x86/X86Common.h
+@@ -0,0 +1,61 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef H_X86SPECIFIC
++#define H_X86SPECIFIC
++
++#include <stdlib.h>
++
++//Forward Declarations
++struct BasicBlock;
++struct CompilationUnit;
++
++/**
++ * @brief Architecture specific BasicBlock creator
++ * @details Initializes x86 specific BasicBlock fields
++ * @return newly created BasicBlock
++ */
++BasicBlock *dvmCompilerArchSpecificNewBB(void);
++
++/**
++ * @brief Architecture specific CompilationErrorHandler creator
++ * @details Initializes x86 specific CompilationErrorHandler fields
++ * @return newly created CompilationErrorHandler
++ */
++CompilationErrorHandler *dvmCompilerArchSpecificNewCompilationErrorHandler (void);
++
++/**
++ * @brief Architecture specific BasicBlock printing
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock
++ * @param file the File in which to dump the BasicBlock
++ * @param beforeMIRs is this call performed before generating the dumps for the MIRs
++ */
++void dvmCompilerDumpArchSpecificBB(CompilationUnit *cUnit, BasicBlock *bb, FILE *file, bool beforeMIRs);
++
++/**
++ * @brief Does the architecture support SSE4.1?
++ * @return whether or not the architecture supports SSE4.1
++ */
++bool dvmCompilerArchitectureSupportsSSE41 (void);
++
++/**
++ * @brief Does the architecture support SSE4.2?
++ * @return whether or not the architecture supports SSE4.2
++ */
++bool dvmCompilerArchitectureSupportsSSE42 (void);
++
++#endif
+diff --git a/vm/compiler/codegen/x86/lightcg/CodegenInterface.cpp b/vm/compiler/codegen/x86/lightcg/CodegenInterface.cpp
+index cf23fb3..6c7119a 100644
+--- a/vm/compiler/codegen/x86/lightcg/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/lightcg/CodegenInterface.cpp
+@@ -30,6 +30,7 @@
+ #include "ExceptionHandling.h"
+ #include "Scheduler.h"
+ #include "Profile.h"
++#include "X86Common.h"
+ 
+ #ifdef HAVE_ANDROID_OS
+ #include <cutils/properties.h>
+@@ -239,18 +240,6 @@ bool dvmIsOpcodeSupportedByJit(const DecodedInstruction & insn)
+ //! default JIT code cache size used by x86 JIT
+ #define DEFAULT_X86_ATOM_DALVIK_JIT_CODE_CACHE_SIZE 512*1024
+ 
+-/**
+- * @brief Does the architecture support SSE41?
+- * @return whether or not the architecture supports SSE41
+- */
+-bool dvmCompilerArchitectureSupportsSSE41 (void)
+-{
+-    const int sse41Mask = 1 << 19;
+-    bool supportsSSE41 = ( (gDvmJit.featureInformation[0] & sse41Mask) != 0);
+-
+-    return supportsSSE41;
+-}
+-
+ //! Initializes target-specific configuration
+ 
+ //! Configures the jit table size, jit threshold, and jit code cache size
+@@ -2784,6 +2773,12 @@ void dvmCompilerLCGDumpBB (CompilationUnit *cUnit, BasicBlock *bb, FILE *file, b
+     }
+ }
+ 
++unsigned int dvmCompilerLcgGetMaxScratch (void)
++{
++    //We can only use as many temporaries as are actually allocated on stack
++    return StackTemporaries::getTotalScratchVRs ();
++}
++
+ /**
+  * @brief A function to check the size of the DvmJitGlobals data structure
+  * @details This function checks the size of the DvmJitGlobals data structure, to ensure consistent usage across shared objects compiled apart from libdvm.so.
+diff --git a/vm/compiler/codegen/x86/lightcg/Lower.h b/vm/compiler/codegen/x86/lightcg/Lower.h
+index a8b2f93..a4dc3ae 100644
+--- a/vm/compiler/codegen/x86/lightcg/Lower.h
++++ b/vm/compiler/codegen/x86/lightcg/Lower.h
+@@ -1512,6 +1512,12 @@ BasicBlock *dvmCompilerLCGNewBB (void);
+ void dvmCompilerLCGDumpBB (CompilationUnit *cUnit, BasicBlock *bb, FILE *file, bool beforeMIRs);
+ 
+ /**
++ * @brief Used to obtain the maximum number of scratch registers that LCG backend can support
++ * @return Returns the maximum number of scratch
++ */
++unsigned int dvmCompilerLcgGetMaxScratch (void);
++
++/**
+  * @brief Handle the invoke label
+  * @param value the form of the arguments
+  * @return the section label's name
+@@ -1591,12 +1597,6 @@ bool vec_extract_imm_reg_reg (int index, int srcReg, bool isSrcPhysical, int des
+         OpndSize vectorUnitSize);
+ 
+ /**
+- * @brief Does the architecture support SSE41?
+- * @return whether or not the architecture supports SSE41
+- */
+-bool dvmCompilerArchitectureSupportsSSE41 (void);
+-
+-/**
+  * @brief Entry point of the LCG backend
+  * @param cUnit the CompilationUnit
+  * @param info the JitTranslationInfo
+diff --git a/vm/compiler/codegen/x86/lightcg/LowerHelper.cpp b/vm/compiler/codegen/x86/lightcg/LowerHelper.cpp
+index c75057e..6ecb3f2 100644
+--- a/vm/compiler/codegen/x86/lightcg/LowerHelper.cpp
++++ b/vm/compiler/codegen/x86/lightcg/LowerHelper.cpp
+@@ -52,6 +52,7 @@ When allocating a physical register for an operand, we can't spill the operands
+ #include "Singleton.h"
+ #include "ExceptionHandling.h"
+ #include "compiler/Dataflow.h"
++#include "X86Common.h"
+ 
+ extern "C" int64_t __divdi3(int64_t, int64_t);
+ extern "C" int64_t __moddi3(int64_t, int64_t);
+diff --git a/vm/compiler/codegen/x86/lightcg/StackExtensionX86.cpp b/vm/compiler/codegen/x86/lightcg/StackExtensionX86.cpp
+deleted file mode 100644
+index 4e8cedb..0000000
+--- a/vm/compiler/codegen/x86/lightcg/StackExtensionX86.cpp
++++ /dev/null
+@@ -1,63 +0,0 @@
+-/*
+- * Copyright (C) 2013 Intel Corporation
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-#include "Dalvik.h"
+-#include "StackExtensionX86.h"
+-
+-/**
+- * @brief Gives number of available scratch registers for x86.
+- * @return Total number of scratch registers
+- */
+-unsigned int dvmArchSpecGetNumberOfScratch (void)
+-{
+-    return StackTemporaries::getTotalScratchVRs ();
+-}
+-
+-/**
+- * @brief Given a scratch register index, it gives the VR register number.
+- * @param method Method that contains the MIR for which we want to
+- * use scratch register.
+- * @param idx Index of scratch register. Must be in range [0 .. N-1] where
+- * N is the maximum number of scratch registers available.
+- * @param registerWindowShift If compilation unit uses a different register frame pointer
+- * base, it shifts the register window. This is the amount that register window has shifted.
+- * @return Return virtual register number when it finds one for the index.
+- * Otherwise, it returns -1.
+- */
+-int dvmArchSpecGetScratchRegister (const Method * method, unsigned int idx, int registerWindowShift)
+-{
+-    unsigned int maxScratch = dvmArchSpecGetNumberOfScratch ();
+-
+-    //Sanity check to make sure that requested index is in
+-    //range [0 .. maxScratch-1]
+-    if (idx > (maxScratch - 1))
+-    {
+-        return -1;
+-    }
+-
+-    //We know the index is okay. Index of 0 corresponds to virtual register
+-    //whose number is: 0 + locals + ins
+-    int numLocals = method->registersSize - method->insSize;
+-    int numIns = method->insSize;
+-
+-    //Calculate the regnum
+-    int regnum = idx + numLocals + numIns;
+-
+-    //Take into account the register window shift
+-    regnum += registerWindowShift;
+-
+-    return regnum;
+-}
+diff --git a/vm/compiler/codegen/x86/lightcg/StackExtensionX86.h b/vm/compiler/codegen/x86/lightcg/StackExtensionX86.h
+deleted file mode 100644
+index 2df5657..0000000
+--- a/vm/compiler/codegen/x86/lightcg/StackExtensionX86.h
++++ /dev/null
+@@ -1,68 +0,0 @@
+-/*
+- * Copyright (C) 2013 Intel Corporation
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-#ifndef STACKEXTENSIONX86_H_
+-#define STACKEXTENSIONX86_H_
+-
+-/**
+- * @brief Space in frame to use for scratch registers.
+- */
+-class StackTemporaries
+-{
+-public:
+-    /**
+-     * @brief Gives the total number of scratch VRs available for every frame.
+-     * @return Maximum number of scratch VRs.
+-     */
+-    static unsigned int getTotalScratchVRs (void)
+-    {
+-        return numScratch;
+-    }
+-
+-private:
+-    /**
+-     * @brief Hardcoded number of scratch registers per frame.
+-     */
+-#ifdef EXTRA_SCRATCH_VR
+-    static const unsigned int numScratch = 4;
+-#else
+-    static const unsigned int numScratch = 0;
+-#endif
+-
+-    /**
+-     * @brief Allocated space for the scratch registers.
+-     */
+-    u4 scratchVirtualRegisters[numScratch];
+-};
+-
+-/**
+- * @brief Stack frame extension for x86.
+- */
+-struct ArchSpecificStackExtension
+-{
+-
+-#ifdef EXTRA_SCRATCH_VR
+-    /**
+-     * @brief Allocated space for temporaries.
+-     * @warning If this structure gets moved, dvmArchSpecGetScratchRegister
+-     * must be updated to provide a new mapping.
+-     */
+-    StackTemporaries temps;
+-#endif
+-
+-};
+-
+-#endif /* STACKEXTENSIONX86_H_ */
+diff --git a/vm/compiler/codegen/x86/pcg/Analysis.cpp b/vm/compiler/codegen/x86/pcg/Analysis.cpp
+index a783961..6d11b72 100644
+--- a/vm/compiler/codegen/x86/pcg/Analysis.cpp
++++ b/vm/compiler/codegen/x86/pcg/Analysis.cpp
+@@ -19,6 +19,7 @@
+ #include "BasicBlockPCG.h"
+ #include "CompilationUnitPCG.h"
+ #include "Dataflow.h"
++#include "Utility.h"
+ #include "UtilityPCG.h"
+ 
+ /**
+@@ -774,8 +775,13 @@ static void pcgAvoidDeferredWritebacks (CompilationUnitPCG *cUnit)
+         //Get information
+         SSANumInfo &info = cUnit->getRootSSANumInformation (ssaNum);
+ 
+-        //Update deferment
+-        info.deferWriteback = false;
++        //Purely local registers do not have a home location and thus they must be registerized.
++        //Thus the deferred writeback should only be disabled for regular virtual registers.
++        if (dvmCompilerIsPureLocalScratch (cUnit, ssaNum, true) == false)
++        {
++            //Update deferment
++            info.deferWriteback = false;
++        }
+ 
+         //Get next number
+         ssaNum = dvmBitVectorIteratorNext (&it);
+@@ -805,9 +811,12 @@ void dvmCompilerPcgApplyRegisterizationHeuristics (CompilationUnitPCG *cUnit, in
+ 
+     if (zheur > 0)
+     {
+-        if (info.numUses <= zheur && info.parentSSANum == ssaNum &&
+-               (info.mir == 0 || (ExtendedMIROpcode) (info.mir->dalvikInsn.opcode) != kMirOpPhi) &&
+-                info.needsNullCheck == false)
++        //Check if we should be disabling registerization for define
++        if (info.numUses <= zheur
++                && info.parentSSANum == ssaNum
++                && (info.mir == 0 || (ExtendedMIROpcode) (info.mir->dalvikInsn.opcode) != kMirOpPhi)
++                && info.needsNullCheck == false
++                && dvmCompilerIsPureLocalScratch (cUnit, ssaNum, true) == false)
+         {
+             cUnit->disableRegisterizationForDef (ssaNum);
+             if (cUnit->checkDebugMask (DebugMaskRegisterizeVRs) == true)
+diff --git a/vm/compiler/codegen/x86/pcg/CompilationErrorPCG.cpp b/vm/compiler/codegen/x86/pcg/CompilationErrorPCG.cpp
+index b537d0b..0a273b3 100644
+--- a/vm/compiler/codegen/x86/pcg/CompilationErrorPCG.cpp
++++ b/vm/compiler/codegen/x86/pcg/CompilationErrorPCG.cpp
+@@ -35,6 +35,7 @@ START_ERRORS
+     NEW_ERROR (kJitErrorPcgCodegen,                     "Undefined issues in trace formation.",                         false, false),
+     NEW_ERROR (kJitErrorPcgPostInvokeEntryNotFound,     "The post-invoke entry block was not found.",                   false, false),
+     NEW_ERROR (kJitErrorPcgRelocationCreation,          "Error when creating a relocation in PCG GL.",                  false, false),
++    NEW_ERROR (kJitErrorPcgScratchFailedRegisterization,"Scratch register failed registerization.",                     false, false),
+ END_ERRORS
+ 
+ unsigned int CompilationErrorHandlerPCG::getMaximumErrors (void) const
+diff --git a/vm/compiler/codegen/x86/pcg/CompilationErrorPCG.h b/vm/compiler/codegen/x86/pcg/CompilationErrorPCG.h
+index 6d330ac..7649e01 100644
+--- a/vm/compiler/codegen/x86/pcg/CompilationErrorPCG.h
++++ b/vm/compiler/codegen/x86/pcg/CompilationErrorPCG.h
+@@ -52,6 +52,8 @@ enum JitPCGCompilationErrors {
+     kJitErrorPcgPostInvokeEntryNotFound,
+     /** @brief Error when creating a relocation */
+     kJitErrorPcgRelocationCreation,
++    /** @brief Error when a scratch register fails to be registerized */
++    kJitErrorPcgScratchFailedRegisterization,
+     /** @brief Maximum defines */
+     kJitErrorMaxDefinedPCG
+ };
+diff --git a/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.cpp b/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.cpp
+index 3e62f45..37c8bc7 100644
+--- a/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.cpp
++++ b/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.cpp
+@@ -15,10 +15,12 @@
+  */
+ 
+ #include "Analysis.h"
++#include "CompilationErrorPCG.h"
+ #include "CompilationUnitPCG.h"
++#include "Dataflow.h"
+ #include "Labels.h"
++#include "Utility.h"
+ #include "UtilityPCG.h"
+-#include "Dataflow.h"
+ 
+ uint32_t CompilationUnitPCG::traceID = 0;
+ 
+@@ -167,7 +169,28 @@ void CompilationUnitPCG::resolveAllRelocations (uint8_t *codePtr)
+     }
+ }
+ 
+-void CompilationUnitPCG::registerizeAnalysisDone (void)
++/**
++ * @brief Used to validate that all scratch registers have been registerized
++ * @param cUnit The compilation unit
++ * @param ssaNum The ssa register to check
++ * @param ssaInfo The information associated with ssa register
++ * @return Returns false if the scratch register is not registerized
++ */
++static bool validateScratchRegisterized (CompilationUnitPCG *cUnit, int ssaNum, SSANumInfo &ssaInfo)
++{
++    if (dvmCompilerIsPureLocalScratch (cUnit, ssaNum, true) == true)
++    {
++        if (ssaInfo.registerize == false || ssaInfo.deferWriteback == false)
++        {
++            return false;
++        }
++    }
++
++    //If we get here we either were not looking at scratch or it is registerized
++    return true;
++}
++
++bool CompilationUnitPCG::registerizeAnalysisDone (void)
+ {
+     std::map<int, SSANumInfo>::iterator it;
+ 
+@@ -183,6 +206,14 @@ void CompilationUnitPCG::registerizeAnalysisDone (void)
+         int ssaNum = it->first;
+         SSANumInfo &info = it->second;
+ 
++        // First let us validate that if this is a scratch register that it has actually been registerized
++        if (validateScratchRegisterized (this, ssaNum, info) == false)
++        {
++            ALOGD ("JIT_INFO: Found non-registerized scratch register, most likely due to type inconsistency");
++            errorHandler->setError (kJitErrorPcgScratchFailedRegisterization);
++            return false;
++        }
++
+         // Only consider top level temps.
+         if (ssaNum != info.parentSSANum)
+         {
+@@ -246,6 +277,9 @@ void CompilationUnitPCG::registerizeAnalysisDone (void)
+ 
+         dvmCompilerPcgApplyRegisterizationHeuristics (this, ssaNum, info);
+     }
++
++    //Everything went fine if we get here
++    return true;
+ }
+ 
+ SSANumInfo &CompilationUnitPCG::getSSANumInformation (int ssaNum)
+diff --git a/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.h b/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.h
+index 5b6843d..e367534 100644
+--- a/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.h
++++ b/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.h
+@@ -298,8 +298,9 @@ class CompilationUnitPCG: public CompilationUnit
+ 
+         /**
+          * Registerize Analysis is done, complete the information
++         * @return Returns true if post-registerization analysis completed successfully
+          */
+-        void registerizeAnalysisDone (void);
++        bool registerizeAnalysisDone (void);
+ 
+         /**
+          * @brief Get a temporary BitVector
+diff --git a/vm/compiler/codegen/x86/pcg/LowerJump.cpp b/vm/compiler/codegen/x86/pcg/LowerJump.cpp
+index 0e7a7f5..3e7867d 100644
+--- a/vm/compiler/codegen/x86/pcg/LowerJump.cpp
++++ b/vm/compiler/codegen/x86/pcg/LowerJump.cpp
+@@ -20,6 +20,7 @@
+ #include "Dataflow.h"
+ #include "LowerJump.h"
+ #include "LowerMemory.h"
++#include "Utility.h"
+ #include "UtilityPCG.h"
+ 
+ void dvmCompilerPcgTranslateDirectJumpToBlock (BasicBlockPCG *bb)
+@@ -311,7 +312,14 @@ void dvmCompilerPcgGenerateWritebacks (CompilationUnitPCG *cUnit, BitVector *bv)
+                     dvmClearBit (tempBV, temp);
+                 }
+             }
+-            dvmCompilerPcgStoreVirtualReg (cUnit, ssaNum, storeMask);
++
++            //Purely local scratch registers do not have a home location.
++            //So therefore we skip the actual store at exit because the way ME
++            //generated code, these are not live out
++            if (dvmCompilerIsPureLocalScratch (cUnit, ssaNum, true) == false)
++            {
++                dvmCompilerPcgStoreVirtualReg (cUnit, ssaNum, storeMask);
++            }
+         }
+     }
+ 
+diff --git a/vm/compiler/codegen/x86/pcg/PcgInterface.cpp b/vm/compiler/codegen/x86/pcg/PcgInterface.cpp
+index 6a4e4a5..944bd1d 100644
+--- a/vm/compiler/codegen/x86/pcg/PcgInterface.cpp
++++ b/vm/compiler/codegen/x86/pcg/PcgInterface.cpp
+@@ -15,6 +15,7 @@
+  */
+ 
+ #include <list>
++#include <limits.h>
+ 
+ #include "Analysis.h"
+ #include "BasicBlockPCG.h"
+@@ -31,6 +32,7 @@
+ #include "PersistentInfo.h"
+ #include "Singleton.h"
+ #include "UtilityPCG.h"
++#include "X86Common.h"
+ 
+ /**
+  * @brief Return an appropriate ISA string based on gDvmJit configuration
+@@ -38,12 +40,9 @@
+  */
+ static const char * pcgGetISALevel (void)
+ {
+-    const int slm_family = 6;
+-    const int slm_model = 74;
+-
+     const char * returnString = "atom_ssse3";
+ 
+-    if (gDvmJit.cpuFamily == slm_family && gDvmJit.cpuModel == slm_model)
++    if (dvmCompilerArchitectureSupportsSSE42 () == true)
+     {
+         returnString = "atom_sse4.2";
+     }
+@@ -138,18 +137,20 @@ void pcgDvmCompilerMIR2LIR (CompilationUnit *cUnitME, JitTranslationInfo* info)
+         //If analysis succeeds continue
+         if (dvmCompilerPcgNewRegisterizeVRAnalysis (&cUnit) == true)
+         {
+-            cUnit.registerizeAnalysisDone ();
+-            dvmCompilerPcgModSSANum (&cUnit);
++            if (cUnit.registerizeAnalysisDone () == true)
++            {
++                dvmCompilerPcgModSSANum (&cUnit);
+ 
+-            pcgConfigureTrace (&cUnit);
++                pcgConfigureTrace (&cUnit);
+ 
+-            bool success = dvmCompilerPcgGenerateIlForTrace (&cUnit, info);
++                bool success = dvmCompilerPcgGenerateIlForTrace (&cUnit, info);
+ 
+-            // Note that if !success, we leave cUnit->baseAddr as 0.
+-            if (success == true)
+-            {
+-                CGCompileRoutine (&cUnit);
+-                dvmCompilerPcgEmitCode (&cUnit, info);
++                // Note that if !success, we leave cUnit->baseAddr as 0.
++                if (success == true)
++                {
++                    CGCompileRoutine (&cUnit);
++                    dvmCompilerPcgEmitCode (&cUnit, info);
++                }
+             }
+         }
+ 
+@@ -232,6 +233,21 @@ static BasicBlock *pcgBBAllocator (void)
+ }
+ 
+ /**
++ * @brief Used to obtain the maximum number of scratch registers that PCG backend can support
++ * @return Returns the maximum number of scratch
++ */
++static unsigned int pcgGetMaxScratch (void)
++{
++    //We want to support a large number of scratch VRs so that from point of view of middle-end
++    //the supply of them seems unlimited. However, due to how CGTemps are represented, we are
++    //limited in how many we can create to around 2^32. However, we want to use CGTemps for
++    //registerizing VRs, vectorization, and possibly others. Thus here we just set a limit
++    //on scratch registers to USHRT_MAX. Technically we can have even more than that but
++    //from point of view of middle-end, it would be surprising if we ran into a limitation soon.
++    return USHRT_MAX;
++}
++
++/**
+  * @brief Initialization of the plugin for the PCG back-end
+  */
+ extern "C" void setupPcgJit (void)
+@@ -248,6 +264,7 @@ extern "C" void setupPcgJit (void)
+     jitFramework.backEndInvokeArgsDone = dvmCompilerPcgHandleInvokeArgsHeader;
+     jitFramework.backendSupportExtendedOp = dvmCompilerPcgSupportsExtendedOp;
+     jitFramework.backEndCompilationErrorHandlerAllocation = dvmCompilerPcgNewCompilationErrorHandler;
++    jitFramework.scratchRegAvail = pcgGetMaxScratch;
+ 
+     // Register callbacks
+     CGRegisterCallbackRoutine("CGGetMemConstSymbolFromClient",
+diff --git a/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp b/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp
+index e83b8b3..049393b 100644
+--- a/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp
++++ b/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp
+@@ -27,6 +27,7 @@
+ #include "Singleton.h"
+ #include "UtilityPCG.h"
+ #include "BitVector.h"
++#include "Utility.h"
+ 
+ /**
+  * @brief Get a call and register from a type
+diff --git a/vm/compiler/codegen/x86/pcg/UtilityPCG.h b/vm/compiler/codegen/x86/pcg/UtilityPCG.h
+index f907e50..2150abe 100644
+--- a/vm/compiler/codegen/x86/pcg/UtilityPCG.h
++++ b/vm/compiler/codegen/x86/pcg/UtilityPCG.h
+@@ -233,4 +233,5 @@ int dvmCompilerPcgGetVROffsetRelativeToVMPtr (CompilationUnitPCG *cUnit, int vR)
+  * @param align the alignment required
+  */
+ CGSymbol pcgDvmClientGetMemConstSymbol(CompilationUnitPCG *cUnit, uint8_t *value, size_t length, uint32_t align);
++
+ #endif
+diff --git a/vm/compiler/codegen/x86/x86Specific.cpp b/vm/compiler/codegen/x86/x86Specific.cpp
+deleted file mode 100644
+index 6576fe3..0000000
+--- a/vm/compiler/codegen/x86/x86Specific.cpp
++++ /dev/null
+@@ -1,53 +0,0 @@
+-/*
+- * Copyright (C) 2013 Intel Corporation
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-#include "CompilerIR.h"
+-#include "x86Specific.h"
+-
+-BasicBlock *dvmCompilerArchSpecificNewBB(void)
+-{
+-    BasicBlock * (*fctPtr) (void) = gDvmJit.jitFramework.backEndBasicBlockAllocation;
+-
+-    //If we have a function pointer, call it
+-    if (fctPtr != 0)
+-    {
+-        return fctPtr ();
+-    }
+-
+-    return 0;
+-}
+-
+-CompilationErrorHandler *dvmCompilerArchSpecificNewCompilationErrorHandler (void)
+-{
+-    CompilationErrorHandler* (*fctPtr) (void) = gDvmJit.jitFramework.backEndCompilationErrorHandlerAllocation;
+-
+-    //If we have a function pointer, call it
+-    if (fctPtr != 0)
+-    {
+-        return fctPtr ();
+-    }
+-
+-    return 0;
+-}
+-
+-void dvmCompilerDumpArchSpecificBB(CompilationUnit *cUnit, BasicBlock *bb, FILE *file, bool beforeMIRs)
+-{
+-    void (*fctPtr) (CompilationUnit *, BasicBlock *, FILE *, bool) = gDvmJit.jitFramework.backEndDumpSpecificBB;
+-
+-    if (fctPtr != 0)
+-    {
+-        fctPtr (cUnit, bb, file, beforeMIRs);
+-    }
+-}
+diff --git a/vm/compiler/codegen/x86/x86Specific.h b/vm/compiler/codegen/x86/x86Specific.h
+deleted file mode 100644
+index 55d36ab..0000000
+--- a/vm/compiler/codegen/x86/x86Specific.h
++++ /dev/null
+@@ -1,49 +0,0 @@
+-/*
+- * Copyright (C) 2013 Intel Corporation
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-#ifndef H_X86SPECIFIC
+-#define H_X86SPECIFIC
+-
+-#include <stdlib.h>
+-
+-//Forward Declarations
+-struct BasicBlock;
+-struct CompilationUnit;
+-
+-/**
+- * @brief Architecture specific BasicBlock creator
+- * @details Initializes x86 specific BasicBlock fields
+- * @return newly created BasicBlock
+- */
+-BasicBlock *dvmCompilerArchSpecificNewBB(void);
+-
+-/**
+- * @brief Architecture specific CompilationErrorHandler creator
+- * @details Initializes x86 specific CompilationErrorHandler fields
+- * @return newly created CompilationErrorHandler
+- */
+-CompilationErrorHandler *dvmCompilerArchSpecificNewCompilationErrorHandler (void);
+-
+-/**
+- * @brief Architecture specific BasicBlock printing
+- * @param cUnit the CompilationUnit
+- * @param bb the BasicBlock
+- * @param file the File in which to dump the BasicBlock
+- * @param beforeMIRs is this call performed before generating the dumps for the MIRs
+- */
+-void dvmCompilerDumpArchSpecificBB(CompilationUnit *cUnit, BasicBlock *bb, FILE *file, bool beforeMIRs);
+-
+-#endif
+-- 
+1.7.4.1
+

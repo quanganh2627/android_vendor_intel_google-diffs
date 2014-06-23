@@ -1,0 +1,944 @@
+From efd4b76609e9e5f70a3f42ff8820b115d4804f01 Mon Sep 17 00:00:00 2001
+From: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Date: Wed, 14 Aug 2013 11:58:20 -0700
+Subject: Dalvik: Invariant sinking
+
+BZ: 132511
+
+New pass has been added that sinks setters that update invariant
+location. The pass only applies when there is no memory clobbering
+and only a single setter exists. Once the location is proved to be
+invariant, the instruction is taken from loop and sunk to the loop
+exits. In order to ensure that sinking is safe in case of exception,
+if the instruction needs null check one is hoisted to the loop
+preheader. The hoisted null check implementation is also updated
+via this patch.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Ic269c7f4ba161f8956de6769aa6956c01aae5cff
+Orig-MCG-Change-Id: I31fdcc07bee5dd33e5779ad21039b125dd95e80c
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Reviewed-on: http://android.intel.com:8080/125626
+Reviewed-by: Provodin, Vitaly A <vitaly.a.provodin@intel.com>
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/BBOptimization.cpp                     |    6 +
+ vm/compiler/Checks.cpp                             |   67 +++-
+ vm/compiler/Checks.h                               |    8 +
+ vm/compiler/Dataflow.cpp                           |   34 ++-
+ vm/compiler/InvariantRemoval.cpp                   |  415 ++++++++++++++++++++
+ vm/compiler/InvariantRemoval.h                     |   15 +
+ vm/compiler/LoopInformation.cpp                    |   35 ++
+ vm/compiler/LoopInformation.h                      |   10 +
+ vm/compiler/LoopOpt.cpp                            |    2 +
+ vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp     |    1 +
+ .../codegen/x86/lightcg/BytecodeVisitor.cpp        |   46 ++-
+ .../codegen/x86/lightcg/CodegenInterface.cpp       |    1 +
+ .../codegen/x86/lightcg/InstructionGeneration.cpp  |   36 ++-
+ 13 files changed, 637 insertions(+), 39 deletions(-)
+
+diff --git a/vm/compiler/BBOptimization.cpp b/vm/compiler/BBOptimization.cpp
+index 2fe486c..33f4d56 100644
+--- a/vm/compiler/BBOptimization.cpp
++++ b/vm/compiler/BBOptimization.cpp
+@@ -127,6 +127,12 @@ bool dvmCompilerMergeBasicBlocks (CompilationUnit *cUnit, BasicBlock *bb)
+         }
+     }
+ 
++    //If we have an instruction, take its offset
++    if (bb->firstMIRInsn != 0)
++    {
++        child->startOffset = bb->startOffset;
++    }
++
+     //Move the MIRs from this block to the beginning of child
+     dvmCompilerMoveLinkedMIRsBefore (child, 0, bb->firstMIRInsn);
+ 
+diff --git a/vm/compiler/Checks.cpp b/vm/compiler/Checks.cpp
+index 85ebec7..1d19391 100644
+--- a/vm/compiler/Checks.cpp
++++ b/vm/compiler/Checks.cpp
+@@ -20,6 +20,7 @@
+ #include "Loop.h"
+ #include "LoopOpt.h"
+ #include "Pass.h"
++#include "LoopInformation.h"
+ 
+ #include <map>
+ 
+@@ -982,6 +983,40 @@ void handleIndexHoist (CompilationUnit *cUnit, SRemoveData *removeData, MIR *mir
+ 
+ }
+ 
++bool dvmCompilerGenerateNullCheckHoist (BasicBlock *hoistToBB, int objectReg)
++{
++    //Assume we will not hoist
++    bool hoisted = false;
++
++    //Check if we have a BB to hoist to
++    if (hoistToBB != 0)
++    {
++        //Now check if we can determine PC in case of exception
++        if (hoistToBB->fallThrough != 0 && hoistToBB->fallThrough->firstMIRInsn != 0)
++        {
++            //Do a sanity check on the block offset before we hoist. It should match the offset of first instruction
++            if (hoistToBB->fallThrough->startOffset == hoistToBB->fallThrough->firstMIRInsn->offset)
++            {
++                MIR *nullCheck = dvmCompilerNewMIR ();
++
++                //Create null check
++                nullCheck->dalvikInsn.opcode = static_cast<Opcode> (kMirOpNullCheck);
++                nullCheck->dalvikInsn.vA = objectReg;
++
++                //For exception purpose, we set the offset to match the offset in the block following entry
++                nullCheck->offset = hoistToBB->fallThrough->startOffset;
++
++                //Now append the MIR to the BB
++                dvmCompilerAppendMIR (hoistToBB, nullCheck);
++
++                //Mark that hoisting was successful
++                hoisted = true;
++            }
++        }
++    }
++
++    return hoisted;
++}
+ 
+ void handleNullCheckHoist (CompilationUnit *cUnit, SRemoveData *removeData, MIR *mir, int objectReg)
+ {
+@@ -998,27 +1033,21 @@ void handleNullCheckHoist (CompilationUnit *cUnit, SRemoveData *removeData, MIR
+             //Get entry block
+             BasicBlock *entry = cUnit->entryBlock;
+ 
+-            if (entry != NULL)
++            bool hoisted = dvmIsBitSet (removeData->hoistedNullChecks, objectReg);
++
++            //Have we hoisted it already?
++            if (hoisted == false)
+             {
+-                //Have we hoisted it already?
+-                if (dvmIsBitSet (removeData->hoistedNullChecks, objectReg) == false)
+-                {
+-                    //Though we have not hoisted yet, the reasons below will be true for any subsequent request
+-                    dvmSetBit (removeData->hoistedNullChecks, objectReg);
+-                        //Actually generate the hoisting code
+-                        MIR *nullCheck = static_cast<MIR *> (dvmCompilerNew (sizeof (*nullCheck), true));
+-                        nullCheck->dalvikInsn.opcode = static_cast<Opcode> (kMirOpNullCheck);
+-                        //We only care about the object register
+-                        nullCheck->dalvikInsn.vA = objectReg;
+-                        nullCheck->dalvikInsn.vB = 0;
+-                        nullCheck->dalvikInsn.vC = 0;
+-                        nullCheck->ssaRep = mir->ssaRep;
+-                        dvmCompilerAppendMIR(entry, nullCheck);
+-                }
++                //Though we have not hoisted yet, the reasons below will be true for any subsequent request
++                dvmSetBit (removeData->hoistedNullChecks, objectReg);
+ 
+-                //In either case, we can remove it:
+-                // Either we have already hoisted it
+-                // Or we haven't and we just did
++                //Actually generate the hoisting code
++                hoisted = dvmCompilerGenerateNullCheckHoist (entry, objectReg);
++            }
++
++            if (hoisted == true)
++            {
++                //If we hoisted the null check the we can eliminate it
+                 mir->OptimizationFlags |= MIR_IGNORE_NULL_CHECK;
+             }
+         }
+diff --git a/vm/compiler/Checks.h b/vm/compiler/Checks.h
+index 47bf119..56bcf41 100644
+--- a/vm/compiler/Checks.h
++++ b/vm/compiler/Checks.h
+@@ -23,6 +23,14 @@
+ class Pass;
+ 
+ /**
++ * @brief Used to generate and add a hoisted null check
++ * @param hoistToBB The basic block to which to append the hoisted null check
++ * @param objectReg The dalvik register on which to do a null check
++ * @return Returns if null check was successfully generated
++ */
++bool dvmCompilerGenerateNullCheckHoist (BasicBlock *hoistToBB, int objectReg);
++
++/**
+  * @brief Remove redundant checks start function
+  * @param cUnit the CompilationUnit
+  * @param curPass the current pass Pass
+diff --git a/vm/compiler/Dataflow.cpp b/vm/compiler/Dataflow.cpp
+index c66df36..5b0e7eb 100644
+--- a/vm/compiler/Dataflow.cpp
++++ b/vm/compiler/Dataflow.cpp
+@@ -826,7 +826,7 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_FORMAT_EXT_OP,
+ 
+     //kMirOpNullCheck
+-    DF_FORMAT_EXT_OP,
++    DF_FORMAT_EXT_OP | DF_NULL_OBJECT_CHECK_0,
+ 
+     //kMirOpBoundCheck
+     DF_FORMAT_EXT_OP,
+@@ -1255,6 +1255,16 @@ void dvmCompilerExtendedDisassembler (const CompilationUnit *cUnit,
+         case kMirOpPackedAddReduce:
+             snprintf (buffer, len, "kMirOpPackedAddReduce v%d = xmm%d, size %d", insn->vA, insn->vB, insn->vC);
+             break;
++        case kMirOpNullCheck:
++            if (mir != 0)
++            {
++                snprintf (buffer, len, "kMirOpNullCheck v%d offset:0x%x", insn->vA, mir->offset);
++            }
++            else
++            {
++                snprintf (buffer, len, "kMirOpNullCheck v%d", insn->vA);
++            }
++            break;
+         default:
+             snprintf (buffer, len, "Unknown Extended Opcode");
+             break;
+@@ -1449,8 +1459,10 @@ static inline void handleDef(BitVector *defV, int dalvikRegId)
+ }
+ 
+ /* Handle use for extended op */
+-void handleExtOpUses (BitVector *useV, BitVector *defV, DecodedInstruction* dInsn)
++void handleExtOpUses (BitVector *useV, BitVector *defV, MIR *mir)
+ {
++    DecodedInstruction* dInsn = &(mir->dalvikInsn);
++
+     switch (static_cast<int> (dInsn->opcode))
+     {
+         case kMirOpPhi:
+@@ -1475,8 +1487,12 @@ void handleExtOpUses (BitVector *useV, BitVector *defV, DecodedInstruction* dIns
+             handleUse (useV, defV, dInsn->vC);
+             break;
+         case kMirOpNullCheck:
+-            //vA holds object reference register
+-            handleUse (useV, defV, dInsn->vA);
++            //We only reference the register if we need to do a null check
++            if ((mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK) == 0)
++            {
++                //vA holds object reference register
++                handleUse (useV, defV, dInsn->vA);
++            }
+             break;
+         case kMirOpBoundCheck:
+             //vA holds object reference register
+@@ -1634,7 +1650,7 @@ bool dvmCompilerFindLocalLiveIn(CompilationUnit *cUnit, BasicBlock *bb)
+         //Now handle uses and defs for extended MIRs
+         if ((dfAttributes & DF_FORMAT_EXT_OP) != 0)
+         {
+-            handleExtOpUses (useV, defV, dInsn);
++            handleExtOpUses (useV, defV, mir);
+             handleExtOpDefs (defV, dInsn);
+         }
+     }
+@@ -1881,8 +1897,12 @@ static void dataFlowSSAFormatExtendedOp(CompilationUnit *cUnit, MIR *mir)
+             numUses++;
+             break;
+         case kMirOpNullCheck:
+-            handleSSAUse(cUnit, uses, mir->dalvikInsn.vA, numUses);
+-            numUses++;
++            //We only have a use if we need to do a null check
++            if ((mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK) == 0)
++            {
++                handleSSAUse(cUnit, uses, mir->dalvikInsn.vA, numUses);
++                numUses++;
++            }
+             break;
+         case kMirOpBoundCheck:
+             handleSSAUse(cUnit, uses, mir->dalvikInsn.vA, numUses);
+diff --git a/vm/compiler/InvariantRemoval.cpp b/vm/compiler/InvariantRemoval.cpp
+index 8480110..209a127 100644
+--- a/vm/compiler/InvariantRemoval.cpp
++++ b/vm/compiler/InvariantRemoval.cpp
+@@ -21,6 +21,9 @@
+ #include "LoopInformation.h"
+ #include "Pass.h"
+ #include "BBOptimization.h"
++#include "LoopOpt.h"
++#include "Checks.h"
++#include <vector>
+ 
+ /**
+  * @brief Are the uses of the MIR instruction all defined in the chosen map
+@@ -1040,3 +1043,415 @@ bool dvmCompilerInvariantRemovalGate (const CompilationUnit *cUnit, Pass *curPas
+     return invariantRemovalGateHelper (cUnit, loopInfo);
+ }
+ 
++/**
++ * @brief Checks if an opcode represents a volatile getter/setter
++ * @param op The opcode to check
++ * @return Returns true if the bytecode is volatile
++ */
++static bool isVolatileGetterSetter (Opcode op)
++{
++    switch (op)
++    {
++        case OP_IGET_VOLATILE:
++        case OP_IPUT_VOLATILE:
++        case OP_SGET_VOLATILE:
++        case OP_SPUT_VOLATILE:
++        case OP_IGET_OBJECT_VOLATILE:
++        case OP_IGET_WIDE_VOLATILE:
++        case OP_IPUT_WIDE_VOLATILE:
++        case OP_SGET_WIDE_VOLATILE:
++        case OP_SPUT_WIDE_VOLATILE:
++        case OP_IPUT_OBJECT_VOLATILE:
++        case OP_SGET_OBJECT_VOLATILE:
++        case OP_SPUT_OBJECT_VOLATILE:
++            return true;
++        default:
++            break;
++    }
++
++    return false;
++}
++
++/**
++ * @brief Finds all getters and setters in a given basic block
++ * @param bb The basic block to check
++ * @param data A vector of MIR pointers where to store the getters and setters
++ * @return Returns true if successfully gone through basic block and filled data
++ */
++static bool findGettersSetters (BasicBlock *bb, void *data)
++{
++    if (data == 0)
++    {
++        //We don't have a place to put our findings
++        return false;
++    }
++
++    //We should have been passed a set where we can store getters and setters
++    std::vector<MIR *> &gettersSetters = *(reinterpret_cast<std::vector<MIR *> *> (data));
++
++    for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        int dfFlags = dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
++
++        if (((dfFlags & DF_IS_SETTER) != 0) || ((dfFlags & DF_IS_GETTER) != 0) || isVolatileGetterSetter (mir->dalvikInsn.opcode) == true)
++        {
++            gettersSetters.push_back (mir);
++        }
++    }
++
++    //We have successfully looked
++    return true;
++}
++
++/**
++ * @brief Is the opcode an iput or iget of object?
++ * @param opcode the Opcode in question
++ * @return Returns whether we have an object iput/iget
++ */
++bool isObjectGetterSetter (int opcode)
++{
++    switch (opcode)
++    {
++        case OP_IGET_OBJECT:
++        case OP_IGET_OBJECT_QUICK:
++        case OP_IPUT_OBJECT:
++        case OP_IPUT_OBJECT_QUICK:
++        case OP_IGET_OBJECT_VOLATILE:
++        case OP_IPUT_OBJECT_VOLATILE:
++        case OP_APUT_OBJECT:
++        case OP_AGET_OBJECT:
++        case OP_SGET_OBJECT:
++        case OP_SPUT_OBJECT:
++        case OP_SGET_OBJECT_VOLATILE:
++        case OP_SPUT_OBJECT_VOLATILE:
++            return true;
++    }
++
++    //We do not have an object getter/setter
++    return false;
++}
++
++/**
++ * @brief Goes through a basic block and checks if any of those MIRs clobber memory
++ * @param bb The basic block whose MIRs to check
++ * @param data Unused argument
++ * @return Returns true if no memory is clobbered
++ */
++static bool checkIfNoClobberMemory (BasicBlock *bb, void *data)
++{
++    for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        int dfFlags = dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
++
++        if ((dfFlags & DF_CLOBBERS_MEMORY) != 0)
++        {
++            //We DO clobber memory
++            return false;
++        }
++
++        //Now check if we have an object update because that may clobber memory
++        if (isObjectGetterSetter (mir->dalvikInsn.opcode) == true)
++        {
++            //We don't know much about memory once we update an object
++            return false;
++        }
++    }
++
++    //We don't actually clobber memory
++    return true;
++}
++
++/**
++ * @brief Tries to select invariant setters for sinking
++ * @param cUnit The compilation unit
++ * @param loopExit The exit block we try to sink to
++ * @param gettersSetters The vector of all getters and setters in the loop
++ * @return Returns the MIRs selected for possible sinking
++ */
++static std::vector<MIR *> selectInvariants (CompilationUnit *cUnit, BasicBlock *loopExit, std::vector<MIR *> &gettersSetters)
++{
++    assert (loopExit != 0);
++
++    //Keep track of selections
++    std::vector<MIR *> selections;
++
++    //We only sink if we find only one memory operation because otherwise we have a hard time disambiguating without coloring
++    if (gettersSetters.size () == 1)
++    {
++        for (std::vector<MIR *>::const_iterator iter = gettersSetters.begin (); iter != gettersSetters.end (); iter++)
++        {
++            MIR *mir = *iter;
++
++            //Get the dataflow flags
++            int dfFlags = dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
++
++            if ((dfFlags & DF_IS_SETTER) == 0)
++            {
++                //Only sink setters
++                continue;
++            }
++
++            //If the MIR is a volatile, skip it
++            if (isVolatileGetterSetter (mir->dalvikInsn.opcode) == true)
++            {
++                continue;
++            }
++
++            //Skip instructions that need a range check because otherwise we need additional work when sinking
++            //in order to deal with potential exception.
++            if ((dfFlags & DF_HAS_NR_CHECKS) != 0 && (mir->OptimizationFlags & MIR_IGNORE_RANGE_CHECK) == 0)
++            {
++                continue;
++            }
++
++            if (mir->ssaRep == 0)
++            {
++                //Cannot do anything without ssa
++                continue;
++            }
++
++            //Determine start index where the object pointer register is
++            int startIndex = dvmCompilerGetStartUseIndex (mir->dalvikInsn.opcode);
++
++            //If the number of uses is greater than the start index, it means that we do have an object
++            //Otherwise we are most likely looking at a static setter
++            if (mir->ssaRep->numUses > startIndex)
++            {
++                //Get the object register
++                int objectSSAReg = mir->ssaRep->uses[startIndex];
++
++                //Without coloring we can only prove the object is invariant if its ssa version is 0
++                //The reason we can do this is that we have loop context and we know it is coming as that into
++                //the loop and is not inter-iteration variant
++                int objectRegVersion = dvmExtractSSASubscript (cUnit, objectSSAReg);
++
++                if (objectRegVersion != 0)
++                {
++                    continue;
++                }
++            }
++
++            //We should have domination information nor dataflow info
++            if (loopExit->dominators == 0 || loopExit->dataFlowInfo == 0 || loopExit->dataFlowInfo->dalvikToSSAMap == 0)
++            {
++                continue;
++            }
++
++            //Only sink if we dominate the loop exit
++            if (dvmIsBitSet (loopExit->dominators, mir->bb->id) == false)
++            {
++                continue;
++            }
++
++            //Assume we have no version mismatch
++            bool problemWithVersions = false;
++
++            //Now go through all of the uses to make sure that the version at the iput match the exit
++            for (int use = 0; use < mir->ssaRep->numUses; use++)
++            {
++                int dalvikReg = dvmExtractSSARegister (cUnit, mir->ssaRep->uses[use]);
++                int regVersion = dvmExtractSSASubscript (cUnit, mir->ssaRep->uses[use]);
++
++                int exitRegVersion = DECODE_SUB (loopExit->dataFlowInfo->dalvikToSSAMap[dalvikReg]);
++
++                //The version the iput is using does not match exit version
++                if (regVersion != exitRegVersion)
++                {
++                    problemWithVersions = true;
++                    break;
++                }
++            }
++
++            if (problemWithVersions == true)
++            {
++                continue;
++            }
++
++            //Finally we should check that noone is touching the same memory.
++            //However, right now we only accept when we have solely one iput so we don't need to check now.
++
++            //Try to remove it from its original location
++            if (dvmCompilerRemoveMIR (mir) == true)
++            {
++                //We succeeded removing it so lets add it to our selections
++                selections.push_back (mir);
++            }
++        }
++    }
++
++    //We have finished selecting
++    return selections;
++}
++
++/**
++ * @brief Goes through the selections MIRs and tries to generate hoisted null checks if needed.
++ * @details For all MIRs that receive hoisted null checks or don't need null check, they are part
++ * of the final selections.
++ * @param cUnit The compilation unit
++ * @param info The loop information
++ * @param selections[in] The MIRs we are trying to sink
++ * @param selections[out] The MIRs that can be safely sunk because they received hoisted null check
++ */
++static void handleNullCheckHoisting (CompilationUnit *cUnit, LoopInformation *info, std::vector<MIR *> &selections)
++{
++    std::vector<MIR *> finalSelections;
++
++    for (std::vector<MIR *>::const_iterator iter = selections.begin (); iter != selections.end (); iter++)
++    {
++        MIR *mir = *iter;
++
++        //Get the dataflow flags
++        int dfFlags = dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
++
++        //Check if we need to have object use but null check has not been done
++        if ((dfFlags & DF_HAS_OBJECT_CHECKS) != 0 && (mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK) == 0)
++        {
++            //Determine the object register index
++            int index = -1;
++            switch (dfFlags & DF_HAS_OBJECT_CHECKS)
++            {
++                case DF_NULL_OBJECT_CHECK_0:
++                    index = 0;
++                    break;
++                case DF_NULL_OBJECT_CHECK_1:
++                    index = 1;
++                    break;
++                case DF_NULL_OBJECT_CHECK_2:
++                    index = 2;
++                    break;
++                default:
++                    break;
++            }
++
++            //Check that we can find the object register
++            if (index >= 0 && mir->ssaRep != 0 && mir->ssaRep->uses != 0)
++            {
++                int ssaReg = mir->ssaRep->uses[index];
++                int objectDalvikReg = dvmExtractSSARegister (cUnit, ssaReg);
++
++                //Now try to generate a hoisted null check. We put it in preheader because it dominates exit
++                bool generatedNullCheck = dvmCompilerGenerateNullCheckHoist (info->getPreHeader (), objectDalvikReg);
++
++                if (generatedNullCheck == true)
++                {
++                    //If we successfully generated the check then we mark this mir as having been checked
++                    mir->OptimizationFlags |= MIR_IGNORE_NULL_CHECK;
++
++                    finalSelections.push_back (mir);
++                }
++            }
++        }
++        else
++        {
++            //We do not need a null check and thus we can safely sink it
++            finalSelections.push_back (mir);
++        }
++    }
++
++    //We need to swap in the final selections for those which we successfully generated null check for
++    selections.swap (finalSelections);
++}
++
++/**
++ * @brief Helper function that tries to sink invariants for a given loop
++ * @param cUnit The compilation unit
++ * @param info The loop for which to sink at exit
++ * @param data Unused argument
++ * @return Always returns true to signify that we have tried sinking invariants for this loop even
++ * if we don't do anything.
++ */
++static bool sinkInvariants (CompilationUnit *cUnit, LoopInformation *info, void *data)
++{
++    //First, check we don't have multiple exits and we only have one backward branch
++    if (dvmCountSetBits (info->getExitLoops ()) != 1)
++    {
++        //We have more than one exit so we stop early
++        return true;
++    }
++
++    if (dvmCountSetBits (info->getBackwardBranches ()) != 1)
++    {
++        //We have more than one exit so we stop early
++        return true;
++    }
++
++    //Second check that we don't clobber any memory
++    if (info->iterateThroughLoopBasicBlocks (cUnit, checkIfNoClobberMemory) == false)
++    {
++        //We take the conservative approach that we cannot sink any memory operations.
++        return true;
++    }
++
++    std::vector<MIR *> gettersSetters, selections;
++
++    //Third find all getters and setters
++    if (info->iterateThroughLoopBasicBlocks (cUnit, findGettersSetters,
++            reinterpret_cast<void *> (&gettersSetters)) == false)
++    {
++        //We ran into an issue while looking for getters/setters
++        return true;
++    }
++
++    //Check if we have any getters and setters because if we don't, we have no work
++    if (gettersSetters.size () == 0)
++    {
++        return true;
++    }
++
++    //Get the loop exit block index
++    int loopExitIdx = dvmHighestBitSet (info->getExitLoops ());
++
++    //Get the loop exit
++    BasicBlock *loopExit = reinterpret_cast<BasicBlock *> (dvmGrowableListGetElement (&cUnit->blockList, loopExitIdx));
++
++    //Fourth, select any setters that can be moved
++    selections = selectInvariants (cUnit, loopExit, gettersSetters);
++
++    //We have no work to do if we made no selections
++    if (selections.size () == 0)
++    {
++        return true;
++    }
++
++    //Fifth generate any needed null checks
++    handleNullCheckHoisting (cUnit, info, selections);
++
++    //Finally move the final selections to the exit
++    info->addInstructionsToExits (cUnit, selections);
++
++    return true;
++}
++
++void dvmCompilerInvariantSinking (CompilationUnit *cUnit, Pass *curPass)
++{
++    //Gate made sure that we have at least one loop
++    LoopInformation *info = cUnit->loopInformation;
++    assert (info != 0);
++
++    //Apply transformation on all loops
++    info->iterate (cUnit, sinkInvariants);
++}
++
++bool dvmCompilerInvariantSinkingGate (const CompilationUnit *cUnit, Pass *curPass)
++{
++    //Unused argument
++    (void) curPass;
++
++    //We only apply optimizations if we have the new loop system
++    if (dvmCompilerTraceIsLoopNewSystem (cUnit, curPass) == false)
++    {
++        return false;
++    }
++
++    //Now let's go through the loop information
++    LoopInformation *info = cUnit->loopInformation;
++
++    if (info == 0)
++    {
++        //We have no loops and thus we cannot sink any invariants
++        return false;
++    }
++
++    return true;
++}
++
+diff --git a/vm/compiler/InvariantRemoval.h b/vm/compiler/InvariantRemoval.h
+index 45d0993..6dd618a 100644
+--- a/vm/compiler/InvariantRemoval.h
++++ b/vm/compiler/InvariantRemoval.h
+@@ -45,4 +45,19 @@ void dvmCompilerIgetIputRemoval (CompilationUnit *cUnit, Pass *curPass);
+  */
+ bool dvmCompilerInvariantRemovalGate (const CompilationUnit *cUnit, Pass *curPass);
+ 
++/**
++ * @brief Attempts to sink invariants as far out of loop as it can: to loop exits or after the loop
++ * @param cUnit The compilation unit
++ * @param curPass The current pass
++ */
++void dvmCompilerInvariantSinking (CompilationUnit *cUnit, Pass *curPass);
++
++/**
++ * @brief Checks whether invariant sinking can be done
++ * @param cUnit The compilation unit
++ * @param curPass The current pass
++ * @return Returns whether we can do invariant sinking
++ */
++bool dvmCompilerInvariantSinkingGate (const CompilationUnit *cUnit, Pass *curPass);
++
+ #endif
+diff --git a/vm/compiler/LoopInformation.cpp b/vm/compiler/LoopInformation.cpp
+index e63cab4..5196cbf 100644
+--- a/vm/compiler/LoopInformation.cpp
++++ b/vm/compiler/LoopInformation.cpp
+@@ -64,6 +64,41 @@ bool LoopInformation::iterate (CompilationUnit *cUnit, bool (*func)(CompilationU
+     return true;
+ }
+ 
++bool LoopInformation::iterateThroughLoopBasicBlocks (CompilationUnit *cUnit, bool (*func) (BasicBlock *, void *), void *data)
++{
++    //Create iterator to go through basic blocks
++    BitVectorIterator blockIter;
++    dvmBitVectorIteratorInit (getBasicBlocks (), &blockIter);
++
++    while (true)
++    {
++        int blockIdx = dvmBitVectorIteratorNext (&blockIter);
++
++        //If done, break out of loop
++        if (blockIdx == -1)
++        {
++            break;
++        }
++
++        //Get the actual basic block
++        BasicBlock *bb = reinterpret_cast<BasicBlock *> (dvmGrowableListGetElement (&cUnit->blockList, blockIdx));
++
++        //Paranoid
++        if (bb == 0)
++        {
++            break;
++        }
++
++        //Now call the worker function
++        if (func (bb, data) == false)
++        {
++            return false;
++        }
++    }
++
++    return true;
++}
++
+ bool LoopInformation::iterate (bool (*func)(LoopInformation *, void *), void *data)
+ {
+     LoopInformation *item = this;
+diff --git a/vm/compiler/LoopInformation.h b/vm/compiler/LoopInformation.h
+index fa627a7..8e28c46 100644
+--- a/vm/compiler/LoopInformation.h
++++ b/vm/compiler/LoopInformation.h
+@@ -489,6 +489,16 @@ class LoopInformation
+          bool iterate (CompilationUnit *cUnit, bool (*func) (CompilationUnit *, LoopInformation *, void *), void *data = 0);
+ 
+          /**
++           * @brief Helper function to iterate over basic blocks in loop
++           * @param cUnit the CompilationUnit
++           * @param func worker function
++           * @param data user data passed to worker
++           * @return Returns false as soon as func returns false. Returns true if all calls to func return true.
++           */
++        bool iterateThroughLoopBasicBlocks (CompilationUnit *cUnit, bool (*func) (BasicBlock *, void *),
++                void *data = 0);
++
++         /**
+           * @brief helper function to iterate over loop information with const cUnit
+           * @param cUnit the CompilationUnit
+           * @param func worker function
+diff --git a/vm/compiler/LoopOpt.cpp b/vm/compiler/LoopOpt.cpp
+index e3f00d5..ee3e08d 100644
+--- a/vm/compiler/LoopOpt.cpp
++++ b/vm/compiler/LoopOpt.cpp
+@@ -94,6 +94,8 @@ START_PASSES
+             0, dvmCompilerAccumulationSinking, 0, 0, kOptimizationBasicBlockChange),
+     NEW_PASS ("Vectorization", kAllNodes, 0, dvmCompilerVectorizationGate,
+             dvmCompilerVectorize, 0, 0, dvmCompilerFreeVectorization, kOptimizationBasicBlockChange | kLoopStructureChange),
++    NEW_PASS ("Invariant_sinking", kAllNodes, 0, dvmCompilerInvariantSinkingGate,
++            dvmCompilerInvariantSinking, 0, 0, 0, kOptimizationBasicBlockChange),
+     //This should be after the last optimization that changes instruction sequence or BB logic
+     //Note: reorder is safe and should be after
+     //We do registerization for all traces to provide spill information to the BE
+diff --git a/vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp b/vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp
+index e9897aa..0706310 100644
+--- a/vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp
++++ b/vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp
+@@ -1264,6 +1264,7 @@ bool skipExtendedMir(Opcode opc) {
+         case kMirOpPackedAddition:
+         case kMirOpPackedAddReduce:
+         case kMirOpPackedSet:
++        case kMirOpNullCheck:
+             return false;
+         default:
+             return true;
+diff --git a/vm/compiler/codegen/x86/lightcg/BytecodeVisitor.cpp b/vm/compiler/codegen/x86/lightcg/BytecodeVisitor.cpp
+index 1116a05..de72b77 100644
+--- a/vm/compiler/codegen/x86/lightcg/BytecodeVisitor.cpp
++++ b/vm/compiler/codegen/x86/lightcg/BytecodeVisitor.cpp
+@@ -1559,6 +1559,23 @@ int getVirtualRegInfo (VirtualRegInfo* infoArray, const MIR * currentMIR, bool u
+ 
+                 num_regs_per_bytecode = 1;
+                 break;
++            case kMirOpNullCheck:
++                if ((currentMIR->OptimizationFlags & MIR_IGNORE_NULL_CHECK) == 0)
++                {
++                    //We only reference register if we need to do a null check
++                    infoArray[0].regNum = currentMIR->dalvikInsn.vA;
++                    infoArray[0].refCount = 1;
++                    infoArray[0].accessType = REGACCESS_U;
++                    infoArray[0].physicalType = LowOpndRegType_gp;
++
++                    num_regs_per_bytecode = 1;
++                }
++                else
++                {
++                    num_regs_per_bytecode = 0;
++                }
++
++                break;
+             default:
+                 ALOGI("JIT_INFO: Extended MIR not supported in getVirtualRegInfo");
+                 SET_JIT_ERROR(kJitErrorUnsupportedBytecode);
+@@ -3699,8 +3716,8 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR, const u2* dal
+                 //If we won't be generating a null check on object, then we have fewer references
+                 if ((currentMIR->OptimizationFlags & MIR_IGNORE_NULL_CHECK) != 0)
+                 {
+-                    //Null check requires two references so we subtract that right now
+-                    infoArray[0].refCount -= 2;
++                    //Null check requires one reference so we subtract that right now
++                    infoArray[0].refCount -= 1;
+                 }
+                 else
+                 {
+@@ -3834,6 +3851,31 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR, const u2* dal
+ 
+                 return 2;
+             }
++            case kMirOpNullCheck:
++            {
++                unsigned int tempRegCount = 0;
++
++                //We only use temps if we need to do a null check
++                if ((currentMIR->OptimizationFlags & MIR_IGNORE_NULL_CHECK) == 0)
++                {
++                    //Use temp1 to hold the "this" object reference
++                    infoArray[0].regNum = 1;
++                    infoArray[0].refCount = 2;
++                    infoArray[0].physicalType = LowOpndRegType_gp;
++                    tempRegCount++;
++
++                    //When nullCheck is called it expects that it can update references to EDX.
++                    //Although EDX is not explicitly used, we must add two references now in order to satisfy
++                    //this dependency. Eventually when nullCheck is fixed this can be removed.
++                    infoArray[1].regNum = PhysicalReg_EDX;
++                    infoArray[1].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++                    infoArray[1].refCount = 2;
++                    tempRegCount++;
++                }
++
++                //Return the number of temps being used
++                return tempRegCount;
++            }
+             default:
+                 ALOGI("JIT_INFO: Extended MIR not supported in getTempRegInfo");
+                 SET_JIT_ERROR(kJitErrorUnsupportedBytecode);
+diff --git a/vm/compiler/codegen/x86/lightcg/CodegenInterface.cpp b/vm/compiler/codegen/x86/lightcg/CodegenInterface.cpp
+index d3962e5..90b70ac 100644
+--- a/vm/compiler/codegen/x86/lightcg/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/lightcg/CodegenInterface.cpp
+@@ -1482,6 +1482,7 @@ bool handleExtendedMIR (CompilationUnit *cUnit, BasicBlock_O1 *bb, MIR *mir)
+             break;
+         }
+         case kMirOpNullCheck: {
++            gDvm.executionMode = origMode;
+             genHoistedNullCheck (cUnit, mir);
+             break;
+         }
+diff --git a/vm/compiler/codegen/x86/lightcg/InstructionGeneration.cpp b/vm/compiler/codegen/x86/lightcg/InstructionGeneration.cpp
+index 1a62a32..65336c2 100644
+--- a/vm/compiler/codegen/x86/lightcg/InstructionGeneration.cpp
++++ b/vm/compiler/codegen/x86/lightcg/InstructionGeneration.cpp
+@@ -27,6 +27,7 @@
+ 
+ #define P_GPR_1 PhysicalReg_EBX
+ #define P_GPR_2 PhysicalReg_ECX
++
+ /**
+  * @brief Generate a Null check
+  * @param cUnit the CompilationUnit
+@@ -34,17 +35,30 @@
+  */
+ void genHoistedNullCheck (CompilationUnit *cUnit, MIR *mir)
+ {
+-    /*
+-     * NOTE: these synthesized blocks don't have ssa names assigned
+-     * for Dalvik registers.  However, because they dominate the following
+-     * blocks we can simply use the Dalvik name w/ subscript 0 as the
+-     * ssa name.
+-     */
+-    /* Assign array in virtual register to P_GPR_1 */
+-    get_virtual_reg(mir->dalvikInsn.vA, OpndSize_32, P_GPR_1, true);
+-    export_pc();
+-    compare_imm_reg(OpndSize_32, 0, P_GPR_1, true);
+-    condJumpToBasicBlock(stream, Condition_E, cUnit->exceptionBlockId);
++    //Check if register allocator is turned on
++    if (gDvm.executionMode == kExecutionModeNcgO1)
++    {
++        //Now we do a null check if it is needed
++        if ((mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK) == 0)
++        {
++            //Now create some locals to make it easier to read
++            const int temp1 = 1;
++            const int vrThisPtr = mir->dalvikInsn.vA;
++
++            //Put the object register in temp1
++            get_virtual_reg (vrThisPtr, OpndSize_32, temp1, false);
++
++            //Do a null check on temp1
++            nullCheck (temp1, false, 1, vrThisPtr);
++        }
++    }
++    else
++    {
++        get_virtual_reg (mir->dalvikInsn.vA, OpndSize_32, P_GPR_1, true);
++        export_pc ();
++        compare_imm_reg (OpndSize_32, 0, P_GPR_1, true);
++        condJumpToBasicBlock (stream, Condition_E, cUnit->exceptionBlockId);
++    }
+ }
+ 
+ /**
+-- 
+1.7.4.1
+

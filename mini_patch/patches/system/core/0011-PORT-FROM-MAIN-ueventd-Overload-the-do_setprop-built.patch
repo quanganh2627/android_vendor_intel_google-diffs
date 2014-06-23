@@ -1,0 +1,169 @@
+From ac319621fe36758c22c95b952c22595cd840d5e8 Mon Sep 17 00:00:00 2001
+From: Quentin Casasnovas <quentinx.casasnovas@intel.com>
+Date: Fri, 12 Jul 2013 10:32:13 +0200
+Subject: [PORT FROM MAIN]ueventd: Overload the do_setprop builtin
+
+BZ: 125765
+
+This patch overloads the do_setprop builtin so we can call it from another
+process than init, particularly from ueventd. This extra function makes sure to
+keep the properties in a temporary area if the init process hasn't initialized
+the property_service at the time the property needs to be defined. This is
+required so we can later on add ueventd actions which will set properties on
+receival of certain modalias, which can happen really early in the boot
+process.
+
+Category: device enablement
+Domain: CWS.WIFI-Common
+Origin: internal
+Upstream-Candidate: yes
+
+Change-Id: I18a0d5c3d5d9a82087434eeb6f4b95de734290be
+Orig-Change-Id: I56f74fb2d4a0f164e329ba2ddff21350c8363ca8
+Signed-off-by: Quentin Casasnovas <quentinx.casasnovas@intel.com>
+Reviewed-on: http://android.intel.com:8080/118419
+Reviewed-by: Champciaux, Nicolas <nicolas.champciaux@intel.com>
+Tested-by: Champciaux, Nicolas <nicolas.champciaux@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Jeremie GARCIA <jeremie.garcia@intel.com>
+---
+ init/builtins.c         |   66 +++++++++++++++++++++++++++++++++++++++++++++++
+ init/keywords.h         |    3 +-
+ init/property_service.c |    1 +
+ init/property_service.h |    2 +
+ 4 files changed, 71 insertions(+), 1 deletions(-)
+
+diff --git a/init/builtins.c b/init/builtins.c
+index c2fc769..5258dcb 100644
+--- a/init/builtins.c
++++ b/init/builtins.c
+@@ -52,6 +52,14 @@
+ 
+ #include <private/android_filesystem_config.h>
+ 
++#ifndef PROPERTY_VALUE_MAX
++#  define PROPERTY_VALUE_MAX 92
++#endif
++
++#ifndef PROPERTY_KEY_MAX
++#  define PROPERTY_KEY_MAX 32
++#endif
++
+ void add_environment(const char *name, const char *value);
+ 
+ extern int init_module(void *, unsigned long, const char *);
+@@ -625,6 +633,64 @@ int do_setprop(int nargs, char **args)
+     return 0;
+ }
+ 
++static int append_to_file(const char* path, const char *data, size_t len)
++{
++    int fd = -1;
++    int ret = 0;
++
++    fd = TEMP_FAILURE_RETRY(open(path, O_WRONLY | O_CREAT | O_APPEND, 0640));
++    if (fd < 0) {
++        ERROR("Failed to open %s (%s)",
++              path, strerror(errno));
++        return -errno;
++    }
++
++    if (TEMP_FAILURE_RETRY(write(fd, data, len)) != (int) len) {
++        ERROR("Failed to write %s in %s (%s)",
++              data, path, strerror(errno));
++        ret = -errno;
++    }
++
++    close(fd);
++    return ret;
++}
++
++static int uevent_temporary_setprop(char* name, char* prop_val)
++{
++    /*  "key" + "=" + "value" + "\n\0" */
++    char buff[PROPERTY_KEY_MAX + 1 + PROPERTY_VALUE_MAX + 2];
++    int len = -1;
++
++    len = snprintf(buff, sizeof(buff), "%s=%s\n", name, prop_val);
++
++    append_to_file(PROP_PATH_UEVENTD, buff, (len >= (int) sizeof(buff) ? sizeof(buff) : len));
++
++    return 0;
++}
++
++int do_ext_setprop(int nargs, char **args)
++{
++    const char *name = args[1];
++    const char *value = args[2];
++    char prop_val[PROP_VALUE_MAX];
++    int ret;
++
++    ret = expand_props(prop_val, value, sizeof(prop_val));
++    if (ret) {
++        ERROR("cannot expand '%s' while assigning to '%s'\n", value, name);
++        return -EINVAL;
++    }
++    if ((ret = __system_property_set(name, prop_val)) < 0) {
++        /*
++         * property_service is not running at this time so we put the
++         * properties in temporary space.
++         */
++        ret = uevent_temporary_setprop(name, prop_val);
++    }
++
++    return ret;
++}
++
+ int do_setrlimit(int nargs, char **args)
+ {
+     struct rlimit limit;
+diff --git a/init/keywords.h b/init/keywords.h
+index 58c0a48..ec5dd53 100644
+--- a/init/keywords.h
++++ b/init/keywords.h
+@@ -25,6 +25,7 @@ int do_setcon(int nargs, char **args);
+ int do_setenforce(int nargs, char **args);
+ int do_setkey(int nargs, char **args);
+ int do_setprop(int nargs, char **args);
++int do_ext_setprop(int nargs, char **args);
+ int do_setrlimit(int nargs, char **args);
+ int do_setsebool(int nargs, char **args);
+ int do_start(int nargs, char **args);
+@@ -82,7 +83,7 @@ enum {
+     KEYWORD(setenforce,  COMMAND, 1, do_setenforce, 0)
+     KEYWORD(setenv,      OPTION,  2, 0, 0)
+     KEYWORD(setkey,      COMMAND, 0, do_setkey, 0)
+-    KEYWORD(setprop,     COMMAND, 2, do_setprop, 0)
++    KEYWORD(setprop,     COMMAND, 2, do_setprop, do_ext_setprop)
+     KEYWORD(setrlimit,   COMMAND, 3, do_setrlimit, 0)
+     KEYWORD(setsebool,   COMMAND, 1, do_setsebool, 0)
+     KEYWORD(socket,      OPTION,  0, 0, 0)
+diff --git a/init/property_service.c b/init/property_service.c
+index 9ac2781..6e199d4 100644
+--- a/init/property_service.c
++++ b/init/property_service.c
+@@ -595,6 +595,7 @@ void start_property_service(void)
+ 
+     listen(fd, 8);
+     property_set_fd = fd;
++    load_properties_from_file(PROP_PATH_UEVENTD);
+ }
+ 
+ int get_property_set_fd()
+diff --git a/init/property_service.h b/init/property_service.h
+index 46cbd8f..4deed28 100644
+--- a/init/property_service.h
++++ b/init/property_service.h
+@@ -20,6 +20,8 @@
+ #include <stdbool.h>
+ #include <sys/system_properties.h>
+ 
++#define PROP_PATH_UEVENTD "/dev/.ueventd_properties"
++
+ extern void handle_property_set_fd(void);
+ extern void property_init(void);
+ extern void property_load_boot_defaults(void);
+-- 
+1.7.4.1
+

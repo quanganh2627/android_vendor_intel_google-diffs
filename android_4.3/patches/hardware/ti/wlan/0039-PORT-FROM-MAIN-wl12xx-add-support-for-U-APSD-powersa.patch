@@ -1,0 +1,110 @@
+From 8250fb089e758b737ae738789172993261611e6b Mon Sep 17 00:00:00 2001
+From: Frode Isaksen <fisaksex>
+Date: Wed, 10 Oct 2012 17:48:54 +0200
+Subject: [PORT FROM MAIN] wl12xx: add support for U-APSD powersave for Voice traffic
+
+BZ: 43272
+
+Add support for U-APSD powersave by forcing the
+chip in power save mode if N (=10) consecutive packets
+transmitted on the AC_VO queue. The time to go into
+power save with RTP traffic should then be about 200ms.
+This should avoid going in and out of power save if a
+mix of Voice traffic with "normal" traffic is sent.
+The forced power save mode is left if a "normal"
+packet is sent.
+
+Signed-off-by: Frode Isaksen <fisaksex>
+
+Change-Id: Ic8e182c0ebacd8505041cb32ce192dad44f474ea
+Orig-Change-Id: Ib7d1c8851553aad8bd0a5ce792fed7e6d0713682
+Reviewed-on: http://android.intel.com:8080/69635
+Reviewed-by: Isaksen, FrodeX <frodex.isaksen@intel.com>
+Reviewed-by: Fiat, Christophe <christophe.fiat@intel.com>
+Reviewed-by: De Cesco, Jonathan <jonathan.de.cesco@intel.com>
+Tested-by: Champciaux, Nicolas <nicolas.champciaux@intel.com>
+Reviewed-by: buildbot <buildbot@intel.com>
+Tested-by: buildbot <buildbot@intel.com>
+Reviewed-on: http://android.intel.com:8080/77996
+Reviewed-by: Li, XiaojingX <xiaojingx.li@intel.com>
+Tested-by: Li, XiaojingX <xiaojingx.li@intel.com>
+---
+ wl12xx-compat/drivers/net/wireless/wl12xx/main.c   |    1 +
+ wl12xx-compat/drivers/net/wireless/wl12xx/tx.c     |   25 ++++++++++++++++++++
+ wl12xx-compat/drivers/net/wireless/wl12xx/wl12xx.h |    5 ++++
+ 3 files changed, 31 insertions(+), 0 deletions(-)
+
+diff --git a/wl12xx-compat/drivers/net/wireless/wl12xx/main.c b/wl12xx-compat/drivers/net/wireless/wl12xx/main.c
+index 0559121..6d33b9f 100644
+--- a/wl12xx-compat/drivers/net/wireless/wl12xx/main.c
++++ b/wl12xx-compat/drivers/net/wireless/wl12xx/main.c
+@@ -4929,6 +4929,7 @@ static int wl1271_op_conf_tx(struct ieee80211_hw *hw,
+ 		ps_scheme = CONF_PS_SCHEME_UPSD_TRIGGER;
+ 	else
+ 		ps_scheme = CONF_PS_SCHEME_LEGACY;
++	wl->conf.tx.tid_conf[wl1271_tx_get_queue(queue)].ps_scheme = ps_scheme;
+ 
+ 	if (!test_bit(WLVIF_FLAG_INITIALIZED, &wlvif->flags))
+ 		goto out;
+diff --git a/wl12xx-compat/drivers/net/wireless/wl12xx/tx.c b/wl12xx-compat/drivers/net/wireless/wl12xx/tx.c
+index ff74ad1..a54f425 100644
+--- a/wl12xx-compat/drivers/net/wireless/wl12xx/tx.c
++++ b/wl12xx-compat/drivers/net/wireless/wl12xx/tx.c
+@@ -696,6 +696,28 @@ void wl12xx_rearm_rx_streaming(struct wl1271 *wl, unsigned long *active_hlids)
+ 	}
+ }
+ 
++static void wl1271_adjust_ps_mode(struct wl1271 *wl, struct wl12xx_vif *wlvif, struct sk_buff *skb)
++{
++	int q = wl1271_tx_get_queue(skb_get_queue_mapping(skb));
++
++	if (wl->conf.tx.tid_conf[q].ps_scheme == CONF_PS_SCHEME_UPSD_TRIGGER) {
++		if (q == CONF_TX_AC_VO) {
++			/* Force power save mode if number of AC_VO tagged packets exceeds threshold  */
++			if (!wl->conf.conn.forced_ps && (++wlvif->force_ps == FORCE_PS_TRESHOLD)) {
++				wl1271_ps_set_mode(wl, wlvif, STATION_POWER_SAVE_MODE);
++				wl->conf.conn.forced_ps = true;
++			}
++		} else {
++			/* "Normal" packet, reset power save */
++			wlvif->force_ps = 0;
++			if (wl->conf.conn.forced_ps) {
++				wl1271_ps_set_mode(wl, wlvif, STATION_AUTO_PS_MODE);
++				wl->conf.conn.forced_ps = false;
++			}
++		}
++	}
++}
++
+ /*
+  * Returns failure values only in case of failed bus ops within this function.
+  * wl1271_prepare_tx_frame retvals won't be returned in order to avoid
+@@ -729,6 +751,9 @@ int wl1271_tx_work_locked(struct wl1271 *wl)
+ 			wlvif = wl12xx_vif_to_data(info->control.vif);
+ 
+ 		has_data = wlvif && wl1271_tx_is_data_present(skb);
++		if (has_data && (wlvif->bss_type != BSS_TYPE_AP_BSS)) {
++			wl1271_adjust_ps_mode(wl, wlvif, skb);
++		}
+ 		ret = wl1271_prepare_tx_frame(wl, wlvif, skb, buf_offset);
+ 		if (ret == -EAGAIN) {
+ 			/*
+diff --git a/wl12xx-compat/drivers/net/wireless/wl12xx/wl12xx.h b/wl12xx-compat/drivers/net/wireless/wl12xx/wl12xx.h
+index 874018a..65e305d 100644
+--- a/wl12xx-compat/drivers/net/wireless/wl12xx/wl12xx.h
++++ b/wl12xx-compat/drivers/net/wireless/wl12xx/wl12xx.h
+@@ -678,6 +678,11 @@ struct wl12xx_vif {
+ 	struct work_struct rx_streaming_disable_work;
+ 	struct timer_list rx_streaming_timer;
+ 
++	/* Force power save if number of AC_VO tagged packets
++	exceeds treshold (normally 200ms for RTP traffic) */
++#define FORCE_PS_TRESHOLD 10
++	int force_ps;
++
+ 	/*
+ 	 * This struct must be last!
+ 	 * data that has to be saved acrossed reconfigs (e.g. recovery)
+-- 
+1.7.4.1
+

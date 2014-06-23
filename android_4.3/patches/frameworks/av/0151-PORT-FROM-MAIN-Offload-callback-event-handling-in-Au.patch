@@ -1,0 +1,272 @@
+From f84b2ebb65265db6373c2062a258d67368c54814 Mon Sep 17 00:00:00 2001
+From: samaga Prasanna Krishna <samaga.krishna@intel.com>
+Date: Wed, 21 Nov 2012 09:24:20 +0530
+Subject: [PORT FROM MAIN]Offload callback event handling in AudioSinkCallback()
+
+BZ: 67267
+
+This patch will fix minor code logic mismatch in
+AudioSinkCallback() for EVENT_TEAR_DOWN and other callback events
+from AudioOutput to solve potential risk of video test case failure.
+
+AudioOutput receives AudioTrack callback events including
+EVENT_MORE_DATA and EVENT_TEAR_DOWN and needs to pass it to
+AudioPlayer to perform specific action based on the event.
+Hence extra parameter for callback event is added in overloaded
+AudioSinkCallback() to handle offload events.
+
+Change-Id: I13eadcfdfa41018342d03caef33ea50f2640ed5d
+Orig-Change-Id: I513d0770ea3a6dba1de08c7e97dbe9773f5bb61f
+origChange-Id: Ic1a5a01a906d8cbcbe53b8f8de2a342299a1c92a
+Signed-off-by: samaga Prasanna Krishna <samaga.krishna@intel.com>
+Signed-off-by: Arulselvan M <arulselvan.m@intel.com>
+---
+ include/media/MediaPlayerInterface.h               |   12 +++++-
+ include/media/stagefright/AudioPlayer.h            |    6 +++
+ libvideoeditor/lvpp/VideoEditorPlayer.h            |    2 +-
+ media/libmediaplayerservice/MediaPlayerService.cpp |   42 ++++++++++++++------
+ media/libmediaplayerservice/MediaPlayerService.h   |    5 +-
+ media/libstagefright/AudioPlayer.cpp               |   28 ++++++++++---
+ 6 files changed, 72 insertions(+), 23 deletions(-)
+
+diff --git a/include/media/MediaPlayerInterface.h b/include/media/MediaPlayerInterface.h
+index d644f9e..96f3977 100644
+--- a/include/media/MediaPlayerInterface.h
++++ b/include/media/MediaPlayerInterface.h
+@@ -74,10 +74,20 @@ public:
+     // AudioSink: abstraction layer for audio output
+     class AudioSink : public RefBase {
+     public:
++        enum cb_event_t {
++            CB_EVENT_FILL_BUFFER,
++            CB_EVENT_STREAM_END,
++            CB_EVENT_TEAR_DOWN
++        };
++
+         // Callback returns the number of bytes actually written to the buffer.
+         typedef size_t (*AudioCallback)(
+                 AudioSink *audioSink, void *buffer, size_t size, void *cookie);
+ 
++        // Overloaded Callback function returns the number of bytes actually written to the buffer.
++        typedef size_t (*AudioCallback2)(
++                AudioSink *audioSink, void *buffer, size_t size, void *cookie,
++                        cb_event_t event);
+         virtual             ~AudioSink() {}
+         virtual bool        ready() const = 0; // audio output is open and ready
+         virtual bool        realtime() const = 0; // audio output is real-time output
+@@ -107,7 +117,7 @@ public:
+                 int bitRate,
+                 audio_format_t format=AUDIO_FORMAT_PCM_16_BIT,
+                 int bufferCount=DEFAULT_AUDIOSINK_BUFFERCOUNT,
+-                AudioCallback cb = NULL,
++                AudioCallback2 cb = NULL,
+                 void *cookie = NULL,
+                 audio_output_flags_t flags = AUDIO_OUTPUT_FLAG_NONE) = 0;
+         virtual void        start() = 0;
+diff --git a/include/media/stagefright/AudioPlayer.h b/include/media/stagefright/AudioPlayer.h
+index 5922232..7fdf08c 100644
+--- a/include/media/stagefright/AudioPlayer.h
++++ b/include/media/stagefright/AudioPlayer.h
+@@ -130,6 +130,12 @@ private:
+             MediaPlayerBase::AudioSink *audioSink,
+             void *data, size_t size, void *me);
+ 
++    // Overloaded for offload callback events
++    static size_t AudioSinkCallback(
++            MediaPlayerBase::AudioSink *audioSink,
++            void *data, size_t size, void *me,
++            MediaPlayerBase::AudioSink::cb_event_t event);
++
+     size_t fillBuffer(void *data, size_t size);
+ 
+     int64_t getRealTimeUsLocked() const;
+diff --git a/libvideoeditor/lvpp/VideoEditorPlayer.h b/libvideoeditor/lvpp/VideoEditorPlayer.h
+index eb91ae4..3d21fb8 100755
+--- a/libvideoeditor/lvpp/VideoEditorPlayer.h
++++ b/libvideoeditor/lvpp/VideoEditorPlayer.h
+@@ -59,7 +59,7 @@ class VideoEditorPlayer : public MediaPlayerInterface {
+                 uint32_t sampleRate, int channelCount, audio_channel_mask_t channelMask,
+                 int bitRate,
+                 audio_format_t format, int bufferCount,
+-                AudioCallback cb, void *cookie,
++                AudioCallback2 cb, void *cookie,
+                 audio_output_flags_t flags) { return NO_ERROR; }
+ 
+         virtual void            start();
+diff --git a/media/libmediaplayerservice/MediaPlayerService.cpp b/media/libmediaplayerservice/MediaPlayerService.cpp
+index 98b866f..b8ce2f8 100644
+--- a/media/libmediaplayerservice/MediaPlayerService.cpp
++++ b/media/libmediaplayerservice/MediaPlayerService.cpp
+@@ -1299,6 +1299,7 @@ MediaPlayerService::AudioOutput::AudioOutput(int sessionId)
+     setMinBufferCount();
+ #ifdef INTEL_MUSIC_OFFLOAD_FEATURE
+     mBitRate = 0;
++    mCallback2 = NULL;
+ #endif
+ }
+ 
+@@ -1383,15 +1384,16 @@ status_t MediaPlayerService::AudioOutput::open(
+         uint32_t sampleRate, int channelCount, audio_channel_mask_t channelMask,
+         int bitRate,
+         audio_format_t format, int bufferCount,
+-        AudioCallback cb, void *cookie,
++        AudioCallback2 cb, void *cookie,
+         audio_output_flags_t flags)
+ {
+ #ifdef INTEL_MUSIC_OFFLOAD_FEATURE
+     if (flags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD){
+         mBitRate = bitRate;
++        mCallback2 = cb;
+      }
+      return open(sampleRate, channelCount, channelMask, format,
+-                 bufferCount, cb, cookie, flags);
++                 bufferCount, NULL /*cb*/, cookie, flags);
+ #else
+     return 0;
+ #endif
+@@ -1440,7 +1442,7 @@ status_t MediaPlayerService::AudioOutput::open(
+     CallbackData *newcbd = NULL;
+ #ifdef INTEL_MUSIC_OFFLOAD_FEATURE
+     if (flags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD) {
+-       if (mCallback != NULL) {
++       if (mCallback2 != NULL) {
+             newcbd = new CallbackData(this);
+             t = new AudioTrack(
+                 mStreamType,
+@@ -1511,11 +1513,20 @@ status_t MediaPlayerService::AudioOutput::open(
+     if (mRecycledTrack) {
+         // check if the existing track can be reused as-is, or if a new track needs to be created.
+         bool reuse = true;
+-        if ((mCallbackData == NULL && mCallback != NULL) ||
+-                (mCallbackData != NULL && mCallback == NULL)) {
++        if ( (!(flags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD)
++                && (mCallbackData == NULL && mCallback != NULL)) ||
++                (!(flags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD)
++                && (mCallbackData != NULL && mCallback == NULL)) ) {
+             // recycled track uses callbacks but the caller wants to use writes, or vice versa
+             ALOGV("can't chain callback and write");
+             reuse = false;
++        } else if ( ((flags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD)
++                && (mCallbackData == NULL && mCallback2 != NULL)) ||
++                ((flags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD)
++                && (mCallbackData != NULL && mCallback2 == NULL)) ) {
++            // recycled track uses callbacks but the caller wants to use writes, or vice versa
++            ALOGV("offload: can't chain callback and write");
++            reuse = false;
+         } else if ((mRecycledTrack->getSampleRate() != sampleRate) ||
+                 (mRecycledTrack->channelCount() != channelCount) ||
+                 (mRecycledTrack->frameCount() != t->frameCount())) {
+@@ -1719,14 +1730,21 @@ void MediaPlayerService::AudioOutput::CallbackWrapper(
+         // For AudioTrack events of Tear down  just call
+         // registered call back function and pass the event
+         AudioTrack::Buffer buffer;
+-        buffer.flags = event;
+-        buffer.size  = 4;
+-        (*me->mCallback)(me, &buffer, buffer.size, me->mCallbackCookie);
++        if (me->mFlags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD) {
++            (*me->mCallback2)(me, NULL, 0, me->mCallbackCookie, CB_EVENT_TEAR_DOWN);
++        }
+     } break;
+     case AudioTrack::EVENT_MORE_DATA:
+     {
+-        size_t actualSize = (*me->mCallback)(
+-            me, buffer->raw, buffer->size, me->mCallbackCookie);
++        size_t actualSize = 0;
++        if (me->mFlags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD) {
++            actualSize = (*me->mCallback2)(
++                me, buffer->raw, buffer->size, me->mCallbackCookie,
++                CB_EVENT_FILL_BUFFER);
++        } else {
++            actualSize = (*me->mCallback)(
++                me, buffer->raw, buffer->size, me->mCallbackCookie);
++        }
+         if ( (actualSize == 0) && (buffer->size > 0) &&
+              ((me->mNextOutput == NULL) ||
+              (me->mFlags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD)) ) {
+@@ -1737,8 +1755,8 @@ void MediaPlayerService::AudioOutput::CallbackWrapper(
+             // to avoid buffer time-out until EOS is posted.
+             memset(buffer->raw, 0, buffer->size);
+             actualSize = buffer->size;
+-       }
+-       buffer->size = actualSize;
++        }
++        buffer->size = actualSize;
+     } break;
+     default:
+     {
+diff --git a/media/libmediaplayerservice/MediaPlayerService.h b/media/libmediaplayerservice/MediaPlayerService.h
+index 4401215..fce8d12 100644
+--- a/media/libmediaplayerservice/MediaPlayerService.h
++++ b/media/libmediaplayerservice/MediaPlayerService.h
+@@ -101,7 +101,7 @@ class MediaPlayerService : public BnMediaPlayerService
+                 uint32_t sampleRate, int channelCount, audio_channel_mask_t channelMask,
+                 int bitRate,
+                 audio_format_t format, int bufferCount,
+-                AudioCallback cb, void *cookie,
++                AudioCallback2 cb, void *cookie,
+                 audio_output_flags_t flags = AUDIO_OUTPUT_FLAG_NONE);
+ 
+ 
+@@ -149,6 +149,7 @@ class MediaPlayerService : public BnMediaPlayerService
+         static int              mMinBufferCount;  // 12 for emulator; otherwise 4
+         audio_output_flags_t    mFlags;
+         int                     mBitRate;
++        AudioCallback2          mCallback2;
+ 
+         // CallbackData is what is passed to the AudioTrack as the "user" data.
+         // We need to be able to target this to a different Output on the fly,
+@@ -212,7 +213,7 @@ class MediaPlayerService : public BnMediaPlayerService
+                 uint32_t sampleRate, int channelCount, audio_channel_mask_t channelMask,
+                 int bitRate,
+                 audio_format_t format, int bufferCount,
+-                AudioCallback cb, void *cookie,
++                AudioCallback2 cb, void *cookie,
+                 audio_output_flags_t flags = AUDIO_OUTPUT_FLAG_NONE){return NO_ERROR;}
+ 
+         virtual void            start();
+diff --git a/media/libstagefright/AudioPlayer.cpp b/media/libstagefright/AudioPlayer.cpp
+index ed9bac5..a00122d 100644
+--- a/media/libstagefright/AudioPlayer.cpp
++++ b/media/libstagefright/AudioPlayer.cpp
+@@ -438,17 +438,31 @@ size_t AudioPlayer::AudioSinkCallback(
+         MediaPlayerBase::AudioSink *audioSink,
+         void *buffer, size_t size, void *cookie) {
+     AudioPlayer *me = (AudioPlayer *)cookie;
+-#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
+-    AudioTrack::Buffer *buff = (AudioTrack::Buffer *)buffer;
++    return me->fillBuffer(buffer, size);
++}
+ 
+-    // Check for control events in this callback function
+-    if((size == 4) && me->mObserver && (buff->flags == AudioTrack::EVENT_TEAR_DOWN)) {
+-        ALOGV("AudioSinkCallback: Tear down event received");
++// static
++size_t AudioPlayer::AudioSinkCallback(
++        MediaPlayerBase::AudioSink *audioSink,
++        void *buffer, size_t size, void *cookie,
++        MediaPlayerBase::AudioSink::cb_event_t event) {
++    ALOGV("Offload AudioSinkCallback");
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++     AudioPlayer *me = (AudioPlayer *)cookie;
++
++    if(event == MediaPlayerBase::AudioSink::CB_EVENT_FILL_BUFFER) {
++        return me->fillBuffer(buffer, size);
++    } else if( event == MediaPlayerBase::AudioSink::CB_EVENT_STREAM_END ) {
++        ALOGV("AudioSinkCallback: stream end");
++        me->mReachedEOS = true;
++        me->notifyAudioEOS();
++    } else if( event ==  MediaPlayerBase::AudioSink::CB_EVENT_TEAR_DOWN ) {
++        ALOGV("AudioSinkCallback: Tear down event");
+         me->mObserver->postAudioOffloadTearDown();
+-        return 0;
+     }
++    return 0;
+ #endif
+-    return me->fillBuffer(buffer, size);
++    return 0;
+ }
+ 
+ void AudioPlayer::AudioCallback(int event, void *info) {
+-- 
+1.7.4.1
+

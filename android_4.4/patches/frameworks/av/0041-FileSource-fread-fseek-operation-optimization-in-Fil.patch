@@ -1,0 +1,193 @@
+From 3992be2af84e83446849312f9be12b23c6ca1449 Mon Sep 17 00:00:00 2001
+From: Richard Tang <richard.tang@intel.com>
+Date: Tue, 30 Apr 2013 13:27:50 +0800
+Subject: FileSource: fread/fseek operation optimization in FileSource
+
+BZ: 48562
+
+It's for fread/fseek optimization and also bug fixing for those introduced by that
+
+details:
+R3 original patch:
+44381: libstagefright: Fix a file length offset overflow issue(BZ: 32335)
+30055: FileSource: Patches porting from R2 to R3(BZ: 18507)
+
+R2 original patches:
+20231: Filesource: add file end checking while read data from buffer(BZ: 8273 9853)
+13487: FileSource: optimize the fread/fseek operation(BZ:4119)
+21103: libstagefright: There is a crash log be created when play a deleted mp3 file from(BZ 9931 )
+19056: FileSource: add mFile checking before using(BZ:9122)
+
+Category: aosp improvement
+Domain: Video.Media-local playback
+Origin: internal
+Upstream-Candidate: no
+
+Change-Id: I020de1508fb5a38ddbde2cf52824af1646f56492
+Orig-Change-Id: Ied6ac7b4d99b4b4b87a44bb754f76c90a1ed2ca0
+Signed-off-by: Weian Chen <weian.chen@intel.com>
+Signed-off-by: Dan Liang <dan.liang@intel.com>
+---
+ include/media/stagefright/FileSource.h |   27 +++++++++
+ media/libstagefright/FileSource.cpp    |   93 ++++++++++++++++++++++++++++++++
+ 2 files changed, 120 insertions(+), 0 deletions(-)
+
+diff --git a/include/media/stagefright/FileSource.h b/include/media/stagefright/FileSource.h
+index d994cb3..ca8ac6e 100644
+--- a/include/media/stagefright/FileSource.h
++++ b/include/media/stagefright/FileSource.h
+@@ -27,6 +27,32 @@
+ 
+ namespace android {
+ 
++#define FILE_SOURCE_META_BUFFER_NUMBER                6
++// must be power of 2
++#define FILE_SOURCE_META_BUFFER_DATA_SIZE             (4*1024)//0x1000 // 4096
++#define FILE_SOURCE_META_BUFFER_DATA_LOCAL_OFFSET     (FILE_SOURCE_META_BUFFER_DATA_SIZE - 1)
++#define FILE_SOURCE_META_BUFFER_DATA_OFFSET           ~(FILE_SOURCE_META_BUFFER_DATA_LOCAL_OFFSET)
++#define FILE_SOURCE_META_BUFFER_LRU_COUNT_LIMIT       100
++struct FileSourceMetaBuffer {
++    char data[FILE_SOURCE_META_BUFFER_DATA_SIZE];
++    off_t offset;
++    char valid;
++    int count; // for LRU calculation
++    size_t len; // actual bytes in buffer
++};
++
++class FileSourceBuffer {
++public:
++    FileSourceBuffer();
++    ssize_t readFromBuffer(off64_t offset, void *data, size_t size, int file);
++
++private:
++    struct FileSourceMetaBuffer mMetaBuffer[FILE_SOURCE_META_BUFFER_NUMBER];
++    int mNextBuffer;
++    Mutex mLock;
++};
++
++
+ class FileSource : public DataSource {
+ public:
+     FileSource(const char *filename);
+@@ -50,6 +76,7 @@ private:
+     int64_t mOffset;
+     int64_t mLength;
+     Mutex mLock;
++    FileSourceBuffer mBuffer;
+ 
+     /*for DRM*/
+     sp<DecryptHandle> mDecryptHandle;
+diff --git a/media/libstagefright/FileSource.cpp b/media/libstagefright/FileSource.cpp
+index a7ca3da..c5e7ea6 100644
+--- a/media/libstagefright/FileSource.cpp
++++ b/media/libstagefright/FileSource.cpp
+@@ -24,6 +24,94 @@
+ 
+ namespace android {
+ 
++FileSourceBuffer::FileSourceBuffer() {
++    for (int i = 0; i < FILE_SOURCE_META_BUFFER_NUMBER; i++) {
++        mMetaBuffer[i].valid = 0;
++        mMetaBuffer[i].count = 0;
++        mMetaBuffer[i].len = 0;
++    }
++    mNextBuffer = 0;
++}
++
++ssize_t FileSourceBuffer::readFromBuffer(off64_t offset, void *data, size_t size, int file) {
++    off64_t local_offset = offset & FILE_SOURCE_META_BUFFER_DATA_LOCAL_OFFSET;
++    Mutex::Autolock autoLock(mLock);
++    if (local_offset + size < FILE_SOURCE_META_BUFFER_DATA_SIZE) {
++        off64_t block_offset = offset & FILE_SOURCE_META_BUFFER_DATA_OFFSET;
++        for (int i = 0; i < FILE_SOURCE_META_BUFFER_NUMBER; i++) {
++            if (mMetaBuffer[i].valid) {
++                if (mMetaBuffer[i].count < FILE_SOURCE_META_BUFFER_LRU_COUNT_LIMIT) {
++                    mMetaBuffer[i].count ++;
++                }
++            }
++        }
++        for (int i = 0; i < FILE_SOURCE_META_BUFFER_NUMBER; i++) {
++            if ((block_offset == mMetaBuffer[i].offset) && mMetaBuffer[i].valid) {
++                if (mMetaBuffer[i].len < FILE_SOURCE_META_BUFFER_DATA_SIZE) {
++                    if (local_offset >= mMetaBuffer[i].len) {
++                        return 0;
++                    }
++                    if ((local_offset + size) > mMetaBuffer[i].len) {
++                        size = mMetaBuffer[i].len - local_offset;
++                    }
++                }
++                memcpy(data, mMetaBuffer[i].data + local_offset, size);
++                mMetaBuffer[i].count = 0;
++                return size;
++            }
++        }
++
++        off64_t err = lseek64(file, block_offset, SEEK_SET);
++
++        if (err == -1) {
++            LOGE("seek to %ld failed", block_offset);
++            return UNKNOWN_ERROR;
++        }
++
++        // mNextBuffer calculation
++        // 1) select the buffer with valid = 0;
++        // 2) LRU calculation: select the buffer with the max count
++        mNextBuffer = -1;
++        for (int i = 0; i < FILE_SOURCE_META_BUFFER_NUMBER; i++) {
++            if (mMetaBuffer[i].valid == 0) {
++                mNextBuffer = i;
++                break;
++            }
++        }
++        if (mNextBuffer == -1) {
++            int max_count = -1;
++            for (int i = 0; i < FILE_SOURCE_META_BUFFER_NUMBER; i++) {
++                if (mMetaBuffer[i].count > max_count) {
++                    max_count = mMetaBuffer[i].count;
++                    mNextBuffer = i;
++                }
++            }
++        }
++        mMetaBuffer[mNextBuffer].valid = 0;
++        size_t len = ::read(file, mMetaBuffer[mNextBuffer].data, FILE_SOURCE_META_BUFFER_DATA_SIZE);
++        if (len <= 0) {
++            return UNKNOWN_ERROR;
++        }
++
++        mMetaBuffer[mNextBuffer].len = len;
++        mMetaBuffer[mNextBuffer].offset = block_offset;
++        mMetaBuffer[mNextBuffer].valid = 1;
++        mMetaBuffer[mNextBuffer].count = 0;
++        if (mMetaBuffer[mNextBuffer].len < FILE_SOURCE_META_BUFFER_DATA_SIZE) {
++            if (local_offset >= mMetaBuffer[mNextBuffer].len) {
++                return 0;
++            }
++            if ((local_offset + size) > mMetaBuffer[mNextBuffer].len) {
++                size = mMetaBuffer[mNextBuffer].len - local_offset;
++            }
++        }
++        memcpy(data, mMetaBuffer[mNextBuffer].data + local_offset, size);
++        return size;
++    }
++    return NOT_ENOUGH_DATA;
++}
++
++
+ FileSource::FileSource(const char *filename)
+     : mFd(-1),
+       mOffset(0),
+@@ -105,6 +193,11 @@ ssize_t FileSource::readAt(off64_t offset, void *data, size_t size) {
+             == mDecryptHandle->decryptApiType) {
+         return readAtDRM(offset, data, size);
+    } else {
++        int ret = mBuffer.readFromBuffer(offset + mOffset, data, size, mFd);
++        // ret >= 0 is the number of bytes read
++        if (ret >= 0) {
++            return ret;
++        }
+         off64_t result = lseek64(mFd, offset + mOffset, SEEK_SET);
+         if (result == -1) {
+             ALOGE("seek to %lld failed", offset + mOffset);
+-- 
+1.7.4.1
+

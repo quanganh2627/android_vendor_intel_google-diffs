@@ -1,0 +1,1695 @@
+From 858ce120ab29f25696a533e25a11a9b6a2749cb4 Mon Sep 17 00:00:00 2001
+From: David Kreitzer <david.l.kreitzer@intel.com>
+Date: Mon, 15 Jul 2013 08:32:29 -0700
+Subject: Dalvik: Improve the placement of VR writebacks in the PCG glue layer
+
+BZ: 124525
+
+Improve the writeback data flow in the PCG glue layer to be as aggressive
+as possible about sinking VR writebacks out of loops.  As part of the changes,
+the type system is improved to distinguish between the high and low halves
+of an 8-byte type. And a connection between the SSA numbers for the high and
+lower halves is made.
+
+In addition, this patch makes it possible for the glue layer to detect type
+mismatches and gracefully disable registerization for affected SSA numbers.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Ibc0bfc49f5e5a679fdc9e655d63d55327467fbb8
+Orig-MCG-Change-Id: I92740fae7da7da7e1bd0f6f4b13c53491df0f8e7
+Signed-off-by: Kreitzer, David L <david.l.kreitzer@intel.com>
+Signed-off-by: Eric Dittert <eric.dittert@intel.com>
+Reviewed-on: http://android.intel.com:8080/119542
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: Lupusoru, Razvan A <razvan.a.lupusoru@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/BitVector.cpp                                   |   17 +
+ vm/BitVector.h                                     |    5 +
+ vm/compiler/codegen/x86/pcg/Analysis.cpp           |  439 ++++++++++++++++----
+ vm/compiler/codegen/x86/pcg/BasicBlockPCG.h        |   18 +
+ vm/compiler/codegen/x86/pcg/CodeGeneration.cpp     |   15 +-
+ vm/compiler/codegen/x86/pcg/CompilationUnitPCG.cpp |   95 ++++-
+ vm/compiler/codegen/x86/pcg/CompilationUnitPCG.h   |   19 +
+ vm/compiler/codegen/x86/pcg/DataStructures.h       |    5 +-
+ vm/compiler/codegen/x86/pcg/LowerCall.cpp          |   37 +-
+ vm/compiler/codegen/x86/pcg/LowerGetPut.cpp        |   36 ++-
+ vm/compiler/codegen/x86/pcg/LowerJump.cpp          |   33 +-
+ vm/compiler/codegen/x86/pcg/UtilityPCG.cpp         |   83 +++--
+ vm/compiler/codegen/x86/pcg/UtilityPCG.h           |   15 +
+ 13 files changed, 633 insertions(+), 184 deletions(-)
+
+diff --git a/vm/BitVector.cpp b/vm/BitVector.cpp
+index b11392b..dc37d06 100644
+--- a/vm/BitVector.cpp
++++ b/vm/BitVector.cpp
+@@ -369,6 +369,23 @@ bool dvmCopyBitVector(BitVector *dest, const BitVector *src)
+     return true;
+ }
+ 
++bool dvmCheckCopyBitVector(BitVector *dst, const BitVector *src)
++{
++    bool changed = false;
++
++    checkSizes(dst, src);
++
++    unsigned int idx;
++    for (idx = 0; idx < dst->storageSize; idx++) {
++        if (dst->storage[idx] != src->storage[idx]) {
++            dst->storage[idx] = src->storage[idx];
++            changed = true;
++        }
++    }
++
++    return changed;
++}
++
+ /*
+  * Intersect two bit vectors and store the result to the dest vector.
+  */
+diff --git a/vm/BitVector.h b/vm/BitVector.h
+index cb28fb6..0a48f1b 100644
+--- a/vm/BitVector.h
++++ b/vm/BitVector.h
+@@ -73,6 +73,11 @@ int dvmCountSetBits(const BitVector* pBits);
+ /* copy one vector to another of equal size */
+ bool dvmCopyBitVector(BitVector *dest, const BitVector *src);
+ 
++/* copy one vector to another of equal size.  Return true if this caused
++ * any changes in the destination bit vector.
++ */
++bool dvmCheckCopyBitVector(BitVector *dst, const BitVector *src);
++
+ /*
+  * Intersect two bit vectors and store the result to the dest vector.
+  */
+diff --git a/vm/compiler/codegen/x86/pcg/Analysis.cpp b/vm/compiler/codegen/x86/pcg/Analysis.cpp
+index 9ad9dda..9e38a14 100644
+--- a/vm/compiler/codegen/x86/pcg/Analysis.cpp
++++ b/vm/compiler/codegen/x86/pcg/Analysis.cpp
+@@ -33,14 +33,6 @@ static pcgDtype pcgMergeDtypes (pcgDtype dtype1, pcgDtype dtype2)
+     {
+         return dtype1;
+     }
+-    if (dtype1 == NOreg)
+-    {
+-        return dtype2;
+-    }
+-    if (dtype2 == NOreg)
+-    {
+-        return dtype1;
+-    }
+     if (dtype1 == Any)
+     {
+         return dtype2;
+@@ -65,11 +57,46 @@ static pcgDtype pcgMergeDtypes (pcgDtype dtype1, pcgDtype dtype2)
+     {
+         return dtype1;
+     }
++    if (dtype1 == Any8Hi && (dtype2 == DPVXreg64Hi || dtype2 == LLregHi))
++    {
++        return dtype2;
++    }
++    if (dtype2 == Any8Hi && (dtype1 == DPVXreg64Hi || dtype1 == LLregHi))
++    {
++        return dtype1;
++    }
+ 
+     return NOreg;
+ }
+ 
+ /**
++ * @brief Recursively disable registerization for ssaNum and any dependent ssa numbers
++ * @param cUnit the CompilationUnitPCG
++ * @param ssaNum the ssa we care about
++ */
++static void pcgDisableRegisterizationForSSANum (CompilationUnitPCG *cUnit, int ssaNum)
++{
++    SSANumInfo &pcgSSAInfo = cUnit->getRootSSANumInformation (ssaNum);
++
++    // Set the dtype to NOreg to make sure we don't mistakenly read it.  If we
++    // are disabling registerization, a likely reason is that we could not
++    // determine ssaNum's dtype.
++    pcgSSAInfo.dtype = NOreg;
++
++    // Only process ssaNum if registerization hasn't already been disabled.
++    // That avoids infinite recursion.
++    if (pcgSSAInfo.registerize) {
++        int pairSSANum = pcgSSAInfo.pairSSANum;
++        pcgSSAInfo.registerize = false;
++
++        // Disable registerization for its pair ssa number, if applicable
++        if (pairSSANum != 0) {
++            pcgDisableRegisterizationForSSANum(cUnit, pairSSANum);
++        }
++    }
++}
++
++/**
+  * @brief Handle the define for the SSA information
+  * @param cUnit the CompilationUnitPCG
+  * @param ssaNum the ssa we care about
+@@ -84,9 +111,14 @@ static void pcgDefRef (CompilationUnitPCG *cUnit, int ssaNum, pcgDtype dtype)
+ 
+     if (newElement == true)
+     {
+-        //Then we have to fill it up a bit
++        // Then we have to fill it up a bit
++        // TODO: These initializations are redundant with the memset that
++        //       happens in cUnit->getSSANumInformation.  This should be
++        //       refactored, possibly by making SSANumInfo into a class with
++        //       a constructor.
+         pcgSSAInfo.dtype = dtype;
+         pcgSSAInfo.parentSSANum = ssaNum;
++        pcgSSAInfo.pairSSANum = 0;
+         pcgSSAInfo.numUses = 0;
+         pcgSSAInfo.mir = 0;
+         pcgSSAInfo.registerize = true;
+@@ -96,21 +128,16 @@ static void pcgDefRef (CompilationUnitPCG *cUnit, int ssaNum, pcgDtype dtype)
+     }
+     else
+     {
+-        //Get a pointer
+-        SSANumInfo *ptrSSAInfo = &pcgSSAInfo;
++        // Get the information for the root of the SSANum tree.
++        SSANumInfo &rootSSAInfo = cUnit->getRootSSANumInformation (ssaNum);
+ 
+-        // Update the data type for the temp
+-        if (ssaNum != pcgSSAInfo.parentSSANum)
+-        {
+-            //Get parent
+-            ptrSSAInfo = & (cUnit->getSSANumInformation (pcgSSAInfo.parentSSANum, newElement));
++        // Merge the types between child and this parent
++        rootSSAInfo.dtype = pcgMergeDtypes (dtype, rootSSAInfo.dtype);
+ 
+-            //We should have it in the information
+-            assert (newElement == false);
++        if (rootSSAInfo.dtype == NOreg)
++        {
++            pcgDisableRegisterizationForSSANum(cUnit, rootSSAInfo.parentSSANum);
+         }
+-
+-        //Merge the types between child and this parent
+-        ptrSSAInfo->dtype = pcgMergeDtypes (dtype, ptrSSAInfo->dtype);
+     }
+ }
+ 
+@@ -140,7 +167,70 @@ static void pcgRef (CompilationUnitPCG *cUnit, int ssaNum, pcgDtype dtype, bool
+ }
+ 
+ /**
+- * @brief Merge SSA types
++ * @brief Handle the pairing of two SSA numbers.  An SSA number pair is used to associate the two halves of an 8-byte value.
++ * @param cUnit the CompilationUnitPCG
++ * @param ssaNum1 the lower half of the 8-byte value
++ * @param ssaNum2 the upper half of the 8-byte value
++ */
++static void pcgCreatePair (CompilationUnitPCG *cUnit, int ssaNum1, int ssaNum2)
++{
++    SSANumInfo &info1 = cUnit->getRootSSANumInformation (ssaNum1);
++    SSANumInfo &info2 = cUnit->getRootSSANumInformation (ssaNum2);
++    int pairSSANum1 = info1.pairSSANum;
++    int pairSSANum2 = info2.pairSSANum;
++
++    // Registerization is only supported for 8-byte temps when there is a 1-1
++    // match for the two halves.  If we are attempting to pair an SSANum when it
++    // already has an existing but different pair, disable registerization for
++    // the existing pair, the new pair, and the SSANum itself.
++    if (pairSSANum1 != 0) {
++        SSANumInfo &currPairInfo = cUnit->getRootSSANumInformation (pairSSANum1);
++        int currPairSSANum = currPairInfo.parentSSANum;
++
++        if (currPairSSANum != info2.parentSSANum) {
++            // Setting info1.registerize to false will cause registerization
++            // to be disabled for ssaNum1 and ssaNum2 below.  Explicitly disable
++            // registerization for ssaNum1's current pair.
++            info1.registerize = false;
++            pcgDisableRegisterizationForSSANum(cUnit, currPairSSANum);
++        }
++    }
++    if (pairSSANum2 != 0) {
++        SSANumInfo &currPairInfo = cUnit->getRootSSANumInformation (pairSSANum2);
++        int currPairSSANum = currPairInfo.parentSSANum;
++
++        if (currPairSSANum != info1.parentSSANum) {
++            // Setting info2.registerize to false will cause registerization
++            // to be disabled for ssaNum1 and ssaNum2 below.  Explicitly disable
++            // registerization for ssaNum2's current pair.
++            info2.registerize = false;
++            pcgDisableRegisterizationForSSANum(cUnit, currPairSSANum);
++        }
++    }
++
++    info1.pairSSANum = info2.parentSSANum;
++    info2.pairSSANum = info1.parentSSANum;
++
++    if (info1.registerize == false || info2.registerize == false) {
++        pcgDisableRegisterizationForSSANum(cUnit, info1.parentSSANum);
++        pcgDisableRegisterizationForSSANum(cUnit, info2.parentSSANum);
++    }
++}
++
++/**
++ * @brief Merge SSA numbers
++ * @details This routine gets called when two SSA numbers must be merged into
++ *  the same CGTemp.  That happens when we see a PHI, e.g.
++ *      kMirOpPhi v0_1 = (v0_0, v0_2)
++ *  In this case, v0_0, v0_1, and v0_2 must all use the same CGTemp, must all
++ *  share the same dtype, must have the same pair, if applicable, and must all
++ *  be registerized or not registerized together.  To implement that, v0_1 is
++ *  used as the "parent" ssa number.  All the information associated with the
++ *  unified CGTemp are stored in v0_1's SSANumInfo record.  v0_0 and v0_2 refer
++ *  to their parent, v0_1, via the parentSSANum field.  This routine creates
++ *  the child-parent tree structure and merges the information from the child
++ *  ssa number into the parent.  If any conflicts are detected, registerization
++ *  is disabled for the parent.
+  * @param cUnit the CompilationUnitPCG
+  * @param childNum the child SSA Number
+  * @param parentNum the parent SSA Number
+@@ -154,6 +244,23 @@ static void pcgMergeSSANums (CompilationUnitPCG *cUnit, int childNum, int parent
+     //Update them
+     child.parentSSANum = parentNum;
+     parent.dtype = pcgMergeDtypes (parent.dtype, child.dtype);
++
++    // Capture the pair SSANum in the parent, if one exists.  If the child &
++    // parent both have a valid but different pair SSANum, do nothing.  There
++    // is a subtle assumption that the child & parent pair SSANums will
++    // eventually have the same parent SSANum.  In other words, if there is a
++    // PHI to merge the low half of an 8-byte value, there must also be a PHI
++    // to merge the high half.
++    if (child.pairSSANum != 0 && parent.pairSSANum == 0) {
++        parent.pairSSANum = child.pairSSANum;
++    }
++
++    // Disable registerization if we were not able to successfully merge.
++    if (parent.dtype == NOreg || child.registerize == false)
++    {
++        parent.dtype = NOreg;
++        pcgDisableRegisterizationForSSANum(cUnit, parentNum);
++    }
+ }
+ 
+ /**
+@@ -202,7 +309,8 @@ static bool pcgAnalyzeExecuteInline (CompilationUnitPCG *cUnit, MIR *mir)
+             //Paranoid
+             assert (ssa->numUses > 1 && ssa->uses != 0);
+             pcgRef (cUnit, ssa->uses[0], LLreg);
+-            pcgRef (cUnit, ssa->uses[1], LLreg);
++            pcgRef (cUnit, ssa->uses[1], LLregHi);
++            pcgCreatePair (cUnit, ssa->uses[0], ssa->uses[1]);
+             break;
+ 
+         case INLINE_STRING_EQUALS:
+@@ -231,7 +339,8 @@ static bool pcgAnalyzeExecuteInline (CompilationUnitPCG *cUnit, MIR *mir)
+             //Paranoid
+             assert (ssa->numUses > 1 && ssa->uses != 0);
+             pcgRef (cUnit, ssa->uses[0], Any8);
+-            pcgRef (cUnit, ssa->uses[1], Any8);
++            pcgRef (cUnit, ssa->uses[1], Any8Hi);
++            pcgCreatePair (cUnit, ssa->uses[0], ssa->uses[1]);
+             break;
+ 
+         case INLINE_MATH_ABS_FLOAT:
+@@ -244,7 +353,8 @@ static bool pcgAnalyzeExecuteInline (CompilationUnitPCG *cUnit, MIR *mir)
+             //Paranoid
+             assert (ssa->numUses > 1 && ssa->uses != 0);
+             pcgRef (cUnit, ssa->uses[0], DPVXreg64);
+-            pcgRef (cUnit, ssa->uses[1], DPVXreg64);
++            pcgRef (cUnit, ssa->uses[1], DPVXreg64Hi);
++            pcgCreatePair (cUnit, ssa->uses[0], ssa->uses[1]);
+             break;
+ 
+         case INLINE_INT_BITS_TO_FLOAT:
+@@ -329,26 +439,90 @@ static void initGensAndKills (CompilationUnitPCG *cUnit)
+         assert (bb != 0);
+ 
+         // Allocate and initialize the bit vectors
++        bb->availIns = dvmCompilerAllocBitVector (bvSize, false);
++        bb->availGens = dvmCompilerAllocBitVector (bvSize, false);
++        bb->availOuts = dvmCompilerAllocBitVector (bvSize, false);
+         bb->dirtyIns = dvmCompilerAllocBitVector (bvSize, false);
++        bb->dirtyGens = dvmCompilerAllocBitVector (bvSize, false);
+         bb->dirtyOuts = dvmCompilerAllocBitVector (bvSize, false);
+         bb->kills = dvmCompilerAllocBitVector (bvSize, false);
+ 
+-        //Clear the bitvectors
++        // Initialize the bitvectors
++        dvmClearAllBits (bb->availIns);
++        dvmClearAllBits (bb->availGens);
+         dvmClearAllBits (bb->dirtyIns);
++        dvmClearAllBits (bb->dirtyGens);
+         dvmClearAllBits (bb->dirtyOuts);
+         dvmClearAllBits (bb->kills);
++        dvmSetInitialBits (bb->availOuts, bvSize);
++
++        // The avail outs bit vectors are initialized differently.
++        // For entry blocks (including "from interpreter" blocks, which are
++        // just alternate entries), the available outs are equal to the live
++        // ins.  They are the values that we will load into registers on entry
++        // to the trace.  For all other blocks, we mark every SSANum available.
++        // (The available SSANum data flow is forward flowing intersection.)
++        if (bb->blockType == kEntryBlock || bb->blockType == kFromInterpreter)
++        {
++            // The live out information needs to be translated from VR number
++            // into SSA numbers.
++            BitVectorIterator bvIterator;
++            BasicBlockPCG *liveInBlock;
++            BasicBlockDataFlow *info;
++            BitVector *reallyIns = dvmCompilerAllocBitVector (1, true);
++            int dalvikVR;
++
++            // The liveness information isn't accurate on the kFromInterpreter
++            // block, so we need to read it from the its fallthrough block, i.e.
++            // the loop preheader block.
++            if (bb->blockType == kEntryBlock)
++            {
++                liveInBlock = bb;
++            }
++            else
++            {
++                liveInBlock = static_cast<BasicBlockPCG *> (bb->fallThrough);
++            }
++            info = liveInBlock->dataFlowInfo;
++
++            dvmIntersectBitVectors (reallyIns, info->liveInV, cUnit->usedVRs);
++            dvmBitVectorIteratorInit (reallyIns, &bvIterator);
++            dalvikVR = dvmBitVectorIteratorNext (&bvIterator);
++
++            while (dalvikVR != -1) {
++                int comboSSANum = info->dalvikToSSAMapEntrance[dalvikVR];
++                int ssaNum = DECODE_REG (comboSSANum);
++                SSANumInfo &info = cUnit->getRootSSANumInformation (ssaNum);
++
++                // We only generate a load for registerized temps.
++                if (info.registerize == true) {
++                    dvmSetBit (bb->availGens, info.parentSSANum);
++                }
++                dalvikVR = dvmBitVectorIteratorNext (&bvIterator);
++            }
++        }
+ 
+         //Go through each instruction
+         for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
+         {
++            //Get opcode
++            Opcode opcode = mir->dalvikInsn.opcode;
++
++            // Ignore PHI's.  They do not define a new value, so they do not
++            // "dirty" a VR.
++            if ( static_cast<ExtendedMIROpcode> (opcode) == kMirOpPhi)
++            {
++                continue;
++            }
+ 
+             //Go through each define
+             for (int i = 0; i < mir->ssaRep->numDefs; i++)
+             {
+-                //Get SSA and its information
++
++                // Get SSA and its information
+                 int ssaNum = mir->ssaRep->defs[i];
+ 
+-                SSANumInfo &info = cUnit->getSSANumInformation (ssaNum);
++                SSANumInfo &info = cUnit->getRootSSANumInformation (ssaNum);
+ 
+                 //Get virtual number
+                 u2 vrNum = dvmExtractSSARegister (cUnit, ssaNum);
+@@ -370,18 +544,16 @@ static void initGensAndKills (CompilationUnitPCG *cUnit)
+                 // Add all defs of this VR to the kills set.
+                 // Remove all defs of this VR from the gens set.
+                 dvmUnifyBitVectors (bb->kills, bb->kills, vrDefsBv);
+-                dvmSubtractBitVectors (bb->dirtyOuts, bb->dirtyOuts, vrDefsBv);
++                dvmSubtractBitVectors (bb->dirtyGens, bb->dirtyGens, vrDefsBv);
+ 
+-                // Add this def to the gens set
++                // Add this def to both the "avail" and "dirty" gens sets
+                 if (info.registerize == true)
+                 {
+-                    dvmSetBit (bb->dirtyOuts, ssaNum);
+-                    dvmClearBit(bb->kills, ssaNum);
++                    dvmSetBit (bb->dirtyGens, info.parentSSANum);
++                    dvmClearBit(bb->kills, info.parentSSANum);
++                    dvmSetBit (bb->availGens, info.parentSSANum);
+                 }
+ 
+-                //Get opcode
+-                Opcode opcode = mir->dalvikInsn.opcode;
+-
+                 //If not extended
+                 if (opcode < static_cast<Opcode> (kMirOpFirst))
+                 {
+@@ -392,7 +564,7 @@ static void initGensAndKills (CompilationUnitPCG *cUnit)
+                     if ((flags & kInstrInvoke) != 0)
+                     {
+                         dvmSetInitialBits (bb->kills, bvSize);
+-                        dvmClearAllBits (bb->dirtyOuts);
++                        dvmClearAllBits (bb->dirtyGens);
+                     }
+                 }
+             }
+@@ -421,34 +593,56 @@ static void propagateOuts (CompilationUnitPCG *cUnit)
+         {
+             BasicBlockPCG *bb = (BasicBlockPCG *)blockList->elemList[i];
+ 
+-            BitVector *ins = bb->dirtyIns;
+-            BitVector *outs = bb->dirtyOuts;
++            BitVector *availIns = bb->availIns;
++            BitVector *availOuts = bb->availOuts;
++            BitVector *availGens = bb->availGens;
++            BitVector *dirtyIns = bb->dirtyIns;
++            BitVector *dirtyGens = bb->dirtyGens;
++            BitVector *dirtyOuts = bb->dirtyOuts;
+             BitVector *kills = bb->kills;
+             BitVectorIterator it;
+             int predId;
+             bool first = true;
+ 
++            // The dataflow equations:
++            // AvailIns = Intersection of AvailOuts of preds
++            // AvailOuts = AvailIns | AvailGens
++            // DirtyIns = (Union of DirtyOuts of preds) & AvailIns
++            // DirtyOuts = DirtyIns - kills + DirtyGens
+             dvmBitVectorIteratorInit (bb->predecessors, &it);
+             while ( (predId = dvmBitVectorIteratorNext (&it)) != -1)
+             {
+                 BasicBlockPCG *bb = (BasicBlockPCG *) blockList->elemList[predId];
++                BitVector *predAvailOuts = bb->availOuts;
+                 BitVector *predOuts = bb->dirtyOuts;
+ 
+                 if (first == true)
+                 {
+-                    dvmCopyBitVector (ins, predOuts);
++                    dvmCopyBitVector (availIns, predAvailOuts);
++                    dvmCopyBitVector (dirtyIns, predOuts);
+                     first = false;
+                 }
+                 else
+                 {
+-                    dvmIntersectBitVectors (ins, ins, predOuts);
++                    dvmIntersectBitVectors (availIns, availIns, predAvailOuts);
++                    dvmUnifyBitVectors (dirtyIns, dirtyIns, predOuts);
+                 }
+             }
++            dvmIntersectBitVectors(dirtyIns, dirtyIns, availIns);
+ 
+-            // outs = ins - kills + gens
+-            dvmCopyBitVector (tempBV, ins);
++            // dirtyOuts = dirtyIns - kills + dirtyGens
++            dvmCopyBitVector (tempBV, dirtyIns);
+             dvmSubtractBitVectors (tempBV, tempBV, kills);
+-            if (dvmCheckMergeBitVectors (outs, tempBV))
++            dvmUnifyBitVectors (tempBV, tempBV, dirtyGens);
++            if (dvmCheckCopyBitVector (dirtyOuts, tempBV) == true)
++            {
++                changed = true;
++            }
++
++            // availOuts = availIns + availGens
++            dvmCopyBitVector (tempBV, availIns);
++            dvmUnifyBitVectors (tempBV, tempBV, availGens);
++            if (dvmCheckCopyBitVector (availOuts, tempBV))
+             {
+                 changed = true;
+             }
+@@ -500,7 +694,7 @@ static void pcgAvoidDeferredWritebacks (CompilationUnitPCG *cUnit)
+     while (ssaNum != -1)
+     {
+         //Get information
+-        SSANumInfo &info = cUnit->getSSANumInformation (ssaNum);
++        SSANumInfo &info = cUnit->getRootSSANumInformation (ssaNum);
+ 
+         //Update deferment
+         info.deferWriteback = false;
+@@ -561,7 +755,30 @@ void dvmCompilerPcgApplyRegisterizationHeuristics (CompilationUnitPCG *cUnit, in
+ 
+         if (info.parentSSANum == ssaNum)
+         {
+-            ALOGI ("v%d_%d type %s [ssanum : %d]\n", vrNum, vrSub, dvmCompilerPcgGetDtypeName (info.dtype), ssaNum);
++            const int cBufSize = 128;
++            char buffer[cBufSize];
++            std::string s;
++
++            snprintf(buffer, cBufSize,  "v%d_%d type %s ",
++                     vrNum, vrSub, dvmCompilerPcgGetDtypeName (info.dtype));
++            s += buffer;
++
++            if (info.registerize == false) {
++               s += "(no reg) ";
++            }
++            if (info.pairSSANum != 0) {
++                // Use the root SSA number for the pair
++                CompilationUnit *simpleCUnit = dynamic_cast<CompilationUnit *> (cUnit);
++                SSANumInfo &pairInfo = cUnit->getSSANumInformation (info.pairSSANum);
++                int pairReg = dvmConvertSSARegToDalvik (simpleCUnit, pairInfo.parentSSANum);
++                int pairNum = DECODE_REG (pairReg);
++                int pairSub = DECODE_SUB (pairReg);
++                snprintf(buffer, cBufSize,  "(pair of v%d_%d) ", pairNum, pairSub);
++                s += buffer;
++            }
++            snprintf(buffer, cBufSize, "[ssanum : %d]", ssaNum);
++            s += buffer;
++            ALOGI("%s", s.c_str());
+         }
+     }
+ }
+@@ -667,7 +884,8 @@ bool dvmCompilerPcgNewRegisterizeVRAnalysis (CompilationUnitPCG *cUnit)
+ 
+                     pcgRef (cUnit, ssaRep->uses[0], INTreg);
+                     pcgDefRef (cUnit, ssaRep->defs[0], LLreg);
+-                    pcgDefRef (cUnit, ssaRep->defs[1], LLreg);
++                    pcgDefRef (cUnit, ssaRep->defs[1], LLregHi);
++                    pcgCreatePair (cUnit, ssaRep->defs[0], ssaRep->defs[1]);
+                     break;
+ 
+                 case OP_IGET_WIDE:
+@@ -677,7 +895,8 @@ bool dvmCompilerPcgNewRegisterizeVRAnalysis (CompilationUnitPCG *cUnit)
+ 
+                     pcgRef (cUnit, ssaRep->uses[0], INTreg, true);
+                     pcgDefRef (cUnit, ssaRep->defs[0], Any8);
+-                    pcgDefRef (cUnit, ssaRep->defs[1], Any8);
++                    pcgDefRef (cUnit, ssaRep->defs[1], Any8Hi);
++                    pcgCreatePair (cUnit, ssaRep->defs[0], ssaRep->defs[1]);
+                     break;
+ 
+                 case OP_LONG_TO_INT:
+@@ -685,7 +904,8 @@ bool dvmCompilerPcgNewRegisterizeVRAnalysis (CompilationUnitPCG *cUnit)
+                     assert (ssaRep->numUses > 1 && ssaRep->numDefs > 0);
+ 
+                     pcgRef (cUnit, ssaRep->uses[0], LLreg);
+-                    pcgRef (cUnit, ssaRep->uses[1], LLreg);
++                    pcgRef (cUnit, ssaRep->uses[1], LLregHi);
++                    pcgCreatePair (cUnit, ssaRep->uses[0], ssaRep->uses[1]);
+                     pcgDefRef (cUnit, ssaRep->defs[0], INTreg);
+                     break;
+ 
+@@ -694,9 +914,11 @@ bool dvmCompilerPcgNewRegisterizeVRAnalysis (CompilationUnitPCG *cUnit)
+                     assert (ssaRep->numUses > 3 && ssaRep->numDefs > 0);
+ 
+                     pcgRef (cUnit, ssaRep->uses[0], LLreg);
+-                    pcgRef (cUnit, ssaRep->uses[1], LLreg);
++                    pcgRef (cUnit, ssaRep->uses[1], LLregHi);
++                    pcgCreatePair (cUnit, ssaRep->uses[0], ssaRep->uses[1]);
+                     pcgRef (cUnit, ssaRep->uses[2], LLreg);
+-                    pcgRef (cUnit, ssaRep->uses[3], LLreg);
++                    pcgRef (cUnit, ssaRep->uses[3], LLregHi);
++                    pcgCreatePair (cUnit, ssaRep->uses[2], ssaRep->uses[3]);
+                     pcgDefRef (cUnit, ssaRep->defs[0], INTreg);
+                     break;
+ 
+@@ -707,9 +929,11 @@ bool dvmCompilerPcgNewRegisterizeVRAnalysis (CompilationUnitPCG *cUnit)
+                     assert (ssaRep->numUses > 1 && ssaRep->numDefs > 1);
+ 
+                     pcgRef (cUnit, ssaRep->uses[0], Any8);
+-                    pcgRef (cUnit, ssaRep->uses[1], Any8);
++                    pcgRef (cUnit, ssaRep->uses[1], Any8Hi);
++                    pcgCreatePair (cUnit, ssaRep->uses[0], ssaRep->uses[1]);
+                     pcgDefRef (cUnit, ssaRep->defs[0], Any8);
+-                    pcgDefRef (cUnit, ssaRep->defs[1], Any8);
++                    pcgDefRef (cUnit, ssaRep->defs[1], Any8Hi);
++                    pcgCreatePair (cUnit, ssaRep->defs[0], ssaRep->defs[1]);
+                     break;
+ 
+                 case OP_CONST:
+@@ -738,7 +962,8 @@ bool dvmCompilerPcgNewRegisterizeVRAnalysis (CompilationUnitPCG *cUnit)
+                     assert (ssaRep->numDefs > 1);
+ 
+                     pcgDefRef (cUnit, ssaRep->defs[0], Any8);
+-                    pcgDefRef (cUnit, ssaRep->defs[1], Any8);
++                    pcgDefRef (cUnit, ssaRep->defs[1], Any8Hi);
++                    pcgCreatePair (cUnit, ssaRep->defs[0], ssaRep->defs[1]);
+                     break;
+ 
+                 case OP_IF_EQ:
+@@ -814,7 +1039,8 @@ bool dvmCompilerPcgNewRegisterizeVRAnalysis (CompilationUnitPCG *cUnit)
+                     assert (ssaRep->numUses > 1);
+ 
+                     pcgRef (cUnit, ssaRep->uses[0], Any8);
+-                    pcgRef (cUnit, ssaRep->uses[1], Any8);
++                    pcgRef (cUnit, ssaRep->uses[1], Any8Hi);
++                    pcgCreatePair (cUnit, ssaRep->uses[0], ssaRep->uses[1]);
+                     break;
+ 
+                 case OP_CHECK_CAST:
+@@ -865,11 +1091,14 @@ bool dvmCompilerPcgNewRegisterizeVRAnalysis (CompilationUnitPCG *cUnit)
+                     assert (ssaRep->numUses > 3 && ssaRep->numDefs > 1);
+ 
+                     pcgRef (cUnit, ssaRep->uses[0], LLreg);
+-                    pcgRef (cUnit, ssaRep->uses[1], LLreg);
++                    pcgRef (cUnit, ssaRep->uses[1], LLregHi);
++                    pcgCreatePair (cUnit, ssaRep->uses[0], ssaRep->uses[1]);
+                     pcgRef (cUnit, ssaRep->uses[2], LLreg);
+-                    pcgRef (cUnit, ssaRep->uses[3], LLreg);
++                    pcgRef (cUnit, ssaRep->uses[3], LLregHi);
++                    pcgCreatePair (cUnit, ssaRep->uses[2], ssaRep->uses[3]);
+                     pcgDefRef (cUnit, ssaRep->defs[0], LLreg);
+-                    pcgDefRef (cUnit, ssaRep->defs[1], LLreg);
++                    pcgDefRef (cUnit, ssaRep->defs[1], LLregHi);
++                    pcgCreatePair (cUnit, ssaRep->defs[0], ssaRep->defs[1]);
+                     break;
+ 
+                 case OP_NEG_LONG:
+@@ -878,9 +1107,11 @@ bool dvmCompilerPcgNewRegisterizeVRAnalysis (CompilationUnitPCG *cUnit)
+                     assert (ssaRep->numUses > 1 && ssaRep->numDefs > 1);
+ 
+                     pcgRef (cUnit, ssaRep->uses[0], LLreg);
+-                    pcgRef (cUnit, ssaRep->uses[1], LLreg);
++                    pcgRef (cUnit, ssaRep->uses[1], LLregHi);
++                    pcgCreatePair (cUnit, ssaRep->uses[0], ssaRep->uses[1]);
+                     pcgDefRef (cUnit, ssaRep->defs[0], LLreg);
+-                    pcgDefRef (cUnit, ssaRep->defs[1], LLreg);
++                    pcgDefRef (cUnit, ssaRep->defs[1], LLregHi);
++                    pcgCreatePair (cUnit, ssaRep->defs[0], ssaRep->defs[1]);
+                     break;
+ 
+                 case OP_SHL_LONG:
+@@ -890,10 +1121,12 @@ bool dvmCompilerPcgNewRegisterizeVRAnalysis (CompilationUnitPCG *cUnit)
+                 case OP_SHR_LONG_2ADDR:
+                 case OP_USHR_LONG_2ADDR:
+                     pcgRef (cUnit, ssaRep->uses[0], LLreg);
+-                    pcgRef (cUnit, ssaRep->uses[1], LLreg);
++                    pcgRef (cUnit, ssaRep->uses[1], LLregHi);
++                    pcgCreatePair (cUnit, ssaRep->uses[0], ssaRep->uses[1]);
+                     pcgRef (cUnit, ssaRep->uses[2], INTreg);
+                     pcgDefRef (cUnit, ssaRep->defs[0], LLreg);
+-                    pcgDefRef (cUnit, ssaRep->defs[1], LLreg);
++                    pcgDefRef (cUnit, ssaRep->defs[1], LLregHi);
++                    pcgCreatePair (cUnit, ssaRep->defs[0], ssaRep->defs[1]);
+                     break;
+ 
+                 case OP_MONITOR_ENTER:
+@@ -921,7 +1154,8 @@ bool dvmCompilerPcgNewRegisterizeVRAnalysis (CompilationUnitPCG *cUnit)
+                 case OP_IPUT_WIDE_QUICK:
+                 case OP_IPUT_WIDE_VOLATILE:
+                     pcgRef (cUnit, ssaRep->uses[0], Any8);
+-                    pcgRef (cUnit, ssaRep->uses[1], Any8);
++                    pcgRef (cUnit, ssaRep->uses[1], Any8Hi);
++                    pcgCreatePair (cUnit, ssaRep->uses[0], ssaRep->uses[1]);
+                     pcgRef (cUnit, ssaRep->uses[2], INTreg, true);
+                     break;
+ 
+@@ -945,7 +1179,8 @@ bool dvmCompilerPcgNewRegisterizeVRAnalysis (CompilationUnitPCG *cUnit)
+                     pcgRef (cUnit, ssaRep->uses[0], INTreg, true);
+                     pcgRef (cUnit, ssaRep->uses[1], INTreg);
+                     pcgDefRef (cUnit, ssaRep->defs[0], Any8);
+-                    pcgDefRef (cUnit, ssaRep->defs[1], Any8);
++                    pcgDefRef (cUnit, ssaRep->defs[1], Any8Hi);
++                    pcgCreatePair (cUnit, ssaRep->defs[0], ssaRep->defs[1]);
+                     break;
+ 
+                 case OP_SGET:
+@@ -969,7 +1204,8 @@ bool dvmCompilerPcgNewRegisterizeVRAnalysis (CompilationUnitPCG *cUnit)
+                 case OP_SGET_WIDE:
+                 case OP_SGET_WIDE_VOLATILE:
+                     pcgDefRef (cUnit, ssaRep->defs[0], Any8);
+-                    pcgDefRef (cUnit, ssaRep->defs[1], Any8);
++                    pcgDefRef (cUnit, ssaRep->defs[1], Any8Hi);
++                    pcgCreatePair (cUnit, ssaRep->defs[0], ssaRep->defs[1]);
+                     break;
+ 
+                 case OP_ADD_INT_2ADDR:
+@@ -1006,7 +1242,8 @@ bool dvmCompilerPcgNewRegisterizeVRAnalysis (CompilationUnitPCG *cUnit)
+ 
+                 case OP_APUT_WIDE:
+                     pcgRef (cUnit, ssaRep->uses[0], Any8);
+-                    pcgRef (cUnit, ssaRep->uses[1], Any8);
++                    pcgRef (cUnit, ssaRep->uses[1], Any8Hi);
++                    pcgCreatePair (cUnit, ssaRep->uses[0], ssaRep->uses[1]);
+                     pcgRef (cUnit, ssaRep->uses[2], INTreg, true);
+                     pcgRef (cUnit, ssaRep->uses[3], INTreg);
+                     break;
+@@ -1037,11 +1274,14 @@ bool dvmCompilerPcgNewRegisterizeVRAnalysis (CompilationUnitPCG *cUnit)
+                 case OP_DIV_DOUBLE_2ADDR:
+                 case OP_REM_DOUBLE_2ADDR:
+                     pcgRef (cUnit, ssaRep->uses[0], DPVXreg64);
+-                    pcgRef (cUnit, ssaRep->uses[1], DPVXreg64);
++                    pcgRef (cUnit, ssaRep->uses[1], DPVXreg64Hi);
++                    pcgCreatePair (cUnit, ssaRep->uses[0], ssaRep->uses[1]);
+                     pcgRef (cUnit, ssaRep->uses[2], DPVXreg64);
+-                    pcgRef (cUnit, ssaRep->uses[3], DPVXreg64);
++                    pcgRef (cUnit, ssaRep->uses[3], DPVXreg64Hi);
++                    pcgCreatePair (cUnit, ssaRep->uses[2], ssaRep->uses[3]);
+                     pcgDefRef (cUnit, ssaRep->defs[0], DPVXreg64);
+-                    pcgDefRef (cUnit, ssaRep->defs[1], DPVXreg64);
++                    pcgDefRef (cUnit, ssaRep->defs[1], DPVXreg64Hi);
++                    pcgCreatePair (cUnit, ssaRep->defs[0], ssaRep->defs[1]);
+                     break;
+ 
+                 case OP_CMPG_FLOAT:
+@@ -1054,23 +1294,28 @@ bool dvmCompilerPcgNewRegisterizeVRAnalysis (CompilationUnitPCG *cUnit)
+                 case OP_CMPG_DOUBLE:
+                 case OP_CMPL_DOUBLE:
+                     pcgRef (cUnit, ssaRep->uses[0], DPVXreg64);
+-                    pcgRef (cUnit, ssaRep->uses[1], DPVXreg64);
++                    pcgRef (cUnit, ssaRep->uses[1], DPVXreg64Hi);
++                    pcgCreatePair (cUnit, ssaRep->uses[0], ssaRep->uses[1]);
+                     pcgRef (cUnit, ssaRep->uses[2], DPVXreg64);
+-                    pcgRef (cUnit, ssaRep->uses[3], DPVXreg64);
++                    pcgRef (cUnit, ssaRep->uses[3], DPVXreg64Hi);
++                    pcgCreatePair (cUnit, ssaRep->uses[2], ssaRep->uses[3]);
+                     pcgDefRef (cUnit, ssaRep->defs[0], INTreg);
+                     break;
+ 
+                 case OP_INT_TO_DOUBLE:
+                     pcgRef (cUnit, ssaRep->uses[0], INTreg);
+                     pcgDefRef (cUnit, ssaRep->defs[0], DPVXreg64);
+-                    pcgDefRef (cUnit, ssaRep->defs[1], DPVXreg64);
++                    pcgDefRef (cUnit, ssaRep->defs[1], DPVXreg64Hi);
++                    pcgCreatePair (cUnit, ssaRep->defs[0], ssaRep->defs[1]);
+                     break;
+ 
+                 case OP_LONG_TO_DOUBLE:
+                     pcgRef (cUnit, ssaRep->uses[0], LLreg);
+-                    pcgRef (cUnit, ssaRep->uses[1], LLreg);
++                    pcgRef (cUnit, ssaRep->uses[1], LLregHi);
++                    pcgCreatePair (cUnit, ssaRep->uses[0], ssaRep->uses[1]);
+                     pcgDefRef (cUnit, ssaRep->defs[0], DPVXreg64);
+-                    pcgDefRef (cUnit, ssaRep->defs[1], DPVXreg64);
++                    pcgDefRef (cUnit, ssaRep->defs[1], DPVXreg64Hi);
++                    pcgCreatePair (cUnit, ssaRep->defs[0], ssaRep->defs[1]);
+                     break;
+ 
+                 case OP_INT_TO_FLOAT:
+@@ -1080,13 +1325,15 @@ bool dvmCompilerPcgNewRegisterizeVRAnalysis (CompilationUnitPCG *cUnit)
+ 
+                 case OP_LONG_TO_FLOAT:
+                     pcgRef (cUnit, ssaRep->uses[0], LLreg);
+-                    pcgRef (cUnit, ssaRep->uses[1], LLreg);
++                    pcgRef (cUnit, ssaRep->uses[1], LLregHi);
++                    pcgCreatePair (cUnit, ssaRep->uses[0], ssaRep->uses[1]);
+                     pcgDefRef (cUnit, ssaRep->defs[0], VXreg32);
+                     break;
+ 
+                 case OP_DOUBLE_TO_INT:
+                     pcgRef (cUnit, ssaRep->uses[0], DPVXreg64);
+-                    pcgRef (cUnit, ssaRep->uses[1], DPVXreg64);
++                    pcgRef (cUnit, ssaRep->uses[1], DPVXreg64Hi);
++                    pcgCreatePair (cUnit, ssaRep->uses[0], ssaRep->uses[1]);
+                     pcgDefRef (cUnit, ssaRep->defs[0], INTreg);
+                     break;
+ 
+@@ -1098,25 +1345,30 @@ bool dvmCompilerPcgNewRegisterizeVRAnalysis (CompilationUnitPCG *cUnit)
+                 case OP_FLOAT_TO_LONG:
+                     pcgRef (cUnit, ssaRep->uses[0], VXreg32);
+                     pcgDefRef (cUnit, ssaRep->defs[0], LLreg);
+-                    pcgDefRef (cUnit, ssaRep->defs[1], LLreg);
++                    pcgDefRef (cUnit, ssaRep->defs[1], LLregHi);
++                    pcgCreatePair (cUnit, ssaRep->defs[0], ssaRep->defs[1]);
+                     break;
+ 
+                 case OP_DOUBLE_TO_LONG:
+                     pcgRef (cUnit, ssaRep->uses[0], DPVXreg64);
+-                    pcgRef (cUnit, ssaRep->uses[1], DPVXreg64);
++                    pcgRef (cUnit, ssaRep->uses[1], DPVXreg64Hi);
++                    pcgCreatePair (cUnit, ssaRep->uses[0], ssaRep->uses[1]);
+                     pcgDefRef (cUnit, ssaRep->defs[0], LLreg);
+-                    pcgDefRef (cUnit, ssaRep->defs[1], LLreg);
++                    pcgDefRef (cUnit, ssaRep->defs[1], LLregHi);
++                    pcgCreatePair (cUnit, ssaRep->defs[0], ssaRep->defs[1]);
+                     break;
+ 
+                 case OP_FLOAT_TO_DOUBLE:
+                     pcgRef (cUnit, ssaRep->uses[0], VXreg32);
+                     pcgDefRef (cUnit, ssaRep->defs[0], DPVXreg64);
+-                    pcgDefRef (cUnit, ssaRep->defs[1], DPVXreg64);
++                    pcgDefRef (cUnit, ssaRep->defs[1], DPVXreg64Hi);
++                    pcgCreatePair (cUnit, ssaRep->defs[0], ssaRep->defs[1]);
+                     break;
+ 
+                 case OP_DOUBLE_TO_FLOAT:
+                     pcgRef (cUnit, ssaRep->uses[0], DPVXreg64);
+-                    pcgRef (cUnit, ssaRep->uses[1], DPVXreg64);
++                    pcgRef (cUnit, ssaRep->uses[1], DPVXreg64Hi);
++                    pcgCreatePair (cUnit, ssaRep->uses[0], ssaRep->uses[1]);
+                     pcgDefRef (cUnit, ssaRep->defs[0], VXreg32);
+                     break;
+ 
+@@ -1138,7 +1390,8 @@ bool dvmCompilerPcgNewRegisterizeVRAnalysis (CompilationUnitPCG *cUnit)
+                 case OP_IGET_WIDE_QUICK:
+                     pcgRef (cUnit, ssaRep->uses[0], INTreg, true);
+                     pcgDefRef (cUnit, ssaRep->defs[0], Any8);
+-                    pcgDefRef (cUnit, ssaRep->defs[1], Any8);
++                    pcgDefRef (cUnit, ssaRep->defs[1], Any8Hi);
++                    pcgCreatePair (cUnit, ssaRep->defs[0], ssaRep->defs[1]);
+                     break;
+ 
+                 case OP_MOVE_RESULT:
+@@ -1153,9 +1406,11 @@ bool dvmCompilerPcgNewRegisterizeVRAnalysis (CompilationUnitPCG *cUnit)
+ 
+                 case OP_NEG_DOUBLE:
+                     pcgRef (cUnit, ssaRep->uses[0], DPVXreg64);
+-                    pcgRef (cUnit, ssaRep->uses[1], DPVXreg64);
++                    pcgRef (cUnit, ssaRep->uses[1], DPVXreg64Hi);
++                    pcgCreatePair (cUnit, ssaRep->uses[0], ssaRep->uses[1]);
+                     pcgDefRef (cUnit, ssaRep->defs[0], DPVXreg64);
+-                    pcgDefRef (cUnit, ssaRep->defs[1], DPVXreg64);
++                    pcgDefRef (cUnit, ssaRep->defs[1], DPVXreg64Hi);
++                    pcgCreatePair (cUnit, ssaRep->defs[0], ssaRep->defs[1]);
+                     break;
+ 
+                 case OP_RETURN_VOID:
+@@ -1169,12 +1424,14 @@ bool dvmCompilerPcgNewRegisterizeVRAnalysis (CompilationUnitPCG *cUnit)
+ 
+                 case OP_RETURN_WIDE:
+                     pcgRef (cUnit, ssaRep->uses[0], Any8);
+-                    pcgRef (cUnit, ssaRep->uses[1], Any8);
++                    pcgRef (cUnit, ssaRep->uses[1], Any8Hi);
++                    pcgCreatePair (cUnit, ssaRep->uses[0], ssaRep->uses[1]);
+                     break;
+ 
+                 case OP_MOVE_RESULT_WIDE:
+                     pcgDefRef (cUnit, ssaRep->defs[0], Any8);
+-                    pcgDefRef (cUnit, ssaRep->defs[1], Any8);
++                    pcgDefRef (cUnit, ssaRep->defs[1], Any8Hi);
++                    pcgCreatePair (cUnit, ssaRep->defs[0], ssaRep->defs[1]);
+                     break;
+ 
+                 case OP_NEW_INSTANCE:
+@@ -1284,14 +1541,13 @@ bool dvmCompilerPcgNewRegisterizeVRAnalysis (CompilationUnitPCG *cUnit)
+     // perfect.  In theory, we might need to iterate multiple times until
+     // there are no more changes.  If we decide to do that, we should probably
+     // keep track of the moves and then iterate over only the moves.
+-    //
+     for (unsigned int i = 0; i < blockList->numUsed; i++)
+     {
+         BasicBlock *bb = (BasicBlock *)blockList->elemList[i];
+         for (MIR *mir = bb->firstMIRInsn; mir; mir = mir->next)
+         {
+             pcgDtype srcDtype, dstDtype, mergedDtype;
+-            pcgDtype src2Dtype, dst2Dtype;
++            pcgDtype src2Dtype, dst2Dtype, merged2Dtype;
+             Opcode dalvikOpCode = mir->dalvikInsn.opcode;
+ 
+             //Get SSARepresentation
+@@ -1326,14 +1582,13 @@ bool dvmCompilerPcgNewRegisterizeVRAnalysis (CompilationUnitPCG *cUnit)
+                     src2Dtype = dvmCompilerPcgGetDtypeForSSANum (cUnit, ssaRep->uses[1]);
+                     dst2Dtype = dvmCompilerPcgGetDtypeForSSANum (cUnit, ssaRep->defs[1]);
+                     mergedDtype = pcgMergeDtypes (srcDtype, dstDtype);
+-                    mergedDtype = pcgMergeDtypes (mergedDtype, src2Dtype);
+-                    mergedDtype = pcgMergeDtypes (mergedDtype, dst2Dtype);
+-                    if (mergedDtype != NOreg)
++                    merged2Dtype = pcgMergeDtypes (src2Dtype, dst2Dtype);
++                    if (mergedDtype != NOreg && merged2Dtype != NOreg)
+                     {
+                         dvmCompilerPcgSetDtypeForSSANum (cUnit, ssaRep->uses[0], mergedDtype);
+                         dvmCompilerPcgSetDtypeForSSANum (cUnit, ssaRep->defs[0], mergedDtype);
+-                        dvmCompilerPcgSetDtypeForSSANum (cUnit, ssaRep->uses[1], mergedDtype);
+-                        dvmCompilerPcgSetDtypeForSSANum (cUnit, ssaRep->defs[1], mergedDtype);
++                        dvmCompilerPcgSetDtypeForSSANum (cUnit, ssaRep->uses[1], merged2Dtype);
++                        dvmCompilerPcgSetDtypeForSSANum (cUnit, ssaRep->defs[1], merged2Dtype);
+                     }
+                     break;
+ 
+diff --git a/vm/compiler/codegen/x86/pcg/BasicBlockPCG.h b/vm/compiler/codegen/x86/pcg/BasicBlockPCG.h
+index e0a21c4..1341e52 100644
+--- a/vm/compiler/codegen/x86/pcg/BasicBlockPCG.h
++++ b/vm/compiler/codegen/x86/pcg/BasicBlockPCG.h
+@@ -68,8 +68,26 @@ struct BasicBlockPCG: public BasicBlock
+         /** @brief Dirty-outs */
+         BitVector *dirtyOuts;
+ 
++        /** @brief Dirty-gens */
++        BitVector *dirtyGens;
++
+         /** @brief Kills */
+         BitVector *kills;
++
++        /**
++         * @brief Available ins
++         * @details The available ins and outs sets specify whether a CGTemp
++         *          is available on entry to and exit from a block.  A CGTemp
++         *          is available at a particular point iff it has been defined
++         *          on every path leading to that point.
++         */
++        BitVector *availIns;
++
++        /** @brief Available outs */
++        BitVector *availOuts;
++
++        /** @brief Available gens */
++        BitVector *availGens;
+ };
+ 
+ #endif
+diff --git a/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp b/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
+index c546de1..1f6a7c1 100644
+--- a/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
++++ b/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
+@@ -967,6 +967,16 @@ static bool handleBBCodeGeneration (CompilationUnitPCG *cUnit, BasicBlockPCG *bb
+             return false;
+         }
+ 
++        // Get opcode
++        Opcode opcode = mir->dalvikInsn.opcode;
++
++        // Ignore PHI's.  They do not define a new value, so they do not
++        // "dirty" a VR.
++        if ( static_cast<ExtendedMIROpcode> (opcode) == kMirOpPhi)
++        {
++            continue;
++        }
++
+         // Update the mod SSANum set.
+         for (int i = 0; i < mir->ssaRep->numDefs; i++)
+         {
+@@ -978,12 +988,12 @@ static bool handleBBCodeGeneration (CompilationUnitPCG *cUnit, BasicBlockPCG *bb
+             dvmSubtractBitVectors (currModBV, currModBV, bv);
+ 
+             //Get the information
+-            SSANumInfo &info = cUnit->getSSANumInformation (ssaNum);
++            SSANumInfo &info = cUnit->getRootSSANumInformation (ssaNum);
+ 
+             // Add this define
+             if (info.registerize == true)
+             {
+-                dvmSetBit (currModBV, ssaNum);
++                dvmSetBit (currModBV, info.parentSSANum);
+             }
+         }
+     }
+@@ -1136,7 +1146,6 @@ static bool dvmCompilerPcgTranslateBB (CompilationUnitPCG *cUnit, BasicBlockPCG
+         case kExitBlock:
+         case kDalvikByteCode:
+         case kPreBackwardBlock:
+-
+             //Handle the general basic block
+             if (handleGeneralBasicBlock (cUnit, bb) == false)
+             {
+diff --git a/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.cpp b/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.cpp
+index f83bba1..ab006d6 100644
+--- a/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.cpp
++++ b/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.cpp
+@@ -18,6 +18,7 @@
+ #include "CompilationUnitPCG.h"
+ #include "Labels.h"
+ #include "UtilityPCG.h"
++#include "Dataflow.h"
+ 
+ uint32_t CompilationUnitPCG::traceID = 0;
+ 
+@@ -73,7 +74,7 @@ CompilationUnitPCG::CompilationUnitPCG (CompilationUnit *cUnit)
+     // This needs to be initialized to some value larger than the highest
+     // SSA number, because we use the SSA number as the
+     // temp number when we registerize VRs.
+-    setCurrentTemporaryVR (numSSARegs + 1);
++    setCurrentTemporaryVR (numSSARegs);
+     vmPtrReg = getCurrentTemporaryVR (true);
+ 
+     //Create the frame pointer register
+@@ -159,26 +160,45 @@ void CompilationUnitPCG::registerizeAnalysisDone (void)
+         // Only consider top level temps.
+         if (ssaNum != info.parentSSANum)
+         {
++            if (checkDebugMask (DebugMaskRegisterizeVRs) == true)
++            {
++                CompilationUnit *simpleCUnit = dynamic_cast<CompilationUnit *> (this);
++                SSANumInfo &rootInfo = getRootSSANumInformation (ssaNum);
++                int dalvikReg = dvmConvertSSARegToDalvik (simpleCUnit, ssaNum);
++                int vrNum = DECODE_REG (dalvikReg);
++                int vrSub = DECODE_SUB (dalvikReg);
++                int parentReg = dvmConvertSSARegToDalvik (simpleCUnit, rootInfo.parentSSANum);
++                int parentNum = DECODE_REG (parentReg);
++                int parentSub = DECODE_SUB (parentReg);
++
++                ALOGI ("v%d_%d child of v%d_%d [ssanum: %d]\n", vrNum, vrSub, parentNum, parentSub, ssaNum);
++            }
+             continue;
+         }
+ 
+-        // Resolve the type
+-        if (info.dtype == Any)
++        // Resolve the type.
++        switch (info.dtype)
+         {
+-            // We don't know the type or size, so just default to intreg. We only currently expect this for invoke arguments.
+-            it->second.dtype = INTreg;
+-        }
++            case Any:
++                // We don't know the type or size, so just default to intreg.
++                // We only currently expect this for invoke arguments.
++                info.dtype = INTreg;
++                break;
+ 
+-        if (info.dtype == Any4)
+-        {
+-            info.dtype = INTreg;
+-        }
+-        else
+-        {
+-            if (info.dtype == Any8)
+-            {
++            case Any4:
++                info.dtype = INTreg;
++                break;
++
++            case Any8:
+                 info.dtype = DPVXreg64;
+-            }
++                break;
++
++            case Any8Hi:
++                info.dtype = DPVXreg64Hi;
++                break;
++
++            default:
++                break;
+         }
+ 
+         // Compute the VR number and add this SSA number to the list of
+@@ -189,7 +209,7 @@ void CompilationUnitPCG::registerizeAnalysisDone (void)
+ 
+         if (bv == 0)
+         {
+-            bv = dvmCompilerAllocBitVector (numSSARegs, false);
++            bv = dvmCompilerAllocBitVector (numSSARegs + 1, false);
+ 
+             setSSANumSet (vrNum, bv);
+ 
+@@ -240,6 +260,43 @@ SSANumInfo &CompilationUnitPCG::getSSANumInformation (int ssaNum, bool &newEleme
+     return ssaNumInfo[ssaNum];
+ }
+ 
++SSANumInfo &CompilationUnitPCG::getRootSSANumInformation (int ssaNum)
++{
++    SSANumInfo *ssaNumInfoPtr = & ssaNumInfo[ssaNum];
++
++    while (ssaNumInfoPtr->parentSSANum != ssaNum)
++    {
++        ssaNum = ssaNumInfoPtr->parentSSANum;
++        ssaNumInfoPtr = & ssaNumInfo[ssaNum];
++    }
++
++    // At this point, we have the option of collapsing the parentSSANum tree.
++    // That is, we can set the original ssaNumInfo[ssaNum].parentSSANum directly
++    // to the final root of the tree.  That might save on compile time, but
++    // leaving the tree untouched is simpler until we get everything stable.
++
++    return *ssaNumInfoPtr;
++}
++
++// In the common case, we just use the SSA number itself as the CGTemp.  PHIs
++// are the exception.  All operands of a PHI must be assigned the same CGTemp.
++// We use the parentSSANum field of the SSANum info structure to handle this.
++// The parentSSANum field forms a tree structure where the SSA number at the
++// root of the tree is used as the CGTemp for all the SSA numbers in the tree.
++// The root points back to itself.
++//
++CGTemp CompilationUnitPCG::getCGTempForSSANum (int ssa)
++{
++    int parentSSANum = ssaNumInfo[ssa].parentSSANum;
++
++    while (ssa != parentSSANum) {
++        ssa = parentSSANum;
++        parentSSANum = ssaNumInfo[ssa].parentSSANum;
++    }
++
++    return static_cast<CGTemp>(ssa);
++}
++
+ BitVector *CompilationUnitPCG::getTemporaryBitVector (void)
+ {
+     //First iterate on the map, perhaps one is free again
+@@ -280,9 +337,13 @@ void CompilationUnitPCG::disableRegisterizationForDef (int ssaNum)
+ {
+     std::set<int>::iterator it;
+ 
+-    SSANumInfo &info = getSSANumInformation (ssaNum);
++    SSANumInfo &info = getRootSSANumInformation (ssaNum);
+ 
++    // Set registerize to false.  Also set the dtype to NOreg to make sure we
++    // don't mistakenly read it.  If we are disabling registerization, a likely
++    // reason is that we could not determine ssaNum's dtype.
+     info.registerize = false;
++    info.dtype = NOreg;
+ 
+     it = references.find (ssaNum);
+ 
+diff --git a/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.h b/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.h
+index 998464d..3b2e0e3 100644
+--- a/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.h
++++ b/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.h
+@@ -268,6 +268,25 @@ class CompilationUnitPCG: public CompilationUnit
+         SSANumInfo &getSSANumInformation (int ssa);
+ 
+         /**
++         * @brief Get the root SSA information structure for an SSA number
++         * @details This method differs from getSSANumInformation in that it
++         *  returns a reference to the SSANumInfo structure at the root of the
++         *  parentSSANum tree.  Conceptually, this means you are getting the
++         *  SSANumInfo for the CGTemp that is associated with the specified SSA
++         *  number.
++         * @param ssa the SSA number we care about
++         * @return a reference to the structure, zeroed if new
++         */
++        SSANumInfo &getRootSSANumInformation (int ssa);
++
++        /**
++         * @brief Get the CGTemp associated with a particular SSA number
++         * @param ssa the SSA number we care about
++         * @return the CGTemp to use
++         */
++        CGTemp getCGTempForSSANum (int ssa);
++
++        /**
+          * Registerize Analysis is done, complete the information
+          */
+         void registerizeAnalysisDone (void);
+diff --git a/vm/compiler/codegen/x86/pcg/DataStructures.h b/vm/compiler/codegen/x86/pcg/DataStructures.h
+index 7317449..8b40a2e 100644
+--- a/vm/compiler/codegen/x86/pcg/DataStructures.h
++++ b/vm/compiler/codegen/x86/pcg/DataStructures.h
+@@ -36,10 +36,12 @@ typedef enum pcgDtype
+     Any,        /**< @brief Any is fine */
+     Any4,       /**< @brief Any 4-byte */
+     Any8,       /**< @brief Any 8-byte */
++    LLregHi,    /**< @brief Upper half of a Long type */
++    DPVXreg64Hi,/**< @brief Upper half of a Double type */
++    Any8Hi,     /**< @brief Upper half of any 8-byte type */
+     MaxType     /**< @brief Max enumeration type */
+ } pcgDtype;
+ 
+-
+ /**
+  * @class SSANumInfo
+  * @brief SSANumInfo provides information to a given SSA number
+@@ -50,6 +52,7 @@ typedef struct SSANumInfo
+     MIR *mir;               /**< @brief the MIR defining the SSA register */
+     int parentSSANum;       /**< @brief the parent SSA, i.e the previous subscript */
+     int numUses;            /**< @brief How many uses does it have? */
++    int pairSSANum;         /**< @brief SSA number of the other half of an 8-byte value */
+     bool registerize;       /**< @brief Should we registerize it? */
+     bool needsNullCheck;    /**< @brief Does it need a null check? */
+     bool checkedForNull;    /**< @brief Has it been checked for null? */
+diff --git a/vm/compiler/codegen/x86/pcg/LowerCall.cpp b/vm/compiler/codegen/x86/pcg/LowerCall.cpp
+index 91400f1..e81c5f2 100644
+--- a/vm/compiler/codegen/x86/pcg/LowerCall.cpp
++++ b/vm/compiler/codegen/x86/pcg/LowerCall.cpp
+@@ -246,6 +246,7 @@ void dvmCompilerPcgTranslateInvokeDirect (CompilationUnitPCG *cUnit, MIR *mir)
+ 
+ void dvmCompilerPcgTranslateReturn (CompilationUnitPCG *cUnit, MIR *mir, bool isVoid)
+ {
++    Opcode dalvikOpCode = mir->dalvikInsn.opcode;
+     CGInst selfIl = dvmCompilerPcgGetSelfPointer (cUnit);
+ 
+     if (isVoid == false)
+@@ -257,8 +258,11 @@ void dvmCompilerPcgTranslateReturn (CompilationUnitPCG *cUnit, MIR *mir, bool is
+ 
+         int ssaNum = ssaRep->uses[0];
+         pcgDtype resDtype = dvmCompilerPcgGetDtypeForSSANum (cUnit, ssaNum);
++        int32_t dtypeSize = (dalvikOpCode == OP_RETURN_WIDE) ? 8 : 4;
+         const char *opcode;
+-        int32_t dtypeSize = dvmCompilerPcgGetOpcodeAndSizeForDtype (resDtype, &opcode);
++
++        resDtype = dvmCompilerPcgApplyDefaultDtype (resDtype, dtypeSize);
++        dvmCompilerPcgGetOpcodeAndSizeForDtype (resDtype, &opcode);
+ 
+         // self->interpSave.retval = vA
+         int32_t offset = offsetof (Thread, interpSave.retval);
+@@ -378,13 +382,9 @@ void dvmCompilerPcgTranslateExecuteInline (CompilationUnitPCG *cUnit, MIR *mir)
+             }
+         case INLINE_MATH_ABS_LONG:
+             {
+-                const char *opcode;
+-                int32_t dtypeSize;
+                 ssaNum = ssaRep->uses[0];
+-                dtypeSize = dvmCompilerPcgGetOpcodeAndSizeForDtype (
+-                    dvmCompilerPcgGetDtypeForSSANum (cUnit, ssaNum), &opcode);
+                 CGInst load = dvmCompilerPcgGetVirtualReg (cUnit, ssaNum,
+-                    opcode, dtypeSize);
++                                                           "lmov", 8);
+                 CGInst shiftedLoad = CGCreateNewInst ("lsar", "ri", load, 63);
+                 CGInst xoredLoad = CGCreateNewInst ("lxor", "rr", load,
+                         shiftedLoad);
+@@ -393,7 +393,7 @@ void dvmCompilerPcgTranslateExecuteInline (CompilationUnitPCG *cUnit, MIR *mir)
+                 self = dvmCompilerPcgGetSelfPointer (cUnit);
+                 dvmCompilerPcgCreateTypedStore (self, CGInstInvalid, 0,
+                     CGSymbolInvalid, offsetof (Thread, interpSave.retval),
+-                    dvmCompilerPcgGetDtypeForSSANum(cUnit, ssaNum), result);
++                    LLreg, result);
+                 return;
+             }
+ 
+@@ -538,9 +538,12 @@ void dvmCompilerPcgTranslateExecuteInline (CompilationUnitPCG *cUnit, MIR *mir)
+         case INLINE_LONG_BITS_TO_DOUBLE:
+             {
+                 const char *opcode;
+-                int32_t dtypeSize;
++                int32_t dtypeSize = (tmp == INLINE_DOUBLE_TO_RAW_LONG_BITS ||
++                                     tmp == INLINE_LONG_BITS_TO_DOUBLE) ? 8 : 4;
+                 ssaNum = ssaRep->uses[0];
+-                dtypeSize = dvmCompilerPcgGetOpcodeAndSizeForDtype (dvmCompilerPcgGetDtypeForSSANum (cUnit, ssaNum), &opcode);
++                pcgDtype dtype = dvmCompilerPcgGetDtypeForSSANum (cUnit, ssaNum);
++                dtype = dvmCompilerPcgApplyDefaultDtype (dtype, dtypeSize);
++                dvmCompilerPcgGetOpcodeAndSizeForDtype (dtype, &opcode);
+                 CGInst load = dvmCompilerPcgGetVirtualReg (cUnit, ssaNum, opcode, dtypeSize);
+                 self = dvmCompilerPcgGetSelfPointer (cUnit);
+                 CGAddr addr = CGCreateAddr (self, CGInstInvalid, 0, CGSymbolInvalid, offsetof (Thread, interpSave.retval));
+@@ -565,8 +568,10 @@ void dvmCompilerPcgTranslateExecuteInline (CompilationUnitPCG *cUnit, MIR *mir)
+     {
+         const char *opcode;
+         int ssaNum = ssaRep->uses[i];
++        pcgDtype dtype = dvmCompilerPcgGetDtypeForSSANum (cUnit, ssaNum);
+ 
+-        dtypeSize = dvmCompilerPcgGetOpcodeAndSizeForDtype (dvmCompilerPcgGetDtypeForSSANum (cUnit, ssaNum), &opcode);
++        dtype = dvmCompilerPcgApplyDefaultDtype (dtype, 4);
++        dtypeSize = dvmCompilerPcgGetOpcodeAndSizeForDtype (dtype, &opcode);
+         CGInst load = dvmCompilerPcgGetVirtualReg (cUnit, ssaRep->uses[i], opcode, dtypeSize);
+         CGAddr addr = CGCreateAddr (spIl, CGInstInvalid, 0, CGSymbolInvalid, i * 4);
+         CGCreateNewInst (opcode, "mr", addr, dtypeSize, (void*)1, load);
+@@ -601,6 +606,7 @@ void dvmCompilerPcgTranslateMoveResult (CompilationUnitPCG *cUnit, MIR *mir)
+     }
+ 
+     //Get the SSARepresentation
++    Opcode dalvikOpCode = mir->dalvikInsn.opcode;
+     SSARepresentation *ssaRep = mir->ssaRep;
+ 
+     assert (ssaRep != 0);
+@@ -608,9 +614,10 @@ void dvmCompilerPcgTranslateMoveResult (CompilationUnitPCG *cUnit, MIR *mir)
+     int ssaNum = ssaRep->defs[0];
+     pcgDtype dtype = dvmCompilerPcgGetDtypeForSSANum (cUnit, ssaNum);
+     const char *opcode;
+-    int objectSize;
++    int objectSize = (dalvikOpCode == OP_MOVE_RESULT_WIDE) ? 8 : 4;
+ 
+-    objectSize = dvmCompilerPcgGetOpcodeAndSizeForDtype (dtype, &opcode);
++    dtype = dvmCompilerPcgApplyDefaultDtype (dtype, objectSize);
++    dvmCompilerPcgGetOpcodeAndSizeForDtype (dtype, &opcode);
+ 
+     CGInst selfPointer = dvmCompilerPcgGetSelfPointer (cUnit);
+     CGAddr addr = CGCreateAddr (selfPointer, CGInstInvalid, 0, CGSymbolInvalid, offsetof (Thread, interpSave.retval));
+@@ -782,8 +789,10 @@ void dvmCompilerPcgStoreInvokeArgs (CompilationUnitPCG *cUnit, MIR *mir)
+         const char *opcode;
+         int32_t dtypeSize;
+         int ssaNum = ssaRep->uses[i];
+-        dtypeSize = dvmCompilerPcgGetOpcodeAndSizeForDtype (dvmCompilerPcgGetDtypeForSSANum (cUnit, ssaNum),
+-                &opcode);
++        pcgDtype dtype = dvmCompilerPcgGetDtypeForSSANum (cUnit, ssaNum);
++
++        dtype = dvmCompilerPcgApplyDefaultDtype (dtype, 4);
++        dtypeSize = dvmCompilerPcgGetOpcodeAndSizeForDtype (dtype, &opcode);
+         CGInst load = dvmCompilerPcgGetVirtualReg (cUnit, ssaNum, opcode, dtypeSize);
+         CGAddr addr = CGCreateAddr (cUnit->getVMPtr (), CGInstInvalid, 0, CGSymbolInvalid,
+                 offset);
+diff --git a/vm/compiler/codegen/x86/pcg/LowerGetPut.cpp b/vm/compiler/codegen/x86/pcg/LowerGetPut.cpp
+index ef07a04..ccf2281 100644
+--- a/vm/compiler/codegen/x86/pcg/LowerGetPut.cpp
++++ b/vm/compiler/codegen/x86/pcg/LowerGetPut.cpp
+@@ -26,6 +26,8 @@
+ #include "Singleton.h"
+ #include "UtilityPCG.h"
+ 
++// TODO: This function should be removed.  The bytecodes currently translated
++// by this routine should instead use dvmCompilerPcgTranslateIgetIput.
+ void dvmCompilerPcgTranslateIput (CompilationUnitPCG *cUnit, MIR *mir)
+ {
+     Opcode dalvikOpCode = mir->dalvikInsn.opcode;
+@@ -36,10 +38,12 @@ void dvmCompilerPcgTranslateIput (CompilationUnitPCG *cUnit, MIR *mir)
+     assert (ssaRep != 0);
+ 
+     pcgDtype dtype = dvmCompilerPcgGetDtypeForSSANum (cUnit, ssaRep->uses[0]);
++    int32_t dtypeSize = (dalvikOpCode == OP_IPUT_WIDE_QUICK) ? 8 : 4;
++    dtype = dvmCompilerPcgApplyDefaultDtype (dtype, dtypeSize);
+     const char *opcode;
+-    int32_t dtypeSize = dvmCompilerPcgGetOpcodeAndSizeForDtype (dtype, &opcode);
+ 
+     int baseN = (dalvikOpCode == OP_IPUT_WIDE_QUICK) ? 2 : 1;
++    dvmCompilerPcgGetOpcodeAndSizeForDtype (dtype, &opcode);
+     CGInst base = dvmCompilerPcgGetVirtualReg (cUnit, ssaRep->uses[baseN], "mov", 4);
+ 
+     dvmCompilerPcgGenerateNullCheck (cUnit, base, mir, ssaRep->uses[baseN]);
+@@ -57,6 +61,8 @@ void dvmCompilerPcgTranslateIput (CompilationUnitPCG *cUnit, MIR *mir)
+ // vA = vB[vC]
+ void dvmCompilerPcgTranslateAget (CompilationUnitPCG *cUnit, MIR *mir)
+ {
++    Opcode dalvikOpCode = mir->dalvikInsn.opcode;
++
+     //Get the SSARepresentation
+     SSARepresentation *ssaRep = mir->ssaRep;
+ 
+@@ -66,9 +72,10 @@ void dvmCompilerPcgTranslateAget (CompilationUnitPCG *cUnit, MIR *mir)
+     int ssaNum = ssaRep->defs[0];
+     pcgDtype dtype = dvmCompilerPcgGetDtypeForSSANum (cUnit, ssaNum);
+     const char *opcode;
+-    int objectSize;
++    int objectSize = (dalvikOpCode == OP_AGET_WIDE) ? 8 : 4;
+ 
+-    objectSize = dvmCompilerPcgGetOpcodeAndSizeForDtype (dtype, &opcode);
++    dtype = dvmCompilerPcgApplyDefaultDtype(dtype, objectSize);
++    dvmCompilerPcgGetOpcodeAndSizeForDtype (dtype, &opcode);
+     dvmCompilerPcgGenerateNullCheck (cUnit, base, mir, ssaRep->uses[0]);
+ 
+     CGInst index = dvmCompilerPcgGetVirtualReg (cUnit, ssaRep->uses[1], "mov", 4);
+@@ -138,10 +145,11 @@ void dvmCompilerPcgTranslateAput (CompilationUnitPCG *cUnit, MIR *mir)
+     CGInst base = dvmCompilerPcgGetVirtualReg (cUnit, ssaRep->uses[baseN], "mov", 4);
+     int ssaNum = ssaRep->uses[0];
+     const char *opcode;
+-    int objectSize;
++    int objectSize = (dalvikOpCode == OP_APUT_WIDE) ? 8 : 4;
++    pcgDtype dtype = dvmCompilerPcgGetDtypeForSSANum (cUnit, ssaNum);
++    dtype = dvmCompilerPcgApplyDefaultDtype (dtype, objectSize);
+ 
+-    objectSize = dvmCompilerPcgGetOpcodeAndSizeForDtype (dvmCompilerPcgGetDtypeForSSANum (cUnit, ssaNum),
+-            &opcode);
++    dvmCompilerPcgGetOpcodeAndSizeForDtype (dtype, &opcode);
+ 
+     dvmCompilerPcgGenerateNullCheck (cUnit, base, mir, ssaRep->uses[baseN]);
+ 
+@@ -255,10 +263,11 @@ bool dvmCompilerPcgTranslateSgetSput (CompilationUnitPCG *cUnit, MIR *mir, bool
+     int ssaNum = (isGet) ? ssaRep->defs[0] : ssaRep->uses[0];
+     pcgDtype dtype = dvmCompilerPcgGetDtypeForSSANum (cUnit, ssaNum);
+     const char *opcode;
+-    int objectSize;
++    int objectSize = (isWide) ? 8 : 4;
+     CGInst parms[3];
+ 
+-    objectSize = dvmCompilerPcgGetOpcodeAndSizeForDtype (dtype, &opcode);
++    dtype = dvmCompilerPcgApplyDefaultDtype (dtype, objectSize);
++    dvmCompilerPcgGetOpcodeAndSizeForDtype (dtype, &opcode);
+ 
+     // This comment is from LowerGetPut.cpp.  We need to figure out how to
+     // handle this.  In general, having a mechanism for PCG to report a
+@@ -364,8 +373,10 @@ void dvmCompilerPcgTranslateIgetObjectQuick (CompilationUnitPCG *cUnit, MIR *mir
+ 
+     int ssaNum = ssaRep->defs[0];
+     const char *opcode;
++    pcgDtype dtype = dvmCompilerPcgGetDtypeForSSANum (cUnit, ssaNum);
++    dtype = dvmCompilerPcgApplyDefaultDtype (dtype, 4);
+ 
+-    dvmCompilerPcgGetOpcodeAndSizeForDtype (dvmCompilerPcgGetDtypeForSSANum (cUnit, ssaNum), &opcode);
++    dvmCompilerPcgGetOpcodeAndSizeForDtype (dtype, &opcode);
+ 
+     CGInst B = dvmCompilerPcgGetVirtualReg (cUnit, ssaRep->uses[0], "mov", 4);
+ 
+@@ -388,8 +399,9 @@ void dvmCompilerPcgTranslateIgetWideQuick (CompilationUnitPCG *cUnit, MIR *mir)
+     SSARepresentation *ssaRep = mir->ssaRep;
+ 
+     assert (ssaRep != 0);
+-
+-    dvmCompilerPcgGetOpcodeAndSizeForDtype (dvmCompilerPcgGetDtypeForSSANum (cUnit, ssaRep->defs[0]), &opcode);
++    pcgDtype dtype = dvmCompilerPcgGetDtypeForSSANum (cUnit, ssaRep->defs[0]);
++    dtype = dvmCompilerPcgApplyDefaultDtype (dtype, 8);
++    dvmCompilerPcgGetOpcodeAndSizeForDtype (dtype, &opcode);
+ 
+     CGInst B = dvmCompilerPcgGetVirtualReg (cUnit, ssaRep->uses[0], "mov", 4);
+ 
+@@ -427,6 +439,7 @@ void dvmCompilerPcgTranslateIgetIput (CompilationUnitPCG *cUnit, MIR *mir, bool
+     if (isGet == true)
+     {
+         pcgDtype dtype = dvmCompilerPcgGetDtypeForSSANum (cUnit, ssaRep->defs[0]);
++        dtype = dvmCompilerPcgApplyDefaultDtype (dtype, (isWide) ? 8 : 4);
+         memSize = dvmCompilerPcgGetOpcodeAndSizeForDtype (dtype, &opcode);
+ 
+         if (isWide == true && isVolatile == true)
+@@ -465,6 +478,7 @@ void dvmCompilerPcgTranslateIgetIput (CompilationUnitPCG *cUnit, MIR *mir, bool
+     else
+     {
+         pcgDtype dtype = dvmCompilerPcgGetDtypeForSSANum (cUnit, ssaRep->uses[0]);
++        dtype = dvmCompilerPcgApplyDefaultDtype (dtype, (isWide) ? 8 : 4);
+         memSize = dvmCompilerPcgGetOpcodeAndSizeForDtype (dtype, &opcode);
+ 
+         CGInst A = dvmCompilerPcgGetVirtualReg (cUnit, ssaRep->uses[0], opcode, memSize);
+diff --git a/vm/compiler/codegen/x86/pcg/LowerJump.cpp b/vm/compiler/codegen/x86/pcg/LowerJump.cpp
+index 80ed31c..359a0e2 100644
+--- a/vm/compiler/codegen/x86/pcg/LowerJump.cpp
++++ b/vm/compiler/codegen/x86/pcg/LowerJump.cpp
+@@ -271,13 +271,12 @@ void dvmCompilerPcgGenerateWritebacks (CompilationUnitPCG *cUnit, BitVector *bv)
+         //TODO: Change while to not have an assign at the same time
+ 
+         //Get information
+-        SSANumInfo &info = cUnit->getSSANumInformation (ssaNum);
++        SSANumInfo &info = cUnit->getRootSSANumInformation (ssaNum);
+ 
+         if (dvmIsBitSet (tempBV, ssaNum) == true && info.deferWriteback == true)
+         {
+-            //Get mir
+-            MIR *mir = info.mir;
+             int storeMask = 1;
++            int pairSSANum = info.pairSSANum;
+ 
+             // For 8-byte stores, we have to distinguish between cases where
+             // we need to write back all 8 bytes vs. just the upper or lower
+@@ -288,25 +287,27 @@ void dvmCompilerPcgGenerateWritebacks (CompilationUnitPCG *cUnit, BitVector *bv)
+             // example, if we have an INTreg writeback to v8, and an upper
+             // 4-bytes of DPVXreg64 writeback to v9, we can do a DPVXreg64
+             // store to v8-v9 followed by an INTreg store to v8.
+-            //
+-            if (mir->ssaRep->numDefs == 2)
++            if (pairSSANum != 0)
+             {
+-                if (dvmIsBitSet (tempBV, mir->ssaRep->defs[0]) && dvmIsBitSet (tempBV, mir->ssaRep->defs[1]))
++                CGTemp temp = cUnit->getCGTempForSSANum(pairSSANum);
++
++                // We model the 8-byte instructions in PCG IL as defining the
++                // CGTemp of the low half, so we need to convert ssaNum here
++                // if it defines the upper half of an 8-byte value.
++                if (dvmCompilerPcgIsHighDtype(info.dtype) == true)
+                 {
+-                    storeMask = 3;
+-                    dvmClearBit (tempBV, mir->ssaRep->defs[0]);
+-                    dvmClearBit (tempBV, mir->ssaRep->defs[1]);
++                    ssaNum = temp;
++                    storeMask = 2;
+                 }
+-                else
++
++                // Now see if we can write back an entire 8-byte value at once.
++                if (dvmIsBitSet (tempBV, temp) == true)
+                 {
+-                    if (ssaNum == mir->ssaRep->defs[1])
+-                    {
+-                        storeMask = 2;
+-                    }
++                    storeMask = 3;
++                    dvmClearBit (tempBV, temp);
+                 }
+             }
+-            dvmCompilerPcgStoreVirtualReg (cUnit, mir->ssaRep->defs[0], storeMask);
+-            dvmClearBit (tempBV, ssaNum);
++            dvmCompilerPcgStoreVirtualReg (cUnit, ssaNum, storeMask);
+         }
+     }
+ 
+diff --git a/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp b/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp
+index 1063774..1fee975 100644
+--- a/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp
++++ b/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp
+@@ -118,12 +118,22 @@ int32_t dvmCompilerPcgGetOpcodeAndSizeForDtype (pcgDtype dtype, const char **opc
+     return size;
+ }
+ 
++pcgDtype dvmCompilerPcgApplyDefaultDtype (pcgDtype dtype, int32_t size)
++{
++    if (dtype != NOreg)
++    {
++        return dtype;
++    }
++
++    return (size == 8) ? DPVXreg64 : INTreg;
++}
++
+ pcgDtype dvmCompilerPcgGetDtypeForSSANum (CompilationUnitPCG *cUnit, int ssaNum)
+ {
+     //Get information
+-    SSANumInfo &info = cUnit->getSSANumInformation (ssaNum);
++    SSANumInfo &info = cUnit->getRootSSANumInformation (ssaNum);
+ 
+-    return dvmCompilerPcgGetDtypeForSSANum (cUnit, ssaNum, info);
++    return info.dtype;
+ }
+ 
+ pcgDtype dvmCompilerPcgGetDtypeForSSANum (CompilationUnitPCG *cUnit, int ssaNum, SSANumInfo &info)
+@@ -134,7 +144,7 @@ pcgDtype dvmCompilerPcgGetDtypeForSSANum (CompilationUnitPCG *cUnit, int ssaNum,
+     {
+         //TODO: the original code did a find without checking so this is semantically different
+         //TODO: figure out if we care or use the safe version and add a check...
+-        SSANumInfo &parent = cUnit->getSSANumInformation (parentSSANum);
++        SSANumInfo &parent = cUnit->getRootSSANumInformation (parentSSANum);
+ 
+         return parent.dtype;
+     }
+@@ -164,18 +174,16 @@ void dvmCompilerPcgSetDtypeForSSANum (CompilationUnitPCG *cUnit, int ssaNum, pcg
+ 
+ CGInst dvmCompilerPcgGetVirtualReg (CompilationUnitPCG *cUnit, int ssaNum, const char *pcgOpcode, uint32_t loadSize)
+ {
+-    //Get parent ssaNum
+-    SSANumInfo *info = & (cUnit->getSSANumInformation (ssaNum));
+-    ssaNum = info->parentSSANum;
++    // Get the root SSA number information, i.e. the information associated
++    // with the CGTemp.
++    SSANumInfo &info = cUnit->getRootSSANumInformation (ssaNum);
+ 
+     //TODO handle dynamic_cast better
+     int dalvikReg = dvmConvertSSARegToDalvik (dynamic_cast<CompilationUnit *> (cUnit), ssaNum);
+ 
+-    if (info->registerize == true)
++    if (info.registerize == true)
+     {
+-        //Get its parent SSA information
+-        info = & (cUnit->getSSANumInformation (ssaNum));
+-        return CGGetTempUseInst (info->parentSSANum);
++        return CGGetTempUseInst (info.parentSSANum);
+     }
+ 
+     u2 virtualReg = DECODE_REG (dalvikReg);
+@@ -190,21 +198,19 @@ CGInst dvmCompilerPcgGetVirtualReg (CompilationUnitPCG *cUnit, int ssaNum, const
+ void dvmCompilerPcgSetVirtualReg (CompilationUnitPCG *cUnit, int ssaNum, const char *pcgOpcode,
+                              uint32_t storeSize, CGInst storeVal)
+ {
+-    //Get parent ssaNum
+-    SSANumInfo *info = & (cUnit->getSSANumInformation (ssaNum));
+-    ssaNum = info->parentSSANum;
++    // Get the root SSA number information, i.e. the information associated
++    // with the CGTemp.
++    SSANumInfo &info = cUnit->getRootSSANumInformation (ssaNum);
+ 
+-    if (info->registerize == true)
++    if (info.registerize == true)
+     {
+         pcgDtype regDtype = dvmCompilerPcgGetDtypeForSSANum (cUnit, ssaNum);
+         dvmCompilerPcgGetOpcodeAndSizeForDtype (regDtype, &pcgOpcode);
+         CGInst copy = CGCreateNewInst (pcgOpcode, "r", storeVal);
+ 
+-        //Get its parent SSA information
+-        SSANumInfo &parent = cUnit->getSSANumInformation (ssaNum);
+-        CGAddTempDef (parent.parentSSANum, copy);
++        CGAddTempDef (info.parentSSANum, copy);
+ 
+-        if (parent.deferWriteback == true)
++        if (info.deferWriteback == true)
+         {
+             return;
+         }
+@@ -362,18 +368,20 @@ void dvmCompilerPcgDumpModRegInfo (CompilationUnitPCG *cUnit)
+     {
+         BasicBlockPCG *bb = (BasicBlockPCG *) blockList->elemList[i];
+ 
+-        ALOGI ("\nBlock %d dirtyIns:  ", i);
++        ALOGI ("Block %d dirtyIns:  ", i);
+         dumpBitVector (cUnit, bb->dirtyIns, cUnit->numSSARegs);
+-        ALOGI ("\n");
++        ALOGI ("Block %d availIns:  ", i);
++        dumpBitVector (cUnit, bb->availIns, cUnit->numSSARegs);
+         for (MIR *mir = bb->firstMIRInsn; mir; mir = mir->next)
+         {
+             char mybuf[2048];
+             dvmCompilerExtendedDisassembler (cUnit, mir, &mir->dalvikInsn, mybuf, sizeof (mybuf));
+             ALOGI ("%s\n", mybuf);
+         }
+-        ALOGI ("Block %d outs: ", i);
++        ALOGI ("Block %d dirtyOuts: ", i);
+         dumpBitVector (cUnit, bb->dirtyOuts, cUnit->numSSARegs);
+-        ALOGI ("\n");
++        ALOGI ("Block %d availOuts: ", i);
++        dumpBitVector (cUnit, bb->availOuts, cUnit->numSSARegs);
+ 
+         if (bb->taken != 0 || bb->fallThrough != 0)
+         {
+@@ -400,7 +408,7 @@ void dvmCompilerPcgDumpModRegInfo (CompilationUnitPCG *cUnit)
+ 
+ const char* dvmCompilerPcgGetDtypeName (pcgDtype dtype)
+ {
+-    static const char *names[] = {"NOreg", "INTreg", "LLreg", "VXreg32", "DPVXreg64", "FPreg32", "FPreg64", "Any", "Any4", "Any8"};
++    static const char *names[] = {"NOreg", "INTreg", "LLreg", "VXreg32", "DPVXreg64", "FPreg32", "FPreg64", "Any", "Any4", "Any8", "LLregHi", "DPVXreg64Hi", "Any8Hi"};
+ 
+     if (dtype >= MaxType)
+     {
+@@ -410,6 +418,16 @@ const char* dvmCompilerPcgGetDtypeName (pcgDtype dtype)
+     return names[dtype];
+ }
+ 
++bool dvmCompilerPcgIsHighDtype (pcgDtype dtype)
++{
++    if (dtype == LLregHi || dtype == DPVXreg64Hi || dtype == Any8Hi)
++    {
++        return true;
++    }
++
++    return false;
++}
++
+ /**
+  * @details Useful interface routine that allows us to selectively use PCG or the existing dalvik JIT.
+  */
+@@ -456,7 +474,6 @@ bool dvmCompilerPcgSupportTrace (CompilationUnit *cUnit)
+             }
+         }
+ 
+-        //Finally, loops are not accepted by default until proved safe
+         int tmp = 0;
+         //Let us see what we have in the backend options concerning optimizations
+         bool res = dvmExtractBackendOption ("OptimizationLevel", &tmp);
+@@ -469,11 +486,6 @@ bool dvmCompilerPcgSupportTrace (CompilationUnit *cUnit)
+                 return false;
+             }
+         }
+-        else
+-        {
+-            //Then reject
+-            return false;
+-        }
+     }
+ 
+     //Is there an option saying don't use it?
+@@ -684,8 +696,19 @@ void dvmCompilerPcgHandleInitialLoad (CompilationUnitPCG *cUnit, BasicBlock *bb,
+     //Get type
+     pcgDtype dtype = dvmCompilerPcgGetDtypeForSSANum (cUnit, ssaNum);
+ 
++    // Ignore the high halves of 64-bit objects
++    if (dvmCompilerPcgIsHighDtype (dtype) == true)
++    {
++        return;
++    }
++
+     //Get information
+-    SSANumInfo &info = cUnit->getSSANumInformation (ssaNum);
++    SSANumInfo &info = cUnit->getRootSSANumInformation (ssaNum);
++
++    if (info.registerize == false)
++    {
++        return;
++    }
+ 
+     if (considerSpeculative == true)
+     {
+diff --git a/vm/compiler/codegen/x86/pcg/UtilityPCG.h b/vm/compiler/codegen/x86/pcg/UtilityPCG.h
+index 6cbdc3f..9a4933e 100644
+--- a/vm/compiler/codegen/x86/pcg/UtilityPCG.h
++++ b/vm/compiler/codegen/x86/pcg/UtilityPCG.h
+@@ -41,6 +41,13 @@ bool dvmCompilerPcgSupportTrace (CompilationUnit *cUnit);
+ const char* dvmCompilerPcgGetDtypeName (pcgDtype dtype);
+ 
+ /**
++ * @brief Determine whether dtype is the high half of an 8-byte type
++ * @param dtype the pcgDtype of interest
++ * @return true if dtype is the high half of an 8-byte type, false otherwise
++ */
++bool dvmCompilerPcgIsHighDtype (pcgDtype dtype);
++
++/**
+  * @brief Dump the register information
+  * @param cUnit the CompilationUnitPCG
+  */
+@@ -81,6 +88,14 @@ pcgDtype dvmCompilerPcgGetDtypeForSSANum(CompilationUnitPCG *cUnit, int ssaNum);
+ int32_t dvmCompilerPcgGetOpcodeAndSizeForDtype (pcgDtype dtype, const char **opc_ptr);
+ 
+ /**
++ * @brief Compute a default translation dtype in case the input dtype is unknown (NOreg)
++ * @param dtype the pcgDtype
++ * @param size the size in bytes of the needed pcgDtype
++ * @return the pcgDtype to use in translation
++ */
++pcgDtype dvmCompilerPcgApplyDefaultDtype (pcgDtype dtype, int32_t size);
++
++/**
+  * @brief Return a handle for a given virtual register
+  * @param virtualReg the virtual register
+  * @param size the size
+-- 
+1.7.4.1
+

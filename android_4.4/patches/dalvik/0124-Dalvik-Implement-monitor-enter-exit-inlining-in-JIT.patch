@@ -1,0 +1,361 @@
+From 1e46106f17f6bf5f094f7a2caea02b4a18d18093 Mon Sep 17 00:00:00 2001
+From: lzang1 <lin.zang@intel.com>
+Date: Wed, 16 Jan 2013 16:21:29 +0800
+Subject: Dalvik: Implement monitor enter/exit inlining in JIT
+
+BZ: 80549
+
+There is significant overhead of the moniter enter/exit, inlining the
+monitor enter/exit in JIT will help improve the performance for monitor.
+
+This patch implements the inlining of monitor enter when lock an object the first time.
+And inlining of monitor exit when unlock an object the last time.
+
+Preliminary experiment shown about 35% improvment for the score of monte carlo scenario of 0xbench workload
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Iec127b08deb9dbe6eeb25a17e9038f1c40949160
+Orig-MCG-Change-Id: I51db94f8cbe973caf731cb6e0a8080c44a673314
+Signed-off-by: lzang1 <lin.zang@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/codegen/x86/AnalysisO1.cpp         |    5 +
+ vm/compiler/codegen/x86/BytecodeVisitor.cpp    |   39 ++++++++-
+ vm/compiler/codegen/x86/Lower.h                |    3 +
+ vm/compiler/codegen/x86/LowerHelper.cpp        |   15 ++++
+ vm/compiler/codegen/x86/LowerObject.cpp        |   98 +++++++++++++++++++++++-
+ vm/compiler/codegen/x86/Schedule.cpp           |   16 ++++-
+ vm/compiler/codegen/x86/libenc/enc_wrapper.cpp |    6 ++
+ 7 files changed, 172 insertions(+), 10 deletions(-)
+
+diff --git a/vm/compiler/codegen/x86/AnalysisO1.cpp b/vm/compiler/codegen/x86/AnalysisO1.cpp
+index 82f4437..7d5705c 100644
+--- a/vm/compiler/codegen/x86/AnalysisO1.cpp
++++ b/vm/compiler/codegen/x86/AnalysisO1.cpp
+@@ -4755,6 +4755,11 @@ int beforeCall(const char* target) { //spill all live registers
+                    (!isVirtualReg(compileTable[k].physicalType)))
+                     continue;
+             }
++
++            if(strncmp(target, "dvmUnlockObject", 15) == 0) {
++               continue;
++            }
++
+ #ifdef DEBUG_REGALLOC
+             ALOGI("SPILL logical register %d %d in beforeCall",
+                   compileTable[k].regNum, compileTable[k].physicalType);
+diff --git a/vm/compiler/codegen/x86/BytecodeVisitor.cpp b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+index e19877d..9232edc 100644
+--- a/vm/compiler/codegen/x86/BytecodeVisitor.cpp
++++ b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+@@ -3520,10 +3520,10 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+ 
+     case OP_MONITOR_ENTER:
+         infoArray[0].regNum = 1;
+-        infoArray[0].refCount = 3; //DU
++        infoArray[0].refCount = 5; //DU
+         infoArray[0].physicalType = LowOpndRegType_gp;
+         infoArray[1].regNum = 3;
+-        infoArray[1].refCount = 2; //DU
++        infoArray[1].refCount = 7; //DU
+         infoArray[1].physicalType = LowOpndRegType_gp;
+         infoArray[2].regNum = 1;
+         infoArray[2].refCount = 2; //DU
+@@ -3534,10 +3534,23 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+         infoArray[4].regNum = PhysicalReg_EDX;
+         infoArray[4].refCount = 2;
+         infoArray[4].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
+-        return 5;
++        infoArray[5].regNum = 2;
++        infoArray[5].refCount = 4; //DU
++        infoArray[5].physicalType = LowOpndRegType_gp;
++        infoArray[6].regNum = 4;
++        infoArray[6].refCount = 2; //DU
++        infoArray[6].physicalType = LowOpndRegType_gp;
++        infoArray[7].regNum = 5;
++        infoArray[7].refCount = 2; //DU
++        infoArray[7].physicalType = LowOpndRegType_gp;
++        infoArray[8].regNum = PhysicalReg_EAX;
++        infoArray[8].refCount = 2; //DU
++        infoArray[8].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++       return 9;
++
+     case OP_MONITOR_EXIT:
+         infoArray[0].regNum = 1;
+-        infoArray[0].refCount = 3; //DU
++        infoArray[0].refCount = 4; //DU
+         infoArray[0].physicalType = LowOpndRegType_gp;
+         infoArray[1].regNum = PhysicalReg_EAX;
+         infoArray[1].refCount = 2; //DU
+@@ -3554,7 +3567,23 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+         infoArray[5].regNum = 3;
+         infoArray[5].refCount = 2; //DU
+         infoArray[5].physicalType = LowOpndRegType_scratch;
+-        return 6;
++        infoArray[6].regNum = 3;
++        infoArray[6].refCount = 2; //DU
++        infoArray[6].physicalType = LowOpndRegType_gp;
++        infoArray[7].regNum = 4;
++        infoArray[7].refCount = 3; //DU
++        infoArray[7].physicalType = LowOpndRegType_gp;
++        infoArray[8].regNum = 5;
++        infoArray[8].refCount = 4; //DU
++        infoArray[8].physicalType = LowOpndRegType_gp;
++        infoArray[9].regNum = 6;
++        infoArray[9].refCount = 3; //DU
++        infoArray[9].physicalType = LowOpndRegType_gp;
++        infoArray[10].regNum = 7;
++        infoArray[10].refCount = 3; //DU
++        infoArray[10].physicalType = LowOpndRegType_gp;
++        return 11;
++
+     case OP_CHECK_CAST:
+         infoArray[0].regNum = 1;
+         infoArray[0].refCount = 4; //DU
+diff --git a/vm/compiler/codegen/x86/Lower.h b/vm/compiler/codegen/x86/Lower.h
+index 7075def..f48c1fb 100644
+--- a/vm/compiler/codegen/x86/Lower.h
++++ b/vm/compiler/codegen/x86/Lower.h
+@@ -869,6 +869,9 @@ void set_VR_to_imm_noalloc(int vA, OpndSize size, int imm);
+ void set_VR_to_imm_noupdateref(LowOp* op, int vA, OpndSize size, int imm);
+ void move_imm_to_reg(OpndSize size, int imm, int reg, bool isPhysical);
+ void move_imm_to_reg_noalloc(OpndSize size, int imm, int reg, bool isPhysical);
++void compareAndExchange(OpndSize size,
++             int reg, bool isPhysical,
++             int disp, int base_reg, bool isBasePhysical);
+ 
+ //LR[reg] = VR[vB]
+ //or
+diff --git a/vm/compiler/codegen/x86/LowerHelper.cpp b/vm/compiler/codegen/x86/LowerHelper.cpp
+index 67a080d..4222ce6 100644
+--- a/vm/compiler/codegen/x86/LowerHelper.cpp
++++ b/vm/compiler/codegen/x86/LowerHelper.cpp
+@@ -4182,3 +4182,18 @@ void popCallerSavedRegs(void) {
+     move_mem_to_reg(OpndSize_32, 0, PhysicalReg_ESP, true,  PhysicalReg_EDX, true);
+     load_effective_addr(12, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
+ }
++
++//! \brief compareAndExchange with one reg operand and one mem operand
++//! used for implementing monitor-enter
++//! \param size operand size
++//! \param reg src register
++//! \param isPhysical if reg is a physical register
++//! \param disp displacement offset
++//! \param base_reg physical register (PhysicalReg type) or a logical register
++//! \param isBasePhysical if base_reg is a physical register
++void compareAndExchange(OpndSize size,
++             int reg, bool isPhysical,
++             int disp, int base_reg, bool isBasePhysical) {
++    dump_reg_mem(Mnemonic_CMPXCHG, ATOM_NORMAL, size, reg, isPhysical, disp, base_reg, isBasePhysical, MemoryAccess_Unknown, -1, getTypeFromIntSize(size));
++}
++
+diff --git a/vm/compiler/codegen/x86/LowerObject.cpp b/vm/compiler/codegen/x86/LowerObject.cpp
+index cb8bc4f..8458117 100644
+--- a/vm/compiler/codegen/x86/LowerObject.cpp
++++ b/vm/compiler/codegen/x86/LowerObject.cpp
+@@ -233,6 +233,17 @@ int monitor_enter_nohelper(int vA, const MIR *mir) {
+     scratchRegs[0] = PhysicalReg_SCRATCH_1;
+     scratchRegs[2] = PhysicalReg_Null; scratchRegs[3] = PhysicalReg_Null;
+ 
++    //Force spill vA.
++    //In native implementation, dvmLockObject() invokes beforeCall() that spill vA
++    //And op_monitor_exit() will retrive vA back from memory
++    //However, after inlining the JIT code,
++    //there will be a chance that dvmLockObject() will not be called,
++    //but the op_moniter_exit still retrieve vA back from memory.
++    //To avoid this issue, we force spill VR out here by call freeReg.
++    if(gDvm.executionMode == kExecutionModeNcgO1) {
++        freeReg(true);
++    }
++
+     if((mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK) == 0)
+     {
+         requestVRFreeDelay(vA,VRDELAY_NULLCHECK); // Request VR delay before transfer to temporary
+@@ -250,6 +261,36 @@ int monitor_enter_nohelper(int vA, const MIR *mir) {
+     }
+ 
+     /////////////////////////////
++    //inline the simple case with JIT
++    //simple case is thin lock, held by no-one.
++
++    //backup the self pointer and Oject for native implementation
++    //which will be passed to dvmLockObject() as parameter
++    move_reg_to_reg(OpndSize_32, 1, false, 4, false);
++    move_reg_to_reg(OpndSize_32, 3, false, 5, false);
++
++    //get the Obj->lock
++    move_mem_to_reg(OpndSize_32, offsetof(Object, lock), 1, false, 2, false);
++
++    //if it is the simple case, the object lock should contain all 0s except the hash_state bits
++    //save the value to EAX, which will be used for CMPXCHG
++    alu_binary_imm_reg(OpndSize_32, and_opc, (LW_HASH_STATE_MASK << LW_HASH_STATE_SHIFT), 2, false);
++    move_reg_to_reg(OpndSize_32, 2, false, PhysicalReg_EAX, true);
++
++    //get self->threadId
++    move_mem_to_reg(OpndSize_32, offsetof(Thread, threadId), 3, false, 3, false);
++
++    //generate the new lock
++    alu_binary_imm_reg(OpndSize_32, shl_opc, LW_LOCK_OWNER_SHIFT, 3, false);
++    alu_binary_reg_reg(OpndSize_32, or_opc, 2, false, 3, false);
++
++    //add the lock to Object using cmpxchg, if it is simple case, EAX value should be same as Object->lock
++    compareAndExchange(OpndSize_32, 3, false, offsetof(Object, lock), 1, false);
++
++    //if successful added lock, jump to the end of this function
++    conditional_jump(Condition_Z, ".call_monitor_native_done", true);
++
++    /////////////////////////////
+     //prepare to call dvmLockObject, inputs: object reference and self
+     // TODO: Should reset inJitCodeCache before calling dvmLockObject
+     //       so that code cache can be reset if needed when locking object
+@@ -262,12 +303,18 @@ int monitor_enter_nohelper(int vA, const MIR *mir) {
+     //       cache is reset during dvmLockObject call, execution after
+     //       dvmLockObject will return to a cleared code cache region,
+     //       resulting in seg fault.
++    if (insertLabel(".call_monitor_native_implementation", true) == -1) {
++       return -1;
++    }
+     load_effective_addr(-8, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
+-    move_reg_to_mem(OpndSize_32, 1, false, 4, PhysicalReg_ESP, true);
+-    move_reg_to_mem(OpndSize_32, 3, false, 0, PhysicalReg_ESP, true);
++    move_reg_to_mem(OpndSize_32, 4, false, 4, PhysicalReg_ESP, true);
++    move_reg_to_mem(OpndSize_32, 5, false, 0, PhysicalReg_ESP, true);
+     scratchRegs[0] = PhysicalReg_SCRATCH_2;
+     call_dvmLockObject();
+     load_effective_addr(8, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++    if (insertLabel(".call_monitor_native_done", true) == -1) {
++       return -1;
++    }
+     /////////////////////////////
+     return 0;
+ }
+@@ -329,7 +376,9 @@ int op_monitor_exit(const MIR * mir) {
+     {
+         ////////////////////
+         //LOWER bytecode MONITOR_EXIT without helper function
+-        //   CALL dvmUnlockObject
++        //inline simple case with JIT,
++        //simple case is thin lock held by unlocking thread with recursive count 0
++        //other case will CALL dvmUnlockObject
+         scratchRegs[0] = PhysicalReg_SCRATCH_1; scratchRegs[1] = PhysicalReg_SCRATCH_2;
+         scratchRegs[2] = PhysicalReg_Null; scratchRegs[3] = PhysicalReg_Null;
+ 
+@@ -346,6 +395,49 @@ int op_monitor_exit(const MIR * mir) {
+             cancelVRFreeDelayRequest(vA,VRDELAY_NULLCHECK);
+         }
+ 
++        //get the self pointer
++        get_self_pointer(3,false);
++
++        //get self->threadid
++        move_mem_to_reg(OpndSize_32, offsetof(Thread, threadId), 3, false, 4, false);
++
++        //threadid << 3, for comparison with obj->lock
++        alu_binary_imm_reg(OpndSize_32, shl_opc, 3, 4,false);
++
++        //get obj->lock
++        move_reg_to_reg(OpndSize_32, 1, false, 7, false);
++
++        //get Obj->lock
++        move_mem_to_reg(OpndSize_32, offsetof(Object, lock), 7, false, 5, false);
++        move_reg_to_reg(OpndSize_32, 5, false, 6, false);
++
++        //test whether obj->lock is thin lock and object is locked by current thread
++        alu_binary_imm_reg(OpndSize_32, and_opc,  ~(LW_HASH_STATE_MASK << LW_HASH_STATE_SHIFT), 5, false);
++        compare_reg_reg( 4, false, 5, false);
++
++        //In native implementation, dvmUnlockObject() invokes beforeCall() that spill VRs which maybe used later
++        //However, after inlining the JIT code,
++        //there will be a chance that dvmUnlockObject() will not be called,
++        //but the spill in beforecall() marked the VR as in memory,
++        //so later use of VR may incorrectly unspill the value from memory.
++        //To avoid this issue, we force spill VR out here by call freeReg.
++	freeReg(true);
++
++	//locked by other thread or fat lock or recursive lock, jump to call the native functions
++        conditional_jump(Condition_NE, "j_call_dvmUnlockObject", true);
++
++        //create the new words(32bit) for obj->lock, it only contains the hash bits of original obj->lock
++        alu_binary_imm_reg(OpndSize_32, and_opc, (LW_HASH_STATE_MASK << LW_HASH_STATE_SHIFT), 6, false);
++
++        //release the lock
++        move_reg_to_mem(OpndSize_32, 6, false, offsetof(Object, lock),7, false);
++
++        //jump to the end of the function
++        unconditional_jump(".unlock_object_done", true);
++        if (insertLabel("j_call_dvmUnlockObject", true) == -1) {
++           return -1;
++        }
++
+         /////////////////////////////
+         //prepare to call dvmUnlockObject, inputs: object reference and self
+         push_reg_to_stack(OpndSize_32, 1, false);
+diff --git a/vm/compiler/codegen/x86/Schedule.cpp b/vm/compiler/codegen/x86/Schedule.cpp
+index 2125367..0f88513 100644
+--- a/vm/compiler/codegen/x86/Schedule.cpp
++++ b/vm/compiler/codegen/x86/Schedule.cpp
+@@ -503,6 +503,11 @@ inline bool usesAndDefinesFlags(Mnemonic m) {
+     return m == Mnemonic_ADC || m == Mnemonic_SBB;
+ }
+ 
++//! \brief Returns true if mnemonic is CMPXCHG, which use and define EAX register
++inline bool isCmpxchgMnemonic(Mnemonic m) {
++    return m == Mnemonic_CMPXCHG;
++}
++
+ //! \brief Returns true if ALU mnemonic has a variant that has implicit
+ //! register usage.
+ //! \details Returns true for div, idiv, mul, imul, and cdq. However, note
+@@ -1176,11 +1181,12 @@ void Scheduler::updateUseDefInformation_mem_to_reg(LowOpMemReg * op) {
+ 
+ //! \brief Updates dependency information for LowOps with two operands:
+ //! register to memory.
+-//! \param op must be a MOV variant, a comparison (CMP), or an ALU instruction
++//! \param op must be a MOV variant, a comparison (CMP), a cmpxchange (CMPXCHG), or an ALU instruction
+ void Scheduler::updateUseDefInformation_reg_to_mem(LowOpRegMem * op) {
+     assert(isMoveMnemonic(op->opCode) || isCompareMnemonic(op->opCode)
+-            || op->opCode2 == ATOM_NORMAL_ALU);
++            || op->opCode2 == ATOM_NORMAL_ALU || isCmpxchgMnemonic(op->opCode));
+     bool isMove = isMoveMnemonic(op->opCode);
++    bool isCmpxchg = isCmpxchgMnemonic(op->opCode);
+     op->instructionLatency = getAtomMnemonicLatency_reg_to_mem(op->opCode);
+     op->portType = getAtomMnemonicPort_reg_to_mem(op->opCode);
+     assert(op->instructionLatency != INVN);
+@@ -1193,6 +1199,12 @@ void Scheduler::updateUseDefInformation_reg_to_mem(LowOpRegMem * op) {
+         updateDependencyGraph(UseDefType_Ctrl, REG_NOT_USED, LowOpndDefUse_Def,
+                 Latency_None, op);
+ 
++    //CMPXCHG uses and defines EAX
++    if (isCmpxchg == true) {
++        updateDependencyGraph(UseDefType_Reg, PhysicalReg_EAX, LowOpndDefUse_UseDef,
++            Latency_None, op);
++    }
++
+     op->opndSrc.defuse = LowOpndDefUse_Use;
+     updateDependencyGraph(UseDefType_Reg, op->regSrc.regNum, op->opndSrc.defuse,
+             Latency_None, op);
+diff --git a/vm/compiler/codegen/x86/libenc/enc_wrapper.cpp b/vm/compiler/codegen/x86/libenc/enc_wrapper.cpp
+index a43980e..3d6b15d 100644
+--- a/vm/compiler/codegen/x86/libenc/enc_wrapper.cpp
++++ b/vm/compiler/codegen/x86/libenc/enc_wrapper.cpp
+@@ -365,6 +365,12 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_reg_mem(Mnemonic m, OpndSize si
+     add_m(args, base_reg, disp, size);
+     add_r(args, reg, size);
+     char* stream_start = stream;
++    if (m == Mnemonic_CMPXCHG ){
++       //CMPXCHG require EAX as args
++       add_r(args,PhysicalReg_EAX,size);
++       //Add lock prefix for CMPXCHG, guarantee the atomic of CMPXCHG in multi-core platform
++       stream = (char *)EncoderBase::prefix(stream, InstPrefix_LOCK);
++    }
+     stream = (char *)EncoderBase::encode(stream, m, args);
+ #ifdef PRINT_ENCODER_STREAM
+     printEncoderInst(m, args);
+-- 
+1.7.4.1
+

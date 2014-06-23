@@ -1,0 +1,130 @@
+From b60be465a03b9d6648f286b14ba7ff762b290746 Mon Sep 17 00:00:00 2001
+From: Billy <xiaobing.feng@windriver.com>
+Date: Thu, 14 Mar 2013 16:00:23 +0800
+Subject: Init: Setting system time back to utc
+
+Fix:
+When rtc_local_time is enabled (ro.rtc_local_time = 1),
+system time loaded from rtc should be local time too during boot.
+Setting system time back to utc as soon as fast, which avoid programs
+get confused about it.
+
+For convert local time to utc, we need to get timezone information.
+Android store timezone in property variable "persist.sys.timezone", and
+its raw file stored on /data partition. So, the reasonalbe time when we
+trigger sysclk should be after /data partition loaded and persist_props
+loaded. We must add a new property variable for triggering sysclk if we
+want to trigger it after load_persist_props commmand, which will make code
+more complicated. Thinking about above, I add sysclk command on post-fs-data
+section in init.bigcore.rc. At this point, partitions loaded, persist_props
+not loaded yet. I get the timezone infromation through reading raw file
+directly instead of call propert_get function
+
+Issue: AXIA-2051
+Change-Id: I0ff1d5932c5b1aaa8695129de44c06dba31cb443
+Signed-off-by: Xiaobing Feng <xiaobing.feng@windriver.com>
+---
+ init/builtins.c |   67 +++++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 files changed, 65 insertions(+), 2 deletions(-)
+
+diff --git a/init/builtins.c b/init/builtins.c
+index ea35198..718bd1c 100644
+--- a/init/builtins.c
++++ b/init/builtins.c
+@@ -37,6 +37,7 @@
+ #include <fnmatch.h>
+ #include <dirent.h>
+ #include <cutils/probe_module.h>
++#include <time.h>
+ 
+ #include <selinux/selinux.h>
+ #include <selinux/label.h>
+@@ -51,6 +52,8 @@
+ 
+ #include <private/android_filesystem_config.h>
+ 
++#define TIMEZONE "/data/property/persist.sys.timezone"
++
+ enum builtin_cmds {
+     DO_CHOWN,
+     DO_CHMOD,
+@@ -782,14 +785,74 @@ int do_rmdir(int nargs, char **args)
+ int do_sysclktz(int nargs, char **args)
+ {
+     struct timezone tz;
++    struct timeval tv;
++    struct tm tm;
++    FILE *fp;
++    char *line = NULL;
++    size_t len = 0;
++    char const *hwtime_mode;
++    time_t t;
+ 
+     if (nargs != 2)
+         return -1;
+ 
+     memset(&tz, 0, sizeof(tz));
+-    tz.tz_minuteswest = atoi(args[1]);   
+-    if (settimeofday(NULL, &tz))
++    memset(&tv, 0, sizeof(tv));
++    memset(&tm, 0, sizeof(tm));
++
++    if (!strcmp(args[1], "0")) {
++        tz.tz_minuteswest = atoi(args[1]);
++        if (settimeofday(NULL, &tz))
++            return -1;
++        return 0;
++    }
++
++    if (gettimeofday(&tv, NULL))
+         return -1;
++    hwtime_mode = property_get("ro.rtc_local_time");
++    if (hwtime_mode && !strcmp(hwtime_mode, "1")
++                    && !strcmp(args[1], "1")) {
++
++        /* Notify kernel that hwtime use local time */
++        write_file("/sys/class/misc/alarm/rtc_local_time",
++                    hwtime_mode);
++        /*
++         * If ro.hwtime.mode is local, set system time
++         * and saved system zone in case of network not
++         * available and auto syncing time not available.
++         */
++        if (access(TIMEZONE, 0) == 0) {
++            fp = fopen(TIMEZONE, "r+");
++            if (fp == NULL)
++                return -1;
++
++            if (getline(&line, &len, fp) == -1)
++                tz.tz_minuteswest = 0;
++            else {
++                /* Hack to get timezone. */
++                for (len = 0; *(line+len) != '\n' && *(line+len) != 0; len++);
++                *(line+len) = '\0';
++                property_set("persist.sys.timezone", line);
++                t = tv.tv_sec;
++                localtime_r(&t, &tm);
++                tz.tz_minuteswest = -(tm.tm_gmtoff / 60);
++            }
++            free(line);
++            fclose(fp);
++        }
++        else
++            tz.tz_minuteswest = 0;
++
++        /*
++         * At this moment, system time should be local
++         * time too, set it back to utc which linux required.
++         */
++        tv.tv_sec += tz.tz_minuteswest * 60;
++        if (settimeofday(&tv, &tz))
++            return -1;
++    } else {
++        return -1;
++    }
+     return 0;
+ }
+ 
+-- 
+1.7.4.1
+

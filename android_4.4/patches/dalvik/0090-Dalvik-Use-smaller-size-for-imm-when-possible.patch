@@ -1,0 +1,146 @@
+From 52513377ed397f58c6ceb1e81bb2c5c0d1784594 Mon Sep 17 00:00:00 2001
+From: Udayan Banerji <udayan.banerji@intel.com>
+Date: Wed, 27 Feb 2013 18:39:27 -0800
+Subject: Dalvik: Use smaller size for imm when possible
+
+BZ: 89868
+
+See if we can do with less than 32-bit size for the immediate values. This
+is possible for ADD, ADC, SUB and SBB, where the imm op is sign extended by
+the architecture, so we can dump a smaller imm size.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I9a34988bc1c01bba632dfea82954f1a16306a7c6
+Orig-MCG-Change-Id: I05f3c55100789fcd7d3cce0151b31d835bb8d706
+Signed-off-by: Udayan Banerji <udayan.banerji@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/codegen/x86/LowerHelper.cpp        |   43 ++++++++++++++++++++----
+ vm/compiler/codegen/x86/Schedule.cpp           |    3 +-
+ vm/compiler/codegen/x86/libenc/enc_wrapper.cpp |   10 ++++--
+ vm/compiler/codegen/x86/libenc/enc_wrapper.h   |    2 +
+ 4 files changed, 47 insertions(+), 11 deletions(-)
+
+diff --git a/vm/compiler/codegen/x86/LowerHelper.cpp b/vm/compiler/codegen/x86/LowerHelper.cpp
+index da3362a..6fbcb22 100644
+--- a/vm/compiler/codegen/x86/LowerHelper.cpp
++++ b/vm/compiler/codegen/x86/LowerHelper.cpp
+@@ -919,20 +919,49 @@ LowOpRegMem* dump_reg_mem(Mnemonic m, AtomOpCode m2, OpndSize size, int reg,
+     return NULL;
+ }
+ 
++//! \brief Checks if Mnemonic sign extends imm operand
++//! \details Information taken from Atom instruction manual
++//! \param mn Mnemonic to check for
++//! \return whether mn sign extends its imm operand
++bool mnemonicSignExtendsImm(Mnemonic mn) {
++    if ((mn == Mnemonic_ADD) || (mn == Mnemonic_ADC)
++            || (mn == Mnemonic_SUB) || (mn == Mnemonic_SBB)) {
++        return true;
++    }
++    return false;
++}
++
++//! \brief Returns minimum size to fit an imm
++//! \param imm The immediate value to check for
++//! \return the OpndSize befitting the imm
++OpndSize minSizeForImm(int imm) {
++    //Don't care about signed values
++    if (imm < 0)
++        return OpndSize_32;
++    if (imm < 128)
++        return OpndSize_8;
++    if (imm < 32768)
++        return OpndSize_16;
++
++    return OpndSize_32;
++}
++
+ //!update fields of LowOp and generate a x86 instruction that takes one immediate and one reg operand
+ 
+ //!The reg operand is allocated already
+ LowOpImmReg* lower_imm_to_reg(Mnemonic m, AtomOpCode m2, OpndSize size, int imm,
+         int reg, bool isPhysical, LowOpndRegType type, bool chaining) {
+     // size of opnd1 can be different from size of opnd2:
+-    OpndSize overridden_size =
+-            (m == Mnemonic_SAL || m == Mnemonic_SHR || m == Mnemonic_SHL
+-                    || m == Mnemonic_SAR || m == Mnemonic_ROR) ?
+-                    OpndSize_8 : size;
++    OpndSize overridden_size = size;
++    if (m == Mnemonic_SAL || m == Mnemonic_SHR || m == Mnemonic_SHL
++                    || m == Mnemonic_SAR || m == Mnemonic_ROR) {
++                    overridden_size = OpndSize_8;
++    }
++    else if (mnemonicSignExtendsImm(m)) {
++        overridden_size = minSizeForImm(imm);
++    }
+     if (!gDvmJit.scheduling) {
+-        // No need to pass overridden size to encoder because it has same logic
+-        // for determining size of immediate
+-        stream = encoder_imm_reg(m, size, imm, reg, isPhysical, type, stream);
++        stream = encoder_imm_reg_diff_sizes(m, overridden_size, imm, size, reg, isPhysical, type, stream);
+         return NULL;
+     }
+ 
+diff --git a/vm/compiler/codegen/x86/Schedule.cpp b/vm/compiler/codegen/x86/Schedule.cpp
+index baf6a81..70e5c0e 100644
+--- a/vm/compiler/codegen/x86/Schedule.cpp
++++ b/vm/compiler/codegen/x86/Schedule.cpp
+@@ -1338,8 +1338,9 @@ void Scheduler::generateAssembly(LowOp * op) {
+     // lower_reg_mem_scale, lower_reg_reg, lower_fp_mem, and lower_mem_fp
+     else if (op->opndDest.type == LowOpndType_Reg
+             && op->opndSrc.type == LowOpndType_Imm) {
+-        stream = encoder_imm_reg(op->opCode, op->opndDest.size,
++        stream = encoder_imm_reg_diff_sizes(op->opCode, op->opndSrc.size,
+                 ((LowOpImmReg*) op)->immSrc.value,
++                op->opndDest.size,
+                 ((LowOpImmReg*) op)->regDest.regNum,
+                 ((LowOpImmReg*) op)->regDest.isPhysical,
+                 ((LowOpImmReg*) op)->regDest.regType, stream);
+diff --git a/vm/compiler/codegen/x86/libenc/enc_wrapper.cpp b/vm/compiler/codegen/x86/libenc/enc_wrapper.cpp
+index f324a3c..b519595 100644
+--- a/vm/compiler/codegen/x86/libenc/enc_wrapper.cpp
++++ b/vm/compiler/codegen/x86/libenc/enc_wrapper.cpp
+@@ -374,14 +374,18 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_reg_mem(Mnemonic m, OpndSize si
+ }
+ extern "C" ENCODER_DECLARE_EXPORT char * encoder_imm_reg(Mnemonic m, OpndSize size,
+                    int imm, int reg, bool isPhysical, LowOpndRegType type, char * stream) {
++    return encoder_imm_reg_diff_sizes(m, size, imm, size, reg, isPhysical, type, stream);
++}
++extern "C" ENCODER_DECLARE_EXPORT char * encoder_imm_reg_diff_sizes(Mnemonic m, OpndSize sizeImm,
++                   int imm, OpndSize sizeReg, int reg, bool isPhysical, LowOpndRegType type, char * stream) {
+     EncoderBase::Operands args;
+-    add_r(args, reg, size); //dst
+-    if(m == Mnemonic_IMUL) add_r(args, reg, size); //src CHECK
++    add_r(args, reg, sizeReg); //dst
++    if(m == Mnemonic_IMUL) add_r(args, reg, sizeReg); //src CHECK
+     if(m == Mnemonic_SAL || m == Mnemonic_SHR || m == Mnemonic_SHL
+        || m == Mnemonic_SAR || m == Mnemonic_ROR || m == Mnemonic_PSLLQ || m == Mnemonic_PSRLQ)  //fix for shift opcodes
+       add_imm(args, OpndSize_8, imm, true/*is_signed*/);
+     else
+-      add_imm(args, size, imm, true/*is_signed*/);
++      add_imm(args, sizeImm, imm, true/*is_signed*/);
+     char* stream_start = stream;
+     stream = (char *)EncoderBase::encode(stream, m, args);
+ #ifdef PRINT_ENCODER_STREAM
+diff --git a/vm/compiler/codegen/x86/libenc/enc_wrapper.h b/vm/compiler/codegen/x86/libenc/enc_wrapper.h
+index d2c1b19..eca38ea 100644
+--- a/vm/compiler/codegen/x86/libenc/enc_wrapper.h
++++ b/vm/compiler/codegen/x86/libenc/enc_wrapper.h
+@@ -221,6 +221,8 @@ ENCODER_DECLARE_EXPORT char* encoder_reg_mem(Mnemonic m, OpndSize size,
+                    int disp, int base_reg, bool isBasePhysical, LowOpndRegType type, char* stream);
+ ENCODER_DECLARE_EXPORT char* encoder_imm_reg(Mnemonic m, OpndSize size,
+                    int imm, int reg, bool isPhysical, LowOpndRegType type, char* stream);
++ENCODER_DECLARE_EXPORT char * encoder_imm_reg_diff_sizes(Mnemonic m, OpndSize sizeImm,
++                   int imm, OpndSize sizeReg, int reg, bool isPhysical, LowOpndRegType type, char * stream);
+ ENCODER_DECLARE_EXPORT char * encoder_update_imm_rm(int imm, char * stream);
+ ENCODER_DECLARE_EXPORT char* encoder_imm_mem(Mnemonic m, OpndSize size,
+                    int imm,
+-- 
+1.7.4.1
+

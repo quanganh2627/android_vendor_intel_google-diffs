@@ -1,0 +1,558 @@
+From c2d641f5e3a33fc7e20a746741597170d660bec3 Mon Sep 17 00:00:00 2001
+From: Sushma Kyasaralli Thimmappa <skyasara2@skyasara2-desktop.(none)>
+Date: Sat, 13 Oct 2012 07:45:55 -0700
+Subject: Dalvik: Resolving "Unknown" symbols coming from helper functions.
+
+BZ: 75820
+
+Symbols of JIT labels were not passed to VTune previously, causing them
+to show up as "Unknown" in benchmarks like Smartbench-Pi. This patch addresses
+the issue by sending all necessary label information to VTune.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I51ffaa8acc0c9486348ed34321eafe257329b92a
+Orig-MCG-Change-Id: I3b102056677334e5cbc8d608cac3229c33e09489
+Signed-off-by: Sushma Kyasaralli Thimmappa <skyasara2@skyasara2-desktop.(none)>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/codegen/x86/Lower.cpp       |   23 ++++
+ vm/compiler/codegen/x86/Lower.h         |    4 +
+ vm/compiler/codegen/x86/LowerInvoke.cpp |   52 +++++++++
+ vm/compiler/codegen/x86/LowerJump.cpp   |  173 +++++++++++++++++++++++++++++++
+ 4 files changed, 252 insertions(+), 0 deletions(-)
+
+diff --git a/vm/compiler/codegen/x86/Lower.cpp b/vm/compiler/codegen/x86/Lower.cpp
+index af394b8..68a3994 100644
+--- a/vm/compiler/codegen/x86/Lower.cpp
++++ b/vm/compiler/codegen/x86/Lower.cpp
+@@ -32,6 +32,9 @@
+ #include "NcgHelper.h"
+ #include "libdex/DexCatch.h"
+ #include "compiler/CompilerIR.h"
++#if defined VTUNE_DALVIK
++#include "compiler/JitProfiling.h"
++#endif
+ 
+ //statistics for optimization
+ int num_removed_nullCheck;
+@@ -998,3 +1001,23 @@ int op_nop() {
+     rPC++;
+     return 0;
+ }
++
++#if defined VTUNE_DALVIK
++/**
++ * Send the label information (size, start_address and name) to VTune
++ */
++void sendLabelInfoToVTune(int startStreamPtr, int endStreamPtr, const char* labelName) {
++    iJIT_Method_Load jitMethod;
++    memset(&jitMethod, 0, sizeof(iJIT_Method_Load));
++    jitMethod.method_id = iJIT_GetNewMethodID();
++    jitMethod.method_name = const_cast<char *>(labelName);
++    jitMethod.method_load_address = (void *)startStreamPtr;
++    jitMethod.method_size = endStreamPtr-startStreamPtr;
++    int res = iJIT_NotifyEvent(iJVM_EVENT_TYPE_METHOD_LOAD_FINISHED, (void*)&jitMethod);
++    if (res) {
++        LOGI("JIT API: a trace of %s method was written successfully.\n", labelName);
++    } else {
++        LOGI("JIT API: failed to write a trace of %s method.\n", labelName);
++    }
++}
++#endif
+diff --git a/vm/compiler/codegen/x86/Lower.h b/vm/compiler/codegen/x86/Lower.h
+index 50b0c2a..33ce761 100644
+--- a/vm/compiler/codegen/x86/Lower.h
++++ b/vm/compiler/codegen/x86/Lower.h
+@@ -1036,6 +1036,10 @@ int common_gotoBail_0();
+ int common_StringIndexOutOfBounds();
+ void goto_invokeArgsDone();
+ 
++#if defined VTUNE_DALVIK
++void sendLabelInfoToVTune(int startStreamPtr, int endStreamPtr, const char* labelName);
++#endif
++
+ //lower a bytecode
+ int lowerByteCode(const Method* method);
+ 
+diff --git a/vm/compiler/codegen/x86/LowerInvoke.cpp b/vm/compiler/codegen/x86/LowerInvoke.cpp
+index 3e29547..9df1ee7 100644
+--- a/vm/compiler/codegen/x86/LowerInvoke.cpp
++++ b/vm/compiler/codegen/x86/LowerInvoke.cpp
+@@ -25,6 +25,10 @@
+ #include "NcgAot.h"
+ #include "enc_wrapper.h"
+ 
++#if defined VTUNE_DALVIK
++#include "compiler/JitProfiling.h"
++#endif
++
+ char* streamMisPred = NULL;
+ 
+ /* according to callee, decide the ArgsDoneType*/
+@@ -532,6 +536,10 @@ int op_invoke_interface_range() {
+ 
+ //!
+ int common_invokeMethodNoRange_noJmp() {
++#if defined VTUNE_DALVIK
++    int startStreamPtr = (int)stream;
++#endif
++
+     u2 count = INST_B(inst);
+     u2 vD = FETCH(2) & 0xf;
+     u2 vE = (FETCH(2) >> 4) & 0xf;
+@@ -563,10 +571,22 @@ int common_invokeMethodNoRange_noJmp() {
+         get_virtual_reg(vD, OpndSize_32, 26, false);
+         move_reg_to_mem(OpndSize_32, 26, false, offsetFromSaveArea-sizeofStackSaveArea, PhysicalReg_FP, true);
+     }
++
++#if defined VTUNE_DALVIK
++    if(gDvmJit.vtuneInfo != kVTuneInfoDisabled) {
++        int endStreamPtr = (int)stream;
++        sendLabelInfoToVTune(startStreamPtr, endStreamPtr, "common_invokeMethodNoRange_noJmp");
++    }
++#endif
+     return 0;
+ }
+ 
+ int common_invokeMethod_Jmp(ArgsDoneType form) {
++#if defined VTUNE_DALVIK
++    int startStreamPtr = (int)stream;
++#endif
++
++#if defined(WITH_JIT)
+     nextVersionOfHardReg(PhysicalReg_EDX, 1);
+     move_imm_to_reg(OpndSize_32, (int)rPC, PhysicalReg_EDX, true);
+     //arguments needed in ArgsDone:
+@@ -587,6 +607,16 @@ int common_invokeMethod_Jmp(ArgsDoneType form) {
+         unconditional_jump_global_API(".invokeArgsDone_native", false);
+     else
+         unconditional_jump_global_API(".invokeArgsDone_normal", false);
++#else
++    goto_invokeArgsDone();
++#endif
++
++#if defined VTUNE_DALVIK
++    if(gDvmJit.vtuneInfo != kVTuneInfoDisabled) {
++        int endStreamPtr = (int)stream;
++        sendLabelInfoToVTune(startStreamPtr, endStreamPtr, "common_invokeMethod_Jmp");
++    }
++#endif
+     return 0;
+ }
+ 
+@@ -621,6 +651,11 @@ int common_invokeMethodNoRange(ArgsDoneType form) {
+ 
+ //! loop is unrolled when count <= 10
+ int common_invokeMethodRange_noJmp() {
++
++#if defined VTUNE_DALVIK
++    int startStreamPtr = (int)stream;
++#endif
++
+     u2 count = INST_AA(inst);
+     u2 vD = FETCH(2); //the first argument
+     savearea_from_fp(21, false);
+@@ -687,6 +722,13 @@ int common_invokeMethodRange_noJmp() {
+         transferToState(1);
+         conditional_jump(Condition_NE, ".invokeMethod_1", true); //backward branch
+     }
++
++#if defined VTUNE_DALVIK
++    if(gDvmJit.vtuneInfo != kVTuneInfoDisabled) {
++        int endStreamPtr = (int)stream;
++        sendLabelInfoToVTune(startStreamPtr, endStreamPtr, "common_invokeMethodRange_noJmp");
++    }
++#endif
+     return 0;
+ }
+ 
+@@ -749,6 +791,10 @@ void generate_stackOverflow(); //forward declaration
+      at execution time during relocation
+    generate invokeArgsDone for NCG if isJitFull is false && form == Full */
+ int common_invokeArgsDone(ArgsDoneType form, bool isJitFull) {
++#if defined VTUNE_DALVIK
++    int startStreamPtr = (int)stream;
++#endif
++
+     bool generateForNcg = false;
+     if(form == ArgsDone_Full) {
+         if(isJitFull)
+@@ -852,6 +898,12 @@ int common_invokeArgsDone(ArgsDoneType form, bool isJitFull) {
+ 
+     if(form == ArgsDone_Full) generate_invokeNative(generateForNcg);
+     generate_stackOverflow();
++#if defined VTUNE_DALVIK
++    if(gDvmJit.vtuneInfo != kVTuneInfoDisabled) {
++        int endStreamPtr = (int)stream;
++        sendLabelInfoToVTune(startStreamPtr, endStreamPtr, "common_invokeArgsDone");
++    }
++#endif
+     return 0;
+ }
+ 
+diff --git a/vm/compiler/codegen/x86/LowerJump.cpp b/vm/compiler/codegen/x86/LowerJump.cpp
+index 8a46b09..c4b6493 100644
+--- a/vm/compiler/codegen/x86/LowerJump.cpp
++++ b/vm/compiler/codegen/x86/LowerJump.cpp
+@@ -28,6 +28,10 @@
+ #include "NcgHelper.h"
+ #include "Scheduler.h"
+ 
++#if defined VTUNE_DALVIK
++#include "compiler/JitProfiling.h"
++#endif
++
+ LabelMap* globalMap;
+ LabelMap* globalShortMap;//make sure for each bytecode, there is no duplicated label
+ LabelMap* globalWorklist = NULL;
+@@ -936,10 +940,22 @@ input: jump target in %eax; at end of the function, jump to %eax
+ */
+ int common_backwardBranch() {
+     insertLabel("common_backwardBranch", false);
++
++#if defined VTUNE_DALVIK
++     int startStreamPtr = (int)stream;
++#endif
++
+     spill_reg(PhysicalReg_EAX, true);
+     call("common_periodicChecks_entry");
+     unspill_reg(PhysicalReg_EAX, true);
+     unconditional_jump_reg(PhysicalReg_EAX, true);
++
++#if defined(VTUNE_DALVIK)
++    if(gDvmJit.vtuneInfo != kVTuneInfoDisabled) {
++        int endStreamPtr = (int)stream;
++        sendLabelInfoToVTune(startStreamPtr, endStreamPtr, "common_backwardBranch");
++    }
++#endif
+     return 0;
+ }
+ #if !defined(WITH_JIT)
+@@ -1092,9 +1108,22 @@ int common_if(s4 tmp, ConditionCode cc_next, ConditionCode cc) {
+ */
+ int common_errNullObject() {
+     insertLabel("common_errNullObject", false);
++
++#if defined VTUNE_DALVIK
++    int startStreamPtr = (int)stream;
++#endif
++
+     move_imm_to_reg(OpndSize_32, 0, PhysicalReg_EAX, true);
+     move_imm_to_reg(OpndSize_32, (int) gDvm.exNullPointerException, PhysicalReg_ECX, true);
+     unconditional_jump("common_throw", false);
++
++#if defined VTUNE_DALVIK
++    if(gDvmJit.vtuneInfo != kVTuneInfoDisabled) {
++        int endStreamPtr = (int)stream;
++        sendLabelInfoToVTune(startStreamPtr, endStreamPtr, "common_errNullObject");
++    }
++#endif
++
+     return 0;
+ }
+ /*!
+@@ -1103,9 +1132,20 @@ int common_errNullObject() {
+ */
+ int common_StringIndexOutOfBounds() {
+     insertLabel("common_StringIndexOutOfBounds", false);
++
++#if defined VTUNE_DALVIK
++    int startStreamPtr = (int)stream;
++#endif
+     move_imm_to_reg(OpndSize_32, 0, PhysicalReg_EAX, true);
+     move_imm_to_reg(OpndSize_32, LstrStringIndexOutOfBoundsException, PhysicalReg_ECX, true);
+     unconditional_jump("common_throw", false);
++
++#if defined VTUNE_DALVIK
++    if(gDvmJit.vtuneInfo != kVTuneInfoDisabled) {
++        int endStreamPtr = (int)stream;
++        sendLabelInfoToVTune(startStreamPtr, endStreamPtr, "common_StringIndexOutOfBounds");
++    }
++#endif
+     return 0;
+ }
+ 
+@@ -1115,9 +1155,20 @@ int common_StringIndexOutOfBounds() {
+ */
+ int common_errArrayIndex() {
+     insertLabel("common_errArrayIndex", false);
++#if defined VTUNE_DALVIK
++    int startStreamPtr = (int)stream;
++#endif
++
+     move_imm_to_reg(OpndSize_32, 0, PhysicalReg_EAX, true);
+     move_imm_to_reg(OpndSize_32, LstrArrayIndexException, PhysicalReg_ECX, true);
+     unconditional_jump("common_throw", false);
++
++#if defined VTUNE_DALVIK
++    if(gDvmJit.vtuneInfo != kVTuneInfoDisabled) {
++        int endStreamPtr = (int)stream;
++        sendLabelInfoToVTune(startStreamPtr, endStreamPtr, "common_errArrayIndex");
++    }
++#endif
+     return 0;
+ }
+ /*!
+@@ -1126,9 +1177,20 @@ int common_errArrayIndex() {
+ */
+ int common_errArrayStore() {
+     insertLabel("common_errArrayStore", false);
++#if defined VTUNE_DALVIK
++    int startStreamPtr = (int)stream;
++#endif
++
+     move_imm_to_reg(OpndSize_32, 0, PhysicalReg_EAX, true);
+     move_imm_to_reg(OpndSize_32, LstrArrayStoreException, PhysicalReg_ECX, true);
+     unconditional_jump("common_throw", false);
++
++#if defined VTUNE_DALVIK
++    if(gDvmJit.vtuneInfo != kVTuneInfoDisabled) {
++        int endStreamPtr = (int)stream;
++        sendLabelInfoToVTune(startStreamPtr, endStreamPtr, "common_errArrayStore");
++    }
++#endif
+     return 0;
+ }
+ /*!
+@@ -1137,9 +1199,20 @@ int common_errArrayStore() {
+ */
+ int common_errNegArraySize() {
+     insertLabel("common_errNegArraySize", false);
++
++#if defined VTUNE_DALVIK
++    int startStreamPtr = (int)stream;
++#endif
+     move_imm_to_reg(OpndSize_32, 0, PhysicalReg_EAX, true);
+     move_imm_to_reg(OpndSize_32, LstrNegativeArraySizeException, PhysicalReg_ECX, true);
+     unconditional_jump("common_throw", false);
++
++#if defined VTUNE_DALVIK
++    if(gDvmJit.vtuneInfo != kVTuneInfoDisabled) {
++        int endStreamPtr = (int)stream;
++        sendLabelInfoToVTune(startStreamPtr, endStreamPtr, "common_errNegArraySize");
++    }
++#endif
+     return 0;
+ }
+ /*!
+@@ -1148,9 +1221,20 @@ int common_errNegArraySize() {
+ */
+ int common_errDivideByZero() {
+     insertLabel("common_errDivideByZero", false);
++
++#if defined VTUNE_DALVIK
++    int startStreamPtr = (int)stream;
++#endif
+     move_imm_to_reg(OpndSize_32, LstrDivideByZero, PhysicalReg_EAX, true);
+     move_imm_to_reg(OpndSize_32, LstrArithmeticException, PhysicalReg_ECX, true);
+     unconditional_jump("common_throw", false);
++
++#if defined VTUNE_DALVIK
++    if(gDvmJit.vtuneInfo != kVTuneInfoDisabled) {
++        int endStreamPtr = (int)stream;
++        sendLabelInfoToVTune(startStreamPtr, endStreamPtr, "common_errDivideByZero");
++    }
++#endif
+     return 0;
+ }
+ /*!
+@@ -1159,9 +1243,20 @@ int common_errDivideByZero() {
+ */
+ int common_errNoSuchMethod() {
+     insertLabel("common_errNoSuchMethod", false);
++
++#if defined VTUNE_DALVIK
++    int startStreamPtr = (int)stream;
++#endif
+     move_imm_to_reg(OpndSize_32, 0, PhysicalReg_EAX, true);
+     move_imm_to_reg(OpndSize_32, LstrNoSuchMethodError, PhysicalReg_ECX, true);
+     unconditional_jump("common_throw", false);
++
++#if defined VTUNE_DALVIK
++    if(gDvmJit.vtuneInfo != kVTuneInfoDisabled) {
++        int endStreamPtr = (int)stream;
++        sendLabelInfoToVTune(startStreamPtr, endStreamPtr, "common_errNoSuchMethod");
++    }
++#endif
+     return 0;
+ }
+ int call_dvmFindCatchBlock();
+@@ -1175,10 +1270,20 @@ int call_dvmFindCatchBlock();
+ */
+ int common_exceptionThrown() {
+     insertLabel("common_exceptionThrown", false);
++#if defined VTUNE_DALVIK
++    int startStreamPtr = (int)stream;
++#endif
+     typedef void (*vmHelper)(int);
+     vmHelper funcPtr = dvmJitToExceptionThrown;
+     move_imm_to_reg(OpndSize_32, (int)funcPtr, C_SCRATCH_1, isScratchPhysical);
+     unconditional_jump_reg(C_SCRATCH_1, isScratchPhysical);
++
++#if defined VTUNE_DALVIK
++    if(gDvmJit.vtuneInfo != kVTuneInfoDisabled) {
++        int endStreamPtr = (int)stream;
++        sendLabelInfoToVTune(startStreamPtr, endStreamPtr, "common_exceptionThrown");
++    }
++#endif
+     return 0;
+ }
+ #undef P_GPR_1
+@@ -1195,6 +1300,10 @@ OUTPUT: no
+ int throw_exception_message(int exceptionPtrReg, int obj_reg, bool isPhysical,
+                             int startLR/*logical register index*/, bool startPhysical) {
+     insertLabel("common_throw_message", false);
++
++#if defined VTUNE_DALVIK
++    int startStreamPtr = (int)stream;
++ #endif
+     scratchRegs[0] = PhysicalReg_ESI; scratchRegs[1] = PhysicalReg_EDX;
+     scratchRegs[2] = PhysicalReg_Null; scratchRegs[3] = PhysicalReg_Null;
+ 
+@@ -1206,6 +1315,13 @@ int throw_exception_message(int exceptionPtrReg, int obj_reg, bool isPhysical,
+     call_dvmThrowWithMessage();
+     load_effective_addr(8, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
+     unconditional_jump("common_exceptionThrown", false);
++
++#if defined VTUNE_DALVIK
++    if(gDvmJit.vtuneInfo != kVTuneInfoDisabled) {
++        int endStreamPtr = (int)stream;
++        sendLabelInfoToVTune(startStreamPtr, endStreamPtr, "common_throw_message");
++    }
++#endif
+     return 0;
+ }
+ /*!
+@@ -1216,6 +1332,11 @@ scratch: C_SCRATCH_1(%edx)
+ int throw_exception(int exceptionPtrReg, int immReg,
+                     int startLR/*logical register index*/, bool startPhysical) {
+     insertLabel("common_throw", false);
++
++#if defined VTUNE_DALVIK
++    int startStreamPtr = (int)stream;
++#endif
++
+     scratchRegs[0] = PhysicalReg_EDX; scratchRegs[1] = PhysicalReg_Null;
+     scratchRegs[2] = PhysicalReg_Null; scratchRegs[3] = PhysicalReg_Null;
+ 
+@@ -1225,6 +1346,13 @@ int throw_exception(int exceptionPtrReg, int immReg,
+     call_dvmThrow();
+     load_effective_addr(8, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
+     unconditional_jump("common_exceptionThrown", false);
++
++#if defined VTUNE_DALVIK
++    if(gDvmJit.vtuneInfo != kVTuneInfoDisabled) {
++        int endStreamPtr = (int)stream;
++        sendLabelInfoToVTune(startStreamPtr, endStreamPtr, "common_throw");
++    }
++#endif
+     return 0;
+ }
+ 
+@@ -1570,6 +1698,11 @@ BCOffset in %edx
+ */
+ int common_periodicChecks4() {
+     insertLabel("common_periodicChecks4", false);
++
++#if defined VTUNE_DALVIK
++    int startStreamPtr = (int)stream;
++#endif
++
+ #if (!defined(ENABLE_TRACING))
+     get_self_pointer(PhysicalReg_ECX, true);
+     move_mem_to_reg(OpndSize_32, offsetof(Thread, suspendCount), PhysicalReg_ECX, true, PhysicalReg_EAX, true);
+@@ -1613,6 +1746,13 @@ int common_periodicChecks4() {
+     move_imm_to_mem(OpndSize_32, 0, offGlue_entryPoint, PhysicalReg_Glue, true);
+     unconditional_jump("common_gotoBail", false); //update glue->rPC with edx
+ #endif
++
++#if defined VTUNE_DALVIK
++    if(gDvmJit.vtuneInfo != kVTuneInfoDisabled) {
++        int endStreamPtr = (int)stream;
++        sendLabelInfoToVTune(startStreamPtr, endStreamPtr, "common_periodicChecks4");
++    }
++#endif
+     return 0;
+ }
+ //input: %edx PC adjustment
+@@ -1623,6 +1763,9 @@ int common_periodicChecks4() {
+ */
+ int common_periodicChecks_entry() {
+     insertLabel("common_periodicChecks_entry", false);
++#if defined VTUNE_DALVIK
++    int startStreamPtr = (int)stream;
++#endif
+     scratchRegs[0] = PhysicalReg_ESI; scratchRegs[1] = PhysicalReg_EAX;
+     scratchRegs[2] = PhysicalReg_Null; scratchRegs[3] = PhysicalReg_Null;
+     get_suspendCount(P_GPR_1, true);
+@@ -1657,6 +1800,14 @@ int common_periodicChecks_entry() {
+     set_glue_entryPoint_imm(0); //kInterpEntryInstr);
+     unconditional_jump("common_gotoBail", false);
+ #endif
++
++#if defined VTUNE_DALVIK
++    if(gDvmJit.vtuneInfo != kVTuneInfoDisabled) {
++        int endStreamPtr = (int)stream;
++        sendLabelInfoToVTune(startStreamPtr, endStreamPtr, "common_periodicChecks_entry");
++    }
++#endif
++
+     return 0;
+ }
+ #undef P_GPR_1
+@@ -1668,6 +1819,10 @@ int common_periodicChecks_entry() {
+ */
+ int common_gotoBail() {
+     insertLabel("common_gotoBail", false);
++
++#if defined VTUNE_DALVIK
++    int startStreamPtr = (int)stream;
++#endif
+     //scratchRegs[0] = PhysicalReg_EDX; scratchRegs[1] = PhysicalReg_ESI;
+     //scratchRegs[2] = PhysicalReg_Null; scratchRegs[3] = PhysicalReg_Null;
+     //save_pc_fp_to_glue();
+@@ -1686,6 +1841,13 @@ int common_gotoBail() {
+     move_mem_to_reg(OpndSize_32, 0, PhysicalReg_ESP, true, PhysicalReg_EBP, true);
+     load_effective_addr(4, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
+     x86_return();
++
++#if defined VTUNE_DALVIK
++    if(gDvmJit.vtuneInfo != kVTuneInfoDisabled) {
++        int endStreamPtr = (int)stream;
++        sendLabelInfoToVTune(startStreamPtr, endStreamPtr, "common_gotoBail");
++    }
++#endif
+     return 0;
+ }
+ /*!
+@@ -1696,6 +1858,10 @@ int common_gotoBail() {
+ int common_gotoBail_0() {
+     insertLabel("common_gotoBail_0", false);
+ 
++#if defined VTUNE_DALVIK
++    int startStreamPtr = (int)stream;
++#endif
++
+     get_self_pointer(PhysicalReg_EAX, true);
+     move_reg_to_mem(OpndSize_32, PhysicalReg_FP, true, offsetof(Thread, interpSave.curFrame), PhysicalReg_EAX, true);
+     move_reg_to_mem(OpndSize_32, PhysicalReg_EDX, true, offsetof(Thread, interpSave.pc), PhysicalReg_EAX, true);
+@@ -1722,5 +1888,12 @@ int common_gotoBail_0() {
+     move_mem_to_reg(OpndSize_32, 0, PhysicalReg_ESP, true, PhysicalReg_EBP, true);
+     load_effective_addr(4, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
+     x86_return();
++
++#if defined VTUNE_DALVIK
++    if(gDvmJit.vtuneInfo != kVTuneInfoDisabled) {
++        int endStreamPtr = (int)stream;
++        sendLabelInfoToVTune(startStreamPtr, endStreamPtr, "common_gotoBail_0");
++    }
++#endif
+     return 0;
+ }
+-- 
+1.7.4.1
+

@@ -1,0 +1,891 @@
+From 172ea52352da5849cb4c086140c3f5c363cfb4f3 Mon Sep 17 00:00:00 2001
+From: Zhenghua Wang <zhenghua.wang@intel.com>
+Date: Mon, 9 Dec 2013 16:49:18 +0800
+Subject: framework: houdini hook and native activity hook rebase on KK
+
+BZ: 150804
+
+houdini hook and native activity hook rebase on KK
+Category: feature differentiation
+Domain: AOSP.Houdini-Integration
+Origin: internal
+Upstream-Candidate: no,proprietary
+
+Orig-MCG-Change-Id: Ie73a6a3eeca23ffe84c328586ed2b730e44ffe02
+Change-Id: Ie73a6a3eeca23ffe84c328586ed2b730e44ffe02
+Signed-off-by: llin4 <ling.lin@intel.com>
+Signed-off-by: Zhenghua Wang <zhenghua.wang@intel.com>
+---
+ core/java/android/content/pm/PackageManager.java   |    9 +
+ .../internal/content/NativeLibraryHelper.java      |   69 ++++++++-
+ core/jni/Android.mk                                |    6 +
+ core/jni/android_app_NativeActivity.cpp            |   43 +++++
+ ...ndroid_internal_content_NativeLibraryHelper.cpp |   47 ++++++
+ .../defcontainer/DefaultContainerService.java      |   20 ++-
+ services/java/com/android/server/pm/CheckExt.java  |   46 ++++++
+ services/java/com/android/server/pm/ICheckExt.java |   30 ++++
+ .../android/server/pm/PackageManagerService.java   |  163 +++++++++++++++++++-
+ .../java/com/android/server/pm/xmlCheckExt.java    |  124 +++++++++++++++
+ 10 files changed, 542 insertions(+), 15 deletions(-)
+ create mode 100644 services/java/com/android/server/pm/CheckExt.java
+ create mode 100644 services/java/com/android/server/pm/ICheckExt.java
+ create mode 100644 services/java/com/android/server/pm/xmlCheckExt.java
+
+diff --git a/core/java/android/content/pm/PackageManager.java b/core/java/android/content/pm/PackageManager.java
+index c97c2b8..bbaea6b 100644
+--- a/core/java/android/content/pm/PackageManager.java
++++ b/core/java/android/content/pm/PackageManager.java
+@@ -363,6 +363,15 @@ public abstract class PackageManager {
+     public static final int INSTALL_SUCCEEDED = 1;
+ 
+     /**
++     * Native Library Copy return code: this is passed to {@link PackageManagerService} by
++     * {@link NativeLibararyHelper} on successful copy of native library.
++     * It indicates that the native library being copied matches 2nd ABI.
++     * @hide
++     */
++
++    public static final int INSTALL_ABI2_SUCCEEDED = 2;
++
++    /**
+      * Installation return code: this is passed to the {@link IPackageInstallObserver} by
+      * {@link #installPackage(android.net.Uri, IPackageInstallObserver, int)} if the package is
+      * already installed.
+diff --git a/core/java/com/android/internal/content/NativeLibraryHelper.java b/core/java/com/android/internal/content/NativeLibraryHelper.java
+index 6d65782..7bf6e3b 100644
+--- a/core/java/com/android/internal/content/NativeLibraryHelper.java
++++ b/core/java/com/android/internal/content/NativeLibraryHelper.java
+@@ -16,7 +16,9 @@
+ 
+ package com.android.internal.content;
+ 
++import android.content.pm.PackageManager;
+ import android.os.Build;
++import android.os.SystemProperties;
+ import android.util.Slog;
+ 
+ import java.io.File;
+@@ -30,6 +32,8 @@ public class NativeLibraryHelper {
+     private static final String TAG = "NativeHelper";
+ 
+     private static final boolean DEBUG_NATIVE = false;
++    private static final boolean ENABLE_HOUDINI = Build.CPU_ABI.equals("x86") &&
++            (Build.CPU_ABI2.length() != 0);
+ 
+     private static native long nativeSumNativeBinaries(String file, String cpuAbi, String cpuAbi2);
+ 
+@@ -42,9 +46,49 @@ public class NativeLibraryHelper {
+     public static long sumNativeBinariesLI(File apkFile) {
+         final String cpuAbi = Build.CPU_ABI;
+         final String cpuAbi2 = Build.CPU_ABI2;
+-        return nativeSumNativeBinaries(apkFile.getPath(), cpuAbi, cpuAbi2);
++
++        if (ENABLE_HOUDINI) {
++            long result = nativeSumNativeBinaries(apkFile.getPath(), cpuAbi, cpuAbi2);
++            if (result == 0) {
++                final String abiUpgrade = SystemProperties.get("ro.product.cpu.upgradeabi",
++                        "armeabi");
++                result = nativeSumNativeBinaries(apkFile.getPath(), cpuAbi, abiUpgrade);
++            }
++            return result;
++        } else {
++            return nativeSumNativeBinaries(apkFile.getPath(), cpuAbi, cpuAbi2);
++        }
+     }
+ 
++    private static native int nativeListNativeBinaries(String file, String cpuAbi, String cpuAbi2);
++
++    /**
++     * List the native binaries info in an APK.
++     *
++     * @param apkFile APK file to scan for native libraries
++     * @return {@link PackageManager#INSTALL_SUCCEEDED} or
++             {@link PackageManager#INSTALL_ABI2_SUCCEEDED}
++     *         or another error code from that class if not
++     */
++    public static int listNativeBinariesLI(File apkFile) {
++        final String cpuAbi = Build.CPU_ABI;
++        final String cpuAbi2 = Build.CPU_ABI2;
++
++        if (ENABLE_HOUDINI) {
++            int result = nativeListNativeBinaries(apkFile.getPath(), cpuAbi, cpuAbi2);
++            if ((result != PackageManager.INSTALL_SUCCEEDED) &&
++                    (result != PackageManager.INSTALL_ABI2_SUCCEEDED)) {
++                final String abiUpgrade = SystemProperties.get("ro.product.cpu.upgradeabi",
++                        "armeabi");
++                result = nativeListNativeBinaries(apkFile.getPath(), cpuAbi, abiUpgrade);
++            }
++            return result;
++        } else {
++            return PackageManager.INSTALL_SUCCEEDED;
++        }
++    }
++
++
+     private native static int nativeCopyNativeBinaries(String filePath, String sharedLibraryPath,
+             String cpuAbi, String cpuAbi2);
+ 
+@@ -53,14 +97,29 @@ public class NativeLibraryHelper {
+      *
+      * @param apkFile APK file to scan for native libraries
+      * @param sharedLibraryDir directory for libraries to be copied to
+-     * @return {@link PackageManager#INSTALL_SUCCEEDED} if successful or another
+-     *         error code from that class if not
++     * @return {@link PackageManager#INSTALL_SUCCEEDED} or
++             {@link PackageManager#INSTALL_ABI2_SUCCEEDED}
++     *         if successful or another error code from that class if not
+      */
+     public static int copyNativeBinariesIfNeededLI(File apkFile, File sharedLibraryDir) {
+         final String cpuAbi = Build.CPU_ABI;
+         final String cpuAbi2 = Build.CPU_ABI2;
+-        return nativeCopyNativeBinaries(apkFile.getPath(), sharedLibraryDir.getPath(), cpuAbi,
+-                cpuAbi2);
++
++        if (ENABLE_HOUDINI) {
++            int result = nativeCopyNativeBinaries(apkFile.getPath(), sharedLibraryDir.getPath(),
++                    cpuAbi, cpuAbi2);
++            if ((result != PackageManager.INSTALL_SUCCEEDED) &&
++                    (result != PackageManager.INSTALL_ABI2_SUCCEEDED)) {
++                final String abiUpgrade = SystemProperties.get("ro.product.cpu.upgradeabi",
++                        "armeabi");
++                result = nativeCopyNativeBinaries(apkFile.getPath(), sharedLibraryDir.getPath(),
++                        cpuAbi, abiUpgrade);
++            }
++            return result;
++        } else {
++            return nativeCopyNativeBinaries(apkFile.getPath(), sharedLibraryDir.getPath(),
++                    cpuAbi, cpuAbi2);
++        }
+     }
+ 
+     // Convenience method to call removeNativeBinariesFromDirLI(File)
+diff --git a/core/jni/Android.mk b/core/jni/Android.mk
+index 5983120..ab60fbf 100644
+--- a/core/jni/Android.mk
++++ b/core/jni/Android.mk
+@@ -228,6 +228,12 @@ ifeq ($(WITH_MALLOC_LEAK_CHECK),true)
+ 	LOCAL_CFLAGS += -DMALLOC_LEAK_CHECK
+ endif
+ 
++ifeq ($(INTEL_HOUDINI), true)
++    LOCAL_CFLAGS += -DWITH_HOUDINI
++	LOCAL_SHARED_LIBRARIES += libdvm
++    LOCAL_STATIC_LIBRARIES += libhoudini_hook
++endif
++
+ LOCAL_MODULE:= libandroid_runtime
+ 
+ include external/stlport/libstlport.mk
+diff --git a/core/jni/android_app_NativeActivity.cpp b/core/jni/android_app_NativeActivity.cpp
+index 5418006..ccd2ccc 100644
+--- a/core/jni/android_app_NativeActivity.cpp
++++ b/core/jni/android_app_NativeActivity.cpp
+@@ -41,6 +41,14 @@
+ #define LOG_TRACE(...)
+ //#define LOG_TRACE(...) ALOG(LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+ 
++#ifdef WITH_HOUDINI
++namespace houdini {
++void* hookDlopen(const char* filename, int flag, bool* useHoudini);
++void* hookDlsym(bool useHoudini, void* handle, const char* symbol);
++void  hookCreateActivity(bool useHoudini, void* createActivityFunc, void* activity, void*houdiniActivity, void* savedState, size_t savedStateSize);
++}
++#endif
++
+ namespace android
+ {
+ 
+@@ -109,6 +117,9 @@ struct NativeCode : public ANativeActivity {
+         createActivityFunc = _createFunc;
+         nativeWindow = NULL;
+         mainWorkRead = mainWorkWrite = -1;
++#ifdef WITH_HOUDINI
++        houdiniNativeActivity = NULL;
++#endif
+     }
+     
+     ~NativeCode() {
+@@ -130,6 +141,10 @@ struct NativeCode : public ANativeActivity {
+             // is really no benefit to unloading the code.
+             //dlclose(dlhandle);
+         }
++#ifdef WITH_HOUDINI
++        if (houdiniNativeActivity != NULL)
++            delete houdiniNativeActivity;
++#endif
+     }
+     
+     void setSurface(jobject _surface) {
+@@ -157,6 +172,9 @@ struct NativeCode : public ANativeActivity {
+     int mainWorkRead;
+     int mainWorkWrite;
+     sp<MessageQueue> messageQueue;
++#ifdef WITH_HOUDINI
++    ANativeActivity *houdiniNativeActivity;
++#endif
+ };
+ 
+ void android_NativeActivity_finish(ANativeActivity* activity) {
+@@ -252,14 +270,24 @@ loadNativeCode_native(JNIEnv* env, jobject clazz, jstring path, jstring funcName
+     const char* pathStr = env->GetStringUTFChars(path, NULL);
+     NativeCode* code = NULL;
+     
++#ifdef WITH_HOUDINI
++    bool useHoudini = false;
++    void* handle = houdini::hookDlopen(pathStr, RTLD_LAZY, &useHoudini);
++#else
+     void* handle = dlopen(pathStr, RTLD_LAZY);
++#endif
+     
+     env->ReleaseStringUTFChars(path, pathStr);
+     
+     if (handle != NULL) {
+         const char* funcStr = env->GetStringUTFChars(funcName, NULL);
++#ifdef WITH_HOUDINI
++        code = new NativeCode(handle, (ANativeActivity_createFunc*)
++                houdini::hookDlsym(useHoudini, handle, funcStr));
++#else
+         code = new NativeCode(handle, (ANativeActivity_createFunc*)
+                 dlsym(handle, funcStr));
++#endif
+         env->ReleaseStringUTFChars(funcName, funcStr);
+         
+         if (code->createActivityFunc == NULL) {
+@@ -331,7 +359,22 @@ loadNativeCode_native(JNIEnv* env, jobject clazz, jstring path, jstring funcName
+             rawSavedSize = env->GetArrayLength(savedState);
+         }
+ 
++#ifdef WITH_HOUDINI
++        if (useHoudini) {
++            /*
++             * If houdini is used, code is used by x86 code. So we create
++             * a houdini version for code. x86 version will store peer's
++             * pointer in houdiniNativeActivity each other.
++             */
++            code->houdiniNativeActivity = new ANativeActivity;
++            *code->houdiniNativeActivity = *(ANativeActivity *)code;
++        }
++
++        houdini::hookCreateActivity(useHoudini, (void*)code->createActivityFunc, (void*)code,
++                (void*)code->houdiniNativeActivity, (void*)rawSavedState, rawSavedSize);
++#else
+         code->createActivityFunc(code, rawSavedState, rawSavedSize);
++#endif
+ 
+         if (rawSavedState != NULL) {
+             env->ReleaseByteArrayElements(savedState, rawSavedState, 0);
+diff --git a/core/jni/com_android_internal_content_NativeLibraryHelper.cpp b/core/jni/com_android_internal_content_NativeLibraryHelper.cpp
+index bf5accd..484202a 100644
+--- a/core/jni/com_android_internal_content_NativeLibraryHelper.cpp
++++ b/core/jni/com_android_internal_content_NativeLibraryHelper.cpp
+@@ -54,8 +54,14 @@ namespace android {
+ // These match PackageManager.java install codes
+ typedef enum {
+     INSTALL_SUCCEEDED = 1,
++#ifdef WITH_HOUDINI
++    INSTALL_ABI2_SUCCEEDED = 2,
++#endif
+     INSTALL_FAILED_INVALID_APK = -2,
+     INSTALL_FAILED_INSUFFICIENT_STORAGE = -4,
++#ifdef WITH_HOUDINI
++    INSTALL_FAILED_CPU_ABI_INCOMPATIBLE = -16,
++#endif
+     INSTALL_FAILED_CONTAINER_ERROR = -18,
+     INSTALL_FAILED_INTERNAL_ERROR = -110,
+ } install_status_t;
+@@ -157,6 +163,14 @@ sumFiles(JNIEnv* env, void* arg, ZipFileRO* zipFile, ZipEntryRO zipEntry, const
+     return INSTALL_SUCCEEDED;
+ }
+ 
++#ifdef WITH_HOUDINI
++static install_status_t
++listFiles(JNIEnv* env, void* arg, ZipFileRO* zipFile, ZipEntryRO zipEntry, const char* fileName)
++{
++    return INSTALL_SUCCEEDED;
++}
++#endif
++
+ /*
+  * Copy the native library if needed.
+  *
+@@ -284,6 +298,10 @@ iterateOverNativeFiles(JNIEnv *env, jstring javaFilePath, jstring javaCpuAbi, js
+ 
+     char fileName[PATH_MAX];
+     bool hasPrimaryAbi = false;
++#ifdef WITH_HOUDINI
++    bool useSecondaryAbi = false;
++    bool noMatchAbi = false;
++#endif
+ 
+     for (int i = 0; i < N; i++) {
+         const ZipEntryRO entry = zipFile.findEntryByIndex(i);
+@@ -333,9 +351,15 @@ iterateOverNativeFiles(JNIEnv *env, jstring javaFilePath, jstring javaCpuAbi, js
+                 ALOGV("Already saw primary ABI, skipping secondary ABI %s\n", cpuAbi2.c_str());
+                 continue;
+             } else {
++#ifdef WITH_HOUDINI
++                useSecondaryAbi = true;
++#endif
+                 ALOGV("Using secondary ABI %s\n", cpuAbi2.c_str());
+             }
+         } else {
++#ifdef WITH_HOUDINI
++            noMatchAbi = true;
++#endif
+             ALOGV("abi didn't match anything: %s (end at %zd)\n", cpuAbiOffset, cpuAbiRegionSize);
+             continue;
+         }
+@@ -355,6 +379,14 @@ iterateOverNativeFiles(JNIEnv *env, jstring javaFilePath, jstring javaCpuAbi, js
+         }
+     }
+ 
++#ifdef WITH_HOUDINI
++    if (!hasPrimaryAbi && !useSecondaryAbi && noMatchAbi)
++        return INSTALL_FAILED_CPU_ABI_INCOMPATIBLE;
++
++    if (!hasPrimaryAbi && useSecondaryAbi)
++        return INSTALL_ABI2_SUCCEEDED;
++#endif
++
+     return INSTALL_SUCCEEDED;
+ }
+ 
+@@ -377,6 +409,16 @@ com_android_internal_content_NativeLibraryHelper_sumNativeBinaries(JNIEnv *env,
+     return totalSize;
+ }
+ 
++#ifdef WITH_HOUDINI
++static jint
++com_android_internal_content_NativeLibraryHelper_listNativeBinaries(JNIEnv *env, jclass clazz,
++        jstring javaFilePath, jstring javaCpuAbi, jstring javaCpuAbi2)
++{
++    return (jint) iterateOverNativeFiles(env, javaFilePath, javaCpuAbi, javaCpuAbi2,
++            listFiles, NULL);
++}
++#endif
++
+ static JNINativeMethod gMethods[] = {
+     {"nativeCopyNativeBinaries",
+             "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I",
+@@ -384,6 +426,11 @@ static JNINativeMethod gMethods[] = {
+     {"nativeSumNativeBinaries",
+             "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)J",
+             (void *)com_android_internal_content_NativeLibraryHelper_sumNativeBinaries},
++#ifdef WITH_HOUDINI
++    {"nativeListNativeBinaries",
++            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I",
++            (void *)com_android_internal_content_NativeLibraryHelper_listNativeBinaries},
++#endif
+ };
+ 
+ 
+diff --git a/packages/DefaultContainerService/src/com/android/defcontainer/DefaultContainerService.java b/packages/DefaultContainerService/src/com/android/defcontainer/DefaultContainerService.java
+index 6e34bbb..d72b9c0 100644
+--- a/packages/DefaultContainerService/src/com/android/defcontainer/DefaultContainerService.java
++++ b/packages/DefaultContainerService/src/com/android/defcontainer/DefaultContainerService.java
+@@ -30,6 +30,7 @@ import android.content.pm.PackageParser;
+ import android.content.res.ObbInfo;
+ import android.content.res.ObbScanner;
+ import android.net.Uri;
++import android.os.Build;
+ import android.os.Environment;
+ import android.os.Environment.UserEnvironment;
+ import android.os.FileUtils;
+@@ -83,6 +84,8 @@ import libcore.io.StructStatVfs;
+ public class DefaultContainerService extends IntentService {
+     private static final String TAG = "DefContainer";
+     private static final boolean localLOGV = false;
++    private static final boolean ENABLE_HOUDINI = Build.CPU_ABI.equals("x86") &&
++            (Build.CPU_ABI2.length()!=0);
+ 
+     private static final String LIB_DIR_NAME = "lib";
+ 
+@@ -411,10 +414,19 @@ public class DefaultContainerService extends IntentService {
+         final File sharedLibraryDir = new File(newCachePath, LIB_DIR_NAME);
+         if (sharedLibraryDir.mkdir()) {
+             int ret = NativeLibraryHelper.copyNativeBinariesIfNeededLI(codeFile, sharedLibraryDir);
+-            if (ret != PackageManager.INSTALL_SUCCEEDED) {
+-                Slog.e(TAG, "Could not copy native libraries to " + sharedLibraryDir.getPath());
+-                PackageHelper.destroySdDir(newCid);
+-                return null;
++            if (ENABLE_HOUDINI) {
++                if ((ret != PackageManager.INSTALL_SUCCEEDED) &&
++                        (ret != PackageManager.INSTALL_ABI2_SUCCEEDED)) {
++                    Slog.e(TAG, "Could not copy native libraries to " + sharedLibraryDir.getPath());
++                    PackageHelper.destroySdDir(newCid);
++                    return null;
++                }
++            } else {
++                if (ret != PackageManager.INSTALL_SUCCEEDED) {
++                    Slog.e(TAG, "Could not copy native libraries to " + sharedLibraryDir.getPath());
++                    PackageHelper.destroySdDir(newCid);
++                    return null;
++                }
+             }
+         } else {
+             Slog.e(TAG, "Could not create native lib directory: " + sharedLibraryDir.getPath());
+diff --git a/services/java/com/android/server/pm/CheckExt.java b/services/java/com/android/server/pm/CheckExt.java
+new file mode 100644
+index 0000000..b15e8f2
+--- /dev/null
++++ b/services/java/com/android/server/pm/CheckExt.java
+@@ -0,0 +1,46 @@
++package com.android.server.pm;
++/*
++ * Copyright (C) 2006 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.util.List;
++import java.util.ArrayList;
++
++/*
++ * class CheckExt is trying to check params
++ */
++public class CheckExt implements ICheckExt {
++    final private String TAG = "CheckExt";
++    private List<ICheckExt> checklist;
++
++    public CheckExt() {
++        checklist = new ArrayList<ICheckExt>();
++        ICheckExt check = new xmlCheckExt();
++        checklist.add(check);
++    }
++
++    public boolean doCheck(String... params) {
++        if (checklist.size() == 0)
++            return false;
++        ICheckExt check;
++        for (int i = 0; i < checklist.size(); i++) {
++            check = checklist.get(i);
++            if (check.doCheck(params))
++                return true;
++
++        }
++        return false;
++    }
++}
+diff --git a/services/java/com/android/server/pm/ICheckExt.java b/services/java/com/android/server/pm/ICheckExt.java
+new file mode 100644
+index 0000000..e540b16
+--- /dev/null
++++ b/services/java/com/android/server/pm/ICheckExt.java
+@@ -0,0 +1,30 @@
++package com.android.server.pm;
++/*
++ * Copyright (C) 2006 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++public interface ICheckExt {
++
++    /*Function: doCheck
++     *Description:
++     * check parameters to decide whether it should pass or not
++     *Parameter:
++     * params : parameters for apk to check
++     *Return:
++     * true - check pass
++     * false - check fail
++     */
++    boolean doCheck(String... params);
++}
+diff --git a/services/java/com/android/server/pm/PackageManagerService.java b/services/java/com/android/server/pm/PackageManagerService.java
+index 5450fd0..2c098ca 100755
+--- a/services/java/com/android/server/pm/PackageManagerService.java
++++ b/services/java/com/android/server/pm/PackageManagerService.java
+@@ -138,6 +138,7 @@ import java.io.FileOutputStream;
+ import java.io.FileReader;
+ import java.io.FilenameFilter;
+ import java.io.IOException;
++import java.io.ObjectOutputStream;
+ import java.io.PrintWriter;
+ import java.security.NoSuchAlgorithmException;
+ import java.security.PublicKey;
+@@ -189,6 +190,8 @@ public class PackageManagerService extends IPackageManager.Stub {
+     private static final boolean DEBUG_PACKAGE_SCANNING = false;
+     private static final boolean DEBUG_APP_DIR_OBSERVER = false;
+     private static final boolean DEBUG_VERIFY = false;
++    private static final boolean ENABLE_HOUDINI = Build.CPU_ABI.equals("x86") &&
++            (Build.CPU_ABI2.length()!=0);
+ 
+     private static final int RADIO_UID = Process.PHONE_UID;
+     private static final int LOG_UID = Process.LOG_UID;
+@@ -507,6 +510,11 @@ public class PackageManagerService extends IPackageManager.Stub {
+     // or internal storage.
+     private IMediaContainerService mContainerService = null;
+ 
++    // Packages that have been installed with library matching 2nd ABI.
++    final HashMap<Integer, String> mPackagesMatchABI2 = new HashMap<Integer,String>();
++    // Packages that have been installed with library matching 2nd ABI and matching neon app list
++    final HashMap<Integer, String> mPackagesMatchABI2Neon = new HashMap<Integer,String>();
++
+     static final int SEND_PENDING_BROADCAST = 1;
+     static final int MCS_BOUND = 3;
+     static final int END_COPY = 4;
+@@ -3970,6 +3978,53 @@ public class PackageManagerService extends IPackageManager.Stub {
+         return new File(mUserAppDataDir.getAbsolutePath() + File.separator + userId);
+     }
+ 
++    private void writeAppwithABI2Internal(String fileName, HashMap<Integer, String> map) {
++        File outputFile;
++        FileOutputStream out = null;
++        File appDataDir = new File("/data/data");
++
++        try {
++            File tempFile = File.createTempFile("tmp", "tmp", appDataDir);
++            String tempFilePath = tempFile.getPath();
++            outputFile = new File(fileName);
++            if (FileUtils.setPermissions(tempFilePath,
++                    FileUtils.S_IRUSR | FileUtils.S_IWUSR |
++                    FileUtils.S_IRGRP | FileUtils.S_IROTH, -1, -1) != 0
++                    || !tempFile.renameTo(outputFile)) {
++                tempFile.delete();
++            }
++            out = new FileOutputStream(outputFile);
++            Iterator<HashMap.Entry<Integer, String>>
++            it = map.entrySet().iterator();
++            while (it.hasNext()) {
++                HashMap.Entry<Integer, String> ent = it.next();
++                int userID = ent.getKey().intValue();
++                out.write(userID & 0xff);
++                out.write((userID>>8)  & 0xff);
++                out.write((userID>>16) & 0xff);
++                out.write((userID>>24) & 0xff);
++                Slog.i(TAG, "Data written:"+ userID);
++            }
++        } catch (Exception e) {
++            Slog.e(TAG, "File Access Error: Not Able to write Data into " + fileName);
++        } finally {
++            try {
++                if (out != null) {
++                    out.close();
++                    Slog.i(TAG, "Data written into " + fileName);
++                }
++            } catch (IOException e) {}
++        }
++    }
++
++    private void writeAppwithABI2() {
++        writeAppwithABI2Internal(new String("/data/data/.appwithABI2"), mPackagesMatchABI2);
++    }
++
++    private void writeAppwithABI2Neon() {
++        writeAppwithABI2Internal(new String("/data/data/.appwithABI2neon"), mPackagesMatchABI2Neon);
++    }
++
+     private File getDataPathForPackage(String packageName, int userId) {
+         /*
+          * Until we fully support multiple users, return the directory we
+@@ -4298,6 +4353,25 @@ public class PackageManagerService extends IPackageManager.Stub {
+                 Slog.w(TAG, "Package " + pkg.packageName
+                         + " was transferred to another, but its .apk remains");
+             }
++
++            if (ENABLE_HOUDINI) {
++                PackageSetting p = mSettings.mPackages.get(pkg.packageName);
++                if ((p != null) && (!p.codePath.equals(destCodeFile))) {
++
++                   // Already existing package. Make sure not upgrade to black list
++                    int result = NativeLibraryHelper.listNativeBinariesLI(scanFile);
++
++                    if (result == PackageManager.INSTALL_ABI2_SUCCEEDED) {
++                        ICheckExt check = new CheckExt();
++                        if (check.doCheck(pkg.packageName, new String("filter"))) {
++                            Slog.i(TAG, "Reject application in black list::" + pkg.packageName);
++                            mLastScanError = PackageManager.INSTALL_FAILED_INVALID_APK;
++                            return null;
++                        }
++                    }
++
++                }
++            }
+             
+             // Just create the setting, don't add it yet. For already existing packages
+             // the PkgSetting exists already and doesn't have to be created.
+@@ -4603,10 +4677,21 @@ public class PackageManagerService extends IPackageManager.Stub {
+                         }
+ 
+                         try {
+-                            if (copyNativeLibrariesForInternalApp(scanFile, nativeLibraryDir) != PackageManager.INSTALL_SUCCEEDED) {
+-                                Slog.e(TAG, "Unable to copy native libraries");
+-                                mLastScanError = PackageManager.INSTALL_FAILED_INTERNAL_ERROR;
+-                                return null;
++                            int copyRet = copyNativeLibrariesForInternalApp(scanFile,
++                                    nativeLibraryDir);
++                            if (ENABLE_HOUDINI) {
++                                if (copyRet != PackageManager.INSTALL_SUCCEEDED
++                                        && copyRet != PackageManager.INSTALL_ABI2_SUCCEEDED) {
++                                    Slog.e(TAG, "Unable to copy native libraries");
++                                    mLastScanError = PackageManager.INSTALL_FAILED_INTERNAL_ERROR;
++                                    return null;
++                                }
++                            } else {
++                                if (copyRet != PackageManager.INSTALL_SUCCEEDED) {
++                                    Slog.e(TAG, "Unable to copy native libraries");
++                                    mLastScanError = PackageManager.INSTALL_FAILED_INTERNAL_ERROR;
++                                    return null;
++                                }
+                             }
+                         } catch (IOException e) {
+                             Slog.e(TAG, "Unable to copy native libraries", e);
+@@ -4615,6 +4700,7 @@ public class PackageManagerService extends IPackageManager.Stub {
+                         }
+                     }
+ 
++
+                     if (DEBUG_INSTALL) Slog.i(TAG, "Linking native library dir for " + path);
+                     final int[] userIds = sUserManager.getUserIds();
+                     synchronized (mInstallLock) {
+@@ -4629,6 +4715,40 @@ public class PackageManagerService extends IPackageManager.Stub {
+                         }
+                     }
+                 }
++
++                // Check the apk to see whether it contains ABI2 library.
++                int result = NativeLibraryHelper.listNativeBinariesLI(scanFile);
++                if (result == PackageManager.INSTALL_SUCCEEDED) {
++                    if (ENABLE_HOUDINI && mPackagesMatchABI2.containsKey(pkg.applicationInfo.uid)) {
++                        Slog.i(TAG, "Replace package with primary ABI Library");
++                        mPackagesMatchABI2.remove(pkg.applicationInfo.uid);
++                        writeAppwithABI2();
++                        if (mPackagesMatchABI2Neon.containsKey(pkg.applicationInfo.uid)) {
++                            mPackagesMatchABI2Neon.remove(pkg.applicationInfo.uid);
++                            writeAppwithABI2Neon();
++                        }
++                    }
++                } else if (ENABLE_HOUDINI && result == PackageManager.INSTALL_ABI2_SUCCEEDED
++                        && !mPackagesMatchABI2.containsKey(pkg.applicationInfo.uid)) {
++                    ICheckExt check = new CheckExt();
++                    if (check.doCheck(pkgName, new String("filter"))) {
++                        Slog.i(TAG, "Package with second ABI is in black list: "
++                                + pkg.applicationInfo.uid + pkg.applicationInfo.processName);
++                        mLastScanError = PackageManager.INSTALL_FAILED_INVALID_APK;
++                        return null;
++                    }
++                    Slog.i(TAG, "Package installed with second ABI Library: "
++                            + pkg.applicationInfo.uid + pkg.applicationInfo.processName);
++                    mPackagesMatchABI2.put(pkg.applicationInfo.uid,
++                            pkg.applicationInfo.processName);
++                    writeAppwithABI2();
++                    if (check.doCheck(pkgName, new String("neon"))) {
++                        mPackagesMatchABI2Neon.put(pkg.applicationInfo.uid,
++                                pkg.applicationInfo.processName);
++                        writeAppwithABI2Neon();
++                    }
++                }
++
+             } catch (IOException ioe) {
+                 Slog.e(TAG, "Unable to get canonical file " + ioe.toString());
+             }
+@@ -5163,6 +5283,18 @@ public class PackageManagerService extends IPackageManager.Stub {
+             final PackageParser.Package pkg = ps.pkg;
+             if (pkg != null) {
+                 cleanPackageDataStructuresLILPw(pkg, chatty);
++
++                Integer pkgUidInt = new Integer(pkg.applicationInfo.uid);
++                if (ENABLE_HOUDINI && mPackagesMatchABI2.containsKey(pkgUidInt)) {
++                    Slog.i(TAG, "Uninstall package with second ABI Library");
++                    mPackagesMatchABI2.remove(pkgUidInt);
++                    writeAppwithABI2();
++                    if (mPackagesMatchABI2Neon.containsKey(pkgUidInt)) {
++                        mPackagesMatchABI2Neon.remove(pkgUidInt);
++                        writeAppwithABI2Neon();
++                    }
++                }
++
+             }
+         }
+     }
+@@ -5180,6 +5312,18 @@ public class PackageManagerService extends IPackageManager.Stub {
+                 mAppDirs.remove(pkg.mPath);
+             }
+             cleanPackageDataStructuresLILPw(pkg, chatty);
++
++            if (ENABLE_HOUDINI && mPackagesMatchABI2.containsKey(new
++                    Integer(pkg.applicationInfo.uid))) {
++                Slog.i(TAG, "Uninstall package with second ABI Library");
++                mPackagesMatchABI2.remove(new Integer(pkg.applicationInfo.uid));
++                writeAppwithABI2();
++                if (mPackagesMatchABI2Neon.containsKey(new Integer(pkg.applicationInfo.uid))) {
++                    mPackagesMatchABI2Neon.remove(new Integer(pkg.applicationInfo.uid));
++                    writeAppwithABI2Neon();
++                }
++            }
++
+         }
+     }
+ 
+@@ -8017,8 +8161,15 @@ public class PackageManagerService extends IPackageManager.Stub {
+             }
+             try {
+                 int copyRet = copyNativeLibrariesForInternalApp(codeFile, nativeLibraryFile);
+-                if (copyRet != PackageManager.INSTALL_SUCCEEDED) {
+-                    return copyRet;
++                if (ENABLE_HOUDINI) {
++                    if (copyRet != PackageManager.INSTALL_SUCCEEDED
++                            && copyRet != PackageManager.INSTALL_ABI2_SUCCEEDED) {
++                        return copyRet;
++                    }
++                } else {
++                    if (copyRet != PackageManager.INSTALL_SUCCEEDED) {
++                        return copyRet;
++                    }
+                 }
+             } catch (IOException e) {
+                 Slog.e(TAG, "Copying native libraries failed", e);
+diff --git a/services/java/com/android/server/pm/xmlCheckExt.java b/services/java/com/android/server/pm/xmlCheckExt.java
+new file mode 100644
+index 0000000..caf78fc
+--- /dev/null
++++ b/services/java/com/android/server/pm/xmlCheckExt.java
+@@ -0,0 +1,124 @@
++package com.android.server.pm;
++/*
++ * Copyright (C) 2006 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.FileNotFoundException;
++import java.io.IOException;
++import java.io.InputStream;
++import java.util.HashMap;
++import java.util.List;
++
++import org.xmlpull.v1.XmlPullParser;
++import org.xmlpull.v1.XmlPullParserException;
++
++import android.app.Activity;
++import android.content.res.AssetManager;
++import android.util.Log;
++import android.util.Xml;
++
++/*
++ * class xmlCheckExt is trying to check by xml rules definition
++ */
++public class xmlCheckExt implements ICheckExt {
++    final private String TAG = "xmlCheckExt";
++    final private String CHECKXMLPATH = "/system/lib/arm/check.xml";
++    private HashMap<String,String > mMap = new  HashMap<String,String >();
++
++    public boolean doCheck(String... params) {
++        String param = null;
++        String param_tag = null;
++        InputStream in = null;
++        try {
++            int eventType;
++            String tag;
++            if (params.length == 0)
++                return false;
++            param = params[0];
++            param_tag = params[1];
++            XmlPullParser xmlParser = Xml.newPullParser();
++            File file = new File(CHECKXMLPATH);
++            if (!file.exists())
++                return false;
++            in = new FileInputStream(file);
++            xmlParser.setInput(in, "utf-8");
++
++            eventType = xmlParser.getEventType();
++            while (eventType != XmlPullParser.END_DOCUMENT) {
++                switch (eventType) {
++                    case XmlPullParser.START_TAG:
++                        tag = xmlParser.getName();
++                        Log.d(TAG,"<"+tag+">");
++                        addTag(tag, xmlParser.nextText());
++                        break;
++                    case XmlPullParser.END_TAG:
++                        tag = xmlParser.getName();
++                        Log.d(TAG,"</"+tag+">");
++                        break;
++                    default:
++                        break;
++                }
++                eventType = xmlParser.next();
++            }
++        } catch (XmlPullParserException e) {
++            // TODO Auto-generated catch block
++            e.printStackTrace();
++        } catch (FileNotFoundException e) {
++            // TODO Auto-generated catch block
++            e.printStackTrace();
++        } catch (IOException e) {
++            // TODO Auto-generated catch block
++            e.printStackTrace();
++        }
++
++        try {
++            if (in != null)
++                in.close();
++        } catch (IOException e) {
++            // TODO Auto-generated catch block
++            e.printStackTrace();
++        }
++
++        return checkPkgName(param, param_tag);
++    }
++
++    /*Function:checkTag
++     *Description:
++     * add tag name to hash map
++     *Parameter:
++     * tag - tag name in xml
++     * text - text for the tag
++     *Return:
++     * true
++     */
++    boolean addTag(String tag, String text) {
++        String pkgName = text;
++        Log.d(TAG, " pkgName = " + pkgName);
++        if (!mMap.containsKey(pkgName))
++            mMap.put(pkgName,tag);
++        return true;
++    }
++
++    boolean checkPkgName(String pkgName, String tag) {
++        String value = mMap.get(pkgName);
++        if (value == null)
++            return false;
++        else
++            return value.equals(tag);
++    }
++
++}
+-- 
+1.7.4.1
+

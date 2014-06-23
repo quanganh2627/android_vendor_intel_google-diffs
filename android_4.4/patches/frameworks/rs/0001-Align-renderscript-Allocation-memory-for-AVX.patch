@@ -1,0 +1,102 @@
+From f39a8fb51b2efc4f27924017e943eacb452ab8f3 Mon Sep 17 00:00:00 2001
+From: Michael Liao <michael.liao@intel.com>
+Date: Wed, 23 Oct 2013 14:33:29 +0200
+Subject: Align renderscript Allocation memory for AVX
+
+The Allocation class aligned to 16 byte. This breaks
+some AVX instructions that require 32 byte alignment.
+
+This patch adds support for 32 byte alignment.
+For efficiency it switches from the default alignment
+to the natural alignment based on the element type and
+rounds it to be a multiple of sizeof(void*) and a power
+of two.
+
+Author: Andy Ross <andy.ross@windriver.com>
+Author: Michael Liao <michael.liao@intel.com>
+
+Issue: AXIA-1222
+Category: AOSP Improvement
+Upstream Candidate: Yes
+Domain: AOSP-frameworks
+
+Change-Id: I23089ed868839b12bb2784249cb5998138012935
+---
+ driver/rsdAllocation.cpp |   43 ++++++++++++++++++++++++++++++++++++-------
+ 1 files changed, 36 insertions(+), 7 deletions(-)
+
+diff --git a/driver/rsdAllocation.cpp b/driver/rsdAllocation.cpp
+index 817c9d8..edadf90 100644
+--- a/driver/rsdAllocation.cpp
++++ b/driver/rsdAllocation.cpp
+@@ -356,9 +356,35 @@ static size_t AllocationBuildPointerTable(const Context *rsc, const Allocation *
+     return allocSize;
+ }
+ 
+-static uint8_t* allocAlignedMemory(size_t allocSize, bool forceZero) {
+-    // We align all allocations to a 16-byte boundary.
+-    uint8_t* ptr = (uint8_t *)memalign(16, allocSize);
++static size_t computeAlignment(size_t elementSize) {
++    // Some architectures (e.g. SSE/AVX with the [v]movap*
++    // instructions) have alignment requirements beyond 16-byte,
++    // but that isn't captured by the driver framework.
++    // As RS assumes data are allocated element-wise aligned, we just need
++    // to ensure the allocated one is aligned to the one rounded to
++    // multiple of sizeof(void *) and power of 2.
++
++    size_t alignment = elementSize;
++    size_t ptrSize = sizeof(void *);
++    // Round alignment to the nearest power of 2.
++    alignment--;
++    alignment |= alignment >> 1;
++    alignment |= alignment >> 2;
++    alignment |= alignment >> 4;
++    alignment |= alignment >> 8;
++    alignment |= alignment >> 16;
++#if __SIZEOF_SIZE_T__ == 8
++    alignment |= alignment >> 32;
++#endif
++    alignment++;
++    // Round alignment to multiple of sizeof(void *).
++    alignment = ((alignment + ptrSize - 1) / ptrSize) * ptrSize;
++    return alignment;
++}
++
++static uint8_t* allocAlignedMemory(size_t allocSize, bool forceZero, size_t alignment) {
++
++    uint8_t* ptr = (uint8_t *)memalign(alignment, allocSize);
+     if (!ptr) {
+         return NULL;
+     }
+@@ -397,13 +423,15 @@ bool rsdAllocationInit(const Context *rsc, Allocation *alloc, bool forceZero) {
+             return false;
+         }
+ 
+-        // rows must be 16-byte aligned
++        // rows must be naturally aligned
+         // validate that here, otherwise fall back to not use the user-backed allocation
+-        if (((alloc->getType()->getDimX() * alloc->getType()->getElement()->getSizeBytes()) % 16) != 0) {
++        size_t alignment = computeAlignment(alloc->getType()->getElementSizeBytes());
++
++        if (((alloc->getType()->getDimX() * alloc->getType()->getElement()->getSizeBytes()) % alignment) != 0) {
+             ALOGV("User-backed allocation failed stride requirement, falling back to separate allocation");
+             drv->useUserProvidedPtr = false;
+ 
+-            ptr = allocAlignedMemory(allocSize, forceZero);
++            ptr = allocAlignedMemory(allocSize, forceZero, alignment);
+             if (!ptr) {
+                 alloc->mHal.drv = NULL;
+                 free(drv);
+@@ -415,7 +443,8 @@ bool rsdAllocationInit(const Context *rsc, Allocation *alloc, bool forceZero) {
+             ptr = (uint8_t*)alloc->mHal.state.userProvidedPtr;
+         }
+     } else {
+-        ptr = allocAlignedMemory(allocSize, forceZero);
++        size_t alignment = computeAlignment(alloc->getType()->getElementSizeBytes());
++        ptr = allocAlignedMemory(allocSize, forceZero, alignment);
+         if (!ptr) {
+             alloc->mHal.drv = NULL;
+             free(drv);
+-- 
+1.7.4.1
+

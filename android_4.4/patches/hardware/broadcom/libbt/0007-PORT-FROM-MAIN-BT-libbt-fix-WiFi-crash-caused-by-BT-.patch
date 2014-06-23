@@ -1,0 +1,448 @@
+From efb36db3ece3d6eb0f6f49dab5d8e8a6477f5ad2 Mon Sep 17 00:00:00 2001
+From: Cedric Poignet <cedric.poignet@intel.com>
+Date: Wed, 5 Jun 2013 11:42:42 +0200
+Subject: [PORT FROM MAIN][BT] libbt: fix WiFi crash caused by BT enable
+
+BZ: 97686
+
+Fix WiFi crash caused by asserting BT enable GPIO
+by BT firmware patch.
+This is a workaround for a hardware bug in 4335B0.
+Release version:        INTEL-AOSP-4.2.2_r1_WAR_001
+Release date:           Tue Apr 23 19:26:45 CEST 2013
+Broadcom ref:           BCM-AOSP-4.2.2_r1_WAR_001
+Note that the lock between WiFi and BT has removed,
+as it seems it is not needed.
+
+Change-Id: Ibd8ae00176c7476526cd83cead2333a5235f1546
+Orig-Change-Id: Ie0adc5ca8b5644980516401546b51d4450f58eac
+Category: device enablement
+Domain: CWS.BT-BCM
+Origin: 3rd-party broadcom
+Upstream-Candidate: no, proprietary
+Signed-off-by: Frode Isaksen <fisaksex@intel.com>
+Signed-off-by: Xavier Boniface <xbonifax@intel.com>
+Reviewed-by: Boniface, XavierX <xavierx.boniface@intel.com>
+Reviewed-by: Gros, Julien <julien.gros@intel.com>
+Reviewed-by: Yao, Yong <yong.yao@intel.com>
+Tested-by: Champciaux, Nicolas <nicolas.champciaux@intel.com>
+Reviewed-on: http://android.intel.com:8080/123806
+Reviewed-by: Poignet, Cedric <cedric.poignet@intel.com>
+---
+ conf/intel/ctp7160/bt_vendor.conf |    1 +
+ include/vnd_byt_t_ffrd8.txt       |    1 +
+ include/vnd_redhookbay.txt        |    1 +
+ include/vnd_saltbay.txt           |    1 +
+ src/bt_vendor_brcm.c              |    2 +
+ src/hardware.c                    |  254 +++++++++++++++++++++++++++++--------
+ 6 files changed, 207 insertions(+), 53 deletions(-)
+
+diff --git a/conf/intel/ctp7160/bt_vendor.conf b/conf/intel/ctp7160/bt_vendor.conf
+index 8efdd81..01d8dd2 100644
+--- a/conf/intel/ctp7160/bt_vendor.conf
++++ b/conf/intel/ctp7160/bt_vendor.conf
+@@ -18,6 +18,7 @@ PCM_DATA_FMT_FILL_BITS = 0
+ PCM_DATA_FMT_FILL_METHOD = 3
+ PCM_DATA_FMT_FILL_NUM = 3
+ PCM_DATA_FMT_JUSTIFY_MODE = 0
++DEPLOY_4335A_AXI_BRIDGE_PATCH = TRUE
+ BTVND_DBG = FALSE
+ BTHW_DBG = FALSE
+ VNDUSERIAL_DBG = FALSE
+diff --git a/include/vnd_byt_t_ffrd8.txt b/include/vnd_byt_t_ffrd8.txt
+index 2aed6d9..bf94cb1 100644
+--- a/include/vnd_byt_t_ffrd8.txt
++++ b/include/vnd_byt_t_ffrd8.txt
+@@ -12,6 +12,7 @@ PCM_DATA_FMT_FILL_BITS = 0
+ PCM_DATA_FMT_FILL_METHOD = 3
+ PCM_DATA_FMT_FILL_NUM = 3
+ PCM_DATA_FMT_JUSTIFY_MODE = 0
++DEPLOY_4335A_AXI_BRIDGE_PATCH = TRUE
+ BTVND_DBG = TRUE
+ BTHW_DBG = TRUE
+ VNDUSERIAL_DBG = TRUE
+diff --git a/include/vnd_redhookbay.txt b/include/vnd_redhookbay.txt
+index 256fbec..3756662 100644
+--- a/include/vnd_redhookbay.txt
++++ b/include/vnd_redhookbay.txt
+@@ -2,6 +2,7 @@ BLUETOOTH_UART_DEVICE_PORT = "/dev/ttyMFD0"
+ FW_PATCHFILE_LOCATION = "/vendor/firmware/"
+ LPM_IDLE_TIMEOUT_MULTIPLE = 5
+ SCO_USE_I2S_INTERFACE = FALSE
++DEPLOY_4335A_AXI_BRIDGE_PATCH = TRUE
+ BTVND_DBG = TRUE
+ BTHW_DBG = TRUE
+ VNDUSERIAL_DBG = TRUE
+diff --git a/include/vnd_saltbay.txt b/include/vnd_saltbay.txt
+index fef2802..79d5aad 100644
+--- a/include/vnd_saltbay.txt
++++ b/include/vnd_saltbay.txt
+@@ -2,6 +2,7 @@ BLUETOOTH_UART_DEVICE_PORT = "/dev/ttyMFD0"
+ FW_PATCHFILE_LOCATION = "/vendor/firmware/"
+ LPM_IDLE_TIMEOUT_MULTIPLE = 5
+ SCO_USE_I2S_INTERFACE = FALSE
++DEPLOY_4335A_AXI_BRIDGE_PATCH = TRUE
+ SCO_I2SPCM_IF_ROLE = 0
+ SCO_I2SPCM_IF_SAMPLE_RATE = 0
+ SCO_I2SPCM_IF_CLOCK_RATE = 0
+diff --git a/src/bt_vendor_brcm.c b/src/bt_vendor_brcm.c
+index ef6236f..19e40d6 100644
+--- a/src/bt_vendor_brcm.c
++++ b/src/bt_vendor_brcm.c
+@@ -46,6 +46,7 @@
+ ******************************************************************************/
+ 
+ void hw_config_start(void);
++void hw_config_cleanup(void);
+ uint8_t hw_lpm_enable(uint8_t turn_on);
+ uint32_t hw_lpm_get_idle_timeout(void);
+ void hw_lpm_set_wake_state(uint8_t wake_assert);
+@@ -230,6 +231,7 @@ static void cleanup( void )
+     BTVNDDBG("cleanup");
+ 
+     upio_cleanup();
++    hw_config_cleanup();
+ 
+     bt_vendor_cbacks = NULL;
+ }
+diff --git a/src/hardware.c b/src/hardware.c
+index ce6cf21..b609f3b 100644
+--- a/src/hardware.c
++++ b/src/hardware.c
+@@ -59,6 +59,16 @@
+ #define BTHWDBG(param, ...) {}
+ #endif
+ 
++/* The fix for AXI bridge contention between BT and WLAN:
++ *
++ *  Set this TRUE only when
++ *      1. the platform is using BCM4335A or BCM4335B0, and
++ *      2. Kernel source has implemented AXI BRIDGE lock logic.
++ */
++#ifndef DEPLOY_4335A_AXI_BRIDGE_PATCH
++#define DEPLOY_4335A_AXI_BRIDGE_PATCH   FALSE
++#endif
++
+ #define FW_PATCHFILE_EXTENSION      ".hcd"
+ #define FW_PATCHFILE_EXTENSION_LEN  4
+ #define FW_PATCHFILE_PATH_MAXLEN    248 /* Local_Name length of return of
+@@ -76,6 +86,7 @@
+ #define HCI_VSC_WRITE_SCO_PCM_INT_PARAM         0xFC1C
+ #define HCI_VSC_WRITE_PCM_DATA_FORMAT_PARAM     0xFC1E
+ #define HCI_VSC_WRITE_I2SPCM_INTERFACE_PARAM    0xFC6D
++#define HCI_VSC_WRITE_RAM                       0xFC4C
+ #define HCI_VSC_LAUNCH_RAM                      0xFC4E
+ #define HCI_READ_LOCAL_BDADDR                   0x1009
+ 
+@@ -118,6 +129,10 @@ enum {
+ #if (USE_CONTROLLER_BDADDR == TRUE)
+     , HW_CFG_READ_BD_ADDR
+ #endif
++#if (DEPLOY_4335A_AXI_BRIDGE_PATCH == TRUE)
++    , HW_CFG_DL_4335A_AXI_PATCH
++    , HW_CFG_LAUNCH_4335A_AXI_PATCH
++#endif
+ };
+ 
+ /* h/w config control block */
+@@ -584,6 +599,58 @@ static uint8_t hw_config_set_bdaddr(HC_BT_HDR *p_buf)
+     return (retval);
+ }
+ 
++/*******************************************************************************
++**
++** Function         hw_config_set_baudrate
++**
++** Description      Change controller's UART baud rate
++**
++** Returns          TRUE, if command is sent
++**                  FALSE, otherwise
++**
++*******************************************************************************/
++static uint8_t hw_config_set_baudrate(HC_BT_HDR *p_buf)
++{
++    uint8_t retval = FALSE;
++    uint8_t *p = (uint8_t *) (p_buf + 1);
++
++    if (hw_cfg_cb.state != HW_CFG_SET_UART_CLOCK)
++    {
++        /* Check if we need to set UART clock first */
++        if (UART_TARGET_BAUD_RATE > 3000000)
++        {
++            /* set UART clock to 48MHz */
++            UINT16_TO_STREAM(p, HCI_VSC_WRITE_UART_CLOCK_SETTING);
++            *p++ = 1; /* parameter length */
++            *p = 1; /* (1,"UART CLOCK 48 MHz")(2,"UART CLOCK 24 MHz") */
++
++            p_buf->len = HCI_CMD_PREAMBLE_SIZE + 1;
++            hw_cfg_cb.state = HW_CFG_SET_UART_CLOCK;
++
++            retval = bt_vendor_cbacks->xmit_cb( \
++                                HCI_VSC_WRITE_UART_CLOCK_SETTING, \
++                                p_buf, hw_config_cback);
++            return (retval);
++        }
++    }
++
++    /* set controller's UART baud rate to 3M */
++    UINT16_TO_STREAM(p, HCI_VSC_UPDATE_BAUDRATE);
++    *p++ = UPDATE_BAUDRATE_CMD_PARAM_SIZE; /* parameter length */
++    *p++ = 0; /* encoded baud rate */
++    *p++ = 0; /* use encoded form */
++    UINT32_TO_STREAM(p, UART_TARGET_BAUD_RATE);
++
++    p_buf->len = HCI_CMD_PREAMBLE_SIZE + UPDATE_BAUDRATE_CMD_PARAM_SIZE;
++    hw_cfg_cb.state = (hw_cfg_cb.f_set_baud_2) ? \
++                HW_CFG_SET_UART_BAUD_2 : HW_CFG_SET_UART_BAUD_1;
++
++    retval = bt_vendor_cbacks->xmit_cb(HCI_VSC_UPDATE_BAUDRATE, \
++                                        p_buf, hw_config_cback);
++
++    return (retval);
++}
++
+ #if (USE_CONTROLLER_BDADDR == TRUE)
+ /*******************************************************************************
+ **
+@@ -613,6 +680,60 @@ static uint8_t hw_config_read_bdaddr(HC_BT_HDR *p_buf)
+ }
+ #endif // (USE_CONTROLLER_BDADDR == TRUE)
+ 
++#if (DEPLOY_4335A_AXI_BRIDGE_PATCH == TRUE)
++
++static const uint8_t bcm4335a_axi_patch_addr[4] =
++{
++    0x00, 0x02, 0x0d, 0x00
++};
++
++static const uint8_t bcm4335a_axi_patch[] =
++{
++    0x70, 0xb5, 0x0c, 0x49, 0x4c, 0xf6, 0x20, 0x30,
++    0x8a, 0xf7, 0xbb, 0xf9, 0x01, 0x28, 0x0d, 0xd1,
++    0x8a, 0xf7, 0x80, 0xf9, 0x08, 0xb1, 0x04, 0x25,
++    0x00, 0xe0, 0x05, 0x25, 0x00, 0x24, 0x03, 0xe0,
++    0x8a, 0xf7, 0x74, 0xf9, 0x64, 0x1c, 0xe4, 0xb2,
++    0xac, 0x42, 0xf9, 0xd3, 0xbd, 0xe8, 0x70, 0x40,
++    0x8a, 0xf7, 0x7f, 0xb9, 0xb0, 0x9b, 0x04, 0x00
++};
++
++/*******************************************************************************
++**
++** Function         hw_4335_dl_axi_patch
++**
++** Description      Download 4335Ax/4335B0 AXI BRIDGE patch
++**
++** Returns          TRUE, if fw patch is sent
++**                  FALSE, otherwise
++**
++*******************************************************************************/
++static uint8_t hw_4335_dl_axi_patch(HC_BT_HDR *p_buf)
++{
++    uint8_t retval = FALSE;
++    uint8_t *p = (uint8_t *) (p_buf + 1);
++    uint8_t len = sizeof(bcm4335a_axi_patch_addr) + sizeof(bcm4335a_axi_patch);
++
++    UINT16_TO_STREAM(p, HCI_VSC_WRITE_RAM);
++    *p++ = len; /* parameter length */
++    memcpy(p, bcm4335a_axi_patch_addr, sizeof(bcm4335a_axi_patch_addr));
++    p = p + sizeof(bcm4335a_axi_patch_addr);
++    memcpy(p, bcm4335a_axi_patch, sizeof(bcm4335a_axi_patch));
++
++    p_buf->len = HCI_CMD_PREAMBLE_SIZE + len;
++    hw_cfg_cb.state = HW_CFG_DL_4335A_AXI_PATCH;
++
++    retval = bt_vendor_cbacks->xmit_cb(HCI_VSC_WRITE_RAM, p_buf, \
++                                 hw_config_cback);
++
++    if (retval == TRUE)
++        ALOGI("Applying 4335 AXI BRIDGE patch...");
++
++    return (retval);
++}
++
++#endif // (DEPLOY_4335A_AXI_BRIDGE_PATCH == TRUE)
++
+ /*******************************************************************************
+ **
+ ** Function         hw_config_cback
+@@ -655,13 +776,7 @@ void hw_config_cback(void *p_mem)
+ 
+         switch (hw_cfg_cb.state)
+         {
+-            case HW_CFG_SET_UART_BAUD_1:
+-                /* update baud rate of host's UART port */
+-                ALOGI("bt vendor lib: set UART baud %i", UART_TARGET_BAUD_RATE);
+-                userial_vendor_set_baud( \
+-                    line_speed_to_userial_baud(UART_TARGET_BAUD_RATE) \
+-                );
+-
++            case HW_CFG_START:
+                 /* read local name */
+                 UINT16_TO_STREAM(p, HCI_READ_LOCAL_NAME);
+                 *p = 0; /* parameter length */
+@@ -720,8 +835,7 @@ void hw_config_cback(void *p_mem)
+                     uint8_t     *p_lmp;
+ 
+                     p_lmp = (uint8_t *) (p_evt_buf + 1) + HCI_EVT_CMD_CMPL_LOCAL_REVISION;
+-                                        STREAM_TO_UINT16(lmp_subversion, p_lmp);
+-
++                    STREAM_TO_UINT16(lmp_subversion, p_lmp);
+                     ALOGI("bt vendor lib: lmp version : %04x.", lmp_subversion);
+                     if (lmp_subversion == 0x4106)
+                     {
+@@ -747,19 +861,6 @@ check_local_name:
+                         {
+                             ALOGE("vendor lib preload failed to open [%s]", tmp_path);
+                         }
+-                        else
+-                        {
+-                            /* vsc_download_minidriver */
+-                            UINT16_TO_STREAM(p, HCI_VSC_DOWNLOAD_MINIDRV);
+-                            *p = 0; /* parameter length */
+-
+-                            p_buf->len = HCI_CMD_PREAMBLE_SIZE;
+-                            hw_cfg_cb.state = HW_CFG_DL_MINIDRIVER;
+-
+-                            is_proceeding = bt_vendor_cbacks->xmit_cb( \
+-                                                HCI_VSC_DOWNLOAD_MINIDRV, p_buf, \
+-                                                hw_config_cback);
+-                        }
+                     }
+                     else
+                     {
+@@ -768,8 +869,67 @@ check_local_name:
+                         );
+                     }
+                 }
++
++#if (DEPLOY_4335A_AXI_BRIDGE_PATCH == TRUE)
++                p_tmp = strstr(hw_cfg_cb.local_chip_name, "BCM4335");
++
++                if ((p_tmp != NULL) &&
++                    ((hw_cfg_cb.local_chip_name[7] == 'A') /* 4335A */||
++                     ((hw_cfg_cb.local_chip_name[7] == 'B') &&
++                      (hw_cfg_cb.local_chip_name[8] == '0')) /* 4335B0 */))
++                {
++                    is_proceeding = hw_4335_dl_axi_patch(p_buf);
++                }
++#endif
+                 if (is_proceeding == FALSE)
+                 {
++                    is_proceeding = hw_config_set_baudrate(p_buf);
++                }
++                break;
++
++#if (DEPLOY_4335A_AXI_BRIDGE_PATCH == TRUE)
++            case HW_CFG_DL_4335A_AXI_PATCH:
++                /* launch AXI patch */
++                UINT16_TO_STREAM(p, HCI_VSC_LAUNCH_RAM);
++                *p++ = sizeof(bcm4335a_axi_patch_addr); /* parameter length */
++                memcpy(p, bcm4335a_axi_patch_addr, \
++                        sizeof(bcm4335a_axi_patch_addr));
++
++                p_buf->len = HCI_CMD_PREAMBLE_SIZE + \
++                             sizeof(bcm4335a_axi_patch_addr);
++                hw_cfg_cb.state = HW_CFG_LAUNCH_4335A_AXI_PATCH;
++
++                is_proceeding = bt_vendor_cbacks->xmit_cb(HCI_VSC_LAUNCH_RAM, \
++                                                    p_buf, hw_config_cback);
++                break;
++
++            case HW_CFG_LAUNCH_4335A_AXI_PATCH:
++                is_proceeding = hw_config_set_baudrate(p_buf);
++                break;
++#endif
++
++            case HW_CFG_SET_UART_BAUD_1:
++                /* update baud rate of host's UART port */
++                ALOGI("bt vendor lib: set UART baud %i", UART_TARGET_BAUD_RATE);
++                userial_vendor_set_baud( \
++                    line_speed_to_userial_baud(UART_TARGET_BAUD_RATE) \
++                );
++
++                if (hw_cfg_cb.fw_fd != -1)
++                {
++                    /* vsc_download_minidriver */
++                    UINT16_TO_STREAM(p, HCI_VSC_DOWNLOAD_MINIDRV);
++                    *p = 0; /* parameter length */
++
++                    p_buf->len = HCI_CMD_PREAMBLE_SIZE;
++                    hw_cfg_cb.state = HW_CFG_DL_MINIDRIVER;
++
++                    is_proceeding = bt_vendor_cbacks->xmit_cb( \
++                                        HCI_VSC_DOWNLOAD_MINIDRV, p_buf, \
++                                        hw_config_cback);
++                }
++                else
++                {
+                     is_proceeding = hw_config_set_bdaddr(p_buf);
+                 }
+                 break;
+@@ -821,38 +981,8 @@ check_local_name:
+                 ms_delay(look_up_fw_settlement_delay());
+ 
+                 /* fall through intentionally */
+-            case HW_CFG_START:
+-                if (UART_TARGET_BAUD_RATE > 3000000)
+-                {
+-                    /* set UART clock to 48MHz */
+-                    UINT16_TO_STREAM(p, HCI_VSC_WRITE_UART_CLOCK_SETTING);
+-                    *p++ = 1; /* parameter length */
+-                    *p = 1; /* (1,"UART CLOCK 48 MHz")(2,"UART CLOCK 24 MHz") */
+-
+-                    p_buf->len = HCI_CMD_PREAMBLE_SIZE + 1;
+-                    hw_cfg_cb.state = HW_CFG_SET_UART_CLOCK;
+-
+-                    is_proceeding = bt_vendor_cbacks->xmit_cb( \
+-                                        HCI_VSC_WRITE_UART_CLOCK_SETTING, \
+-                                        p_buf, hw_config_cback);
+-                    break;
+-                }
+-                /* fall through intentionally */
+             case HW_CFG_SET_UART_CLOCK:
+-                /* set controller's UART baud rate to 3M */
+-                UINT16_TO_STREAM(p, HCI_VSC_UPDATE_BAUDRATE);
+-                *p++ = UPDATE_BAUDRATE_CMD_PARAM_SIZE; /* parameter length */
+-                *p++ = 0; /* encoded baud rate */
+-                *p++ = 0; /* use encoded form */
+-                UINT32_TO_STREAM(p, UART_TARGET_BAUD_RATE);
+-
+-                p_buf->len = HCI_CMD_PREAMBLE_SIZE + \
+-                             UPDATE_BAUDRATE_CMD_PARAM_SIZE;
+-                hw_cfg_cb.state = (hw_cfg_cb.f_set_baud_2) ? \
+-                            HW_CFG_SET_UART_BAUD_2 : HW_CFG_SET_UART_BAUD_1;
+-
+-                is_proceeding = bt_vendor_cbacks->xmit_cb(HCI_VSC_UPDATE_BAUDRATE, \
+-                                                    p_buf, hw_config_cback);
++                is_proceeding = hw_config_set_baudrate(p_buf);
+                 break;
+ 
+             case HW_CFG_SET_UART_BAUD_2:
+@@ -1103,6 +1233,24 @@ void hw_config_start(void)
+ 
+ /*******************************************************************************
+ **
++** Function        hw_config_cleanup
++**
++** Description     Clean up system resource allocated in HW CONFIG module
++**
++** Returns         None
++**
++*******************************************************************************/
++void hw_config_cleanup(void)
++{
++    if ((hw_cfg_cb.fw_fd != -1) && (hw_cfg_cb.fw_fd > 2 /*stderr*/))
++    {
++        close(hw_cfg_cb.fw_fd);
++        hw_cfg_cb.fw_fd = -1;
++    }
++}
++
++/*******************************************************************************
++**
+ ** Function        hw_lpm_enable
+ **
+ ** Description     Enalbe/Disable LPM
+-- 
+1.7.4.1
+

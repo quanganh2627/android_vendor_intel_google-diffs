@@ -1,0 +1,336 @@
+From e72869fba5bb607f1351a6259eb6dd78f838a6ce Mon Sep 17 00:00:00 2001
+From: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Date: Tue, 21 May 2013 14:34:13 -0700
+Subject: Dalvik: Fix dataflow for extended MIRs
+
+BZ: 109771
+
+The dataflow table is incomplete for extended MIRs. Since each extended MIR
+has its own semantic meaning and virtual register usages and defs, we add
+helper methods to handle them from dataflow and SSA perspectives.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I06c89427a4dca5a6a4843a4c13318c0c5a9b2d4a
+Orig-MCG-Change-Id: Iddb475b3fa27d04f3ead9d1df8b023957828c3cb
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/Dataflow.cpp |  235 ++++++++++++++++++++++++++++++++++++++++++++--
+ vm/compiler/Dataflow.h   |    2 +
+ 2 files changed, 228 insertions(+), 9 deletions(-)
+
+diff --git a/vm/compiler/Dataflow.cpp b/vm/compiler/Dataflow.cpp
+index be2e260..8d13785 100644
+--- a/vm/compiler/Dataflow.cpp
++++ b/vm/compiler/Dataflow.cpp
+@@ -803,13 +803,17 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     // FF OP_UNUSED_FF
+     DF_NOP,
+ 
+-    // Beginning of extended MIR opcodes
+-    // 100 OP_MIR_PHI
+-    DF_PHI | DF_DA,
+-    /*
+-     * For extended MIR inserted at the MIR2LIR stage, it is okay to have
+-     * undefined values here.
+-     */
++    // This is the beginning of the extended MIR opcodes. We make sure that each receives the
++    // tag for extended format so that we can treat the uses and defs specially for each.
++    DF_FORMAT_EXT_OP,
++    DF_FORMAT_EXT_OP,
++    DF_FORMAT_EXT_OP,
++    DF_FORMAT_EXT_OP,
++    DF_FORMAT_EXT_OP,
++    DF_FORMAT_EXT_OP,
++    DF_FORMAT_EXT_OP,
++    DF_FORMAT_EXT_OP,
++    DF_FORMAT_EXT_OP,
+ };
+ 
+ /* Return the Dalvik register/subscript pair of a given SSA register */
+@@ -1347,6 +1351,89 @@ static inline void handleDef(BitVector *defV, int dalvikRegId)
+     dvmCompilerSetBit(defV, dalvikRegId);
+ }
+ 
++/* Handle use for extended op */
++void handleExtOpUses (BitVector *useV, BitVector *defV, DecodedInstruction* dInsn)
++{
++    switch (static_cast<int> (dInsn->opcode))
++    {
++        case kMirOpPhi:
++            //Phi nodes shouldn't be updating the ssa so we make it seem that it has no uses
++            break;
++        case kMirOpPunt:
++            //No uses
++            break;
++        case kMirOpNullNRangeUpCheck:
++        case kMirOpNullNRangeDownCheck:
++            //vA holds the array pointer register
++            handleUse (useV, defV, dInsn->vA);
++            //vB holds the index register
++            handleUse (useV, defV, dInsn->vB);
++            break;
++        case kMirOpLowerBound:
++            //vA holds the index register
++            handleUse (useV, defV, dInsn->vA);
++            break;
++        case kMirOpCheckInlinePrediction:
++            //vC holds the reference register
++            handleUse (useV, defV, dInsn->vC);
++            break;
++        case kMirOpNullCheck:
++            //vA holds object reference register
++            handleUse (useV, defV, dInsn->vA);
++            break;
++        case kMirOpBoundCheck:
++            //vA holds object reference register
++            handleUse (useV, defV, dInsn->vA);
++
++            //We also have a use if we have an index register
++            if (dInsn->arg[0] == MIR_BOUND_CHECK_REG)
++            {
++                handleUse (useV, defV, dInsn->arg[1]);
++            }
++            break;
++        case kMirOpRegisterize:
++            //vA holds the register number we want to registerize
++            handleUse(useV, defV, dInsn->vA);
++
++            //The type of usage depends on whether we have a wide VR. So we check if we can make that it
++            //a non-wide use. If we cannot tell that it is surely non-wide, then make conservative assumption
++            //that it is a wide use.
++            if (dInsn->vB != static_cast<u4> (kCoreReg) && dInsn->vB != static_cast<u4> (kSFPReg))
++            {
++                //We add a use for VR represented by high bits
++                handleUse (useV, defV, dInsn->vA + 1);
++            }
++            break;
++        default:
++            ALOGW("JIT_INFO: Unexpected Extended opcode %#x", dInsn->opcode);
++            break;
++    }
++}
++
++/* Handle def extended op */
++void handleExtOpDefs (BitVector *defV, DecodedInstruction* dInsn)
++{
++    switch (static_cast<int> (dInsn->opcode))
++    {
++        case kMirOpNullNRangeUpCheck:
++        case kMirOpNullNRangeDownCheck:
++        case kMirOpLowerBound:
++        case kMirOpPunt:
++        case kMirOpCheckInlinePrediction:
++        case kMirOpNullCheck:
++        case kMirOpBoundCheck:
++        case kMirOpRegisterize:
++            //No defs
++            break;
++        case kMirOpPhi:
++            handleDef (defV, dInsn->vA);
++            break;
++        default:
++            ALOGW("JIT_INFO: Unexpected Extended opcode %#x", dInsn->opcode);
++            break;
++    }
++}
++
+ /*
+  * Find out live-in variables for natural loops. Variables that are live-in in
+  * the main loop body are considered to be defined in the entry block.
+@@ -1439,12 +1526,20 @@ bool dvmCompilerFindLocalLiveIn(CompilationUnit *cUnit, BasicBlock *bb)
+                 }
+             }
+         }
++
+         if (dfAttributes & DF_HAS_DEFS) {
+             handleDef(defV, dInsn->vA);
+             if (dfAttributes & DF_DA_WIDE) {
+                 handleDef(defV, dInsn->vA + 1);
+             }
+         }
++
++        //Now handle uses and defs for extended MIRs
++        if ((dfAttributes & DF_FORMAT_EXT_OP) != 0)
++        {
++            handleExtOpUses (useV, defV, dInsn);
++            handleExtOpDefs (defV, dInsn);
++        }
+     }
+     return true;
+ }
+@@ -1532,6 +1627,123 @@ static void dataFlowSSAFormat3RC(CompilationUnit *cUnit, MIR *mir)
+     }
+ }
+ 
++/**
++ * @brief Handles ssa representation for extended MIRs.
++ * @param cUnit The compilation Unit
++ * @param mir Extended bytecode
++ */
++static void dataFlowSSAFormatExtendedOp(CompilationUnit *cUnit, MIR *mir)
++{
++    //We need to keep track of uses and defs and just so we can put those arrays
++    //on the stack, we set up some maximums.
++    const int maxUses = 2;
++    const int maxDefs = 1;
++
++    //Now declare the temporary arrays we will use
++    int uses[maxUses] = {}, defs[maxDefs] = {};
++    bool fpUse[maxUses] = {}, fpDef[maxDefs] = {};
++
++    //Eagerly assume there are no uses or defs
++    int numUses = 0, numDefs = 0;
++
++    switch (static_cast<int> (mir->dalvikInsn.opcode))
++    {
++        case kMirOpPunt:
++            //No uses or defs
++            break;
++        case kMirOpPhi:
++            handleSSADef (cUnit, defs, mir->dalvikInsn.vA, numDefs);
++            numDefs++;
++            break;
++        case kMirOpNullNRangeUpCheck:
++        case kMirOpNullNRangeDownCheck:
++            handleSSAUse(cUnit, uses, mir->dalvikInsn.vA, numUses);
++            numUses++;
++            handleSSAUse(cUnit, uses, mir->dalvikInsn.vB, numUses);
++            numUses++;
++            break;
++        case kMirOpLowerBound:
++            handleSSAUse(cUnit, uses, mir->dalvikInsn.vA, numUses);
++            numUses++;
++            break;
++        case kMirOpCheckInlinePrediction:
++            handleSSAUse(cUnit, uses, mir->dalvikInsn.vC, numUses);
++            numUses++;
++            break;
++        case kMirOpNullCheck:
++            handleSSAUse(cUnit, uses, mir->dalvikInsn.vA, numUses);
++            numUses++;
++            break;
++        case kMirOpBoundCheck:
++            handleSSAUse(cUnit, uses, mir->dalvikInsn.vA, numUses);
++            numUses++;
++
++            //We also have a use if we have an index register
++            if (mir->dalvikInsn.arg[0] == MIR_BOUND_CHECK_REG)
++            {
++                handleSSAUse(cUnit, uses, mir->dalvikInsn.arg[1], numUses);
++                numUses++;
++            }
++            break;
++        case kMirOpRegisterize:
++            handleSSAUse(cUnit, uses, mir->dalvikInsn.vA, numUses);
++            numUses++;
++
++            //The type of usage depends on whether we have a wide VR. So we check if we can make that it
++            //a non-wide use. If we cannot tell that it is surely non-wide, then make conservative assumption
++            //that it is a wide use.
++            if (mir->dalvikInsn.vB != static_cast<u4> (kCoreReg) && mir->dalvikInsn.vB != static_cast<u4> (kSFPReg))
++            {
++                handleSSAUse(cUnit, uses, mir->dalvikInsn.vA + 1, numUses);
++                numUses++;
++            }
++            break;
++        default:
++            ALOGW("Unexpected extended opcode when figuring out SSA %#x", mir->dalvikInsn.opcode);
++            break;
++    }
++
++    //Paranoid because we shouldn't exceed the space allocated
++    assert (numUses <= maxUses);
++    assert (numDefs <= maxDefs);
++
++    //Do we need more space for the uses?
++    if (numUses > mir->ssaRep->numUses)
++    {
++        mir->ssaRep->uses = static_cast<int *> (dvmCompilerNew (sizeof(*(mir->ssaRep->uses)) * numUses, false));
++        mir->ssaRep->fpUse = static_cast<bool *> (dvmCompilerNew (sizeof(*(mir->ssaRep->fpUse)) * numUses, false));
++        mir->ssaRep->defWhere = static_cast<MIR **> (dvmCompilerNew (sizeof(*(mir->ssaRep->defWhere)) * numUses, true));
++    }
++
++    //Do we need more space for the defs?
++    if (numDefs > mir->ssaRep->numDefs)
++    {
++        mir->ssaRep->defs = static_cast<int *> (dvmCompilerNew (sizeof(*(mir->ssaRep->defs)) * numDefs, false));
++        mir->ssaRep->fpDef = static_cast<bool *> (dvmCompilerNew (sizeof(*(mir->ssaRep->fpDef)) * numDefs, false));
++        mir->ssaRep->usedNext = static_cast<SUsedChain **> (dvmCompilerNew (sizeof(*(mir->ssaRep->usedNext)) * numDefs,
++                true));
++    }
++
++    //Initialize the number of uses and defs for the ssa
++    mir->ssaRep->numUses = numUses;
++    mir->ssaRep->numDefs = numDefs;
++
++    //Now do the actual copying
++    if (numUses != 0)
++    {
++        //Copy uses to ssa representation
++        memcpy (mir->ssaRep->uses, uses, numUses * sizeof(int));
++        memcpy (mir->ssaRep->fpUse, fpUse, numUses * sizeof(bool));
++    }
++
++    if (numDefs != 0)
++    {
++        //Copy defs to ssa representation
++        memcpy (mir->ssaRep->defs, defs, numDefs * sizeof(int));
++        memcpy (mir->ssaRep->fpDef, fpDef, numDefs * sizeof(bool));
++    }
++}
++
+ /* Entry function to convert a block into SSA representation */
+ bool dvmCompilerDoSSAConversion(CompilationUnit *cUnit, BasicBlock *bb)
+ {
+@@ -1566,8 +1778,6 @@ bool dvmCompilerDoSSAConversion(CompilationUnit *cUnit, BasicBlock *bb)
+         int dfAttributes =
+             dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
+ 
+-        int numUses = 0;
+-
+         if (dfAttributes & DF_FORMAT_35C) {
+             dataFlowSSAFormat35C(cUnit, mir);
+             continue;
+@@ -1578,6 +1788,13 @@ bool dvmCompilerDoSSAConversion(CompilationUnit *cUnit, BasicBlock *bb)
+             continue;
+         }
+ 
++        if (dfAttributes & DF_FORMAT_EXT_OP) {
++            dataFlowSSAFormatExtendedOp(cUnit, mir);
++            continue;
++        }
++
++        int numUses = 0;
++
+         if (dfAttributes & DF_HAS_USES) {
+             if (dfAttributes & DF_UA) {
+                 numUses++;
+diff --git a/vm/compiler/Dataflow.h b/vm/compiler/Dataflow.h
+index fe37e55..3581774 100644
+--- a/vm/compiler/Dataflow.h
++++ b/vm/compiler/Dataflow.h
+@@ -34,6 +34,7 @@ typedef enum DataFlowAttributePos {
+     kSetsConst,
+     kFormat35c,
+     kFormat3rc,
++    kFormatExtendedOp,   //!< Flag used to tag extended MIRs since each different dataflow treatment
+     kPhi,
+     kNullNRangeCheck0,
+     kNullNRangeCheck1,
+@@ -67,6 +68,7 @@ typedef enum DataFlowAttributePos {
+ #define DF_SETS_CONST           (1 << kSetsConst)
+ #define DF_FORMAT_35C           (1 << kFormat35c)
+ #define DF_FORMAT_3RC           (1 << kFormat3rc)
++#define DF_FORMAT_EXT_OP        (1 << kFormatExtendedOp)
+ #define DF_PHI                  (1 << kPhi)
+ #define DF_NULL_N_RANGE_CHECK_0 (1 << kNullNRangeCheck0)
+ #define DF_NULL_N_RANGE_CHECK_1 (1 << kNullNRangeCheck1)
+-- 
+1.7.4.1
+

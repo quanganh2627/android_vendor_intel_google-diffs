@@ -1,0 +1,188 @@
+From 9c6daa63420df6676df7b3e33eaf243c625efcdd Mon Sep 17 00:00:00 2001
+From: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Date: Thu, 12 Dec 2013 14:16:40 -0800
+Subject: Dalvik: Create predicted CC for virtual/interface invokes
+
+BZ: 158733
+
+Predicted chaining cells must be created for all virtual and interface invokes.
+But the current approach looks at method resolution to make a decision on the
+type of chaining cell to create. When method resolution can be done for virtual
+invokes, this approach is no longer correct.
+
+Change-Id: I77c79856976a88ee8f829f790e791122818808d4
+Category: device enablement
+Domain: AOSP.Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: yes
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+---
+ vm/compiler/BBOptimization.cpp       |   38 +++++++++++++++++++--------------
+ vm/compiler/InlineTransformation.cpp |   29 ++-----------------------
+ vm/compiler/Utility.cpp              |   20 +++++++++++++++++
+ vm/compiler/Utility.h                |    7 ++++++
+ 4 files changed, 52 insertions(+), 42 deletions(-)
+
+diff --git a/vm/compiler/BBOptimization.cpp b/vm/compiler/BBOptimization.cpp
+index 648ccb5..8ed1b87 100644
+--- a/vm/compiler/BBOptimization.cpp
++++ b/vm/compiler/BBOptimization.cpp
+@@ -1022,30 +1022,36 @@ bool dvmCompilerAddInvokeSupportBlocks (CompilationUnit *cUnit, BasicBlock *bb)
+             continue;
+         }
+ 
+-        //When we get here, we know we need to add a chaining cell.
+-        //Check if we can figure out the method being called by this invoke.
+-        const Method *callee = dvmCompilerCheckResolvedMethod (cUnit->method, &mir->dalvikInsn);
+-
+         BasicBlock *invokeCC = 0;
+ 
+-        //Create chaining cells if needed. If we know the method we create a Singleton CC.
+-        //Otherwise we create a Predicted CC.
+-        if (callee != 0)
++        //We decide on the type of chaining cell to add based on whether we need prediction or not
++        bool needsPrediction = dvmCompilerDoesInvokeNeedPrediction (mir->dalvikInsn.opcode);
++
++        if (needsPrediction == true)
++        {
++            invokeCC = dvmCompilerNewBBinCunit (cUnit, kChainingCellInvokePredicted);
++        }
++        else
+         {
+-            if (dvmIsNativeMethod(callee) == false)
++            const Method *callee = dvmCompilerCheckResolvedMethod (cUnit->method, &mir->dalvikInsn);
++
++            bool createCC = true;
++
++            //If we know for sure that we have a Native JNI call, then we do not add a chaining cell.
++            if (callee != 0)
+             {
+-                invokeCC = dvmCompilerNewBBinCunit (cUnit, kChainingCellInvokeSingleton);
+-                invokeCC->containingMethod = callee;
++                if (dvmIsNativeMethod (callee) == true)
++                {
++                    createCC = false;
++                }
+             }
+-            else
++
++            if (createCC == true)
+             {
+-                //Native JNI call does not need chaining cell
++                invokeCC = dvmCompilerNewBBinCunit (cUnit, kChainingCellInvokeSingleton);
++                invokeCC->containingMethod = callee;
+             }
+         }
+-        else
+-        {
+-            invokeCC = dvmCompilerNewBBinCunit (cUnit, kChainingCellInvokePredicted);
+-        }
+ 
+         if (invokeCC != 0)
+         {
+diff --git a/vm/compiler/InlineTransformation.cpp b/vm/compiler/InlineTransformation.cpp
+index 5ef9496..b98de0a 100755
+--- a/vm/compiler/InlineTransformation.cpp
++++ b/vm/compiler/InlineTransformation.cpp
+@@ -230,6 +230,8 @@ static bool canInlineBytecode (const Method *method, const DecodedInstruction *i
+         case OP_INVOKE_INTERFACE:
+         case OP_INVOKE_VIRTUAL_RANGE:
+         case OP_INVOKE_INTERFACE_RANGE:
++        case OP_INVOKE_VIRTUAL_QUICK:
++        case OP_INVOKE_VIRTUAL_QUICK_RANGE:
+             if (failureMessage != 0)
+             {
+                 *failureMessage = "no support for making prediction for inlined virtual invokes";
+@@ -439,31 +441,6 @@ static inline bool isRangeInvoke (Opcode opcode)
+ }
+ 
+ /**
+- * @brief Used to check if invoke is polymorphic and as a result needs prediction for inlining
+- * @param opcode The opcode to check
+- * @return Returns true if a prediction for inlining needs to be made
+- */
+-static inline bool doesInvokeNeedPrediction (Opcode opcode)
+-{
+-    switch (opcode)
+-    {
+-        //Return true for all virtual/interface invokes
+-        case OP_INVOKE_VIRTUAL:
+-        case OP_INVOKE_VIRTUAL_QUICK:
+-        case OP_INVOKE_INTERFACE:
+-        case OP_INVOKE_VIRTUAL_RANGE:
+-        case OP_INVOKE_VIRTUAL_QUICK_RANGE:
+-        case OP_INVOKE_INTERFACE_RANGE:
+-            return true;
+-        default:
+-            break;
+-    }
+-
+-    //If we get here we do not have a virtual invoke
+-    return false;
+-}
+-
+-/**
+  * @brief Determines the mapping between caller's and callee's virtual registers.
+  * @param invoke The decoded instruction for the invoke we are trying to inline.
+  * @param invokedMethod Information about the method we are invoking.
+@@ -1876,7 +1853,7 @@ static bool handleInlining (CompilationUnit *cUnit, JitTranslationInfo *info, Ba
+ 
+     //Figure out early if we need to make a prediction for the inlining.
+     //We would need to make a prediction in case of a polymorphic call.
+-    bool isPredicted = doesInvokeNeedPrediction (opcode);
++    bool isPredicted = dvmCompilerDoesInvokeNeedPrediction (opcode);
+ 
+     //Assume we will successfully inline
+     InliningFailure inlined = kInliningSuccess;
+diff --git a/vm/compiler/Utility.cpp b/vm/compiler/Utility.cpp
+index 1eb8504..b6f9c52 100644
+--- a/vm/compiler/Utility.cpp
++++ b/vm/compiler/Utility.cpp
+@@ -679,6 +679,26 @@ void dvmCompilerFindEntries (CompilationUnit *cUnit, GrowableList *list)
+     }
+ }
+ 
++bool dvmCompilerDoesInvokeNeedPrediction (Opcode opcode)
++{
++    switch (opcode)
++    {
++        //Return true for all virtual/interface invokes
++        case OP_INVOKE_VIRTUAL:
++        case OP_INVOKE_VIRTUAL_QUICK:
++        case OP_INVOKE_INTERFACE:
++        case OP_INVOKE_VIRTUAL_RANGE:
++        case OP_INVOKE_VIRTUAL_QUICK_RANGE:
++        case OP_INVOKE_INTERFACE_RANGE:
++            return true;
++        default:
++            break;
++    }
++
++    //If we get here we do not have a virtual invoke
++    return false;
++}
++
+ /**
+  * Checks if invoke calls fully resolved method
+  * @see Utility.h
+diff --git a/vm/compiler/Utility.h b/vm/compiler/Utility.h
+index f33c39c..1aae7d5 100644
+--- a/vm/compiler/Utility.h
++++ b/vm/compiler/Utility.h
+@@ -38,6 +38,13 @@ void dvmCompilerFindEntries (CompilationUnit *cUnit, GrowableList *list);
+ BasicBlock *dvmCompilerGetNextBasicBlockViaBitVector (BitVectorIterator &bvIterator, const GrowableList &blockList);
+ 
+ /**
++ * @brief Used to check if invoke is polymorphic and as a result needs prediction for inlining
++ * @param opcode The opcode to check
++ * @return Returns true if a prediction for inlining needs to be made
++ */
++bool dvmCompilerDoesInvokeNeedPrediction (Opcode opcode);
++
++/**
+  * @brief Checks if invoke calls fully resolved method.
+  * @details Since we are including instructions from possibly a cold method into the current trace,
+  * we need to make sure that all the associated information with the callee is properly initialized.
+-- 
+1.7.4.1
+

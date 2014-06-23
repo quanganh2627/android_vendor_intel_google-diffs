@@ -1,0 +1,198 @@
+From 605bc0350ec4ed0eb95e8c2f520597699f390f62 Mon Sep 17 00:00:00 2001
+From: Daniel Leung <daniel.leung@intel.com>
+Date: Thu, 12 Sep 2013 09:50:28 -0700
+Subject: init/ueventd: add options to USB device class matching rule
+
+Since Jelly Bean, the bluetooth driver has been moved to userspace.
+There is no longer a corresponding kernel driver for the BT adapter,
+causing runtime power management to be disabled. Kernel has tendency
+to re-enumerate USB device across suspend/resume, resetting runtime
+PM option. Therefore, we need to enable runtime PM when the device
+shows up, to maximize power saving.
+
+The rule for usbclass has been changed to:
+  usbclass:<A/B/C> <perm> <uid> <gid> <options>
+
+Options define the actions to perform when the rule matches.
+This patch adds three power-related options:
+
+  () suspend_auto: enable autosuspend by writing "auto"
+     to the power/control sysfs node.
+
+  () suspend_on: disable autosuspend by writing "on"
+     to the power/control sysfs node.
+
+  () pwr_ctrl_perm: change the owner and permission of
+     the power/control sysfs node. This enables userspace
+     with different credential to manipulate autosuspend
+     status.
+
+Change-Id: Ia15f7ecc2321c90ea93a020508f3e6db10c25035
+Signed-off-by: Daniel Leung <daniel.leung@intel.com>
+---
+ init/builtins.c |    2 +-
+ init/devices.c  |   53 ++++++++++++++++++++++++++++++++++++++++++++++++++++-
+ init/devices.h  |    2 +-
+ init/ueventd.c  |   11 +++++++++--
+ 4 files changed, 63 insertions(+), 5 deletions(-)
+
+diff --git a/init/builtins.c b/init/builtins.c
+index bf84099..db5984c 100644
+--- a/init/builtins.c
++++ b/init/builtins.c
+@@ -63,7 +63,7 @@ void add_environment(const char *name, const char *value);
+ 
+ extern int init_module(void *, unsigned long, const char *);
+ 
+-static int write_file(const char *path, const char *value)
++int write_file(const char *path, const char *value)
+ {
+     int fd, ret, len;
+ 
+diff --git a/init/devices.c b/init/devices.c
+index 0f267b1..0df091f 100644
+--- a/init/devices.c
++++ b/init/devices.c
+@@ -86,9 +86,15 @@ struct usb_device_class_node {
+     mode_t perm;
+     unsigned int uid;
+     unsigned int gid;
++    unsigned short pwr_ctrl_auto;
++    unsigned short pwr_ctrl_on;
++    unsigned short pwr_ctrl_perm;
+     struct listnode list;
+ };
+ 
++/* defined in builtins.c */
++extern int write_file(const char *path, const char *value);
++
+ static list_declare(sys_perms);
+ static list_declare(dev_perms);
+ static list_declare(platform_names);
+@@ -142,7 +148,7 @@ int add_dev_perms(const char *name, const char *attr,
+ int add_usb_device_class_matching(
+                          const char *devclass,
+                          mode_t perm, unsigned int uid,
+-                         unsigned int gid) {
++                         unsigned int gid, const char* options) {
+     struct usb_device_class_node *node = calloc(1, sizeof(*node));
+     if (!node)
+         return -ENOMEM;
+@@ -155,6 +161,27 @@ int add_usb_device_class_matching(
+     node->uid = uid;
+     node->gid = gid;
+ 
++    if (options) {
++        /* enable autosuspend for devices */
++        if (strstr(options, "suspend_auto")) {
++            node->pwr_ctrl_auto = 1;
++            node->pwr_ctrl_on = 0;
++        }
++
++        /* disable autosuspend for devices */
++        if (strstr(options, "suspend_on")) {
++            node->pwr_ctrl_auto = 0;
++            node->pwr_ctrl_on = 1;
++        }
++
++        /* change the owner/permission for power/control
++         * sysfs node.
++         */
++        if (strstr(options, "pwr_ctrl_perm")) {
++            node->pwr_ctrl_perm = 1;
++        }
++    }
++
+     list_add_tail(&usb_device_classes, &node->list);
+ 
+     return 0;
+@@ -543,6 +570,7 @@ static char **parse_platform_block_device(struct uevent *uevent)
+ 
+ static void handle_usb_device_class_rule(struct uevent *uevent, const char *devpath)
+ {
++    char sysfs[512];
+     struct listnode *node;
+     struct usb_device_class_node *usbdc;
+ 
+@@ -560,6 +588,29 @@ static void handle_usb_device_class_rule(struct uevent *uevent, const char *devp
+         /* change device node owner/permission */
+         chown(devpath, usbdc->uid, usbdc->gid);
+         chmod(devpath, usbdc->perm);
++
++        /* power-related options to manipulate <sysfs path>/power/control */
++        if (usbdc->pwr_ctrl_auto || usbdc->pwr_ctrl_on || usbdc->pwr_ctrl_perm) {
++            /* make sure buf is larger enough for
++             * adding "/sys" and "/power/control" and '\0'.
++             */
++            if ((strlen(uevent->path) + 4 + 14 + 1) > sizeof(sysfs))
++                continue;
++
++            sprintf(sysfs, "/sys%s/power/control", uevent->path);
++
++            if (usbdc->pwr_ctrl_auto) {
++                write_file(sysfs, "auto");
++            } else if (usbdc->pwr_ctrl_on) {
++                write_file(sysfs, "on");
++            }
++
++            if (usbdc->pwr_ctrl_perm) {
++                INFO("fixup %s %d %d 0%o\n", sysfs, usbdc->uid, usbdc->gid, usbdc->perm);
++                chown(sysfs, usbdc->uid, usbdc->gid);
++                chmod(sysfs, usbdc->perm);
++            }
++        }
+     }
+ }
+ 
+diff --git a/init/devices.h b/init/devices.h
+index 009ae8e..6277b70 100644
+--- a/init/devices.h
++++ b/init/devices.h
+@@ -46,7 +46,7 @@ extern int add_dev_perms(const char *name, const char *attr,
+ extern int add_usb_device_class_matching(
+                          const char *devclass,
+                          mode_t perm, unsigned int uid,
+-                         unsigned int gid);
++                         unsigned int gid, const char* options);
+ int get_device_fd();
+ void coldboot(const char *path);
+ #endif	/* _INIT_DEVICES_H */
+diff --git a/init/ueventd.c b/init/ueventd.c
+index 5b6095e..96208a1 100644
+--- a/init/ueventd.c
++++ b/init/ueventd.c
+@@ -164,6 +164,7 @@ void set_device_permission(int nargs, char **args)
+ {
+     char *name;
+     char *attr = 0;
++    char *options = 0;
+     mode_t perm;
+     uid_t uid;
+     gid_t gid;
+@@ -185,7 +186,13 @@ void set_device_permission(int nargs, char **args)
+         /* skip the prefix "usbclass:" */
+         attr = args[0] + 9;
+ 
+-        INFO("usbclass rule '%s'\n", attr);
++        /* if there are options */
++        if (nargs == 5) {
++            options = args[4];
++            nargs--;
++        }
++
++        INFO("usbclass rule '%s', options '%s'\n", attr, options);
+ 
+         usb_device_class_rule = 1;
+     }
+@@ -238,7 +245,7 @@ void set_device_permission(int nargs, char **args)
+     gid = ret;
+ 
+     if (usb_device_class_rule) {
+-        add_usb_device_class_matching(attr, perm, uid, gid);
++        add_usb_device_class_matching(attr, perm, uid, gid, options);
+     } else {
+         add_dev_perms(name, attr, perm, uid, gid, wildcard);
+     }
+-- 
+1.7.4.1
+

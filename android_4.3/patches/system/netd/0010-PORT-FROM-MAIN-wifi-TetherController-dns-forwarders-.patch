@@ -1,0 +1,160 @@
+From dd895f4a0702b264188bfdaa707cfe9c1f056669 Mon Sep 17 00:00:00 2001
+From: Maher Khenissi <maherx.khenissi@intel.com>
+Date: Thu, 8 Mar 2012 12:31:15 +0100
+Subject: [PORT FROM MAIN] wifi/TetherController: dns forwarders are not set after dnsmasq is restarted.
+
+BZ: 29453 25452 17650
+
+Patch set 2: a counter is added to usleep and the duration of the sleep is
+decreased to 1ms. We can use a synchronization mechanism instead of the
+sleep (using shared semaphore between dnsmasq and netd processes, or
+by modifying the existing pipe between netd and dnsmasq to report events
+from dnsmasq to netd... but this is more complicated than simple sleep).
+
+The actual netd tethering implementation restarts the dnsmasq when
+a new tethered interface goes up or down, but the dns servers are not
+set (using update_dns command).
+Fix: update_dns using the mDnsForwarders servers list is called
+after the dnsmasq is restarted in (un)tetherInterface function.
+Note: 1- usleep(10000) is used to wait for dnsmasq to be started.
+      2- We could call "tether dns set" (NetworkManagement::
+SetDnsForwarders) from the Tethering java code, but keeping the
+dns update at the netd level is simpler and keeps the dnsmasq restart
+hidden to the upper levels.
+
+Fix klocwork issue
+
+Feature   : Wlan
+Category  : Improvement
+Purpose   : AOSP+
+Origin    : Upstream
+Upstream-candidate: yes
+
+Orig-Change-Id: I482b2433aec626e7caf644e4f6886131c888e6b1
+Signed-off-by: Paul Naoumenko <paulx.naoumenko@intel.com>
+Change-Id: I7b64777f4baf416b3a5e270d2c91f8ede0163115
+---
+ TetherController.cpp |   60 +++++++++++++++++++++++++++++++++++++++++++++++--
+ TetherController.h   |    1 +
+ 2 files changed, 58 insertions(+), 3 deletions(-)
+
+diff --git a/TetherController.cpp b/TetherController.cpp
+index b498195..0214326 100644
+--- a/TetherController.cpp
++++ b/TetherController.cpp
+@@ -33,6 +33,8 @@
+ 
+ #include "TetherController.h"
+ 
++#define MAX_DNS_TRIALS 3
++
+ TetherController::TetherController() {
+     mInterfaces = new InterfaceCollection();
+     mDnsForwarders = new NetAddressCollection();
+@@ -265,6 +267,42 @@ int TetherController::setDnsForwarders(char **servers, int numServers) {
+     return 0;
+ }
+ 
++int TetherController::resetDnsForwarders() {
++    int numServers = mDnsForwarders == NULL ? 0 : (int) mDnsForwarders->size();
++
++    char daemonCmd[MAX_CMD_SIZE];
++    memset(daemonCmd, '\0' , sizeof(daemonCmd));
++
++    if (mDaemonFd == -1)
++        return -1;
++
++    strcpy(daemonCmd, "update_dns");
++    int cmdLen = strlen(daemonCmd);
++
++    if(numServers > 0) {
++        NetAddressCollection::iterator it;
++        for (it = mDnsForwarders->begin(); it != mDnsForwarders->end(); ++it) {
++            cmdLen += strlen(inet_ntoa(*it));
++            if (cmdLen + 2 >= sizeof(daemonCmd)) {
++                LOGD("(resetDnsForwarders) Too many DNS servers listed");
++                break;
++            } else {
++                strncat(daemonCmd, ":", 1 );
++                strncat(daemonCmd, inet_ntoa(*it), sizeof(daemonCmd) - strlen(daemonCmd) + 1);
++            }
++        }
++    }
++
++    LOGD("(resetDnsForwarders) Sending update msg to dnsmasq [%s]", daemonCmd);
++    if (write(mDaemonFd, daemonCmd, strlen(daemonCmd) +1) < 0) {
++        LOGE("(resetDnsForwarders) Failed to send update command to dnsmasq (%s)", strerror(errno));
++        mDnsForwarders->clear();
++        return -1;
++    }
++
++    return 0;
++}
++
+ NetAddressCollection *TetherController::getDnsForwarders() {
+     return mDnsForwarders;
+ }
+@@ -303,12 +341,21 @@ int TetherController::applyDnsInterfaces() {
+ int TetherController::tetherInterface(const char *interface) {
+     ALOGD("tetherInterface(%s)", interface);
+     mInterfaces->push_back(strdup(interface));
+-
+     /* Restart DHCP server to take in account the new tethered interface*/
+     if(mDaemonPid) {
+         mIntTetherRestart = 1;
+         stopTethering();
+         startTethering(mNum_addrs, mAddrs);
++        usleep(1000);
++        for (int i=0; i<MAX_DNS_TRIALS; i++) {
++            if(resetDnsForwarders()==-1) {
++                LOGE("Failed to reset Dns Forwarders (trial %d/%d) ",i,MAX_DNS_TRIALS);
++                usleep(1000);
++            } else {
++                break;
++            }
++        }
++
+     }
+ 
+     if (applyDnsInterfaces()) {
+@@ -328,9 +375,7 @@ int TetherController::tetherInterface(const char *interface) {
+ 
+ int TetherController::untetherInterface(const char *interface) {
+     InterfaceCollection::iterator it;
+-
+     ALOGD("untetherInterface(%s)", interface);
+-
+     for (it = mInterfaces->begin(); it != mInterfaces->end(); ++it) {
+         if (!strcmp(interface, *it)) {
+             free(*it);
+@@ -340,6 +385,15 @@ int TetherController::untetherInterface(const char *interface) {
+                 mIntTetherRestart = 1;
+                 stopTethering();
+                 startTethering(mNum_addrs, mAddrs);
++                usleep(1000);
++                for (int i=0; i<MAX_DNS_TRIALS; i++) {
++                    if(resetDnsForwarders()==-1) {
++                        LOGE("Failed to reset Dns Forwarders (trial %d/%d) ",i,MAX_DNS_TRIALS);
++                        usleep(1000);
++                    } else {
++                        break;
++                    }
++                }
+             }
+ 
+             return applyDnsInterfaces();
+diff --git a/TetherController.h b/TetherController.h
+index f9a920a..d633b55 100644
+--- a/TetherController.h
++++ b/TetherController.h
+@@ -47,6 +47,7 @@ public:
+ 
+     int setDnsForwarders(char **servers, int numServers);
+     NetAddressCollection *getDnsForwarders();
++    int resetDnsForwarders();
+ 
+     int tetherInterface(const char *interface);
+     int untetherInterface(const char *interface);
+-- 
+1.7.4.1
+

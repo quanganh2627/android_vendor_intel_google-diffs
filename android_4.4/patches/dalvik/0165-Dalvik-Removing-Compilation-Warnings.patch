@@ -1,0 +1,751 @@
+From e1fec291a12698b45c5dcb622b4d15098ac7ad5c Mon Sep 17 00:00:00 2001
+From: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Date: Tue, 9 Apr 2013 09:36:05 -0700
+Subject: Dalvik: Removing Compilation Warnings
+
+BZ: 99154
+
+Patch removes compiler warnings from the x86 code base
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I2f087a3c98278529086b5a95b6e2335595ba3cb8
+Orig-MCG-Change-Id: Icdcfbcca2857978bfe372723779a77e9a81756fd
+Signed-off-by: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/codegen/x86/AnalysisO1.cpp         |  120 +-----------------------
+ vm/compiler/codegen/x86/BytecodeVisitor.cpp    |    3 +-
+ vm/compiler/codegen/x86/CodegenInterface.cpp   |    5 +-
+ vm/compiler/codegen/x86/Lower.h                |    1 -
+ vm/compiler/codegen/x86/LowerHelper.cpp        |   14 ++--
+ vm/compiler/codegen/x86/LowerJump.cpp          |    2 +-
+ vm/compiler/codegen/x86/Scheduler.cpp          |    6 +-
+ vm/compiler/codegen/x86/libenc/enc_base.cpp    |   54 ++++-------
+ vm/compiler/codegen/x86/libenc/enc_tabl.cpp    |   21 +----
+ vm/compiler/codegen/x86/libenc/enc_wrapper.cpp |   53 ++++++++++-
+ 10 files changed, 93 insertions(+), 186 deletions(-)
+
+diff --git a/vm/compiler/codegen/x86/AnalysisO1.cpp b/vm/compiler/codegen/x86/AnalysisO1.cpp
+index d400d99..a7ab80a 100644
+--- a/vm/compiler/codegen/x86/AnalysisO1.cpp
++++ b/vm/compiler/codegen/x86/AnalysisO1.cpp
+@@ -1232,12 +1232,6 @@ int codeGenBasicBlock(const Method* method, BasicBlock_O1* bb) {
+ #ifdef DEBUG_REACHING_DEF
+     printDefUseTable();
+ #endif
+-#ifdef DSE_OPT
+-    retCode = removeDeadDefs();
+-    if (retCode < 0)
+-        return retCode;
+-    printDefUseTable();
+-#endif
+ #ifdef DEBUG_COMPILE_TABLE
+     ALOGI("At start of basic block %d (num of VRs %d) -------", bb->bb_index, bb->infoBasicBlock.size ());
+     dumpCompileTable();
+@@ -1302,15 +1296,6 @@ int codeGenBasicBlock(const Method* method, BasicBlock_O1* bb) {
+             return retCode;
+         //otherwise, bytecode does not generate a constant
+ 
+-        bool isDeadStmt = false;
+-#ifdef DSE_OPT
+-        for(k = 0; k < num_dead_pc; k++) {
+-            if(deadPCs[k] == offsetPC) {
+-                isDeadStmt = true;
+-                break;
+-            }
+-        }
+-#endif
+         getVirtualRegInfo(infoByteCode, mir);
+         //call something similar to mergeEntry2, but only update refCount
+         //clear refCount
+@@ -1326,22 +1311,8 @@ int codeGenBasicBlock(const Method* method, BasicBlock_O1* bb) {
+             if(indexT >= 0)
+                 compileTable[indexT].refCount += infoByteCode[k].refCount;
+         } //for k
+-#ifdef DSE_OPT
+-        if(isDeadStmt) { //search compileTable
+-            getVirtualRegInfo(infoByteCode);
+-#ifdef DEBUG_DSE
+-            ALOGI("DSE: stmt at offsetPC %d is dead", offsetPC);
+-#endif
+-            for(k = 0; k < num_regs_per_bytecode; k++) {
+-                int indexT = searchCompileTable(LowOpndRegType_virtual | infoByteCode[k].physicalType,
+-                                                infoByteCode[k].regNum);
+-                if(indexT >= 0)
+-                    compileTable[indexT].refCount -= infoByteCode[k].refCount;
+-            }
+-        }
+-#endif
+         lastByteCodeIsJump = false;
+-        if(!isConst && !isDeadStmt)  //isDeadStmt is false when DSE_OPT is not enabled
++        if(isConst == false)
+         {
+ #ifdef DEBUG_COMPILE_TABLE
+             dumpCompileTable();
+@@ -1391,7 +1362,7 @@ int codeGenBasicBlock(const Method* method, BasicBlock_O1* bb) {
+                     compileTable[k].refCount = 0;
+                 }
+             }
+-        } else { //isConst || isDeadStmt
++        } else { //isConst
+             //if this bytecode is the target of a jump, the mapFromBCtoNCG should be updated
+             offsetNCG = stream - streamMethodStart;
+             mapFromBCtoNCG[mir->offset] = offsetNCG;
+@@ -3417,9 +3388,9 @@ int spillLogicalReg(int spill_index, bool updateTable) {
+         return -1;
+     }
+ 
++#ifdef PRINT_WARNING
+     int physicalReg = compileTable[spill_index].physicalReg;
+ 
+-#ifdef PRINT_WARNING
+     //If we can't spill it, print out a warning
+     if(gCompilationUnit->getCanSpillReg (physicalReg) == false) {
+         // This scenario can occur whenever a VR is allocated to the
+@@ -3949,87 +3920,6 @@ void updateVRAtUse(int reg, LowOpndRegType pType, int regAll) {
+         }
+     }
+ }
+-///////////////////////////////////////////////////////////////////////////////
+-// DEAD/USELESS STATEMENT ELMINATION
+-// bytecodes can be removed if a bytecode has no side effect and the defs are not used
+-// this optimization is guarded with DSE_OPT
+-// currently, this optimization is not on, since it does not provide observable performance improvement
+-//     and it increases compilation time
+-
+-/* we remove a maximal of 40 bytecodes within a single basic block */
+-#define MAX_NUM_DEAD_PC_IN_BB 40
+-int deadPCs[MAX_NUM_DEAD_PC_IN_BB];
+-int num_dead_pc = 0;
+-
+-//! \brief collect all PCs that can be removed
+-//!
+-//! \details traverse each byte code in the current basic block and check whether it can be removed, if yes, update deadPCs
+-//! \return -1 if error happened, 0 otherwise
+-static int getDeadStmts() {
+-    BasicBlock_O1* bb = currentBB;
+-    int k;
+-    num_dead_pc = 0;
+-    //traverse each bytecode in the basic block
+-    //update offsetPC, rPC & inst
+-    for(MIR * mir = bb->firstMIRInsn; mir; mir = mir->next) {
+-        offsetPC = mir->seqNum;
+-        if(mir->dalvikInsn.opcode >= kNumPackedOpcodes) continue;
+-#ifdef DEBUG_DSE
+-        ALOGI("DSE: offsetPC %x", offsetPC);
+-#endif
+-        bool isDeadStmt = true;
+-        getVirtualRegInfo(infoByteCode, mir);
+-        u2 inst_op = mir->dalvikInsn.opcode;
+-        //skip bytecodes with side effect
+-        if(inst_op != OP_CONST_STRING && inst_op != OP_CONST_STRING_JUMBO &&
+-           inst_op != OP_MOVE && inst_op != OP_MOVE_OBJECT &&
+-           inst_op != OP_MOVE_FROM16 && inst_op != OP_MOVE_OBJECT_FROM16 &&
+-           inst_op != OP_MOVE_16 && inst_op != OP_CONST_CLASS &&
+-           inst_op != OP_MOVE_OBJECT_16 && inst_op != OP_MOVE_WIDE &&
+-           inst_op != OP_MOVE_WIDE_FROM16 && inst_op != OP_MOVE_WIDE_16 &&
+-           inst_op != OP_MOVE_RESULT && inst_op != OP_MOVE_RESULT_OBJECT) {
+-            continue;
+-        }
+-        //some statements do not define any VR!!!
+-        int num_defs = 0;
+-        for(k = 0; k < num_regs_per_bytecode; k++) {
+-            if(infoByteCode[k].accessType == REGACCESS_D ||
+-               infoByteCode[k].accessType == REGACCESS_UD ||
+-               infoByteCode[k].accessType == REGACCESS_DU) { //search defUseTable
+-                num_defs++;
+-                DefUsePair* indexT = searchDefUseTable(offsetPC, infoByteCode[k].regNum, infoByteCode[k].physicalType);
+-                if(indexT == NULL) {
+-                    ALOGI("JIT_INFO: Def at %x of VR %d %d not in table\n",
+-                        offsetPC, infoByteCode[k].regNum, infoByteCode[k].physicalType);
+-                    SET_JIT_ERROR(kJitErrorRegAllocFailed);
+-                    return -1;
+-                }
+-                if(indexT->num_uses > 0) {
+-                    isDeadStmt = false;
+-                    break;
+-                } else {
+-#ifdef DEBUG_DSE
+-                    ALOGI("DSE: num_uses is %d for def at %d for VR %d %d", indexT->num_uses,
+-                          offsetPC, infoByteCode[k].regNum, infoByteCode[k].physicalType);
+-#endif
+-                }
+-            }
+-        } //for k
+-        if(num_defs == 0) isDeadStmt = false;
+-        if(isDeadStmt && num_dead_pc < MAX_NUM_DEAD_PC_IN_BB) {
+-#ifdef DEBUG_DSE
+-            ALOGI("DSE: stmt at %x is dead", offsetPC);
+-#endif
+-            deadPCs[num_dead_pc++] = offsetPC;
+-        }
+-    } //for offsetPC
+-#ifdef DEBUG_DSE
+-    ALOGI("Dead Stmts: ");
+-    for(k = 0; k < num_dead_pc; k++)
+-        ALOGI("%x ", deadPCs[k]);
+-#endif
+-    return 0;
+-}
+ 
+ /////////////////////////////////////////////////////////////
+ //!search memVRTable for a given virtual register
+@@ -4282,7 +4172,7 @@ int requestVRFreeDelay(int regNum, u4 reason) {
+     // TODO Add 64-bit operand support when needed
+     int indexL = searchMemTable(regNum);
+     if(indexL >= 0) {
+-        if(reason >= 0 && reason < VRDELAY_COUNT) {
++        if(reason < VRDELAY_COUNT) {
+ #ifdef DEBUG_REGALLOC
+             ALOGI("requestFreeDelay: reason=%i VR=%d count=%i", reason, regNum, memVRTable[indexL].delayFreeCounters[reason]);
+ #endif
+@@ -4318,7 +4208,7 @@ int cancelVRFreeDelayRequest(int regNum, u4 reason) {
+     bool needCallToFreeReg = false;
+     int indexL = searchMemTable(regNum);
+     if(indexL >= 0) {
+-        if(reason >= 0 && reason < VRDELAY_COUNT) { // don't cancel delay if it wasn't requested
++        if(reason < VRDELAY_COUNT) { // don't cancel delay if it wasn't requested
+             if(memVRTable[indexL].delayFreeCounters[reason] > 0) {
+ #ifdef DEBUG_REGALLOC
+                 ALOGI("cancelVRFreeDelay: reason=%i VR=%d count=%i", reason, regNum, memVRTable[indexL].delayFreeCounters[reason]);
+diff --git a/vm/compiler/codegen/x86/BytecodeVisitor.cpp b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+index 1d38a5c..1d85012 100644
+--- a/vm/compiler/codegen/x86/BytecodeVisitor.cpp
++++ b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+@@ -1274,7 +1274,7 @@ int getConstInfo(BasicBlock_O1* bb, const MIR * currentMIR) {
+ int getVirtualRegInfo(VirtualRegInfo* infoArray, const MIR * currentMIR) {
+     u2 inst_op = currentMIR->dalvikInsn.opcode;
+     int vA = 0, vB = 0, vref, vindex;
+-    int v1, v2, vD, vG, vE, vF;
++    int v1, v2, vD, vE, vF;
+     u2 length, count;
+     int kk, num, num_entry;
+     s2 tmp_s2;
+@@ -2121,7 +2121,6 @@ int getVirtualRegInfo(VirtualRegInfo* infoArray, const MIR * currentMIR) {
+         count = currentMIR->dalvikInsn.vA;
+         vE = currentMIR->dalvikInsn.arg[1];
+         vF = currentMIR->dalvikInsn.arg[2];
+-        vG = currentMIR->dalvikInsn.arg[3];
+         vA = currentMIR->dalvikInsn.arg[4]; //5th argument
+ 
+         for (int vrNum = 0; vrNum < count; vrNum++) {
+diff --git a/vm/compiler/codegen/x86/CodegenInterface.cpp b/vm/compiler/codegen/x86/CodegenInterface.cpp
+index ec6f4de..4340eae 100644
+--- a/vm/compiler/codegen/x86/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/CodegenInterface.cpp
+@@ -891,7 +891,6 @@ u4* dvmJitUnchain(void* codeAddr)
+     u1* patchAddr;
+     int relativeNCG;
+     int ismove_flag = 0;
+-    u1* vrStoreCodePtr;
+ 
+     /* Locate the beginning of the chain cell region */
+     pChainCells = (u1 *)((char*)codeAddr + chainCellOffset);
+@@ -1583,7 +1582,7 @@ typedef std::pair<BBType, char*> CodeBlockElem;
+ static void printTrace(CompilationUnit *cUnit, std::vector<CodeBlockElem> &code_block_table,
+                        ChainCellCounts &chainCellCounts, int wide_const_count, u2* pCCOffsetSection)
+ {
+-    char *code_ptr, *next_code_ptr;
++    char *code_ptr, *next_code_ptr = 0;
+     BBType blk_type;
+     int k;
+ 
+@@ -1990,6 +1989,8 @@ static void compilerMIR2LIRJit(CompilationUnit_O1 *cUnit, JitTranslationInfo *in
+     size_t unprotected_code_cache_bytes =
+             gDvmJit.codeCacheSize - gDvmJit.codeCacheByteUsed - CODE_CACHE_PADDING;
+     UNPROTECT_CODE_CACHE(stream, unprotected_code_cache_bytes);
++    //Use the variable otherwise compiler warns about it
++    (void) unprotected_code_cache_bytes;
+ 
+     streamStart = stream; /* trace start before alignment */
+     stream += EXTRA_BYTES_FOR_CHAINING; /* This is needed for chaining. Add the bytes before the alignment */
+diff --git a/vm/compiler/codegen/x86/Lower.h b/vm/compiler/codegen/x86/Lower.h
+index e59691c..e03a284 100644
+--- a/vm/compiler/codegen/x86/Lower.h
++++ b/vm/compiler/codegen/x86/Lower.h
+@@ -39,7 +39,6 @@
+ /*! remove redundant spill of virtual registers */
+ #define SPILL_OPT
+ #define XFER_OPT
+-//#define DSE_OPT //no perf improvement for cme
+ /*! use live range analysis to allocate registers */
+ #define LIVERANGE_OPT
+ /*! remove redundant null check */
+diff --git a/vm/compiler/codegen/x86/LowerHelper.cpp b/vm/compiler/codegen/x86/LowerHelper.cpp
+index a795123..fa37948 100644
+--- a/vm/compiler/codegen/x86/LowerHelper.cpp
++++ b/vm/compiler/codegen/x86/LowerHelper.cpp
+@@ -1388,7 +1388,7 @@ void compare_VR_reg_all(OpndSize size,
+                                 tmpPtr->valueH, tmpPtr->valueH);
+ #endif
+                     } else {
+-                        ALOGI("JIT_INFO: Error creating constant failed for VR %d, regnum %d, valueL %d(%x) valueH %d(%x)",
++                        ALOGI("JIT_INFO: Error creating constant failed for VR %d, valueL %d(%x) valueH %d(%x)",
+                                 tmpPtr->regNum, tmpPtr->valueL, tmpPtr->valueL,
+                                 tmpPtr->valueH, tmpPtr->valueH);
+                     }
+@@ -1434,7 +1434,7 @@ void compare_VR_reg_all(OpndSize size,
+                                 tmpPtr->valueH, tmpPtr->valueH);
+ #endif
+                     } else {
+-                        ALOGI("JIT_INFO: Error creating constant failed for VR %d, regnum %d, valueL %d(%x) valueH %d(%x)",
++                        ALOGI("JIT_INFO: Error creating constant failed for VR %d, valueL %d(%x) valueH %d(%x)",
+                                 tmpPtr->regNum, tmpPtr->valueL, tmpPtr->valueL,
+                                 tmpPtr->valueH, tmpPtr->valueH);
+                     }
+@@ -2023,7 +2023,7 @@ void alu_sd_binary_VR_reg(ALU_Opcode opc, int vA, int reg, bool isPhysical, bool
+                             tmpPtr->regNum, tmpPtr->valueL, tmpPtr->valueL, tmpPtr->valueH, tmpPtr->valueH);
+ #endif
+                 } else {
+-                    ALOGI("JIT_INFO: Error creating constant failed for VR %d, regnum %d, valueL %d(%x) valueH %d(%x)",
++                    ALOGI("JIT_INFO: Error creating constant failed for VR %d, valueL %d(%x) valueH %d(%x)",
+                             tmpPtr->regNum, tmpPtr->valueL, tmpPtr->valueL, tmpPtr->valueH, tmpPtr->valueH);
+                 }
+             }
+@@ -2058,7 +2058,7 @@ void alu_sd_binary_VR_reg(ALU_Opcode opc, int vA, int reg, bool isPhysical, bool
+                             tmpPtr->regNum, tmpPtr->valueL, tmpPtr->valueL, tmpPtr->valueH, tmpPtr->valueH);
+ #endif
+                 } else {
+-                    ALOGI("JIT_INFO: Error creating constant failed for VR %d, regnum %d, valueL %d(%x) valueH %d(%x)",
++                    ALOGI("JIT_INFO: Error creating constant failed for VR %d, valueL %d(%x) valueH %d(%x)",
+                             tmpPtr->regNum, tmpPtr->valueL, tmpPtr->valueL, tmpPtr->valueH, tmpPtr->valueH);
+                 }
+             }
+@@ -2143,7 +2143,7 @@ void alu_binary_VR_reg(OpndSize size, ALU_Opcode opc, int vA, int reg, bool isPh
+                             tmpPtr->regNum, tmpPtr->valueL, tmpPtr->valueL, tmpPtr->valueH, tmpPtr->valueH);
+ #endif
+                 } else {
+-                    ALOGI("JIT_INFO: Error creating constant failed for VR %d, regnum %d, valueL %d(%x) valueH %d(%x)",
++                    ALOGI("JIT_INFO: Error creating constant failed for regnum %d, valueL %d(%x) valueH %d(%x)",
+                             tmpPtr->regNum, tmpPtr->valueL, tmpPtr->valueL, tmpPtr->valueH, tmpPtr->valueH);
+                 }
+             }
+@@ -2586,7 +2586,7 @@ void get_virtual_reg_all(int vR, OpndSize size, int reg, bool isPhysical, Mnemon
+                                 tmpPtr->regNum, tmpPtr->valueL, tmpPtr->valueL, tmpPtr->valueH, tmpPtr->valueH);
+ #endif
+                     } else {
+-                        ALOGI("JIT_INFO: Error creating constant failed for VR %d, regnum %d, valueL %d(%x) valueH %d(%x)",
++                        ALOGI("JIT_INFO: Error creating constant failed for VR %d, valueL %d(%x) valueH %d(%x)",
+                                 tmpPtr->regNum, tmpPtr->valueL, tmpPtr->valueL, tmpPtr->valueH, tmpPtr->valueH);
+                     }
+                 }
+@@ -2623,7 +2623,7 @@ void get_virtual_reg_all(int vR, OpndSize size, int reg, bool isPhysical, Mnemon
+                                 tmpPtr->regNum, tmpPtr->valueL, tmpPtr->valueL, tmpPtr->valueH, tmpPtr->valueH);
+ #endif
+                     } else {
+-                        ALOGI("JIT_INFO: Error creating constant failed for VR %d, regnum %d, valueL %d(%x) valueH %d(%x)",
++                        ALOGI("JIT_INFO: Error creating constant failed for VR %d, valueL %d(%x) valueH %d(%x)",
+                                 tmpPtr->regNum, tmpPtr->valueL, tmpPtr->valueL, tmpPtr->valueH, tmpPtr->valueH);
+                     }
+                 }
+diff --git a/vm/compiler/codegen/x86/LowerJump.cpp b/vm/compiler/codegen/x86/LowerJump.cpp
+index 8b0008c..4b7d9e4 100644
+--- a/vm/compiler/codegen/x86/LowerJump.cpp
++++ b/vm/compiler/codegen/x86/LowerJump.cpp
+@@ -1660,7 +1660,7 @@ int op_packed_switch(const MIR * mir, const u2 * dalvikPC) {
+     scratchRegs[0] = PhysicalReg_SCRATCH_1;
+     call_dvmJitHandlePackedSwitch();
+     load_effective_addr(16, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
+-    //TODO: eax should be absolute address, call handleVRsEndOfBB 
++    //TODO: eax should be absolute address, call handleVRsEndOfBB
+     retCode = handleVRsEndOfBB(true); //update GG VRs
+     if (retCode < 0)
+         return retCode;
+diff --git a/vm/compiler/codegen/x86/Scheduler.cpp b/vm/compiler/codegen/x86/Scheduler.cpp
+index 5bcadaf..f235154 100644
+--- a/vm/compiler/codegen/x86/Scheduler.cpp
++++ b/vm/compiler/codegen/x86/Scheduler.cpp
+@@ -888,12 +888,14 @@ void Scheduler::setupLiveOutDependencies() {
+         LowOp* lastFlagWriter = (queuedLIREntries[ctrlEntries.back()]);
+ 
+         // Don't include last flag writer in the iteration
+-        for (int iter = 0; iter < ctrlEntries.size() - 1; iter++) {
++        for (std::vector<unsigned int>::const_iterator iter = ctrlEntries.begin ();
++                                                       (iter + 1) != ctrlEntries.end ();
++                                                       iter++) {
+             // Add a WAW dependency to the last flag writer from all other
+             // flag writers
+             DependencyInformation ds;
+             ds.dataHazard = Dependency_WAW;
+-            ds.lowopSlotId = ctrlEntries[iter];
++            ds.lowopSlotId = *iter;
+             ds.causeOfEdgeLatency = Latency_None;
+             ds.edgeLatency = mapLatencyReasonToValue[Latency_None];
+             dependencyAssociation[lastFlagWriter].predecessorDependencies.push_back(
+diff --git a/vm/compiler/codegen/x86/libenc/enc_base.cpp b/vm/compiler/codegen/x86/libenc/enc_base.cpp
+index d141e1f..dde49b7 100644
+--- a/vm/compiler/codegen/x86/libenc/enc_base.cpp
++++ b/vm/compiler/codegen/x86/libenc/enc_base.cpp
+@@ -355,17 +355,31 @@ char * EncoderBase::encode(char * stream, Mnemonic mn, const Operands& opnds)
+ 
+     if (copy_opcode) {
+         if (odesc->opcode_len==1) {
+-        *(unsigned char*)stream = *(unsigned char*)&odesc->opcode;
++            unsigned char *dest = (unsigned char *) (stream);
++            unsigned char *src = (unsigned char *) (& (odesc->opcode));
++            *dest = *src;
+         }
+         else if (odesc->opcode_len==2) {
+-        *(unsigned short*)stream = *(unsigned short*)&odesc->opcode;
++            short *dest = (short *) (stream);
++            void *ptr = (void *) (& (odesc->opcode));
++            short *src = (short *) (ptr);
++            *dest = *src;
+         }
+         else if (odesc->opcode_len==3) {
+-        *(unsigned short*)stream = *(unsigned short*)&odesc->opcode;
+-        *(unsigned char*)(stream+2) = odesc->opcode[2];
++            unsigned short *dest = (unsigned short *) (stream);
++            void *ptr = (void *) (& (odesc->opcode));
++            unsigned short *src = (unsigned short *) (ptr);
++            *dest = *src;
++
++            //Now handle the last part
++            unsigned char *dest2 = (unsigned char *) (stream + 2);
++            *dest2 = odesc->opcode[2];
+         }
+         else if (odesc->opcode_len==4) {
+-        *(unsigned*)stream = *(unsigned*)&odesc->opcode;
++            unsigned int *dest = (unsigned int *) (stream);
++            void *ptr = (void *) (& (odesc->opcode));
++            unsigned int *src = (unsigned int *) (ptr);
++            *dest = *src;
+         }
+         stream += odesc->opcode_len;
+     }
+@@ -675,36 +689,6 @@ assert(0);
+     return false;
+ }
+ 
+-/**
+- *
+- */
+-static bool match(const EncoderBase::OpcodeDesc& odesc,
+-                      const EncoderBase::Operands& opnds) {
+-
+-    assert(odesc.roles.count == opnds.count());
+-
+-    for(unsigned j = 0; j < odesc.roles.count; j++) {
+-        const EncoderBase::OpndDesc& desc = odesc.opnds[j];
+-        const EncoderBase::Operand& op = opnds[j];
+-        // location must match exactly
+-        if ((desc.kind & op.kind()) != op.kind()) {
+-//assert(0);
+-            return false;
+-        }
+-        // size must match exactly
+-        if (desc.size != op.size()) {
+-//assert(0);
+-            return false;
+-        }
+-        // extentions should be consistent
+-        if (!EncoderBase::extAllowed(op.ext(), desc.ext)) {
+-            return false;
+-        }
+-    }
+-    return true;
+-}
+-
+-
+ static bool try_match(const EncoderBase::OpcodeDesc& odesc,
+                       const EncoderBase::Operands& opnds, bool strict) {
+ 
+diff --git a/vm/compiler/codegen/x86/libenc/enc_tabl.cpp b/vm/compiler/codegen/x86/libenc/enc_tabl.cpp
+index da87bf3..af20bd8 100644
+--- a/vm/compiler/codegen/x86/libenc/enc_tabl.cpp
++++ b/vm/compiler/codegen/x86/libenc/enc_tabl.cpp
+@@ -311,10 +311,7 @@ unsigned short EncoderBase::getHash(const OpcodeInfo* odesc)
+         { Mnemonic_##mn, flags, roles, #mn,
+ #define END_MNEMONIC() },
+ #define BEGIN_OPCODES() {
+-#define END_OPCODES()   { OpcodeInfo::all, {OpcodeByteKind_LAST} }}
+-
+-//#define BEGIN_MNEMONIC(mn, affflags, ulags, cond, symm, roles)     \
+-//        { Mnemonic_##mn, affflags, ulags, cond, symm, roles, #mn,
++#define END_OPCODES()   { OpcodeInfo::all, {OpcodeByteKind_LAST}, {}, {0, 0, 0, 0}}}
+ 
+ 
+ static MnemonicInfo masterEncodingTable[] = {
+@@ -1739,17 +1736,8 @@ END_MNEMONIC()
+ 
+ ENCODER_NAMESPACE_END
+ 
+-//#include <algorithm>
+-
+ ENCODER_NAMESPACE_START
+ 
+-static bool mnemonic_info_comparator(const MnemonicInfo& one,
+-                                     const MnemonicInfo& two)
+-{
+-    return one.mn < two.mn;
+-}
+-
+-
+ static int compareMnemonicInfo(const void* info1, const void* info2)
+ {
+     Mnemonic id1, id2;
+@@ -1767,13 +1755,10 @@ int EncoderBase::buildTable(void)
+ {
+     // A check: all mnemonics must be covered
+     assert(COUNTOF(masterEncodingTable) == Mnemonic_Count);
++
+     // sort out the mnemonics so the list become ordered
+-#if 0 //Android x86
+-    std::sort(masterEncodingTable, masterEncodingTable+Mnemonic_Count,
+-              mnemonic_info_comparator);
+-#else
+     qsort(masterEncodingTable, Mnemonic_Count, sizeof(MnemonicInfo), compareMnemonicInfo);
+-#endif
++
+     //
+     // clear the things
+     //
+diff --git a/vm/compiler/codegen/x86/libenc/enc_wrapper.cpp b/vm/compiler/codegen/x86/libenc/enc_wrapper.cpp
+index 3d6b15d..be8f3b3 100644
+--- a/vm/compiler/codegen/x86/libenc/enc_wrapper.cpp
++++ b/vm/compiler/codegen/x86/libenc/enc_wrapper.cpp
+@@ -172,7 +172,9 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_imm(Mnemonic m, OpndSize size,
+     EncoderBase::Operands args;
+     //assert(imm.get_size() == size_32);
+     add_imm(args, size, imm, true/*is_signed*/);
++#ifdef PRINT_ENCODER_STREAM
+     char* stream_start = stream;
++#endif
+     stream = (char *)EncoderBase::encode(stream, m, args);
+ #ifdef PRINT_ENCODER_STREAM
+     printEncoderInst(m, args);
+@@ -193,9 +195,11 @@ extern "C" ENCODER_DECLARE_EXPORT unsigned encoder_get_cur_operand_offset(int op
+ 
+ extern "C" ENCODER_DECLARE_EXPORT char * encoder_update_imm(int imm, char * stream) {
+     Inst decInst;
+-    unsigned numBytes = DecoderBase::decode(stream, &decInst);
+     EncoderBase::Operands args;
+-    //assert(imm.get_size() == size_32);
++
++    //Decode the instruction
++    DecoderBase::decode(stream, &decInst);
++
+     add_imm(args, decInst.operands[0].size(), imm, true/*is_signed*/);
+     char* stream_next = (char *)EncoderBase::encode(stream, decInst.mn, args);
+ #ifdef PRINT_ENCODER_STREAM
+@@ -208,7 +212,9 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_mem(Mnemonic m, OpndSize size,
+                int disp, int base_reg, bool isBasePhysical, char * stream) {
+     EncoderBase::Operands args;
+     add_m(args, base_reg, disp, size);
++#ifdef PRINT_ENCODER_STREAM
+     char* stream_start = stream;
++#endif
+     stream = (char *)EncoderBase::encode(stream, m, args);
+ #ifdef PRINT_ENCODER_STREAM
+     printEncoderInst(m, args);
+@@ -224,7 +230,9 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_reg(Mnemonic m, OpndSize size,
+       add_r(args, 3/*edx*/, size);
+     }
+     add_r(args, reg, size);
++#ifdef PRINT_ENCODER_STREAM
+     char* stream_start = stream;
++#endif
+     stream = (char *)EncoderBase::encode(stream, m, args);
+ #ifdef PRINT_ENCODER_STREAM
+     printEncoderInst(m, args);
+@@ -243,7 +251,9 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_reg_reg_diff_sizes(Mnemonic m,
+       add_r(args, reg, OpndSize_8);
+     else
+       add_r(args, reg, srcOpndSize);
++#ifdef PRINT_ENCODER_STREAM
+     char* stream_start = stream;
++#endif
+     stream = (char *)EncoderBase::encode(stream, m, args);
+ #ifdef PRINT_ENCODER_STREAM
+     printEncoderInst(m, args);
+@@ -264,7 +274,9 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_mem_to_reg_diff_sizes(Mnemonic
+     EncoderBase::Operands args;
+     add_r(args, reg, regOpndSize);
+     add_m(args, base_reg, disp, memOpndSize);
++#ifdef PRINT_ENCODER_STREAM
+     char* stream_start = stream;
++#endif
+     stream = (char *)EncoderBase::encode(stream, m, args);
+ #ifdef PRINT_ENCODER_STREAM
+     printEncoderInst(m, args);
+@@ -283,7 +295,9 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_mem_scale_reg(Mnemonic m, OpndS
+     EncoderBase::Operands args;
+     add_r(args, reg, size);
+     add_m_scale(args, base_reg, index_reg, scale, size);
++#ifdef PRINT_ENCODER_STREAM
+     char* stream_start = stream;
++#endif
+     stream = (char *)EncoderBase::encode(stream, m, args);
+ #ifdef PRINT_ENCODER_STREAM
+     printEncoderInst(m, args);
+@@ -298,7 +312,9 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_reg_mem_scale(Mnemonic m, OpndS
+     EncoderBase::Operands args;
+     add_m_scale(args, base_reg, index_reg, scale, size);
+     add_r(args, reg, size);
++#ifdef PRINT_ENCODER_STREAM
+     char* stream_start = stream;
++#endif
+     stream = (char *)EncoderBase::encode(stream, m, args);
+ #ifdef PRINT_ENCODER_STREAM
+     printEncoderInst(m, args);
+@@ -313,7 +329,9 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_mem_disp_scale_to_reg_diff_size
+     EncoderBase::Operands args;
+     add_r(args, reg, regOpndSize);
+     add_m_disp_scale(args, base_reg, disp, index_reg, scale, memOpndSize);
++#ifdef PRINT_ENCODER_STREAM
+     char* stream_start = stream;
++#endif
+     stream = (char *)EncoderBase::encode(stream, m, args);
+ #ifdef PRINT_ENCODER_STREAM
+     printEncoderInst(m, args);
+@@ -334,7 +352,9 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_movzs_mem_disp_scale_reg(Mnemon
+     EncoderBase::Operands args;
+     add_r(args, reg, OpndSize_32);
+     add_m_disp_scale(args, base_reg, disp, index_reg, scale, size);
++#ifdef PRINT_ENCODER_STREAM
+     char* stream_start = stream;
++#endif
+     stream = (char *)EncoderBase::encode(stream, m, args);
+ #ifdef PRINT_ENCODER_STREAM
+     printEncoderInst(m, args);
+@@ -349,7 +369,9 @@ extern "C" ENCODER_DECLARE_EXPORT char* encoder_reg_mem_disp_scale(Mnemonic m, O
+     EncoderBase::Operands args;
+     add_m_disp_scale(args, base_reg, disp, index_reg, scale, size);
+     add_r(args, reg, size);
++#ifdef PRINT_ENCODER_STREAM
+     char* stream_start = stream;
++#endif
+     stream = (char *)EncoderBase::encode(stream, m, args);
+ #ifdef PRINT_ENCODER_STREAM
+     printEncoderInst(m, args);
+@@ -364,7 +386,9 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_reg_mem(Mnemonic m, OpndSize si
+     EncoderBase::Operands args;
+     add_m(args, base_reg, disp, size);
+     add_r(args, reg, size);
++#ifdef PRINT_ENCODER_STREAM
+     char* stream_start = stream;
++#endif
+     if (m == Mnemonic_CMPXCHG ){
+        //CMPXCHG require EAX as args
+        add_r(args,PhysicalReg_EAX,size);
+@@ -392,7 +416,9 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_imm_reg_diff_sizes(Mnemonic m,
+       add_imm(args, OpndSize_8, imm, true/*is_signed*/);
+     else
+       add_imm(args, sizeImm, imm, true/*is_signed*/);
++#ifdef PRINT_ENCODER_STREAM
+     char* stream_start = stream;
++#endif
+     stream = (char *)EncoderBase::encode(stream, m, args);
+ #ifdef PRINT_ENCODER_STREAM
+     printEncoderInst(m, args);
+@@ -402,8 +428,11 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_imm_reg_diff_sizes(Mnemonic m,
+ }
+ extern "C" ENCODER_DECLARE_EXPORT char * encoder_update_imm_rm(int imm, char * stream) {
+     Inst decInst;
+-    unsigned numBytes = DecoderBase::decode(stream, &decInst);
+     EncoderBase::Operands args;
++
++    //Decode the instruction
++    DecoderBase::decode(stream, &decInst);
++
+     args.add(decInst.operands[0]);
+     add_imm(args, decInst.operands[1].size(), imm, true/*is_signed*/);
+     char* stream_next = (char *)EncoderBase::encode(stream, decInst.mn, args);
+@@ -422,7 +451,9 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_imm_mem(Mnemonic m, OpndSize si
+         || m == Mnemonic_SAR || m == Mnemonic_ROR)
+         size = OpndSize_8;
+     add_imm(args, size, imm, true);
++#ifdef PRINT_ENCODER_STREAM
+     char* stream_start = stream;
++#endif
+     stream = (char *)EncoderBase::encode(stream, m, args);
+ #ifdef PRINT_ENCODER_STREAM
+     printEncoderInst(m, args);
+@@ -436,7 +467,9 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_fp_mem(Mnemonic m, OpndSize siz
+     add_m(args, base_reg, disp, size);
+     // a fake FP register as operand
+     add_fp(args, reg, size == OpndSize_64/*is_double*/);
++#ifdef PRINT_ENCODER_STREAM
+     char* stream_start = stream;
++#endif
+     stream = (char *)EncoderBase::encode(stream, m, args);
+ #ifdef PRINT_ENCODER_STREAM
+     printEncoderInst(m, args);
+@@ -451,7 +484,9 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_mem_fp(Mnemonic m, OpndSize siz
+     // a fake FP register as operand
+     add_fp(args, reg, size == OpndSize_64/*is_double*/);
+     add_m(args, base_reg, disp, size);
++#ifdef PRINT_ENCODER_STREAM
+     char* stream_start = stream;
++#endif
+     stream = (char *)EncoderBase::encode(stream, m, args);
+ #ifdef PRINT_ENCODER_STREAM
+     printEncoderInst(m, args);
+@@ -462,7 +497,9 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_mem_fp(Mnemonic m, OpndSize siz
+ 
+ extern "C" ENCODER_DECLARE_EXPORT char * encoder_return(char * stream) {
+     EncoderBase::Operands args;
++#ifdef PRINT_ENCODER_STREAM
+     char* stream_start = stream;
++#endif
+     stream = (char *)EncoderBase::encode(stream, Mnemonic_RET, args);
+ #ifdef PRINT_ENCODER_STREAM
+     printEncoderInst(Mnemonic_RET, args);
+@@ -477,7 +514,9 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_compare_fp_stack(bool pop, int
+     //FST ST(i) has a single operand in encoder.inl?
+     EncoderBase::Operands args;
+     add_fp(args, reg, isDouble);
++#ifdef PRINT_ENCODER_STREAM
+     char* stream_start = stream;
++#endif
+     stream = (char *)EncoderBase::encode(stream, m, args);
+ #ifdef PRINT_ENCODER_STREAM
+     printEncoderInst(m, args);
+@@ -491,7 +530,9 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_movez_mem_to_reg(OpndSize size,
+     EncoderBase::Operands args;
+     add_r(args, reg, OpndSize_32);
+     add_m(args, base_reg, disp, size);
++#ifdef PRINT_ENCODER_STREAM
+     char* stream_start = stream;
++#endif
+     stream = (char *)EncoderBase::encode(stream, Mnemonic_MOVZX, args);
+ #ifdef PRINT_ENCODER_STREAM
+     printEncoderInst(Mnemonic_MOVZX, args);
+@@ -505,7 +546,9 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_moves_mem_to_reg(OpndSize size,
+     EncoderBase::Operands args;
+     add_r(args, reg, OpndSize_32);
+     add_m(args, base_reg, disp, size);
++#ifdef PRINT_ENCODER_STREAM
+     char* stream_start = stream;
++#endif
+     stream = (char *)EncoderBase::encode(stream, Mnemonic_MOVSX, args);
+ #ifdef PRINT_ENCODER_STREAM
+     printEncoderInst(Mnemonic_MOVSX, args);
+@@ -519,7 +562,9 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_movez_reg_to_reg(OpndSize size,
+     EncoderBase::Operands args;
+     add_r(args, reg2, OpndSize_32); //destination
+     add_r(args, reg, size);
++#ifdef PRINT_ENCODER_STREAM
+     char* stream_start = stream;
++#endif
+     stream = (char *)EncoderBase::encode(stream, Mnemonic_MOVZX, args);
+ #ifdef PRINT_ENCODER_STREAM
+     printEncoderInst(Mnemonic_MOVZX, args);
+@@ -533,7 +578,9 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_moves_reg_to_reg(OpndSize size,
+     EncoderBase::Operands args;
+     add_r(args, reg2, OpndSize_32); //destination
+     add_r(args, reg, size);
++#ifdef PRINT_ENCODER_STREAM
+     char* stream_start = stream;
++#endif
+     stream = (char *)EncoderBase::encode(stream, Mnemonic_MOVSX, args);
+ #ifdef PRINT_ENCODER_STREAM
+     printEncoderInst(Mnemonic_MOVSX, args);
+-- 
+1.7.4.1
+

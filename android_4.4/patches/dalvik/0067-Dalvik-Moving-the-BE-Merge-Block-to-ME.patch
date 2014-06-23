@@ -1,0 +1,306 @@
+From f9e62d2473d760174f65e6a7b8ed1c77946241cc Mon Sep 17 00:00:00 2001
+From: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Date: Fri, 25 Jan 2013 10:54:31 -0800
+Subject: Dalvik: Moving the BE Merge Block to ME
+
+BZ: 75098
+
+Backend Merge Block
+
+Removing the merge block code in the backend due to faulty considerations when
+  a complex CFG is involved.
+A version in the Middle-End is provided instead.
+
+- BBOptimization.cpp, BBOptimization.h:
+  - New files to hold the new Merge pass
+- LoopOpt.cpp:
+  - Added the pass call the Merge
+- CodegenInterface.cpp:
+  - Removed the merge pass from the backend
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I0120350b21d4954c3aed746eb707bb473e9712e2
+Orig-MCG-Change-Id: Ib5d4eb421961275fe52ebb9dbbbe2730f3bcf1b0
+Signed-off-by: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/Dvm.mk                                    |    3 +-
+ vm/compiler/BBOptimization.cpp               |  130 ++++++++++++++++++++++++++
+ vm/compiler/BBOptimization.h                 |   32 +++++++
+ vm/compiler/LoopOpt.cpp                      |    3 +
+ vm/compiler/codegen/x86/CodegenInterface.cpp |   36 -------
+ 5 files changed, 167 insertions(+), 37 deletions(-)
+ create mode 100644 vm/compiler/BBOptimization.cpp
+ create mode 100644 vm/compiler/BBOptimization.h
+
+diff --git a/vm/Dvm.mk b/vm/Dvm.mk
+index ab59348..93fbb83 100644
+--- a/vm/Dvm.mk
++++ b/vm/Dvm.mk
+@@ -355,7 +355,8 @@ ifeq ($(dvm_arch),x86)
+               compiler/codegen/$(dvm_arch_variant)/CodegenErrors.cpp \
+               compiler/LoopOpt.cpp \
+               compiler/Checks.cpp \
+-              compiler/Pass.cpp
++              compiler/Pass.cpp \
++              compiler/BBOptimization.cpp
+        # need apache harmony x86 encoder/decoder
+        LOCAL_C_INCLUDES += \
+ 	      dalvik/vm/compiler/codegen/x86/libenc
+diff --git a/vm/compiler/BBOptimization.cpp b/vm/compiler/BBOptimization.cpp
+new file mode 100644
+index 0000000..dd48a03
+--- /dev/null
++++ b/vm/compiler/BBOptimization.cpp
+@@ -0,0 +1,130 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "Dalvik.h"
++#include "Dataflow.h"
++#include "Loop.h"
++#include "LoopOpt.h"
++#include "BBOptimization.h"
++
++bool dvmCompilerMergeBasicBlocks (CompilationUnit *cUnit, BasicBlock *bb)
++{
++    //We only merge blocks if they are kDalvikByteCode and not hidden
++    if (bb->blockType != kDalvikByteCode ||
++        bb->hidden == true)
++    {
++        return false;
++    }
++
++    //We also refuse to merge if we have a taken and a fallthrough or neither
++    if ( (bb->taken != 0 && bb->fallThrough != 0) ||
++         (bb->taken == 0 && bb->fallThrough == 0))
++    {
++        return false;
++    }
++
++    //Now we actually have either a taken or a fallthrough, check if that child only has one parent
++    BasicBlock *child = (bb->taken != 0) ? bb->taken : bb->fallThrough;
++
++    //If child is hidden, we bail
++    if (child->hidden == true)
++    {
++        //No change to the BasicBlock
++        return false;
++    }
++
++    //Child must be dalvik code
++    if (child->blockType != kDalvikByteCode)
++    {
++        return false;
++    }
++
++    unsigned int bitsSet = dvmCountSetBits (child->predecessors);
++
++    //If not only one parent, we must bail
++    if (bitsSet != 1)
++    {
++        //No change to the BasicBlock
++        return false;
++    }
++
++    //Ok we have one child, with only one parent, let's combine them
++    MIR *lastInsn = bb->lastMIRInsn;
++
++    //If we don't have an instruction we can skip this case
++    if (lastInsn != 0)
++    {
++        //Question: is it a jump? if so, we can remove it now
++        int opcode = lastInsn->dalvikInsn.opcode;
++
++        switch (opcode)
++        {
++            case OP_GOTO:
++            case OP_GOTO_32:
++            case OP_GOTO_16:
++                lastInsn = lastInsn->prev;
++
++                //This clean up is not automatically necessary (links get fixed later)
++                //But it's good practice to do it now
++                if (lastInsn != 0)
++                {
++                    lastInsn->next = 0;
++                }
++                bb->lastMIRInsn = lastInsn;
++                break;
++            default:
++                //We bail if we don't have one of those goto instructions
++                return false;
++        }
++    }
++
++    //Now that we have our last, get the child's first
++    MIR *firstInsn = child->firstMIRInsn;
++
++    //If we had a last instruction, firstInsn becomes its next
++    if (lastInsn != 0)
++    {
++        lastInsn->next = firstInsn;
++    }
++    else
++    {
++        bb->firstMIRInsn = firstInsn;
++    }
++
++    //Prev for firstInsn is always lastInsn (0 at worst)
++    if (firstInsn != 0)
++    {
++        firstInsn->prev = lastInsn;
++
++        //Now that the instructions are linked together, we can set the last instruction
++        //We do it here because if firstInsn == 0, then child has no instruction and we keep ours
++        bb->lastMIRInsn = child->lastMIRInsn;
++    }
++
++    //Now attach the basic blocks: child is now going to disappear
++    bb->taken = child->taken;
++    bb->fallThrough = child->fallThrough;
++
++    child->hidden = true;
++    child->firstMIRInsn = 0;
++    child->lastMIRInsn = 0;
++    child->taken = 0;
++    child->fallThrough = 0;
++
++    //We have changed the basic block
++    return true;
++}
++
+diff --git a/vm/compiler/BBOptimization.h b/vm/compiler/BBOptimization.h
+new file mode 100644
+index 0000000..5ae57bd
+--- /dev/null
++++ b/vm/compiler/BBOptimization.h
+@@ -0,0 +1,32 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef DALVIK_VM_BBOPTIMIZATION
++#define DALVIK_VM_BBOPTIMIZATION
++
++//Forward declarations
++struct BasicBlock;
++struct CompilationUnit;
++
++/**
++ * @brief Merge BasicBlocks together to reduce unnecessary jumps
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock
++ * @return returns whether we changed anything in the BasicBlock
++ */
++bool dvmCompilerMergeBasicBlocks (CompilationUnit *cUnit, BasicBlock *bb);
++
++#endif
+diff --git a/vm/compiler/LoopOpt.cpp b/vm/compiler/LoopOpt.cpp
+index d26083a..1150755 100644
+--- a/vm/compiler/LoopOpt.cpp
++++ b/vm/compiler/LoopOpt.cpp
+@@ -14,6 +14,7 @@
+ * limitations under the License.
+ */
+ 
++#include "BBOptimization.h"
+ #include "Checks.h"
+ #include "Dalvik.h"
+ #include "Dataflow.h"
+@@ -71,6 +72,8 @@ START_PASSES
+                  NULL, endHoisting, NULL, 0, 0),
+     NEW_PASS ("Check Removal", kAllNodes, NULL, NULL,
+                 dvmCompilerStartCheckRemoval, dvmCompilerEndCheckRemoval, dvmCompilerCheckRemoval, 0, 0),
++    NEW_PASS ("Merge Blocks", kAllNodes, NULL, NULL,
++                NULL, NULL, dvmCompilerMergeBasicBlocks, 0, kOptimizationBasicBlockChange),
+ 
+     /* Last element must have and be the only one to have a "" as name, it's our ending check */
+     NEW_PASS ("",       /** Pass name */
+diff --git a/vm/compiler/codegen/x86/CodegenInterface.cpp b/vm/compiler/codegen/x86/CodegenInterface.cpp
+index 48680db..82ca0b7 100644
+--- a/vm/compiler/codegen/x86/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/CodegenInterface.cpp
+@@ -974,36 +974,6 @@ void handleExtendedMIR(CompilationUnit *cUnit, MIR *mir)
+     gDvm.executionMode = origMode;
+ }
+ 
+-/* check whether we can merge the block at index i with its target block */
+-bool mergeBlock(BasicBlock *bb, CompilationUnit *cUnit) {
+-    if(bb->blockType == kDalvikByteCode &&
+-        bb->firstMIRInsn != NULL &&
+-        (bb->lastMIRInsn->dalvikInsn.opcode == OP_GOTO_16 ||
+-         bb->lastMIRInsn->dalvikInsn.opcode == OP_GOTO ||
+-         bb->lastMIRInsn->dalvikInsn.opcode == OP_GOTO_32) &&
+-         bb->fallThrough == NULL) {
+-        MIR* prevInsn = bb->lastMIRInsn->prev;
+-        if(bb->taken == NULL) return false;
+-        if(cUnit->jitMode == kJitLoop && bb->taken == cUnit->entryBlock->fallThrough)
+-            return false;
+-        MIR* mergeInsn = bb->taken->firstMIRInsn;
+-        if(mergeInsn == NULL) return false;
+-        if(prevInsn == NULL) {//the block has a single instruction
+-            bb->firstMIRInsn = mergeInsn;
+-        } else {
+-            prevInsn->next = mergeInsn; //remove goto from the chain
+-        }
+-        mergeInsn->prev = prevInsn;
+-        bb->lastMIRInsn = bb->taken->lastMIRInsn;
+-        bb->taken->firstMIRInsn = NULL; //block being merged in
+-        bb->taken->lastMIRInsn = NULL; //block being merged in
+-        bb->fallThrough = bb->taken->fallThrough;
+-        bb->taken = bb->taken->taken;
+-        return true;
+-    }
+-    return false;
+-}
+-
+ static int genTraceProfileEntry(CompilationUnit *cUnit)
+ {
+     cUnit->headerSize = 6;
+@@ -1301,12 +1271,6 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+     }
+     startOfTrace(cUnit->method, labelList, cUnit->exceptionBlockId, cUnit);
+     if(gDvm.executionMode == kExecutionModeNcgO1) {
+-        //merge blocks ending with "goto" with the fall through block
+-        for (i = 0; i < blockList->numUsed; i++) {
+-            bb = (BasicBlock *) blockList->elemList[i];
+-            bool merged = mergeBlock(bb, cUnit);
+-            while(merged) merged = mergeBlock(bb, cUnit);
+-        }
+         for (i = 0; i < blockList->numUsed; i++) {
+             bb = (BasicBlock *) blockList->elemList[i];
+             if(bb->blockType == kDalvikByteCode &&
+-- 
+1.7.4.1
+

@@ -1,0 +1,412 @@
+From 27de731e96bd636110aeb1655dab087136ae0659 Mon Sep 17 00:00:00 2001
+From: David Kreitzer <david.l.kreitzer@intel.com>
+Date: Thu, 8 Aug 2013 18:11:44 -0700
+Subject: Dalvik: Add support for hoisted null/range-check-related extended bytecodes in pcgDalvik
+
+BZ: 129618
+
+Adds support for kMirOpLowerBound, kMirOpNullCheck, kMirOpNullNRangeUpCheck,
+kMirOpNullNRangeDownCheck, kMirOpBoundCheck.  Also modifed
+dvmCompilerPcgSupportTrace to use an opt-in strategy for extended bytecodes.
+That is, the PCG glue layer will reject traces containing extended bytecodes
+that are not listed explicitly.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I813fb94cc36405ee78afc5337fde873f26cc3c4c
+Orig-MCG-Change-Id: Ib7555437f6db6dbfeaca66bbb36fec70c7a10045
+Signed-off-by: Kreitzer, David L <david.l.kreitzer@intel.com>
+Signed-off-by: Eric Dittert <eric.dittert@intel.com>
+Reviewed-on: http://android.intel.com:8080/124620
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: Lupusoru, Razvan A <razvan.a.lupusoru@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ .../codegen/x86/lightcg/InstructionGeneration.cpp  |    2 +-
+ vm/compiler/codegen/x86/pcg/Analysis.cpp           |   46 +++++--
+ vm/compiler/codegen/x86/pcg/Android.mk             |    2 +
+ vm/compiler/codegen/x86/pcg/CodeGeneration.cpp     |   21 ++++
+ vm/compiler/codegen/x86/pcg/LowerExtended.cpp      |  126 ++++++++++++++++++++
+ vm/compiler/codegen/x86/pcg/LowerExtended.h        |   53 ++++++++
+ vm/compiler/codegen/x86/pcg/UtilityPCG.cpp         |   20 +++
+ 7 files changed, 255 insertions(+), 15 deletions(-)
+ create mode 100644 vm/compiler/codegen/x86/pcg/LowerExtended.cpp
+ create mode 100644 vm/compiler/codegen/x86/pcg/LowerExtended.h
+
+diff --git a/vm/compiler/codegen/x86/lightcg/InstructionGeneration.cpp b/vm/compiler/codegen/x86/lightcg/InstructionGeneration.cpp
+index 65336c2..e8b81b3 100644
+--- a/vm/compiler/codegen/x86/lightcg/InstructionGeneration.cpp
++++ b/vm/compiler/codegen/x86/lightcg/InstructionGeneration.cpp
+@@ -189,7 +189,7 @@ void genHoistedLowerBoundCheck(CompilationUnit *cUnit, MIR *mir)
+     get_virtual_reg(mir->dalvikInsn.vA, OpndSize_32, P_GPR_1, true); //array
+     export_pc();
+     compare_imm_reg(OpndSize_32, -minC, P_GPR_1, true);
+-    condJumpToBasicBlock(stream, Condition_C, cUnit->exceptionBlockId);
++    condJumpToBasicBlock(stream, Condition_L, cUnit->exceptionBlockId);
+ }
+ #undef P_GPR_1
+ 
+diff --git a/vm/compiler/codegen/x86/pcg/Analysis.cpp b/vm/compiler/codegen/x86/pcg/Analysis.cpp
+index 9e38a14..8e28fe8 100644
+--- a/vm/compiler/codegen/x86/pcg/Analysis.cpp
++++ b/vm/compiler/codegen/x86/pcg/Analysis.cpp
+@@ -798,7 +798,7 @@ bool dvmCompilerPcgNewRegisterizeVRAnalysis (CompilationUnitPCG *cUnit)
+             //Paranoid
+             assert (ssaRep != 0);
+ 
+-            Opcode dalvikOpCode = mir->dalvikInsn.opcode;
++            int dalvikOpCode = mir->dalvikInsn.opcode;
+ 
+             switch (dalvikOpCode)
+             {
+@@ -1471,13 +1471,11 @@ bool dvmCompilerPcgNewRegisterizeVRAnalysis (CompilationUnitPCG *cUnit)
+                     pcgAnalyzeInvokeArgs (cUnit, mir, 0);
+                     break;
+ 
+-                default:
+-                    if ( (ExtendedMIROpcode)dalvikOpCode == kMirOpRegisterize)
+-                    {
+-                        pcgRef (cUnit, ssaRep->uses[0], Any);
+-                        break;
+-                    }
+-                    else if ( (ExtendedMIROpcode)dalvikOpCode == kMirOpPhi)
++                case kMirOpRegisterize:
++                    pcgRef (cUnit, ssaRep->uses[0], Any);
++                    break;
++
++                case kMirOpPhi:
+                     {
+                         // Use the result's SSA Num for all operands of the phi.
+                         int ssaNum = ssaRep->defs[0];
+@@ -1489,15 +1487,35 @@ bool dvmCompilerPcgNewRegisterizeVRAnalysis (CompilationUnitPCG *cUnit)
+                             pcgRef (cUnit, ssaRep->uses[i], Any);
+                             pcgMergeSSANums (cUnit, ssaRep->uses[i], ssaNum);
+                         }
+-                        break;
+                     }
+-                    else if ( (ExtendedMIROpcode)dalvikOpCode == kMirOpCheckInlinePrediction)
+-                    {
+-                        // Reference the "this" pointer
+-                        pcgRef (cUnit, ssaRep->uses[0], INTreg, true);
+-                        break;
++                    break;
++
++                case kMirOpCheckInlinePrediction:
++                    // Reference the "this" pointer
++                    pcgRef (cUnit, ssaRep->uses[0], INTreg, true);
++                    break;
++
++                case kMirOpLowerBound:
++                case kMirOpNullCheck:
++                    pcgRef (cUnit, ssaRep->uses[0], INTreg);
++                    break;
++
++                case kMirOpNullNRangeUpCheck:
++                case kMirOpNullNRangeDownCheck:
++                    pcgRef (cUnit, ssaRep->uses[0], INTreg);
++                    pcgRef (cUnit, ssaRep->uses[1], INTreg);
++                    break;
++
++                case kMirOpBoundCheck:
++                    // kMirOpBoundCheck is special, because the index being
++                    // checked might either be specified as a constant or a VR.
++                    pcgRef (cUnit, ssaRep->uses[0], INTreg);
++                    if (ssaRep->numUses > 1) {
++                        pcgRef (cUnit, ssaRep->uses[1], INTreg);
+                     }
++                    break;
+ 
++                default:
+                     ALOGI ("Unsupported instruction in trace for new registerization:");
+                     char mybuf[2048];
+                     dvmCompilerExtendedDisassembler (cUnit, mir, &mir->dalvikInsn, mybuf, sizeof (mybuf));
+diff --git a/vm/compiler/codegen/x86/pcg/Android.mk b/vm/compiler/codegen/x86/pcg/Android.mk
+index 886cbe4..ff3767c 100644
+--- a/vm/compiler/codegen/x86/pcg/Android.mk
++++ b/vm/compiler/codegen/x86/pcg/Android.mk
+@@ -53,6 +53,7 @@ LOCAL_SRC_FILES := \
+     LowerALU.cpp \
+     LowerArray.cpp \
+     LowerCall.cpp \
++    LowerExtended.cpp \
+     LowerGetPut.cpp \
+     LowerJump.cpp \
+     LowerMemory.cpp \
+@@ -113,6 +114,7 @@ ifeq ($(WITH_HOST_DALVIK),true)
+         LowerALU.cpp \
+         LowerArray.cpp \
+         LowerCall.cpp \
++        LowerExtended.cpp \
+         LowerGetPut.cpp \
+         LowerJump.cpp \
+         LowerMemory.cpp \
+diff --git a/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp b/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
+index 1f6a7c1..87a7934 100644
+--- a/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
++++ b/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
+@@ -29,6 +29,7 @@
+ #include "LowerALU.h"
+ #include "LowerArray.h"
+ #include "LowerCall.h"
++#include "LowerExtended.h"
+ #include "LowerGetPut.h"
+ #include "LowerJump.h"
+ #include "LowerMemory.h"
+@@ -78,6 +79,26 @@ static bool dvmCompilerPcgTranslateInsn (CompilationUnitPCG *cUnit, MIR *mir)
+                 dvmCompilerPcgTranslatePredictionInlineCheck (cUnit, mir);
+                 break;
+ 
++            case kMirOpLowerBound:
++                dvmCompilerPcgTranslateLowerBoundCheck (cUnit, mir);
++                break;
++
++            case kMirOpBoundCheck:
++                dvmCompilerPcgTranslateBoundCheck (cUnit, mir);
++                break;
++
++            case kMirOpNullCheck:
++                dvmCompilerPcgTranslateNullCheck (cUnit, mir);
++                break;
++
++            case kMirOpNullNRangeUpCheck:
++                dvmCompilerPcgTranslateLoopChecks (cUnit, mir, true);
++                break;
++
++            case kMirOpNullNRangeDownCheck:
++                dvmCompilerPcgTranslateLoopChecks (cUnit, mir, false);
++                break;
++
+             default:
+                 LOGE ("Jit (PCG): unsupported externded MIR opcode");
+                 assert (0);
+diff --git a/vm/compiler/codegen/x86/pcg/LowerExtended.cpp b/vm/compiler/codegen/x86/pcg/LowerExtended.cpp
+new file mode 100644
+index 0000000..75f61df
+--- /dev/null
++++ b/vm/compiler/codegen/x86/pcg/LowerExtended.cpp
+@@ -0,0 +1,126 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "ChainingCellException.h"
++#include "CompilationUnitPCG.h"
++#include "CompilerIR.h"
++#include "Dataflow.h"
++#include "LowerExtended.h"
++#include "LowerMemory.h"
++#include "UtilityPCG.h"
++
++/*
++ * uses[0] = idxReg;
++ * vB = minC;
++ */
++void dvmCompilerPcgTranslateLowerBoundCheck (CompilationUnitPCG *cUnit, MIR *mir)
++{
++    // Get the SSARepresentation
++    SSARepresentation *ssaRep = mir->ssaRep;
++    assert (ssaRep != 0);
++
++    CGInst arrayIndex = dvmCompilerPcgGetVirtualReg (cUnit, ssaRep->uses[0], "mov", 4);
++    CGInst minC = CGCreateNewInst ("movi", "i", -mir->dalvikInsn.vB);
++    CGLabel boundCheckPassedLabel = CGCreateLabel ();
++    CGCreateNewInst ("cjcc", "rcrbp", arrayIndex, "sge", minC, boundCheckPassedLabel, 100);
++    dvmCompilerPcgGenerateRaiseException (cUnit);
++    CGBindLabel (boundCheckPassedLabel);
++}
++
++/**
++ * uses[0] arrayReg
++ * arg[0] -> determines whether it is a constant or a register
++ * arg[1] -> constant, if applicable
++ * uses[1] indexReg, if applicable
++ *
++ * Generate code to check idx < 0 || idx >= array.length.
++ */
++void dvmCompilerPcgTranslateBoundCheck (CompilationUnitPCG *cUnit, MIR *mir)
++{
++    // Get the SSARepresentation
++    SSARepresentation *ssaRep = mir->ssaRep;
++    assert (ssaRep != 0);
++
++    CGInst array = dvmCompilerPcgGetVirtualReg (cUnit, ssaRep->uses[0], "mov", 4);
++    CGInst index;
++
++    if (mir->dalvikInsn.arg[0] == MIR_BOUND_CHECK_REG) {
++        index = dvmCompilerPcgGetVirtualReg (cUnit, ssaRep->uses[1], "mov", 4);
++    }
++    else {
++        index = CGCreateNewInst ("mov", "i", mir->dalvikInsn.arg[1]);
++    }
++
++    CGLabel upperBoundCheckPassedLabel = CGCreateLabel ();
++    CGLabel checkFailedLabel = CGCreateLabel ();
++
++    CGInst arrayLength = dvmCompilerPcgCreateSimpleLoad (array, OFFSETOF_MEMBER(ArrayObject, length));
++    CGCreateNewInst("cjcc", "rcrbp", index, "slt", arrayLength, upperBoundCheckPassedLabel, 100);
++    CGBindLabel(checkFailedLabel);
++    dvmCompilerPcgGenerateRaiseException (cUnit);
++
++    CGBindLabel (upperBoundCheckPassedLabel);
++    CGInst zero = CGCreateNewInst ("mov", "i", 0);
++    CGCreateNewInst("cjcc", "rcrbp", index, "slt", zero, checkFailedLabel, 0);
++}
++
++void dvmCompilerPcgTranslateNullCheck (CompilationUnitPCG *cUnit, MIR *mir)
++{
++    // Get the SSARepresentation
++    SSARepresentation *ssaRep = mir->ssaRep;
++    assert (ssaRep != 0);
++
++    CGInst object = dvmCompilerPcgGetVirtualReg (cUnit, ssaRep->uses[0], "mov", 4);
++    dvmCompilerPcgGenerateNullCheck (cUnit, object, mir);
++}
++
++/*
++ * uses[0] = arrayReg;
++ * uses[1] = indexReg;
++ * arg[0] = maxC
++ * arg[1] = minC
++ * arg[2] = loopBranchConditionCode
++ */
++void dvmCompilerPcgTranslateLoopChecks (CompilationUnitPCG *cUnit, MIR *mir, bool countUp)
++{
++    //Get the SSARepresentation
++    SSARepresentation *ssaRep = mir->ssaRep;
++    assert (ssaRep != 0);
++    CGLabel nullCheckPassedLabel = CGCreateLabel ();
++    CGLabel checkFailedLabel = CGCreateLabel ();
++
++    CGInst array = dvmCompilerPcgGetVirtualReg (cUnit, ssaRep->uses[0], "mov", 4);
++    CGInst zero = CGCreateNewInst ("movi", "i", 0);
++
++    // Generate the null check explicitly rather than calling dvmCompilerPcgGenerateNullCheck
++    // to do it.  That way, we can reuse the block that raises the exception.
++
++    CGCreateNewInst ("cjcc", "rcrbp", array, "ne", zero, nullCheckPassedLabel, 100);
++    CGBindLabel (checkFailedLabel);
++    dvmCompilerPcgGenerateRaiseException (cUnit);
++    CGBindLabel (nullCheckPassedLabel);
++
++    CGInst startIndex = dvmCompilerPcgGetVirtualReg (cUnit, ssaRep->uses[1], "mov", 4);
++    int maxC = mir->dalvikInsn.arg[0];
++    // If the loop end condition is ">=" instead of ">", then the largest value
++    // of the index is "endCondition - 1".
++    if (countUp && mir->dalvikInsn.arg[2] == OP_IF_GE) {
++        maxC--;
++    }
++    CGInst endIndex = CGCreateNewInst ("add", "ri", startIndex, maxC);
++    CGInst arrayLength = dvmCompilerPcgCreateSimpleLoad (array, OFFSETOF_MEMBER(ArrayObject, length));
++    CGCreateNewInst ("cjcc", "rcrbp", endIndex, "uge", arrayLength, checkFailedLabel, 0);
++}
+diff --git a/vm/compiler/codegen/x86/pcg/LowerExtended.h b/vm/compiler/codegen/x86/pcg/LowerExtended.h
+new file mode 100644
+index 0000000..eb19f82
+--- /dev/null
++++ b/vm/compiler/codegen/x86/pcg/LowerExtended.h
+@@ -0,0 +1,53 @@
++/*
++ * Copyright  (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0  (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef H_LOWEREXTENDED
++#define H_LOWEREXTENDED
++
++// Forward declarations
++class CompilationUnitPCG;
++struct MIR;
++
++/**
++ * @brief Translate a lower bound check instruction
++ * @param cUnit the CompilationUnitPCG
++ * @param mir the MIR instruction
++ */
++void dvmCompilerPcgTranslateLowerBoundCheck (CompilationUnitPCG *cUnit, MIR *mir);
++
++/**
++ * @brief Translate a bound check instruction
++ * @param cUnit the CompilationUnitPCG
++ * @param mir the MIR instruction
++ */
++void dvmCompilerPcgTranslateBoundCheck (CompilationUnitPCG *cUnit, MIR *mir);
++
++/**
++ * @brief Translate a null check instruction
++ * @param cUnit the CompilationUnitPCG
++ * @param mir the MIR instruction
++ */
++void dvmCompilerPcgTranslateNullCheck (CompilationUnitPCG *cUnit, MIR *mir);
++
++/**
++ * @brief Translate safety checks for array accesses in a loop.
++ * @param cUnit the CompilationUnitPCG
++ * @param mir the MIR instruction
++ * @param countUp distinguishes between countUp and countDown loops.
++ */
++void dvmCompilerPcgTranslateLoopChecks (CompilationUnitPCG *cUnit, MIR *mir, bool countUp);
++
++#endif // H_LOWEREXTENDED
+diff --git a/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp b/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp
+index 1fee975..89306cd 100644
+--- a/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp
++++ b/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp
+@@ -525,6 +525,26 @@ bool dvmCompilerPcgSupportTrace (CompilationUnit *cUnit)
+                     break;
+             }
+ 
++            if (dalvikOpCode >= kNumPackedOpcodes) {
++                // Use an opt-in approach for extended MIRs.
++                switch ( (ExtendedMIROpcode) dalvikOpCode) {
++                    // The are the PCG-supported extended MIR bytecodes.
++                    case kMirOpPhi:
++                    case kMirOpRegisterize:
++                    case kMirOpCheckInlinePrediction:
++                    case kMirOpLowerBound:
++                    case kMirOpBoundCheck:
++                    case kMirOpNullCheck:
++                    case kMirOpNullNRangeUpCheck:
++                    case kMirOpNullNRangeDownCheck:
++                        break;
++
++                    default:
++                        faultyMIR = mir;
++                        break;
++                }
++            }
++
+             if (faultyMIR != 0)
+             {
+                 traceOk = false;
+-- 
+1.7.4.1
+

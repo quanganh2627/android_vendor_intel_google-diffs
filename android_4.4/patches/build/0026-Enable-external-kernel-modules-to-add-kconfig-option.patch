@@ -1,0 +1,253 @@
+From ad3e2b58df46bed23fb79e323bd9d5e9064943e6 Mon Sep 17 00:00:00 2001
+From: Hans Odeberg <hans.odeberg@intel.com>
+Date: Mon, 25 Nov 2013 10:39:00 +0100
+Subject: Enable external kernel modules to add kconfig options
+
+Some kernel drivers that have earlier been compiled from within
+the kernel tree, but have now been moved outside the tree,
+have Kconfig files defining additional kconfig options.
+These options can not be added to the kernel .config using
+mixin overlay files, as make allnoconfig will remove any
+options defined outside the kernel tree.
+In this patch, basic support is added for using additional
+kconfig options in external modules.
+The syntax in the external module Android.mk file is changed:
+LOCAL_PATH := $(call my-dir)
+include $(CLEAR_VARS)
+LOCAL_MODULE := <module name>
+LOCAL_MODULE_PATH := $(LOCAL_PATH)
+LOCAL_KCONFIG_OVERRIDE_FILES := config_flags.txt
+include $(BUILD_EXTERNAL_KERNEL_MODULE)
+
+The variable LOCAL_KCONFIG_OVERRIDE_FILES variable is optional.
+When present, it points to a set of files containing kconfig
+option assignments. Example content of config_flags.txt:
+CONFIG_MYFLAG=y
+CONFIG_MY_OTHER_FLAG_n
+The external module Makefile may then use these local config
+flags like any other config flags. Example:
+obj-$(CONFIG_MYFLAG) += myfile.o
+
+The implementation is currently very basic. If the variable
+LOCAL_KCONFIG_OVERRIDE_FILES is non-empty, additional
+make rules are set up to create and use a .config file
+in the external module build directory which contains
+the concatentation of the kernel .config file and the
+local config files.
+
+Not an upstream candidate, as the whole build-kernel-from-Android
+framework which this is based on is not upstreamed.
+
+Change-Id: I0744273e116c2b461be0369e4654b71ee4e0afae
+Issue: APDEV-595
+Category: AOSP Enhancement
+Domain: AOSP-build
+Upstream-Candidate: no
+Signed-off-by: Hans Odeberg <hans.odeberg@intel.com>
+---
+ core/build_lkm.mk   |   51 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ core/clear_vars.mk  |    2 ++
+ core/config.mk      |    1 +
+ core/definitions.mk |    9 +++++++++
+ core/kernel.mk      |   31 ++++++++++++++-----------------
+ 5 files changed, 77 insertions(+), 17 deletions(-)
+ create mode 100644 core/build_lkm.mk
+
+diff --git a/core/build_lkm.mk b/core/build_lkm.mk
+new file mode 100644
+index 0000000..8153505
+--- /dev/null
++++ b/core/build_lkm.mk
+@@ -0,0 +1,51 @@
++# Defines how to build a Linux external kernel module
++
++
++# The source tree currently has at least one kernel tree which contains
++# symlinks to external drivers. This leads to the Android.mk
++# files in those directories being read more than once. Thus an
++# exclusion guard is needed.
++ifeq ($($(LOCAL_MODULE)_EXCLUSION_GUARD),)
++$(LOCAL_MODULE)_EXCLUSION_GUARD := true
++
++ext_mod_dir := $(PRODUCT_KERNEL_OUTPUT)/extmods/$(LOCAL_MODULE_PATH)
++ext_mod_file := $(ext_mod_dir)/.sentinel
++
++ifneq ($(firstword $(LOCAL_KCONFIG_OVERRIDE_FILES)),)
++# As the module has some extra CONFIG parameters, a new
++# .config file must be created and used during build.
++
++local_config_files := $(addprefix $(LOCAL_MODULE_PATH)/,$(LOCAL_KCONFIG_OVERRIDE_FILES))
++
++ext_cfg_file :=	$(PRODUCT_KERNEL_OUTPUT)/extmods/$(LOCAL_MODULE_PATH)/.config
++
++$(ext_cfg_file): $(local_config_files)
++	$(hide) mkdir -p $(@D)
++	$(hide) cat $^ > $@
++
++$(ext_mod_file): $(ext_cfg_file)
++$(ext_mod_file): PRIVATE_CONFIG_PATH:=KCONFIG_CONFIG=$(ext_cfg_file)
++
++else
++# Use the unmodified kernel config file
++$(ext_mod_file): PRIVATE_CONFIG_PATH:=
++endif
++
++# Define build of this module here, separately,
++# to ensure it gets the appropriate config file.
++# FIXME Workaround due to lack of simultaneous support of M= and O=; copy the
++# source into an intermediate directory and compile it there, preserving
++# timestamps so code is only rebuilt if it changes.
++$(ext_mod_file): private_src_dir:=$(LOCAL_MODULE_PATH)
++$(ext_mod_file): $(INSTALLED_KERNEL_TARGET) FORCE
++	$(hide) mkdir -p $(@D)
++	$(hide) $(ACP) -rtf $(private_src_dir)/* $(@D)
++	$(mk_kernel) M=$(@D)   modules
++	touch $@
++
++# Add module to list of modules to install. This must
++# be done in one place in a for loop, as the
++# install modifies common files.
++EXTERNAL_KERNEL_MODULES_TO_INSTALL += $(ext_mod_file)
++
++endif
+diff --git a/core/clear_vars.mk b/core/clear_vars.mk
+index 399e8ed..8607a20 100644
+--- a/core/clear_vars.mk
++++ b/core/clear_vars.mk
+@@ -143,6 +143,8 @@ LOCAL_PREBUILT_MODULE_FILE:=
+ LOCAL_POST_INSTALL_CMD:=
+ LOCAL_DIST_BUNDLED_BINARIES:=
+ LOCAL_HAL_STATIC_LIBRARIES:=
++LOCAL_KCONFIG_OVERRIDE_FILES :=
++
+ 
+ # Trim MAKEFILE_LIST so that $(call my-dir) doesn't need to
+ # iterate over thousands of entries every time.
+diff --git a/core/config.mk b/core/config.mk
+index 66e3b71..ffe7402 100644
+--- a/core/config.mk
++++ b/core/config.mk
+@@ -81,6 +81,7 @@ BUILD_HOST_NATIVE_TEST := $(BUILD_SYSTEM)/host_native_test.mk
+ BUILD_NOTICE_FILE := $(BUILD_SYSTEM)/notice_files.mk
+ BUILD_PREBUILT_BUNDLE_CREATE := $(BUILD_SYSTEM)/prebuilt_bundle_create.mk
+ BUILD_PREBUILT_BUNDLE := $(BUILD_SYSTEM)/prebuilt_bundle.mk
++BUILD_EXTERNAL_KERNEL_MODULE := $(BUILD_SYSTEM)/build_lkm.mk
+ 
+ -include cts/build/config.mk
+ 
+diff --git a/core/definitions.mk b/core/definitions.mk
+index 290bb2f..f5204ac 100644
+--- a/core/definitions.mk
++++ b/core/definitions.mk
+@@ -90,6 +90,15 @@ HOST_DEPENDENCIES_ON_SHARED_LIBRARIES :=
+ # They are escaped and quoted so can be passed safely to a bash command.
+ ANDROID_RESOURCE_GENERATED_CLASSES := 'R.class' 'R$$*.class' 'Manifest.class' 'Manifest$$*.class'
+ 
++
++# Path to kernel module build directory
++PRODUCT_KERNEL_OUTPUT := $(CURDIR)/$(TARGET_OUT_INTERMEDIATES)/kernel
++
++# List of external kernel modules
++EXTERNAL_KERNEL_MODULES_TO_INSTALL :=
++
++
++
+ ###########################################################
+ ## Debugging; prints a variable list to stdout
+ ###########################################################
+diff --git a/core/kernel.mk b/core/kernel.mk
+index a1cb518..7f09802 100644
+--- a/core/kernel.mk
++++ b/core/kernel.mk
+@@ -82,14 +82,13 @@ endif
+ TARGET_KERNEL_SOURCE ?= kernel
+ 
+ kernel_script_deps := $(foreach s,$(TARGET_KERNEL_SCRIPTS),$(TARGET_KERNEL_SOURCE)/scripts/$(s))
+-kbuild_output := $(CURDIR)/$(TARGET_OUT_INTERMEDIATES)/kernel
+ script_output := $(CURDIR)/$(TARGET_OUT_INTERMEDIATES)/kscripts
+ modbuild_output := $(CURDIR)/$(TARGET_OUT_INTERMEDIATES)/kernelmods
+ 
+ # Leading "+" gives child Make access to the jobserver.
+ # Be sure to have CONFIG_KERNEL_MINIGZIP enabled or your
+ # incremental OTA binary diffs will be very large.
+-mk_kernel := + $(hide) $(MAKE) -C $(TARGET_KERNEL_SOURCE)  O=$(kbuild_output) ARCH=$(TARGET_KERNEL_ARCH) $(if $(SHOW_COMMANDS),V=1) KCFLAGS="$(TARGET_KERNEL_EXTRA_CFLAGS)"
++mk_kernel := + $(hide) $(MAKE) -C $(TARGET_KERNEL_SOURCE)  O=$(PRODUCT_KERNEL_OUTPUT) ARCH=$(TARGET_KERNEL_ARCH) $(if $(SHOW_COMMANDS),V=1) KCFLAGS="$(TARGET_KERNEL_EXTRA_CFLAGS)"
+ ifneq ($(TARGET_KERNEL_CROSS_COMPILE),false)
+   ifneq ($(TARGET_KERNEL_TOOLS_PREFIX),)
+     ifneq ($(USE_CCACHE),)
+@@ -115,9 +114,9 @@ kernel_fw_enabled = $(shell grep ^CONFIG_FIRMWARE_IN_KERNEL=y $(kernel_config_fi
+ 
+ # signed kernel modules
+ kernel_signed_mod_enabled = $(shell grep ^CONFIG_MODULE_SIG=y $(kernel_config_file))
+-kernel_genkey := $(kbuild_output)/x509.genkey
+-kernel_private_key := $(kbuild_output)/signing_key.priv
+-kernel_public_key := $(kbuild_output)/signing_key.x509
++kernel_genkey := $(PRODUCT_KERNEL_OUTPUT)/x509.genkey
++kernel_private_key := $(PRODUCT_KERNEL_OUTPUT)/signing_key.priv
++kernel_public_key := $(PRODUCT_KERNEL_OUTPUT)/signing_key.x509
+ kernel_key_deps := $(if kernel_signed_mod_enabled,$(kernel_private_key) $(kernel_public_key))
+ 
+ $(kernel_public_key): $(TARGET_MODULE_KEY_PAIR).x509.pem $(kernel_genkey)
+@@ -132,49 +131,47 @@ $(kernel_genkey): $(TARGET_MODULE_GENKEY) | $(ACP)
+ # The actual .config that is in use during the build is derived from
+ # a base $kernel_config_file, plus a a list of config overrides which
+ # are processed in order.
+-kernel_dotconfig_file := $(kbuild_output)/.config
++kernel_dotconfig_file := $(PRODUCT_KERNEL_OUTPUT)/.config
+ $(kernel_dotconfig_file): $(kernel_config_file) $(TARGET_KERNEL_CONFIG_OVERRIDES) | $(ACP)
+ 	$(hide) mkdir -p $(dir $@)
+ 	build/tools/build-defconfig.py $^ > $@
+ 
+-built_kernel_target := $(kbuild_output)/arch/$(TARGET_ARCH)/boot/$(KERNEL_TARGET)
++built_kernel_target := $(PRODUCT_KERNEL_OUTPUT)/arch/$(TARGET_ARCH)/boot/$(KERNEL_TARGET)
+ 
+ # Declared .PHONY to force a rebuild each time. We can't tell if the kernel
+ # sources have changed from this context
+ .PHONY : $(INSTALLED_KERNEL_TARGET)
+ 
+ $(INSTALLED_KERNEL_TARGET): $(kernel_dotconfig_file) $(kernel_key_deps) $(MINIGZIP) | $(ACP)
+-	$(hide) rm -f $(kbuild_output)/.config.old
++	$(hide) rm -f $(PRODUCT_KERNEL_OUTPUT)/.config.old
+ 	$(mk_kernel) oldnoconfig
+ 	$(mk_kernel) $(KERNEL_TARGET) $(if $(kernel_mod_enabled),modules)
+ 	$(hide) $(ACP) -fp $(built_kernel_target) $@
+ 
+ $(INSTALLED_SYSTEM_MAP): $(INSTALLED_KERNEL_TARGET) | $(ACP)
+-	$(hide) $(ACP) $(kbuild_output)/System.map $@
++	$(hide) $(ACP) $(PRODUCT_KERNEL_OUTPUT)/System.map $@
+ 
+-# FIXME Workaround due to lack of simultaneous support of M= and O=; copy the
+-# source into an intermediate directory and compile it there, preserving
+-# timestamps so code is only rebuilt if it changes.
+ # Extra newline intentional to prevent calling foreach from concatenating
+ # into a single line
+ # FIXME: Need to extend this so that all external modules are not built by
+ # default, need to define them each as an Android module and include them as
+ # needed in PRODUCT_PACKAGES
+ define make-ext-module
+-	$(hide) mkdir -p $(kbuild_output)/extmods/$(1)
+-	$(hide) $(ACP) -rtf $(1)/* $(kbuild_output)/extmods/$(1)
+-	$(mk_kernel) M=$(kbuild_output)/extmods/$(1) INSTALL_MOD_PATH=$(2) modules
+-	$(mk_kernel) M=$(kbuild_output)/extmods/$(1) INSTALL_MOD_PATH=$(2) modules_install
++	$(mk_kernel) M=$(1) INSTALL_MOD_PATH=$(2) modules_install
+ 
+ endef
+ 
+ define make-modules
+ 	$(mk_kernel) INSTALL_MOD_PATH=$(1) modules_install
+-	$(foreach item,$(EXTERNAL_KERNEL_MODULES),$(call make-ext-module,$(item),$(1)))
++	$(foreach item,$(dir $(EXTERNAL_KERNEL_MODULES_TO_INSTALL)),$(call make-ext-module,$(item),$(1)))
+ 	$(hide) rm -f $(1)/lib/modules/*/{build,source}
+ 	$(hide) cd $(1)/lib/modules && find -type f -print0 | xargs -t -0 -I{} mv {} .
+ endef
+ 
++ifneq ($(kernel_mod_enabled),)
++$(INSTALLED_MODULES_TARGET): $(EXTERNAL_KERNEL_MODULES_TO_INSTALL)
++endif
++
+ $(INSTALLED_MODULES_TARGET): $(INSTALLED_KERNEL_TARGET) $(MINIGZIP) | $(ACP)
+ 	$(hide) rm -rf $(modbuild_output)/lib/modules
+ 	$(hide) mkdir -p $(modbuild_output)/lib/modules
+-- 
+1.7.4.1
+

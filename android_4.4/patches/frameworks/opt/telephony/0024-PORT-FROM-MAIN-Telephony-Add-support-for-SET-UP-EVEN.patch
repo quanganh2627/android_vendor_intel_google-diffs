@@ -1,0 +1,511 @@
+From 52bc1325218a6ef89bb7979b2ab6c6681b6ef30e Mon Sep 17 00:00:00 2001
+From: Guillaume Lucas <guillaume.lucas@intel.com>
+Date: Fri, 20 Sep 2013 12:46:32 +0300
+Subject: [PORT FROM MAIN] Telephony: Add support for SET UP EVENT LIST
+
+BZ: 70855
+
+This patch includes the following changes:
+
+- Adds the support for handling of
+  SET UP EVENT LIST proactive command.
+- Adds onEventDownload callback function
+  for STK app to pass the event to CAT.
+- Adds isEventDownloadActive function
+  for STK app to check whether an event
+  download is active for the given
+  event.
+
+Change-Id: I6fce1934ff03fc050f9a0a3c189ae038627b07fe
+Orig-Change-Id: Ibe7693f79ca78bf6f2fa832f36610ec8d85c49c6
+Category: device enablement
+Domain: Telephony-Telephony-FWK
+Origin: internal
+Upstream-Candidate: no, prorietary
+Signed-off-by: Guillaume Lucas <guillaume.lucas@intel.com>
+Signed-off-by: Arun Ravindran <arun.ravindran@intel.com>
+---
+ .../internal/telephony/cat/AppInterface.java       |   10 ++
+ .../internal/telephony/cat/CatCmdMessage.java      |   26 +++++
+ .../internal/telephony/cat/CatEventMessage.java    |   58 ++++++++++
+ .../internal/telephony/cat/CatResponseMessage.java |    6 +
+ .../android/internal/telephony/cat/CatService.java |  119 +++++++++++++++++++-
+ .../internal/telephony/cat/CommandParams.java      |    9 ++
+ .../telephony/cat/CommandParamsFactory.java        |   35 ++++++
+ .../android/internal/telephony/cat/EventCode.java  |   64 +++++++++++
+ 8 files changed, 324 insertions(+), 3 deletions(-)
+ create mode 100644 src/java/com/android/internal/telephony/cat/CatEventMessage.java
+ create mode 100644 src/java/com/android/internal/telephony/cat/EventCode.java
+
+diff --git a/src/java/com/android/internal/telephony/cat/AppInterface.java b/src/java/com/android/internal/telephony/cat/AppInterface.java
+index e96eebe..2daf599 100644
+--- a/src/java/com/android/internal/telephony/cat/AppInterface.java
++++ b/src/java/com/android/internal/telephony/cat/AppInterface.java
+@@ -47,6 +47,16 @@ public interface AppInterface {
+     void onCmdResponse(CatResponseMessage resMsg);
+ 
+     /*
++     * Returns true - Event download active for the given event.
++     */
++    boolean isEventDownloadActive(int event);
++
++    /*
++     * Callback function from app to telephony to pass a event to the SIM.
++     */
++    void onEventDownload(CatEventMessage eventMsg);
++
++    /*
+      * Enumeration for representing "Type of Command" of proactive commands.
+      * Those are the only commands which are supported by the Telephony. Any app
+      * implementation should support those.
+diff --git a/src/java/com/android/internal/telephony/cat/CatCmdMessage.java b/src/java/com/android/internal/telephony/cat/CatCmdMessage.java
+index 4e06f60..a1ff846 100644
+--- a/src/java/com/android/internal/telephony/cat/CatCmdMessage.java
++++ b/src/java/com/android/internal/telephony/cat/CatCmdMessage.java
+@@ -33,6 +33,7 @@ public class CatCmdMessage implements Parcelable {
+     private BrowserSettings mBrowserSettings = null;
+     private ToneSettings mToneSettings = null;
+     private CallSettings mCallSettings = null;
++    private byte[] mEventList = null;
+ 
+     /*
+      * Container for Launch Browser command settings.
+@@ -97,7 +98,10 @@ public class CatCmdMessage implements Parcelable {
+             break;
+         case PROVIDE_LOCAL_INFORMATION:
+         case REFRESH:
++            break;
+         case SET_UP_EVENT_LIST:
++            mEventList = ((EventListParams) cmdParams).eventList;
++            break;
+         default:
+             break;
+         }
+@@ -122,6 +126,14 @@ public class CatCmdMessage implements Parcelable {
+             mCallSettings.confirmMsg = in.readParcelable(null);
+             mCallSettings.callMsg = in.readParcelable(null);
+             break;
++        case SET_UP_EVENT_LIST:
++            mEventList = null;
++            int len = in.readInt();
++            if (len > 0) {
++                mEventList = new byte[len];
++                in.readByteArray(mEventList);
++            }
++            break;
+         default:
+             break;
+         }
+@@ -145,6 +157,16 @@ public class CatCmdMessage implements Parcelable {
+             dest.writeParcelable(mCallSettings.confirmMsg, 0);
+             dest.writeParcelable(mCallSettings.callMsg, 0);
+             break;
++        case SET_UP_EVENT_LIST:
++            int len = 0;
++            if (mEventList != null) {
++                len = mEventList.length;
++            }
++            dest.writeInt(len);
++            if (len > 0) {
++                dest.writeByteArray(mEventList);
++            }
++            break;
+         default:
+             break;
+         }
+@@ -195,4 +217,8 @@ public class CatCmdMessage implements Parcelable {
+     public CallSettings getCallSettings() {
+         return mCallSettings;
+     }
++
++    public byte[] getEventList() {
++        return mEventList;
++    }
+ }
+diff --git a/src/java/com/android/internal/telephony/cat/CatEventMessage.java b/src/java/com/android/internal/telephony/cat/CatEventMessage.java
+new file mode 100644
+index 0000000..7987af9
+--- /dev/null
++++ b/src/java/com/android/internal/telephony/cat/CatEventMessage.java
+@@ -0,0 +1,58 @@
++/*
++ * Copyright (C) 2010 Giesecke & Devrient GmbH
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.internal.telephony.cat;
++
++public class CatEventMessage {
++    private int mEvent = 0;
++    private int mSourceId = CatService.DEV_ID_TERMINAL;
++    private int mDestId = CatService.DEV_ID_UICC;
++    private byte[] mAdditionalInfo = null;
++    private boolean mOneShot = false;
++
++    public CatEventMessage(int event, int sourceId, int destId, byte[] additionalInfo,
++            boolean oneShot) {
++        this.mEvent = event;
++        this.mSourceId = sourceId;
++        this.mDestId = destId;
++        this.mAdditionalInfo = additionalInfo;
++        this.mOneShot = oneShot;
++    }
++
++    public CatEventMessage(int event, byte[] additionalInfo, boolean oneShot) {
++        this.mEvent = event;
++        this.mAdditionalInfo = additionalInfo;
++        this.mOneShot = oneShot;
++    }
++
++    public int getEvent() {
++        return mEvent;
++    }
++
++    public int getSourceId() {
++        return mSourceId;
++    }
++
++    public int getDestId() {
++        return mDestId;
++    }
++    public byte[] getAdditionalInfo() {
++        return mAdditionalInfo;
++    }
++    public boolean isOneShot() {
++        return mOneShot;
++    }
++}
+diff --git a/src/java/com/android/internal/telephony/cat/CatResponseMessage.java b/src/java/com/android/internal/telephony/cat/CatResponseMessage.java
+index a3fc04e..946f8e4 100644
+--- a/src/java/com/android/internal/telephony/cat/CatResponseMessage.java
++++ b/src/java/com/android/internal/telephony/cat/CatResponseMessage.java
+@@ -25,6 +25,12 @@ public class CatResponseMessage {
+         boolean mUsersConfirm = false;
+         boolean mIncludeAdditionalInfo = false;
+         int mAdditionalInfo = 0;
++        String mEnvelopeCmd;
++
++        public CatResponseMessage(String envCmd) {
++            this.mEnvelopeCmd = envCmd;
++        }
++
+         public CatResponseMessage(CatCmdMessage cmdMsg) {
+             mCmdDet = cmdMsg.mCmdDet;
+         }
+diff --git a/src/java/com/android/internal/telephony/cat/CatService.java b/src/java/com/android/internal/telephony/cat/CatService.java
+index 3972a49..248d3e1 100644
+--- a/src/java/com/android/internal/telephony/cat/CatService.java
++++ b/src/java/com/android/internal/telephony/cat/CatService.java
+@@ -81,6 +81,7 @@ public class CatService extends Handler implements AppInterface {
+     private Context mContext;
+     private CatCmdMessage mCurrntCmd = null;
+     private CatCmdMessage mMenuCmd = null;
++    private byte[] mEventList = null;
+ 
+     private RilMessageDecoder mMsgDecoder = null;
+     private boolean mStkAppInstalled = false;
+@@ -100,9 +101,11 @@ public class CatService extends Handler implements AppInterface {
+     private static final int MSG_ID_ICC_RECORDS_LOADED       = 20;
+ 
+     private static final int DEV_ID_KEYPAD      = 0x01;
+-    private static final int DEV_ID_UICC        = 0x81;
+-    private static final int DEV_ID_TERMINAL    = 0x82;
+-    private static final int DEV_ID_NETWORK     = 0x83;
++    public static final int DEV_ID_DISPLAY      = 0x02;
++    public static final int DEV_ID_EARPIECE     = 0x03;
++    public static final int DEV_ID_UICC        = 0x81;
++    public static final int DEV_ID_TERMINAL    = 0x82;
++    public static final int DEV_ID_NETWORK     = 0x83;
+ 
+     static final String STK_DEFAULT = "Default Message";
+ 
+@@ -240,6 +243,11 @@ public class CatService extends Handler implements AppInterface {
+                 }
+                 break;
+             case REFRESH:
++                // Invalidate event list if the SIM resets
++                if (cmdParams.mCmdDet.commandQualifier
++                        == CommandParamsFactory.REFRESH_UICC_RESET) {
++                    mEventList = null;
++                }
+                 // ME side only handles refresh commands which meant to remove IDLE
+                 // MODE TEXT.
+                 cmdParams.mCmdDet.typeOfCommand = CommandType.SET_UP_IDLE_MODE_TEXT.value();
+@@ -358,6 +366,20 @@ public class CatService extends Handler implements AppInterface {
+                     sendTerminalResponse(cmdParams.mCmdDet, ResultCode.OK, false, 0, null);
+                 }
+                 break;
++           case SET_UP_EVENT_LIST:
++                // Store eventlist
++                mCurrntCmd = cmdMsg;
++                mEventList = mCurrntCmd.getEventList();
++                if (mEventList != null) {
++                    for (byte b : mEventList) {
++                        CatLog.d(this, "Registered Event: " + b);
++                    }
++                } else {
++                    CatLog.d( this, "WARNING: No Event in event list!" );
++                }
++
++                sendTerminalResponse(cmdParams.mCmdDet, ResultCode.OK, false, 0, null);
++                break;
+             default:
+                 CatLog.d(this, "Unsupported command");
+                 return;
+@@ -606,6 +628,93 @@ public class CatService extends Handler implements AppInterface {
+         return getInstance(null, null, null);
+     }
+ 
++    public boolean isEventDownloadActive(int event) {
++        if (mEventList != null) {
++            for (byte b : mEventList) {
++                if (b == (byte)event) {
++                    return true;
++                }
++            }
++        }
++
++        return false;
++    }
++
++    public void updateEventList(byte event, byte value) {
++        if (mEventList != null) {
++            for (int i = 0; i < mEventList.length; i++) {
++                if (mEventList[i] == event) {
++                    mEventList[i] = value;
++                    break;
++                }
++            }
++        }
++    }
++
++    public void onEventDownload(CatEventMessage eventMsg) {
++        CatLog.d(this, "Download event: " + eventMsg.getEvent());
++        eventDownload(eventMsg.getEvent(),
++                eventMsg.getSourceId(),
++                eventMsg.getDestId(),
++                eventMsg.getAdditionalInfo(),
++                eventMsg.isOneShot());
++    }
++
++    private void eventDownload(int event, int sourceId, int destinationId,
++            byte[] additionalInfo, boolean oneShot) {
++
++        CatLog.d(this, "eventDownload()  "+ event+ "  " + sourceId + " ");
++        // Check if the SIM have subscribed to this event using setup eventlist
++        boolean allowed = isEventDownloadActive((byte)event);
++        if (!allowed) {
++            CatLog.d(this, "(U)SIM has not subscribed for event: " + event);
++            return;
++        }
++
++        if (oneShot) {
++            updateEventList((byte)event, (byte)EventCode.INVALID_EVENT.value());
++        }
++
++        ByteArrayOutputStream buf = new ByteArrayOutputStream();
++
++        // tag
++        int tag = BerTlv.BER_EVENT_DOWNLOAD_TAG;
++        buf.write(tag);
++
++        // length
++        buf.write(0x00); // place holder, assume length < 128.
++
++        // event list
++        tag = ComprehensionTlvTag.EVENT_LIST.value();
++        buf.write(tag);
++        buf.write(0x01); // length
++        buf.write(event); // event value
++
++        // device identities
++        tag = ComprehensionTlvTag.DEVICE_IDENTITIES.value();
++        buf.write(tag);
++        buf.write(0x02); // length
++        buf.write(sourceId); // source device id
++        buf.write(destinationId); // destination device id
++
++        // additional information
++        if (additionalInfo != null) {
++            for (byte b : additionalInfo) {
++                buf.write(b);
++            }
++        }
++
++        byte[] rawData = buf.toByteArray();
++
++        // write real length
++        int len = rawData.length - 2; // minus (tag + length)
++        rawData[1] = (byte) len;
++
++        String hexString = IccUtils.bytesToHexString(rawData);
++
++        mCmdIf.sendEnvelope(hexString, null);
++    }
++
+     @Override
+     public void handleMessage(Message msg) {
+ 
+@@ -678,6 +787,10 @@ public class CatService extends Handler implements AppInterface {
+     }
+ 
+     private void handleCmdResponse(CatResponseMessage resMsg) {
++        if ((resMsg != null) && (resMsg.mEnvelopeCmd != null)) {
++            mCmdIf.sendEnvelope(resMsg.mEnvelopeCmd, null);
++            return;
++        }
+         // Make sure the response details match the last valid command. An invalid
+         // response is a one that doesn't have a corresponding proactive command
+         // and sending it can "confuse" the baseband/ril.
+diff --git a/src/java/com/android/internal/telephony/cat/CommandParams.java b/src/java/com/android/internal/telephony/cat/CommandParams.java
+index 3d9425d..7db768c 100644
+--- a/src/java/com/android/internal/telephony/cat/CommandParams.java
++++ b/src/java/com/android/internal/telephony/cat/CommandParams.java
+@@ -212,3 +212,12 @@ class BIPClientParams extends CommandParams {
+         return false;
+     }
+ }
++
++class EventListParams extends CommandParams {
++    byte[] eventList = null;
++    EventListParams(CommandDetails cmdDet, byte[] eventList) {
++        super(cmdDet);
++        this.eventList = eventList;
++    }
++}
++
+diff --git a/src/java/com/android/internal/telephony/cat/CommandParamsFactory.java b/src/java/com/android/internal/telephony/cat/CommandParamsFactory.java
+index dd7faba..e9a1c3a 100644
+--- a/src/java/com/android/internal/telephony/cat/CommandParamsFactory.java
++++ b/src/java/com/android/internal/telephony/cat/CommandParamsFactory.java
+@@ -183,6 +183,9 @@ class CommandParamsFactory extends Handler {
+              case LANGUAGE_NOTIFICATION:
+                 cmdPending = processLanguageNotification(cmdDet, ctlvs);
+                 break;
++            case SET_UP_EVENT_LIST:
++                 cmdPending = processSetUpEventList(cmdDet, ctlvs);
++                 break;
+             default:
+                 // unsupported proactive commands
+                 mCmdParams = new CommandParams(cmdDet);
+@@ -966,4 +969,36 @@ class CommandParamsFactory extends Handler {
+         }
+         return false;
+     }
++
++    /**
++     * Processes SET_UP_EVENT_LIST proactive command from the SIM card.
++     *
++     * @param cmdDet Command Details object retrieved.
++     * @param ctlvs List of ComprehensionTlv objects following Command Details
++     *        object and Device Identities object within the proactive command
++     * @return true if the command is processing is pending and additional
++     *         asynchronous processing is required.
++     */
++    private boolean processSetUpEventList(CommandDetails cmdDet,
++            List<ComprehensionTlv> ctlvs) {
++
++        CatLog.d(this, "process SetUpEventList");
++        ComprehensionTlv ctlv = searchForTag(ComprehensionTlvTag.EVENT_LIST,ctlvs);
++        if (ctlv != null) {
++            byte[] rawValue = ctlv.getRawValue();
++            int valueIndex = ctlv.getValueIndex();
++            int valueLength = ctlv.getLength();
++            byte[] eventList;
++            if (valueLength > 0 && rawValue.length >= (valueIndex + valueLength)) {
++                eventList = new byte[valueLength];
++                if (eventList != null) {
++                    System.arraycopy(rawValue, valueIndex, eventList, 0, valueLength);
++                }
++            } else {
++                eventList = null;
++            }
++            mCmdParams = new EventListParams(cmdDet, eventList);
++        }
++        return false;
++    }
+ }
+diff --git a/src/java/com/android/internal/telephony/cat/EventCode.java b/src/java/com/android/internal/telephony/cat/EventCode.java
+new file mode 100644
+index 0000000..8e895f5
+--- /dev/null
++++ b/src/java/com/android/internal/telephony/cat/EventCode.java
+@@ -0,0 +1,64 @@
++/*
++ * Copyright (C) 2006 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.internal.telephony.cat;
++/**
++ * Enumeration for the event code in SET UP EVENT LIST and event download.
++ * To get the actual return code for each enum value, call {@link #code() code}
++ * method.
++ *
++ * {@hide}
++ */
++public enum EventCode {
++    MT_CALL(0x00),
++    CALL_CONNECTED(0x01),
++    CALL_DISCONNECTED(0x02),
++    LOACATION_STATUS(0x03),
++    USER_ACTIVITY(0x04),
++    IDLE_SCREEN_AVAILABLE(0x05),
++    CARD_READER_STATUS(0x06),
++    LANGUAGE_SELECTION(0x07),
++    BROWSER_TERMINATION(0x08),
++    DATA_AVAILABLE(0x09),
++    CHANNEL_STATUS(0x0A),
++    NETWORK_SEARCH_MODE_CHANGE(0x0E),
++    HCI_CONNECTIVITY_EVENT(0x13),
++    INVALID_EVENT(0xFF);
++
++    private int mCode;
++
++    EventCode(int code) {
++       mCode = code;
++    }
++
++    /**
++     * Retrieves the actual result code that this object represents.
++     * @return Actual result code
++     */
++   public int value() {
++        return mCode;
++    }
++
++   public static EventCode fromInt(int value) {
++       for (EventCode r : EventCode.values()) {
++            if (r.mCode == value) {
++                return r;
++            }
++        }
++        return null;
++    }
++}
++
+-- 
+1.7.4.1
+

@@ -1,0 +1,176 @@
+From 1ab84a81bf3deac1a57b6a710e9832e544c44d13 Mon Sep 17 00:00:00 2001
+From: Chuanxiao Dong <chuanxiao.dong@intel.com>
+Date: Tue, 27 Nov 2012 16:19:03 +0800
+Subject: [PORT FROM MAIN] vold: change vold so that vold can skip the scan on extend partition
+
+BZ: 47043
+
+Below is the original commit info
+	BZ: 17252
+
+	Using the tool fsck_msdos to check extend partition will cause libc error.
+	Change vold so that vold can skip such partition.
+
+Change-Id: I10c47f13a318ce1b838a965bc3767c90d2ed27f3
+Orig-Change-Id: I9d4832461e39e061f130115ac06fe4e843d85afb
+Signed-off-by: Chuanxiao Dong <chuanxiao.dong@intel.com>
+Reviewed-on: http://android.intel.com:8080/76535
+Reviewed-by: Yao, Yong <yong.yao@intel.com>
+Tested-by: Sun, Jianhua <jianhua.sun@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+---
+ DirectVolume.h |    2 +-
+ Fat.cpp        |   35 +++++++++++++++++++++++++++++++++++
+ Fat.h          |    1 +
+ Volume.cpp     |   22 ++++++++++++++++++----
+ Volume.h       |    3 +++
+ 5 files changed, 58 insertions(+), 5 deletions(-)
+
+diff --git a/DirectVolume.h b/DirectVolume.h
+index 4f86c67..5f7001c 100644
+--- a/DirectVolume.h
++++ b/DirectVolume.h
+@@ -27,7 +27,7 @@ typedef android::List<char *> PathCollection;
+ 
+ class DirectVolume : public Volume {
+ public:
+-    static const int MAX_PARTITIONS = 32;
++    static const int MAX_PARTITIONS = MAX_PARTS;
+ protected:
+     PathCollection *mPaths;
+     int            mDiskMajor;
+diff --git a/Fat.cpp b/Fat.cpp
+index 807f440..afdf00f 100644
+--- a/Fat.cpp
++++ b/Fat.cpp
+@@ -220,3 +220,38 @@ int Fat::format(const char *fsPath, unsigned int numSectors) {
+     }
+     return 0;
+ }
++
++int Fat::check_extend(const char *fsPath, unsigned int numParts)
++{
++    int n = numParts, i, fd;
++    unsigned char buf[512];
++    unsigned char *PartInfo;
++    int PartInfoOffset = 0x1be;
++    int sizeofPart = 16;
++
++    fd = open(fsPath, O_RDONLY);
++    if (fd < 0) {
++         /* Badness - abort the mount */
++         SLOGE("%s failed FS open (%s)", fsPath, strerror(errno));
++         return -1;
++    }
++
++    if (read(fd, buf, 512) < 0) {
++        /* Badness - abort the mount */
++        SLOGE("%s failed MBR read (%s)", fsPath, strerror(errno));
++        close(fd);
++        return -1;
++    }
++    close(fd);
++
++    PartInfo = buf + PartInfoOffset;
++
++    for (i = 0; i < n; i++, PartInfo += sizeofPart) {
++        if (PartInfo[4] == 5) {
++            SLOGW("%s This is an Extend Partition, skip to next one, n is %d\n", fsPath, i);
++            return i;
++        }
++    }
++
++    return -1;
++}
+diff --git a/Fat.h b/Fat.h
+index e02d88c..865b784 100644
+--- a/Fat.h
++++ b/Fat.h
+@@ -27,6 +27,7 @@ public:
+                        int ownerUid, int ownerGid, int permMask,
+                        bool createLost);
+     static int format(const char *fsPath, unsigned int numSectors);
++    static int check_extend(const char *fsPath, unsigned int numParts);
+ };
+ 
+ #endif
+diff --git a/Volume.cpp b/Volume.cpp
+index 793d954..8ad4c89 100644
+--- a/Volume.cpp
++++ b/Volume.cpp
+@@ -225,7 +225,7 @@ int Volume::formatVol() {
+     }
+ 
+     bool formatEntireDevice = (mPartIdx == -1);
+-    char devicePath[255];
++    char devicePath[PATH_MAX];
+     dev_t diskNode = getDiskDevice();
+     dev_t partNode = MKDEV(MAJOR(diskNode), (formatEntireDevice ? MINOR(diskNode) : MINOR(diskNode) + mPartIdx));
+ 
+@@ -300,7 +300,8 @@ bool Volume::isMountpointMounted(const char *path) {
+ }
+ 
+ int Volume::mountVol() {
+-    dev_t deviceNodes[4];
++    dev_t deviceNodes[MAX_PARTS];
++    dev_t diskdevice;
+     int n, i, rc = 0;
+     char errmsg[255];
+     const char* externalStorage = getenv("EXTERNAL_STORAGE");
+@@ -310,6 +311,8 @@ int Volume::mountVol() {
+     char encrypt_progress[PROPERTY_VALUE_MAX];
+     int flags;
+     int nParts = 0;
++    char devicePath[PATH_MAX];
++    int extendPart = -1;
+ 
+     property_get("vold.decrypt", decrypt_state, "");
+     property_get("vold.encrypt_progress", encrypt_progress, "");
+@@ -342,7 +345,7 @@ int Volume::mountVol() {
+         return 0;
+     }
+ 
+-    nParts = getDeviceNodes((dev_t *) &deviceNodes, 4);
++    nParts = getDeviceNodes((dev_t *) &deviceNodes, MAX_PARTS);
+     if (!nParts)
+         n = 1;
+     else
+@@ -398,8 +401,19 @@ int Volume::mountVol() {
+         }
+     }
+ 
++    /*
++     * Since we support multiple partitions, in case there is extend SD card
++     * partition, we need to skip this extend partition
++     */
++    diskdevice = getDiskDevice();
++    sprintf(devicePath, "/dev/block/vold/%d:%d", MAJOR(diskdevice),
++        MINOR(diskdevice));
++    extendPart = Fat::check_extend(devicePath, n);
++
+     for (i = 0; i < n; i++) {
+-        char devicePath[255];
++
++        if (i == extendPart)
++            continue;
+ 
+         sprintf(devicePath, "/dev/block/vold/%d:%d", MAJOR(deviceNodes[i]),
+                 MINOR(deviceNodes[i]));
+diff --git a/Volume.h b/Volume.h
+index c717d4d..7b778fe 100644
+--- a/Volume.h
++++ b/Volume.h
+@@ -19,6 +19,9 @@
+ 
+ #include <utils/List.h>
+ 
++#define MAX_PARTS 32
++#define PATH_MAX  255
++
+ class NetlinkEvent;
+ class VolumeManager;
+ 
+-- 
+1.7.4.1
+

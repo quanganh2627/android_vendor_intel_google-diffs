@@ -1,0 +1,197 @@
+From 95c6b3e65a717fd1d0178d85395ef6fe95a27ff9 Mon Sep 17 00:00:00 2001
+From: Mark Mendell <mark.p.mendell@intel.com>
+Date: Fri, 15 Nov 2013 11:31:02 -0800
+Subject: Dalvik: Add message when a loop trace is too large
+
+BZ: 152485
+
+Add a debug message when the number of byte codes in
+a loop trace exceeds the maximum, to allow better
+checking in QA tests for failed loop optimization
+
+Added even more messages to make it clearer why we
+don't form loops
+
+Added JIT-INFO: to ALOGD lines
+
+Change-Id: I92ab20638b330dd0f5da992c3ad2d74f3ff08929
+Category: device enablement
+Domain: AOSP.Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, need rework
+Signed-off-by: Mark Mendell <mark.p.mendell@intel.com>
+Signed-off-by: Vitaly Provodin <vitaly.a.provodin@intel.com>
+---
+ vm/compiler/Frontend.cpp |   17 +++++++++++++----
+ vm/compiler/Loop.cpp     |   30 ++++++++++++++++++++++++++++--
+ 2 files changed, 41 insertions(+), 6 deletions(-)
+
+diff --git a/vm/compiler/Frontend.cpp b/vm/compiler/Frontend.cpp
+index 682988b..4a4010d 100644
+--- a/vm/compiler/Frontend.cpp
++++ b/vm/compiler/Frontend.cpp
+@@ -2172,6 +2172,7 @@ static bool compileLoop(CompilationUnit *cUnit, unsigned int startOffset,
+     /* Try to identify a loop */
+     if (dvmCompilerCalculateBasicBlockInformation (cUnit) == false)
+     {
++        // Reason for failure already logged
+         goto bail;
+     }
+ 
+@@ -2179,14 +2180,20 @@ static bool compileLoop(CompilationUnit *cUnit, unsigned int startOffset,
+     dvmCompilerLoopOpt(cUnit);
+ 
+     //If over accepted amount, bail
+-    if (countByteCodes (cUnit) > JIT_MAX_TRACE_LEN)
+     {
+-        goto bail;
++        int numByteCodes = countByteCodes (cUnit);
++        if (numByteCodes > JIT_MAX_TRACE_LEN)
++        {
++            ALOGD("JIT_INFO: Loop trace @ offset %04x aborted due too many byte codes (%d/%d)",
++                  cUnit->entryBlock->startOffset, numByteCodes, JIT_MAX_TRACE_LEN);
++            goto bail;
++        }
+     }
+ 
+     //If anybody wanted to quit, exit now
+     if (cUnit->quitLoopMode == true)
+     {
++        // No message needed - reason should be already logged
+         goto bail;
+     }
+ 
+@@ -2256,7 +2263,7 @@ static bool compileLoop(CompilationUnit *cUnit, unsigned int startOffset,
+     /* Loop contains never executed blocks / heavy instructions */
+     if (cUnit->quitLoopMode) {
+         if (cUnit->printMe || gDvmJit.receivedSIGUSR2) {
+-            ALOGD("Loop trace @ offset %04x aborted due to unresolved code info",
++            ALOGD("JIT_INFO: Loop trace @ offset %04x aborted due to unresolved code info",
+                     cUnit->entryBlock->startOffset);
+         }
+         goto bail;
+@@ -2279,11 +2286,13 @@ static bool compileLoop(CompilationUnit *cUnit, unsigned int startOffset,
+ 
+     /* Loop is too big - bail out */
+     if (cUnit->assemblerStatus == kRetryHalve) {
++        ALOGD("JIT_INFO: Loop trace @ offset %04x aborted because trace is too large",
++                cUnit->entryBlock->startOffset);
+         goto bail;
+     }
+ 
+     if (cUnit->printMe || gDvmJit.receivedSIGUSR2) {
+-        ALOGD("Loop trace @ offset %04x", cUnit->entryBlock->startOffset);
++        ALOGD("JIT_INFO: Loop trace @ offset %04x", cUnit->entryBlock->startOffset);
+         dvmCompilerCodegenDump(cUnit);
+     }
+ 
+diff --git a/vm/compiler/Loop.cpp b/vm/compiler/Loop.cpp
+index 7c91755..9bd414c 100644
+--- a/vm/compiler/Loop.cpp
++++ b/vm/compiler/Loop.cpp
+@@ -1141,7 +1141,11 @@ static bool checkBBInstructionsForCFGLoop (CompilationUnit *cUnit, BasicBlock *b
+         {
+             //If we don't support it, just quit
+             if (mir->dalvikInsn.opcode == nonFixableOpcodes[i])
++            {
++                ALOGD("JIT_INFO: Loop trace @ offset %04x not a loop: unsupported opcode in loop : %s",
++                      cUnit->entryBlock->startOffset, dexGetOpcodeName(mir->dalvikInsn.opcode));
+                 return false;
++            }
+         }
+     }
+ 
+@@ -1553,6 +1557,8 @@ static bool acceptCFGLoops (CompilationUnit *cUnit)
+ 
+     if (res == true)
+     {
++        ALOGD("JIT_INFO: Loop trace @ offset %04x not a loop: first BB hidden",
++              cUnit->entryBlock->startOffset);
+         return false;
+     }
+ 
+@@ -1562,6 +1568,8 @@ static bool acceptCFGLoops (CompilationUnit *cUnit)
+ 
+     if (res == false)
+     {
++        ALOGD("JIT_INFO: Loop trace @ offset %04x not a loop: children of first BB hidden",
++              cUnit->entryBlock->startOffset);
+         return false;
+     }
+ 
+@@ -1577,6 +1585,7 @@ static bool acceptCFGLoops (CompilationUnit *cUnit)
+     //Ok, if the acceptance returned false, we are done
+     if (found == false)
+     {
++        // message logged above
+         return false;
+     }
+ 
+@@ -1588,6 +1597,11 @@ static bool acceptCFGLoops (CompilationUnit *cUnit)
+     {
+         //If it isn't top formed, it must be bottom formed
+         bool res = isBottomFormed (cUnit, first);
++        if (res == false)
++        {
++            ALOGD("JIT_INFO: Loop trace @ offset %04x not a loop: not top or bottom formed",
++                  cUnit->entryBlock->startOffset);
++        }
+         return res;
+     }
+ 
+@@ -1605,7 +1619,11 @@ bool dvmCompilerFilterLoopBlocks(CompilationUnit *cUnit)
+     /*
+      * A loop body should have at least two incoming edges.
+      */
+-    if (numPred < 2) return false;
++    if (numPred < 2) {
++        ALOGD("JIT_INFO: Loop trace @ offset %04x not a loop: only one predecessor",
++              cUnit->entryBlock->startOffset);
++        return false;
++    }
+ 
+     //Let us see if we can accept the loop
+     //We have two loop acceptance systems: the new system and the old one, which one do we want?
+@@ -1655,12 +1673,16 @@ bool dvmCompilerFilterLoopBlocks(CompilationUnit *cUnit)
+                  * to handle.
+                  */
+                 if (bb->taken == cUnit->exitBlock) {
++                    ALOGD("JIT_INFO: Loop trace @ offset %04x taken branch to exit block",
++                          cUnit->entryBlock->startOffset);
+                     return false;
+                 }
+                 if (bb->taken->hidden) {
+                     //We should only be adding one loop exit
+                     if (normalChainingAdded == true)
+                     {
++                        ALOGD("JIT_INFO: Loop trace @ offset %04x more than one loop exit",
++                              cUnit->entryBlock->startOffset);
+                         return false;
+                     }
+                     bb->taken->blockType = kChainingCellNormal;
+@@ -1677,11 +1699,15 @@ bool dvmCompilerFilterLoopBlocks(CompilationUnit *cUnit)
+                  * to handle.
+                  */
+                 if (bb->fallThrough == cUnit->exitBlock) {
++                    ALOGD("JIT_INFO: Loop trace @ offset %04x fallthrough to exit block",
++                          cUnit->entryBlock->startOffset);
+                     return false;
+                 }
+                 if (bb->fallThrough->hidden) {
+                     //We should only be adding one loop exit
+                     if (normalChainingAdded == true) {
++                        ALOGD("JIT_INFO: Loop trace @ offset %04x fallthrough to more than one loop exit",
++                              cUnit->entryBlock->startOffset);
+                         return false;
+                     }
+                     bb->fallThrough->blockType = kChainingCellNormal;
+@@ -2440,4 +2466,4 @@ void dvmCompilerInsertLoopHelperBlocks (CompilationUnit *cUnit, Pass *currentPas
+     //Unused argument
+     (void) currentPass;
+ }
+-#endif
+\ No newline at end of file
++#endif
+-- 
+1.7.4.1
+

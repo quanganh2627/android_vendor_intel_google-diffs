@@ -1,0 +1,170 @@
+From 922cfcdc03d57e11c242a4d9529c83f817694d8e Mon Sep 17 00:00:00 2001
+From: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Date: Thu, 12 Dec 2013 14:46:52 -0800
+Subject: Dalvik: Make CFG building and preparation more robust
+
+BZ: 158749
+
+CFG building and preparation has been made more robust by:
+-Ensuring that Prebackward blocks are only added when there are backward CCs
+-FromInterpreter nodes receive a correct block offset
+-Manual manipulation of children is done through helper functions
+-Unconditional throws are basic block ending
+-Reverts "Dalvik: Always terminate blocks ending with unconditional throws"
+because it causes assert failures during CFG building
+
+Change-Id: I388a8b98e368002646f24a2b1404fe1cc3b43011
+Category: device enablement
+Domain: AOSP.Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, need rework
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+---
+ vm/compiler/Frontend.cpp |   37 +++++++++++++++++++------------------
+ vm/compiler/Loop.cpp     |   36 +++++++++++++++++++++++++++---------
+ 2 files changed, 46 insertions(+), 27 deletions(-)
+
+diff --git a/vm/compiler/Frontend.cpp b/vm/compiler/Frontend.cpp
+index 6809ecf..520dc68 100644
+--- a/vm/compiler/Frontend.cpp
++++ b/vm/compiler/Frontend.cpp
+@@ -1718,10 +1718,21 @@ bool dvmCompilerBuildCFG (const Method *method, GrowableList *blockList, BasicBl
+         codePtr += width;
+         int flags = dexGetFlagsFromOpcode(insn->dalvikInsn.opcode);
+ 
+-        if (flags & kInstrCanBranch) {
++        //Handle case when instruction can branch
++        if ((flags & kInstrCanBranch) != 0)
++        {
+             processCanBranch (blockList, curBlock, insn, curOffset, width, flags,
+                              codePtr, codeEnd);
+-        } else if (flags & kInstrCanReturn) {
++        }
++        //Handle case when we can throw and have try/catch information
++        else if ((flags & kInstrCanThrow) != 0 && tryBlockAddr != 0)
++        {
++            processCanThrow (method, blockList, curBlock, insn, curOffset, width, flags,
++                             tryBlockAddr, codePtr, codeEnd);
++        }
++        //Handle case when instruction can return or unconditionally throw
++        else if (((flags & kInstrCanReturn) != 0) || (flags == kInstrCanThrow))
++        {
+             dvmCompilerReplaceChildBasicBlock (exitBlock, curBlock, kChildTypeFallthrough);
+ 
+             /*
+@@ -1743,30 +1754,20 @@ bool dvmCompilerBuildCFG (const Method *method, GrowableList *blockList, BasicBl
+                                NULL);
+                 }
+             }
+-        } else if ((flags & kInstrCanThrow) != 0 && tryBlockAddr != 0) {
+-            processCanThrow (method, blockList, curBlock, insn, curOffset, width, flags,
+-                             tryBlockAddr, codePtr, codeEnd);
+-        } else if (flags & kInstrCanSwitch) {
+-            processCanSwitch (blockList, curBlock, insn, method->insns, curOffset, width, flags);
+         }
+-        curOffset += width;
+-
+-        //Should we create the next block if not found
+-        bool shouldCreate = false;
+-
+-        //Generally we would like to continue in the same block. However, for unconditional throws,
+-        //we would like to terminate the current block even if we ignored the catch blocks, i.e.,
+-        //the tryBlockAddr == 0
+-        if ((flags & kInstrCanThrow) != 0 && (flags & kInstrCanContinue) == 0 && tryBlockAddr == 0)
++        //Handle case when instruction can switch
++        else if ((flags & kInstrCanSwitch) != 0)
+         {
+-            shouldCreate = true;
++            processCanSwitch (blockList, curBlock, insn, method->insns, curOffset, width, flags);
+         }
+ 
++        curOffset += width;
++
+         BasicBlock *nextBlock = findBlock (blockList, curOffset,
+                                            /* split */
+                                            false,
+                                            /* create */
+-                                           shouldCreate,
++                                           false,
+                                            /* immedPredBlockP */
+                                            NULL);
+ 
+diff --git a/vm/compiler/Loop.cpp b/vm/compiler/Loop.cpp
+index d3fbe8d..d2e201c 100644
+--- a/vm/compiler/Loop.cpp
++++ b/vm/compiler/Loop.cpp
+@@ -2279,6 +2279,12 @@ static void insertBlockBeforeBackwardHelper (CompilationUnit *cUnit,
+     //Checking preconditions
+     assert(backward != 0);
+ 
++    //Only insert prebackward if backward branch CC is involved
++    if (backward->blockType != kChainingCellBackwardBranch)
++    {
++        return;
++    }
++
+     BitVector *predecessors = backward->predecessors;
+ 
+     //Paranoid
+@@ -2293,6 +2299,8 @@ static void insertBlockBeforeBackwardHelper (CompilationUnit *cUnit,
+     //over predecessors.
+     if (dvmCountSetBits (predecessors) != 1)
+     {
++        PASS_LOG (ALOGD, cUnit, "JIT_INFO: Backward branch has more than one predecessor");
++
+         cUnit->quitLoopMode = true;
+         return;
+     }
+@@ -2355,10 +2363,10 @@ static void insertBlockBeforeBackwardHelper (CompilationUnit *cUnit,
+             ifMir->dalvikInsn.opcode = negated;
+ 
+             //Set the fallthrough to be the old taken
+-            predecessor->fallThrough = predecessor->taken;
++            dvmCompilerReplaceChildBasicBlock (predecessor->taken, predecessor, kChildTypeFallthrough);
+ 
+             //Make the backward be the new taken
+-            predecessor->taken = backward;
++            dvmCompilerReplaceChildBasicBlock (backward, predecessor, kChildTypeTaken);
+         }
+     }
+ 
+@@ -2444,19 +2452,29 @@ static bool insertBlockFromInterpreter (CompilationUnit *cUnit, LoopInformation
+     //Get the preheader
+     BasicBlock *preHeader = info->getPreHeader ();
+ 
++    //Get one of the backward blocks since we want to get offset from it
++    int backwardIdx = dvmHighestBitSet (info->getBackwardBranches ());
++    BasicBlock *backward = reinterpret_cast<BasicBlock *> (dvmGrowableListGetElement (&cUnit->blockList, backwardIdx));
++    assert (backward != 0);
++
++    if (backward == 0)
++    {
++        PASS_LOG (ALOGD, cUnit, "Insert_LoopHelper_Blocks: FromInterpreter cannot be properly inserting "
++                "without offset from backward CC.");
++        cUnit->quitLoopMode = true;
++        return false;
++    }
++
+     if (preHeader != 0)
+     {
+         //Also add a from interpreter node
+         BasicBlock *fromInterpreter = dvmCompilerNewBBinCunit (cUnit, kFromInterpreter);
+ 
+-        //Link fromInterpreter to preHeader
+-        fromInterpreter->fallThrough = preHeader;
++        //Set the correct offset
++        fromInterpreter->startOffset = backward->startOffset;
+ 
+-        //Paranoid
+-        assert (preHeader->predecessors != 0);
+-
+-        //Set predecessor bit
+-        dvmSetBit (preHeader->predecessors, fromInterpreter->id);
++        //Link fromInterpreter to preHeader
++        dvmCompilerReplaceChildBasicBlock (preHeader, fromInterpreter, kChildTypeFallthrough);
+     }
+ 
+     //Unused parameter
+-- 
+1.7.4.1
+

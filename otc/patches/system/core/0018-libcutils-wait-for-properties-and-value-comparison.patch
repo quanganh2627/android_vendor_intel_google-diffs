@@ -1,0 +1,452 @@
+From cb6ebd0a039c4dde6f732ba9be8dd72274fbc3f0 Mon Sep 17 00:00:00 2001
+From: Daniel Leung <daniel.leung@intel.com>
+Date: Tue, 7 Aug 2012 15:03:34 -0700
+Subject: libcutils: wait for properties and value comparison
+
+Add a property_try_get() function to wait for property to appear.
+This can be used to block operations until some properties are set.
+
+Add property_cmp() and property_try_cmp() to compare property
+to specified value.
+
+Also add a trygetprop, cmpprop, trycmpprop command in toolbox
+to use these.
+
+Issue: AXIA-539
+Change-Id: I9d531e57c84140cebe6440efe3d3195c505932fa
+Signed-off-by: Daniel Leung <daniel.leung@intel.com>
+---
+ include/cutils/properties.h |   36 ++++++++++++++
+ libcutils/properties.c      |  111 +++++++++++++++++++++++++++++++++++++++++++
+ toolbox/Android.mk          |    3 +
+ toolbox/cmpprop.c           |   61 +++++++++++++++++++++++
+ toolbox/trycmpprop.c        |   68 ++++++++++++++++++++++++++
+ toolbox/trygetprop.c        |   63 ++++++++++++++++++++++++
+ 6 files changed, 342 insertions(+), 0 deletions(-)
+ create mode 100644 toolbox/cmpprop.c
+ create mode 100644 toolbox/trycmpprop.c
+ create mode 100644 toolbox/trygetprop.c
+
+diff --git a/include/cutils/properties.h b/include/cutils/properties.h
+index 25fd67a..c494b2b 100644
+--- a/include/cutils/properties.h
++++ b/include/cutils/properties.h
+@@ -40,12 +40,48 @@ extern "C" {
+ */
+ int property_get(const char *key, char *value, const char *default_value);
+ 
++/* property_try_get: returns the length of the value which will never be
++** greater than PROPERTY_VALUE_MAX - 1 and will always be zero terminated.
++** (the length does not include the terminating zero). In case the property
++** is not available immediately, it will wait (up to timeout seconds)
++** for the property to be set before returning.
++**
++** If the property read fails eventually, or returns an empty value,
++** the default value is used (if nonnull).
++**
++** If timeout is 0, it will return immediately.
++** If timeout is < 0, it will wait indefinitely.
++** if timeout is > 0, it will wait 'timeout' seconds.
++*/
++int property_try_get(const char *key, char *value,
++                     const char *default_value, int timeout);
++
+ /* property_set: returns 0 on success, < 0 on failure
+ */
+ int property_set(const char *key, const char *value);
+     
+ int property_list(void (*propfn)(const char *key, const char *value, void *cookie), void *cookie);    
+ 
++/* property_cmp: compare the property value to the input.
++**
++** Returns 0 if equal, and non-zero if not equal or
++** property not found.
++*/
++int property_cmp(const char *key, const char *cmp_to);
++
++/* property_try_cmp: compare the property value to the input.
++** In case the property is not available immediately, it will wait
++** (up to timeout seconds) for the property to be set before
++** returning.
++**
++** Returns 0 if equal, and non-zero if not equal or
++** property not found.
++**
++** If timeout is 0, it will return immediately.
++** If timeout is < 0, it will wait indefinitely.
++** if timeout is > 0, it will wait 'timeout' seconds.
++*/
++int property_try_cmp(const char *key, const char *cmp_to, int timeout);
+ 
+ #ifdef HAVE_SYSTEM_PROPERTY_SERVER
+ /*
+diff --git a/libcutils/properties.c b/libcutils/properties.c
+index f732ec0..f6b47d1 100644
+--- a/libcutils/properties.c
++++ b/libcutils/properties.c
+@@ -22,6 +22,8 @@
+ #include <cutils/sockets.h>
+ #include <errno.h>
+ #include <assert.h>
++#include <time.h>
++#include <limits.h>
+ 
+ #include <cutils/properties.h>
+ #include "loghack.h"
+@@ -31,6 +33,29 @@
+ #define _REALLY_INCLUDE_SYS__SYSTEM_PROPERTIES_H_
+ #include <sys/_system_properties.h>
+ 
++/* used to increase waiting time between each successive polling */
++#define WAIT_INIT		(250 * 1000) /* microsecond = 0.25 s */
++#define WAIT_INC_FACTOR_SHIFT	3 /* increase by factor 1.125 */
++#define WAIT_MAX		(2000 * 1000) /* microsecond = 2 s */
++
++/*
++ * gettime() - returns the time in seconds of
++ * the system's monotonic clock or zero on error.
++ */
++static time_t gettime(void)
++{
++    struct timespec ts;
++    int ret;
++
++    ret = clock_gettime(CLOCK_MONOTONIC, &ts);
++    if (ret < 0) {
++        ALOGE("clock_gettime(CLOCK_MONOTONIC) failed: %s\n", strerror(errno));
++        return 0;
++    }
++
++    return ts.tv_sec;
++}
++
+ int property_set(const char *key, const char *value)
+ {
+     return __system_property_set(key, value);
+@@ -52,6 +77,42 @@ int property_get(const char *key, char *value, const char *default_value)
+     return len;
+ }
+ 
++int property_try_get(const char *key, char *value,
++                     const char *default_value, int timeout)
++{
++    int len = 0;
++    int wait;
++    time_t timeout_time = gettime() + timeout;
++
++    if (!key || !value) {
++        return 0;
++    }
++
++    /* initial waiting period between each polling */
++    wait = WAIT_INIT;
++
++    /* timeout == -1, wait indefinitely, or else */
++    /* just wait at most 'timeout' seconds. */
++    while ((timeout < 0) || (gettime() < timeout_time)) {
++        /* property_get returns 0 if property does not exist  */
++        /* and we do not want to have the default_value *yet* */
++        len = property_get(key, value, NULL);
++        if (len > 0) {
++            return len;
++        }
++
++        usleep(wait);
++
++        /* make the next waiting period longer */
++        wait = wait + (wait >> WAIT_INC_FACTOR_SHIFT);
++        if (wait > WAIT_MAX) {
++            wait = WAIT_MAX;
++        }
++    }
++
++    return property_get(key, value, default_value);
++}
++
+ int property_list(void (*propfn)(const char *key, const char *value, void *cookie), 
+                   void *cookie)
+ {
+@@ -67,6 +128,56 @@ int property_list(void (*propfn)(const char *key, const char *value, void *cooki
+     return 0;
+ }
+ 
++int property_cmp(const char *key, const char *cmp_to)
++{
++    int len = 0;
++    char value[PROP_VALUE_MAX];
++
++    if (key && cmp_to) {
++        len = property_get(key, value, NULL);
++    }
++
++    if (len == 0) {
++        return INT_MIN;
++    } else {
++        return strncmp(value, cmp_to, PROP_VALUE_MAX);
++    }
++}
++
++int property_try_cmp(const char *key, const char *cmp_to, int timeout)
++{
++    int ret = INT_MIN;
++    int wait;
++    time_t timeout_time = gettime() + timeout;
++
++    if (!key || !cmp_to) {
++        return ret;
++    }
++
++    /* initial waiting period between each polling */
++    wait = WAIT_INIT;
++
++    /* timeout == -1, wait indefinitely, or else */
++    /* just wait at most 'timeout' seconds. */
++    while ((timeout < 0) || (gettime() < timeout_time)) {
++        /* property_get returns 0 if property does not exist  */
++        /* and we do not want to have the default_value *yet* */
++        ret = property_cmp(key, cmp_to);
++        if (ret == 0) {
++            return 0;
++        }
++        usleep(wait);
++
++        /* make the next waiting period longer */
++        wait = wait + (wait >> WAIT_INC_FACTOR_SHIFT);
++        if (wait > WAIT_MAX) {
++            wait = WAIT_MAX;
++        }
++    }
++
++    return property_cmp(key, cmp_to);
++}
++
+ #elif defined(HAVE_SYSTEM_PROPERTY_SERVER)
+ 
+ /*
+diff --git a/toolbox/Android.mk b/toolbox/Android.mk
+index ab2fc85..8aac1bc 100644
+--- a/toolbox/Android.mk
++++ b/toolbox/Android.mk
+@@ -34,6 +34,9 @@ TOOLS := \
+ 	df \
+ 	getprop \
+ 	setprop \
++	cmpprop \
++	trygetprop \
++	trycmpprop \
+ 	watchprops \
+ 	log \
+ 	sleep \
+diff --git a/toolbox/cmpprop.c b/toolbox/cmpprop.c
+new file mode 100644
+index 0000000..03c7d05
+--- /dev/null
++++ b/toolbox/cmpprop.c
+@@ -0,0 +1,61 @@
++#include <stdio.h>
++#include <stdlib.h>
++
++#include <cutils/properties.h>
++
++#include <sys/system_properties.h>
++#include "dynarray.h"
++
++static void record_prop(const char* key, const char* name, void* opaque)
++{
++    strlist_t* list = opaque;
++    char* temp = NULL;
++    if (asprintf(&temp, "[%s]: [%s]", key, name)) {
++        strlist_append_dup(list, temp);
++        free(temp);
++    }
++}
++
++static void list_properties(void)
++{
++    strlist_t  list[1] = { STRLIST_INITIALIZER };
++
++    /* Record properties in the string list */
++    (void)property_list(record_prop, list);
++
++    /* Sort everything */
++    strlist_sort(list);
++
++    /* print everything */
++    STRLIST_FOREACH(list, str, printf("%s\n", str));
++
++    /* voila */
++    strlist_done(list);
++}
++
++int cmpprop_main(int argc, char *argv[])
++{
++    int n = 0;
++
++    if (argc == 1) {
++        list_properties();
++    } else if (argc < 3) {
++        printf("usage: cmpprop name cmp_to_value\n");
++        printf("       - if no arguments are give, all properties are printed.\n");
++    } else {
++        char* value;
++
++        /* enforce length of value */
++        value = strndup(argv[2], PROPERTY_VALUE_MAX);
++        if (!value) {
++            printf("error allocating memory space, quitting...\n");
++            return -1;
++        }
++
++        n = property_cmp(argv[1], value);
++        printf("%d\n", n);
++
++        free(value);
++    }
++    return 0;
++}
+diff --git a/toolbox/trycmpprop.c b/toolbox/trycmpprop.c
+new file mode 100644
+index 0000000..75427ba
+--- /dev/null
++++ b/toolbox/trycmpprop.c
+@@ -0,0 +1,68 @@
++#include <stdio.h>
++#include <stdlib.h>
++
++#include <cutils/properties.h>
++
++#include <sys/system_properties.h>
++#include "dynarray.h"
++
++static void record_prop(const char* key, const char* name, void* opaque)
++{
++    strlist_t* list = opaque;
++    char* temp = NULL;
++    if (asprintf(&temp, "[%s]: [%s]", key, name)) {
++        strlist_append_dup(list, temp);
++        free(temp);
++    }
++}
++
++static void list_properties(void)
++{
++    strlist_t  list[1] = { STRLIST_INITIALIZER };
++
++    /* Record properties in the string list */
++    (void)property_list(record_prop, list);
++
++    /* Sort everything */
++    strlist_sort(list);
++
++    /* print everything */
++    STRLIST_FOREACH(list, str, printf("%s\n", str));
++
++    /* voila */
++    strlist_done(list);
++}
++
++int trycmpprop_main(int argc, char *argv[])
++{
++    int n = 0;
++
++    if (argc == 1) {
++        list_properties();
++    } else if (argc < 3) {
++        printf("usage: trycmpprop name cmp_to_value [timeout]\n");
++        printf("       - if no argument is given, all properties will be printed.\n");
++    } else {
++        char* value;
++        int timeout = 0;
++
++        /* enforce lenght of value */
++        value = strndup(argv[2], PROPERTY_VALUE_MAX);
++        if (!value) {
++            printf("error allocating memory space, quitting...\n");
++            return -1;
++        }
++
++        if (argc > 3) {
++            timeout = atoi(argv[3]);
++        } else {
++            timeout = 0;
++        }
++
++        n = property_try_cmp(argv[1], value, timeout);
++        printf("%d\n", n);
++
++        free(value);
++    }
++    return 0;
++}
+diff --git a/toolbox/trygetprop.c b/toolbox/trygetprop.c
+new file mode 100644
+index 0000000..5f39f53
+--- /dev/null
++++ b/toolbox/trygetprop.c
+@@ -0,0 +1,63 @@
++#include <stdio.h>
++#include <stdlib.h>
++
++#include <cutils/properties.h>
++
++#include <sys/system_properties.h>
++#include "dynarray.h"
++
++static void record_prop(const char* key, const char* name, void* opaque)
++{
++    strlist_t* list = opaque;
++    char* temp = NULL;
++    if (asprintf(&temp, "[%s]: [%s]", key, name)) {
++        strlist_append_dup(list, temp);
++        free(temp);
++    }
++}
++
++static void list_properties(void)
++{
++    strlist_t  list[1] = { STRLIST_INITIALIZER };
++
++    /* Record properties in the string list */
++    (void)property_list(record_prop, list);
++
++    /* Sort everything */
++    strlist_sort(list);
++
++    /* print everything */
++    STRLIST_FOREACH(list, str, printf("%s\n", str));
++
++    /* voila */
++    strlist_done(list);
++}
++
++int trygetprop_main(int argc, char *argv[])
++{
++    int n = 0;
++
++    /* usage: trygetprop property_name [timeout [default_value]] */
++
++    if (argc == 1) {
++        list_properties();
++    } else {
++        char value[PROPERTY_VALUE_MAX];
++        char *default_value;
++        int timeout = 0;
++        if(argc > 3) {
++            timeout = atoi(argv[2]);
++            default_value = argv[3];
++        } else if(argc > 2) {
++            timeout = atoi(argv[2]);
++            default_value = "";
++        } else {
++            timeout = 0;
++            default_value = "";
++        }
++
++        property_try_get(argv[1], value, default_value, timeout);
++        printf("%s\n", value);
++    }
++    return 0;
++}
+-- 
+1.7.4.1
+

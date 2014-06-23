@@ -1,0 +1,306 @@
+From 9526089a6114bb0d2d5c65e3c3398fd3ba35cf4b Mon Sep 17 00:00:00 2001
+From: Yixin Shou <yixin.shou@intel.com>
+Date: Thu, 23 Aug 2012 06:57:31 -0700
+Subject: Dalvik: remove redudant move instructions
+
+BZ: 75820
+
+There are redudant move instructions between registers generated
+when lowering some bytecode. This patch implemented the optimization
+that remove these redudant move instructions.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I2e8880b2a345a6a75de5e10ce906ab8d43857f28
+Orig-MCG-Change-Id: I3c1df4d0604738f356286af79fe3036906c7cbae
+Signed-off-by: Yixin Shou <yixin.shou@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/codegen/x86/AnalysisO1.cpp      |   28 +++++++----
+ vm/compiler/codegen/x86/BytecodeVisitor.cpp |   73 +++++++++++++++++++++++----
+ vm/compiler/codegen/x86/Lower.h             |    2 +-
+ vm/compiler/codegen/x86/LowerAlu.cpp        |    4 +-
+ vm/compiler/codegen/x86/LowerHelper.cpp     |    4 +-
+ 5 files changed, 85 insertions(+), 26 deletions(-)
+
+diff --git a/vm/compiler/codegen/x86/AnalysisO1.cpp b/vm/compiler/codegen/x86/AnalysisO1.cpp
+index f0e5531..0178d9e 100644
+--- a/vm/compiler/codegen/x86/AnalysisO1.cpp
++++ b/vm/compiler/codegen/x86/AnalysisO1.cpp
+@@ -4475,9 +4475,20 @@ int checkVirtualReg(int reg, LowOpndRegType type, int updateRefCount) {
+ 
+ //!This is called in get_virtual_reg
+ //!If this function returns false, new register will be allocated for this temporary
+-bool checkTempReg2(int reg, int type, bool isPhysical, int physicalRegForVR) {
++bool checkTempReg2(int reg, int type, bool isPhysical, int physicalRegForVR, u2 vB) {
+     if(currentBB == NULL) return false;
+     if(isPhysical) return false;
++    int index = -1;
++    for(int k = 0; k < num_compile_entries; k++) {
++        if (isVirtualReg(compileTable[k].physicalType) && compileTable[k].regNum == vB) {
++            if (isLastByteCodeOfLiveRange(k) || (reachEndOfBB(k) && isNextToLastAccess(k))) {
++                index = k;
++                if (physicalRegForVR >= PhysicalReg_EAX && physicalRegForVR <= PhysicalReg_EDX)
++                    return true;
++            }
++            break;
++        }
++    }
+ 
+     int newType = convertType(type, reg, isPhysical);
+     if(newType & LowOpndRegType_scratch) reg = reg - PhysicalReg_SCRATCH_1 + 1;
+@@ -4489,15 +4500,12 @@ bool checkTempReg2(int reg, int type, bool isPhysical, int physicalRegForVR) {
+             ALOGI("MOVE_OPT checkTempRegs for %d %d returns %d %d",
+                    reg, newType, infoByteCodeTemp[k].shareWithVR, infoByteCodeTemp[k].is8Bit);
+ #endif
+-            if(!infoByteCodeTemp[k].is8Bit) return infoByteCodeTemp[k].shareWithVR;
+-            //is8Bit true for gp type only
+-            if(!infoByteCodeTemp[k].shareWithVR) return false;
+-            //both true
+-            if(physicalRegForVR >= PhysicalReg_EAX && physicalRegForVR <= PhysicalReg_EDX) return true;
+-#ifdef DEBUG_MOVE_OPT
+-            ALOGI("MOVE_OPT registerAllocMove not used for 8-bit register");
+-#endif
+-            return false;
++            if(!infoByteCodeTemp[k].is8Bit || (physicalRegForVR >= PhysicalReg_EAX && physicalRegForVR <= PhysicalReg_EDX)) {
++                if (index >= 0) return true;
++                return infoByteCodeTemp[k].shareWithVR;
++            }
++            else
++                return false;
+         }
+     }
+     ALOGE("checkTempReg2 %d %d", reg, newType);
+diff --git a/vm/compiler/codegen/x86/BytecodeVisitor.cpp b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+index dd81f16..7164228 100644
+--- a/vm/compiler/codegen/x86/BytecodeVisitor.cpp
++++ b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+@@ -3368,7 +3368,7 @@ int getTempRegInfo(TempRegInfo* infoArray) { //returns an array of TempRegInfo
+         infoArray[k].shareWithVR = true;
+         infoArray[k].is8Bit = false;
+     }
+-    u2 vA, v1, length, num, tmp;
++    u2 vA, vB, v1, length, num, tmp;
+     u2 inst_op = INST_INST(inst);
+     s2 tmp_s2;
+     s4 tmp_s4;
+@@ -4555,10 +4555,13 @@ int getTempRegInfo(TempRegInfo* infoArray) { //returns an array of TempRegInfo
+         ////////////////////////////////////////////// ALU
+     case OP_NEG_INT:
+     case OP_NOT_INT:
++        vA = INST_A(inst);
++        vB = INST_B(inst);
+         infoArray[0].regNum = 1;
+         infoArray[0].refCount = 3; //define, update, use
+         infoArray[0].physicalType = LowOpndRegType_gp;
+-        infoArray[0].shareWithVR = false;
++        if (vA != vB)
++            infoArray[0].shareWithVR = false;
+         return 1;
+     case OP_NEG_LONG:
+         infoArray[0].regNum = 1;
+@@ -4569,28 +4572,39 @@ int getTempRegInfo(TempRegInfo* infoArray) { //returns an array of TempRegInfo
+         infoArray[1].physicalType = LowOpndRegType_xmm;
+         return 2;
+     case OP_NOT_LONG:
++        vA = INST_A(inst);
++        vB = INST_B(inst);
+         infoArray[0].regNum = 1;
+         infoArray[0].refCount = 3; //define, update, use
+         infoArray[0].physicalType = LowOpndRegType_xmm;
+-        infoArray[0].shareWithVR = false;
++        if (vA != vB)
++            infoArray[0].shareWithVR = false;
+         infoArray[1].regNum = 2;
+         infoArray[1].refCount = 2;
+         infoArray[1].physicalType = LowOpndRegType_xmm;
+         return 2;
+     case OP_NEG_FLOAT:
++        vA = INST_A(inst);
++        vB = INST_B(inst);
+         infoArray[0].regNum = 1;
+         infoArray[0].refCount = 3; //define, update, use
+         infoArray[0].physicalType = LowOpndRegType_gp;
+-        infoArray[0].shareWithVR = false;
++        if (vA != vB)
++            infoArray[0].shareWithVR = false;
+         return 1;
+     case OP_NEG_DOUBLE:
++        vA = INST_A(inst);
++        vB = INST_B(inst);
+         infoArray[0].regNum = 1;
+-        infoArray[0].refCount = 2; //define, use
++        infoArray[0].refCount = 3; //define, use
+         infoArray[0].physicalType = LowOpndRegType_xmm;
+         infoArray[1].regNum = 2;
+-        infoArray[1].refCount = 3; //define, update, use
++        infoArray[1].refCount = 2; //define, update, use
+         infoArray[1].physicalType = LowOpndRegType_xmm;
++        if (vA != vB)
++            infoArray[0].shareWithVR = false;
+         return 2;
++
+     case OP_INT_TO_LONG: //hard-code eax & edx
+         infoArray[0].regNum = PhysicalReg_EAX;
+         infoArray[0].refCount = 2+1;
+@@ -4630,10 +4644,13 @@ int getTempRegInfo(TempRegInfo* infoArray) { //returns an array of TempRegInfo
+     case OP_INT_TO_BYTE:
+     case OP_INT_TO_CHAR:
+     case OP_INT_TO_SHORT:
++        vA = INST_A(inst);
++        vB = INST_B(inst);
+         infoArray[0].regNum = 1;
+         infoArray[0].refCount = 4; //define, update, update, use
+         infoArray[0].physicalType = LowOpndRegType_gp;
+-        infoArray[0].shareWithVR = false;
++        if (vA != vB)
++            infoArray[0].shareWithVR = false;
+         return 1;
+ 
+     case OP_ADD_INT:
+@@ -4829,10 +4846,19 @@ int getTempRegInfo(TempRegInfo* infoArray) { //returns an array of TempRegInfo
+     case OP_AND_LONG_2ADDR:
+     case OP_OR_LONG_2ADDR:
+     case OP_XOR_LONG_2ADDR:
++        if(inst_op == OP_ADD_LONG || inst_op == OP_SUB_LONG || inst_op == OP_AND_LONG ||
++           inst_op == OP_OR_LONG || inst_op == OP_XOR_LONG) {
++            vA = INST_AA(inst);
++            v1 = *((u1*)rPC + 2);
++        } else {
++            vA = INST_A(inst);
++            v1 = vA;
++        }
+         infoArray[0].regNum = 1;
+         infoArray[0].refCount = 3; //define, update, use
+         infoArray[0].physicalType = LowOpndRegType_xmm;
+-        infoArray[0].shareWithVR = false;
++        if(vA != v1)
++            infoArray[0].shareWithVR = false;
+         infoArray[1].regNum = 2;
+         infoArray[1].refCount = 2; //define, use
+         infoArray[1].physicalType = LowOpndRegType_xmm;
+@@ -4840,10 +4866,18 @@ int getTempRegInfo(TempRegInfo* infoArray) { //returns an array of TempRegInfo
+ 
+     case OP_SHL_LONG:
+     case OP_SHL_LONG_2ADDR:
++        if(inst_op == OP_SHL_LONG) {
++            vA = INST_AA(inst);
++            v1 = *((u1*)rPC + 2);
++        } else {
++            vA = INST_A(inst);
++            v1 = vA;
++        }
+         infoArray[0].regNum = 1;
+         infoArray[0].refCount = 3; //define, update, use
+         infoArray[0].physicalType = LowOpndRegType_xmm;
+-        infoArray[0].shareWithVR = false;
++        if(vA != v1)
++            infoArray[0].shareWithVR = false;
+         infoArray[1].regNum = 2;
+         infoArray[1].refCount = 3; //define, update, use
+         infoArray[1].physicalType = LowOpndRegType_xmm;
+@@ -4855,10 +4889,18 @@ int getTempRegInfo(TempRegInfo* infoArray) { //returns an array of TempRegInfo
+ 
+     case OP_SHR_LONG:
+     case OP_SHR_LONG_2ADDR:
++        if(inst_op == OP_SHR_LONG) {
++            vA = INST_AA(inst);
++            v1 = *((u1*)rPC + 2);
++        } else {
++            vA = INST_A(inst);
++            v1 = vA;
++        }
+         infoArray[0].regNum = 1;
+         infoArray[0].refCount = 4; //define, update, use
+         infoArray[0].physicalType = LowOpndRegType_xmm;
+-        infoArray[0].shareWithVR = false;
++        if(vA != v1)
++            infoArray[0].shareWithVR = false;
+         infoArray[1].regNum = 2;
+         infoArray[1].refCount = 4; //define, update, use
+         infoArray[1].physicalType = LowOpndRegType_xmm;
+@@ -4876,10 +4918,18 @@ int getTempRegInfo(TempRegInfo* infoArray) { //returns an array of TempRegInfo
+ 
+     case OP_USHR_LONG:
+     case OP_USHR_LONG_2ADDR:
++        if(inst_op == OP_USHR_LONG) {
++            vA = INST_AA(inst);
++            v1 = *((u1*)rPC + 2);
++        } else {
++            vA = INST_A(inst);
++            v1 = vA;
++        }
+         infoArray[0].regNum = 1;
+         infoArray[0].refCount = 3; //define, update, use
+         infoArray[0].physicalType = LowOpndRegType_xmm;
+-        infoArray[0].shareWithVR = false;
++        if(vA != v1)
++            infoArray[0].shareWithVR = false;
+         infoArray[1].regNum = 2;
+         infoArray[1].refCount = 3; //define, update, use
+         infoArray[1].physicalType = LowOpndRegType_xmm;
+@@ -4965,6 +5015,7 @@ int getTempRegInfo(TempRegInfo* infoArray) { //returns an array of TempRegInfo
+         infoArray[1].refCount = 2;
+         infoArray[1].physicalType = LowOpndRegType_xmm;
+         return 2;
++
+     case OP_REM_FLOAT:
+     case OP_REM_FLOAT_2ADDR:
+         infoArray[0].regNum = 1;
+diff --git a/vm/compiler/codegen/x86/Lower.h b/vm/compiler/codegen/x86/Lower.h
+index a1c0619..efa1127 100644
+--- a/vm/compiler/codegen/x86/Lower.h
++++ b/vm/compiler/codegen/x86/Lower.h
+@@ -568,7 +568,7 @@ int updateRefCount2(int reg, int type, bool isPhysical);
+ int spillVirtualReg(int vrNum, LowOpndRegType type, bool updateTable);
+ int isVirtualRegConstant(int regNum, LowOpndRegType type, int* valuePtr, bool updateRef);
+ int checkTempReg(int reg, int type, bool isPhysical, int vA);
+-bool checkTempReg2(int reg, int type, bool isPhysical, int physicalRegForVR);
++bool checkTempReg2(int reg, int type, bool isPhysical, int physicalRegForVR, u2 vB);
+ int freeReg(bool spillGL);
+ int nextVersionOfHardReg(PhysicalReg pReg, int refCount);
+ int updateVirtualReg(int reg, LowOpndRegType type);
+diff --git a/vm/compiler/codegen/x86/LowerAlu.cpp b/vm/compiler/codegen/x86/LowerAlu.cpp
+index 473f489..d83f1e7 100644
+--- a/vm/compiler/codegen/x86/LowerAlu.cpp
++++ b/vm/compiler/codegen/x86/LowerAlu.cpp
+@@ -100,8 +100,8 @@ int op_neg_double() {
+     u2 vB = INST_B(inst);
+     get_virtual_reg(vB, OpndSize_64, 1, false);
+     load_global_data_API("doubNeg", OpndSize_64, 2, false);
+-    alu_binary_reg_reg(OpndSize_64, xor_opc, 1, false, 2, false);
+-    set_virtual_reg(vA, OpndSize_64, 2, false);
++    alu_binary_reg_reg(OpndSize_64, xor_opc, 2, false, 1, false);
++    set_virtual_reg(vA, OpndSize_64, 1, false);
+     rPC += 1;
+     return 0;
+ }
+diff --git a/vm/compiler/codegen/x86/LowerHelper.cpp b/vm/compiler/codegen/x86/LowerHelper.cpp
+index 3fec038..1a70a91 100644
+--- a/vm/compiler/codegen/x86/LowerHelper.cpp
++++ b/vm/compiler/codegen/x86/LowerHelper.cpp
+@@ -368,7 +368,7 @@ LowOpRegReg* dump_reg_reg_noalloc_src(Mnemonic m, AtomOpCode m2, OpndSize size,
+                                int reg2, bool isPhysical2, LowOpndRegType type) {
+     if(gDvm.executionMode == kExecutionModeNcgO1) {
+         int regAll2;
+-        if(isMnemonicMove(m) && checkTempReg2(reg2, type, isPhysical2, reg)) { //dst reg is logical
++        if(isMnemonicMove(m) && checkTempReg2(reg2, type, isPhysical2, reg, -1)) { //dst reg is logical
+             //only from get_virtual_reg_all
+             regAll2 = registerAllocMove(reg2, type, isPhysical2, reg);
+         } else {
+@@ -1761,7 +1761,7 @@ void get_virtual_reg_all(u2 vB, OpndSize size, int reg, bool isPhysical, Mnemoni
+         }
+ 
+         //temporary reg has pType
+-        if(checkTempReg2(reg, pType, isPhysical, regAll)) {
++        if(checkTempReg2(reg, pType, isPhysical, regAll, vB)) {
+             registerAllocMove(reg, pType, isPhysical, regAll);
+             dump_mem_reg_noalloc(m, size, 4*vB, PhysicalReg_FP, true,
+                 MemoryAccess_VR, vB, regAll, true, pType);
+-- 
+1.7.4.1
+

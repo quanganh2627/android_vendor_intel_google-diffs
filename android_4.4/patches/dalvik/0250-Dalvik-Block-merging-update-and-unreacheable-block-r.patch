@@ -1,0 +1,278 @@
+From aae071c197b30fee7361a257833ff68f1c1b1b77 Mon Sep 17 00:00:00 2001
+From: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Date: Thu, 13 Jun 2013 14:24:08 -0700
+Subject: Dalvik: Block merging update and unreacheable block removal
+
+BZ: 116028
+
+-Added capability to make a pass iterative so it can be run until there are no
+more updates.
+-Updated block merging to use helper methods in order to ensure that its state
+is properly set up.
+-Extended block merging to accept cases when instructions have continue
+semantics.
+-Added pass to remove unreachable blocks in order to clean up CFG
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: If4c3ce861252991059c37d8468db6b9e3513ffae
+Orig-MCG-Change-Id: Iee1b5d545122870f4ebec43568c75544bf25b9e6
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/BBOptimization.cpp |  121 ++++++++++++++++++++--------------------
+ vm/compiler/BBOptimization.h   |    8 +++
+ vm/compiler/LoopOpt.cpp        |   13 +++-
+ vm/compiler/Pass.h             |    6 +-
+ 4 files changed, 83 insertions(+), 65 deletions(-)
+
+diff --git a/vm/compiler/BBOptimization.cpp b/vm/compiler/BBOptimization.cpp
+index 17e4f08..6492d4b 100644
+--- a/vm/compiler/BBOptimization.cpp
++++ b/vm/compiler/BBOptimization.cpp
+@@ -30,6 +30,12 @@ bool dvmCompilerMergeBasicBlocks (CompilationUnit *cUnit, BasicBlock *bb)
+         return false;
+     }
+ 
++    //We cannot merge blocks that have multiple targets for switch or exception
++    if (bb->successorBlockList.blockListType != kNotUsed)
++    {
++        return false;
++    }
++
+     //We also refuse to merge if we have a taken and a fallthrough or neither
+     if ( (bb->taken != 0 && bb->fallThrough != 0) ||
+          (bb->taken == 0 && bb->fallThrough == 0))
+@@ -62,83 +68,78 @@ bool dvmCompilerMergeBasicBlocks (CompilationUnit *cUnit, BasicBlock *bb)
+         return false;
+     }
+ 
+-    //Ok we have one child, with only one parent, let's combine them
+-    MIR *lastInsn = bb->lastMIRInsn;
+-
+-    //If we don't have an instruction we can skip this case
+-    if (lastInsn != 0)
++    //We allow merge if one of the blocks has no instructions or if both have no instructions.
++    //In case when both have instructions, we need to check further if we can do the merge.
++    if (bb->lastMIRInsn != 0 && child->firstMIRInsn != 0)
+     {
+-        //Question: is it a jump? if so, we can remove it now
++        MIR *lastInsn = bb->lastMIRInsn;
++
++        //Get the opcode
+         int opcode = lastInsn->dalvikInsn.opcode;
+ 
+-        switch (opcode)
+-        {
+-            case OP_GOTO:
+-            case OP_GOTO_32:
+-            case OP_GOTO_16:
+-                lastInsn = lastInsn->prev;
+-
+-                //This clean up is not automatically necessary (links get fixed later)
+-                //But it's good practice to do it now
+-                if (lastInsn != 0)
+-                {
+-                    lastInsn->next = 0;
+-                }
+-                bb->lastMIRInsn = lastInsn;
+-                break;
+-            default:
+-                //We bail if we don't have one of those goto instructions
+-                return false;
+-        }
+-    }
++        //Get the opcode flags
++        int flags = dvmCompilerGetOpcodeFlags (opcode);
+ 
+-    //Now that we have our last, get the child's first
+-    MIR *firstInsn = child->firstMIRInsn;
++        //Is it an unconditional jump?
++        bool isUnconditionalJump = (flags == kInstrCanBranch);
+ 
+-    //If we had a last instruction, firstInsn becomes its next
+-    if (lastInsn != 0)
+-    {
+-        lastInsn->next = firstInsn;
+-    }
+-    else
+-    {
+-        bb->firstMIRInsn = firstInsn;
+-    }
++        //We also check if instruction can continue but cannot do anything else, with one exception...
++        //If instruction can throw we have two possible paths, one fallthrough for continue and one taken
++        //for exception. But when we get here we know that the basic block doesn't have two branches.
++        //This means that we have implicit jump to exception which backend will automatically take care of.
++        //Thus we can still merge blocks if the instruction can continue and throw but nothing else.
++        bool continues = (flags == (kInstrCanContinue | kInstrCanThrow)) || (flags == kInstrCanContinue);
+ 
+-    //Prev for firstInsn is always lastInsn (0 at worst)
+-    if (firstInsn != 0)
+-    {
+-        firstInsn->prev = lastInsn;
++        //We can do the merge if we have an unconditional jump or we have a continue.
++        //Thus for rejection we check the negated statement.
++        if (isUnconditionalJump == false && continues == false)
++        {
++            return false;
++        }
+ 
+-        //Now that the instructions are linked together, we can set the last instruction
+-        //We do it here because if firstInsn == 0, then child has no instruction and we keep ours
+-        bb->lastMIRInsn = child->lastMIRInsn;
++        if (isUnconditionalJump == true)
++        {
++            //We have an unconditional jump but we can remove it since we are merging blocks
++            dvmCompilerRemoveMIR (lastInsn);
++        }
+     }
+ 
+-    //Now attach the basic blocks: child is now going to disappear
+-    bb->taken = child->taken;
+-    bb->fallThrough = child->fallThrough;
+-
+-    //Update all children MIRs, they are now in bb
+-    while (firstInsn != 0)
+-    {
+-        firstInsn->bb = bb;
+-        firstInsn = firstInsn->next;
+-    }
++    //Move the MIRs from child to the new block
++    dvmCompilerMoveLinkedMIRsAfter (bb, bb->lastMIRInsn, child->firstMIRInsn);
+ 
+-    child->hidden = true;
+-    child->firstMIRInsn = 0;
+-    child->lastMIRInsn = 0;
+-    child->taken = 0;
+-    child->fallThrough = 0;
++    //Now attach the basic blocks: child is now going to disappear
++    dvmCompilerReplaceChildBasicBlock (child->taken, bb, kChildTypeTaken);
++    dvmCompilerReplaceChildBasicBlock (child->fallThrough, bb, kChildTypeFallthrough);
+ 
+-    //Finally merge any spill request between what the father has and the child
++    //Merge any spill request between what the father has and the child
+     dvmUnifyBitVectors (bb->requestWriteBack, bb->requestWriteBack, child->requestWriteBack);
+ 
++    //Now remove the child from the cUnit
++    dvmCompilerHideBasicBlock (cUnit->blockList, child);
++
+     //We have changed the basic block
+     return true;
+ }
+ 
++bool dvmCompilerRemoveUnreachableBlocks (CompilationUnit *cUnit, BasicBlock *bb)
++{
++    //Get the predecessors for this block
++    unsigned int predecessorCount = dvmCountSetBits (bb->predecessors);
++
++    //If it has no predecessors and it is a bytecode type block, then we can remove it without repercussion
++    if (predecessorCount == 0 && bb->blockType == kDalvikByteCode)
++    {
++        //Remove the block
++        dvmCompilerHideBasicBlock (cUnit->blockList, bb);
++
++        //We changed the CFG
++        return true;
++    }
++
++    //We've done nothing
++    return false;
++}
++
+ /**
+  * @brief Update the predecessor information of old and new BB
+  * @details This only switches predecessors, unlike dvmCompilerCalculatePredecessors()
+diff --git a/vm/compiler/BBOptimization.h b/vm/compiler/BBOptimization.h
+index 3938c85..5d0b422 100644
+--- a/vm/compiler/BBOptimization.h
++++ b/vm/compiler/BBOptimization.h
+@@ -32,6 +32,14 @@ class LoopInformation;
+ bool dvmCompilerMergeBasicBlocks (CompilationUnit *cUnit, BasicBlock *bb);
+ 
+ /**
++ * @brief Removes all bytecode blocks that have no predecessors
++ * @param cUnit the Compilation Unit
++ * @param bb the Basic Block
++ * @return Returns whether we changed anything for the basic block
++ */
++bool dvmCompilerRemoveUnreachableBlocks (CompilationUnit *cUnit, BasicBlock *bb);
++
++/**
+  * @brief Form a loop
+  * @details make sure it is a bottom formed
+  * loop (or make it so), add a preloop block and an exit block
+diff --git a/vm/compiler/LoopOpt.cpp b/vm/compiler/LoopOpt.cpp
+index 83fbad9..c6adaee 100644
+--- a/vm/compiler/LoopOpt.cpp
++++ b/vm/compiler/LoopOpt.cpp
+@@ -67,7 +67,10 @@ START_PASSES
+     //For the moment, no pass will create new blocks, etc. so this is fine up here
+     //Otherwise, we might want to duplicate the merge or make the gate for memory aliasing smarter
+     NEW_PASS ("Merge_Blocks", kAllNodes, 0, 0,
+-                0, 0, dvmCompilerMergeBasicBlocks, 0, kOptimizationBasicBlockChange | kLoopStructureChange),
++                0, 0, dvmCompilerMergeBasicBlocks, 0,
++                kOptimizationBasicBlockChange | kLoopStructureChange | kOptimizationNeedIterative),
++    NEW_PASS ("Remove_unreachable_blocks", kAllNodes, 0, 0,
++                0, 0, dvmCompilerRemoveUnreachableBlocks, 0, kOptimizationBasicBlockChange | kOptimizationNeedIterative),
+     NEW_PASS ("Memory_Aliasing", kAllNodes, 0, dvmCompilerVerySimpleLoopGate,
+               0, 0, dvmCompilerMemoryAliasing, 0, 0),
+     NEW_PASS ("Local_Value_Numbering", kAllNodes, 0, dvmCompilerVerySimpleLoopGate,
+@@ -140,7 +143,7 @@ void dvmCompilerBuildPassList (void)
+ }
+ 
+ /**
+-  * @brief Handle pass flag, if it is kOptimizationBasicBlockChange, call back dvmCompilerCalculateBasicBlockInformation
++  * @brief Handle any pass flag that requires clean-up
+   * @param cUnit the CompilationUnit
+   * @param pass the Pass
+   */
+@@ -205,7 +208,11 @@ void dvmCompilerLoopOptimizationDriver (CompilationUnit *cUnit)
+                 {
+                     //Set the data in cUnit
+                     cUnit->passData = curPass->getData ();
+-                    dvmCompilerDataFlowAnalysisDispatcher (cUnit, doWork, curPass->getTraversal (), false /* isIterative */);
++
++                    //Determine if pass is iterative
++                    bool isIterative = curPass->getFlag (kOptimizationNeedIterative);
++
++                    dvmCompilerDataFlowAnalysisDispatcher (cUnit, doWork, curPass->getTraversal (), isIterative);
+                     cUnit->passData = 0;
+                 }
+ 
+diff --git a/vm/compiler/Pass.h b/vm/compiler/Pass.h
+index 85c8c79..9052fdd 100644
+--- a/vm/compiler/Pass.h
++++ b/vm/compiler/Pass.h
+@@ -30,13 +30,15 @@ typedef bool (*fctWorkPtr) (CompilationUnit *, BasicBlock *);
+ typedef bool (*fctGatePtr) (const CompilationUnit *, const Pass *);
+ 
+ /**
+- * @brief OptimizationFlag is an enumeration to perform certain tasks after a given pass using the flags field of Pass, each enum should be a power of 2 to be correctly used
++ * @brief OptimizationFlag is an enumeration to perform certain tasks for a given pass.
++ * @details Each enum should be a power of 2 to be correctly used.
+  */
+ enum OptimizationFlag
+ {
+     kOptimizationBasicBlockChange = 1,   /**< @brief Recalculate BasicBlock information */
+     kLoopStructureChange          = 2,   /**< @brief Recalculate LoopInformation nest information */
+     kOptimizationDefUsesChange    = 4,   /**< @brief Additonal information about def-uses discovered */
++    kOptimizationNeedIterative    = 8,   /**< @brief Pass must be run until there are no more updates */
+ };
+ 
+ /**
+@@ -77,7 +79,7 @@ class Pass
+          */
+         void (*freeDataPtr) (void *data);
+ 
+-        /** @brief Flags for clean-up */
++        /** @brief Flags for additional directives */
+         unsigned int flags;
+ 
+         /** @brief Next Pass */
+-- 
+1.7.4.1
+

@@ -1,0 +1,672 @@
+From d3d0de26f69497a9c3ddab39d66034927d6e5c28 Mon Sep 17 00:00:00 2001
+From: Daniel Leung <daniel.leung@intel.com>
+Date: Wed, 24 Apr 2013 10:37:20 -0700
+Subject: sign_target_files_apks: Re-signing binaries with sbsign
+
+() Implements some new build properties to generate sbsign_certs.txt
+   in target files archive. This file is similar to apkcerts.txt,
+   but is used to provide a list of binaries to be re-signed.
+
+() Extends sign_target_files_apks script to re-sign these binaries
+   with sbsign and new keys/certificates. A default key/cert
+   mapping is provided which is similar to how APKs are signed.
+   New command line parameters can be specified to re-sign certain
+   binaries with another key.
+
+() For those binaries with embedded certificate, a new mechanism
+   is implemented to replace the binary blob within these binaries.
+   This lets these binaries to verify the signatures of other files.
+   The first application of this is to replace the certificate
+   inside UEFI shim so that the final release product will not be
+   using the test key to verify gummiboot and boot images.
+
+Issue: AXIA-2387
+Change-Id: Ida4ee56bdd086727b74572b6320f9b6eb73dcc86
+Signed-off-by: Daniel Leung <daniel.leung@intel.com>
+---
+ core/Makefile                             |   44 ++++++
+ core/prebuilt.mk                          |   15 ++
+ tools/releasetools/common.py              |  229 ++++++++++++++++++++++++++++-
+ tools/releasetools/sign_target_files_apks |  198 ++++++++++++++++++++++++-
+ 4 files changed, 478 insertions(+), 8 deletions(-)
+
+diff --git a/core/Makefile b/core/Makefile
+index 684847a..b015766 100644
+--- a/core/Makefile
++++ b/core/Makefile
+@@ -287,6 +287,42 @@ ifneq (,$(TARGET_BUILD_APPS))
+ endif
+ 
+ # -----------------------------------------------------------------
++# Cert-to-package mapping.  Used by the post-build signing tools.
++# This list is used to re-sign binaries with sbsign.
++name := $(TARGET_PRODUCT)
++ifeq ($(TARGET_BUILD_TYPE),debug)
++  name := $(name)_debug
++endif
++name := $(name)-sbsigncerts-$(FILE_NAME_TAG)
++intermediates := \
++	$(call intermediates-dir-for,PACKAGING,sbsign_certs)
++SBSIGN_CERTS_FILE := $(intermediates)/$(name).txt
++# We don't need to really build all the modules.
++# TODO: rebuild SBSIGN_CERTS_FILE if any app change its cert.
++$(SBSIGN_CERTS_FILE):
++	@echo SBSIGN certs list: $@
++	@mkdir -p $(dir $@)
++	@rm -f $@
++	$(hide) for xline in \
++			$(foreach p,$(PACKAGES),\
++			$(if $(PACKAGES.$(p).SBSIGN_KEY),\
++				'$(p) $(PACKAGES.$(p).SBSIGN_CERTIFICATE) $(PACKAGES.$(p).SBSIGN_PRIVATE_KEY) $(PACKAGES.$(p).SBSIGN_BINARY_REPLACE_CERTIFICATE)', \
++				'$(p) IGNORE')) ; \
++		do \
++			read pkg_name pkg_cer pkg_key pkg_replace <<<$${xline}; \
++			echo name=\"$${pkg_name}\" certificate=\"$${pkg_cer}\" private_key=\"$${pkg_key}\" binary_replace_cert=\"$${pkg_replace}\" >>$@ ; \
++		done
++	# In case $(PACKAGES) is empty.
++	$(hide) touch $@
++
++.PHONY: sbsigncerts-list
++sbsigncerts-list: $(SBSIGN_CERTS_FILE)
++
++ifneq (,$(TARGET_BUILD_APPS))
++  $(call dist-for-goals, apps_only, $(SBSIGN_CERTS_FILE):sbsign_certs.txt)
++endif
++
++# -----------------------------------------------------------------
+ # module info file
+ ifdef CREATE_MODULE_INFO_FILE
+   MODULE_INFO_FILE := $(PRODUCT_OUT)/module-info.txt
+@@ -1174,6 +1210,8 @@ $(BUILT_TARGET_FILES_PACKAGE): \
+ 		$(INSTALLED_ANDROID_INFO_TXT_TARGET) \
+ 		$(built_ota_tools) \
+ 		$(APKCERTS_FILE) \
++		$(SBSIGN_CERTS_FILE) \
++		$(TARGET_FILES_PACKAGE_DISCARD_FILES) \
+ 		$(HOST_OUT_EXECUTABLES)/fs_config \
+ 		| $(ACP)
+ 	@echo "Package target files: $@"
+@@ -1241,6 +1279,12 @@ endif
+ 	@# build them.
+ 	$(hide) mkdir -p $(zip_root)/META
+ 	$(hide) $(ACP) $(APKCERTS_FILE) $(zip_root)/META/apkcerts.txt
++	$(hide) $(ACP) $(SBSIGN_CERTS_FILE) $(zip_root)/META/sbsign_certs.txt
++ifdef TARGET_FILES_PACKAGE_DISCARD_FILES
++	$(hide) $(foreach t,$(TARGET_FILES_PACKAGE_DISCARD_FILES),\
++	            mkdir -p $(zip_root)/DISCARD/$(dir $(t)); \
++	            $(ACP) $(t) $(zip_root)/DISCARD/$(t);)
++endif
+ 	$(hide)	echo "$(PRODUCT_OTA_PUBLIC_KEYS)" > $(zip_root)/META/otakeys.txt
+ 	$(hide) echo "recovery_api_version=$(PRIVATE_RECOVERY_API_VERSION)" > $(zip_root)/META/misc_info.txt
+ 	$(hide) echo "fstab_version=$(PRIVATE_RECOVERY_FSTAB_VERSION)" >> $(zip_root)/META/misc_info.txt
+diff --git a/core/prebuilt.mk b/core/prebuilt.mk
+index 6e08832..50ee31a 100644
+--- a/core/prebuilt.mk
++++ b/core/prebuilt.mk
+@@ -119,6 +119,21 @@ else ifeq ($(LOCAL_CERTIFICATE),PRESIGNED)
+   # but the dexpreopt process will not try to re-sign the app.
+   PACKAGES.$(LOCAL_MODULE).CERTIFICATE := PRESIGNED
+   PACKAGES := $(PACKAGES) $(LOCAL_MODULE)
++else ifeq ($(LOCAL_CERTIFICATE),SBSIGN)
++  # The magic string "SBSIGN" means this package is already signed.
++  # If LOCAL_SBSIGN_REPLACE_CERTIFICATE is specified, the final package
++  # will be re-signed with a different key later.
++  #
++  # By setting .CERTIFICATE but not .PRIVATE_KEY, this package will be
++  # mentioned in apkcerts.txt (with certificate set to "SBSIGN")
++  # but the dexpreopt process will not try to re-sign the app.
++  PACKAGES.$(LOCAL_MODULE).CERTIFICATE := SBSIGN
++  PACKAGES := $(PACKAGES) $(LOCAL_MODULE)
++
++  PACKAGES.$(LOCAL_MODULE).SBSIGN_KEY := 1
++  PACKAGES.$(LOCAL_MODULE).SBSIGN_PRIVATE_KEY := $(LOCAL_SBSIGN_CERTIFICATE)
++  PACKAGES.$(LOCAL_MODULE).SBSIGN_CERTIFICATE := $(LOCAL_SBSIGN_CERTIFICATE)
++  PACKAGES.$(LOCAL_MODULE).SBSIGN_BINARY_REPLACE_CERTIFICATE := $(LOCAL_SBSIGN_BINARY_REPLACE_CERTIFICATE)
+ else
+   # If this is not an absolute certificate, assign it to a generic one.
+   ifeq ($(dir $(strip $(LOCAL_CERTIFICATE))),./)
+diff --git a/tools/releasetools/common.py b/tools/releasetools/common.py
+index 2836fec..e6ff323 100644
+--- a/tools/releasetools/common.py
++++ b/tools/releasetools/common.py
+@@ -49,7 +49,8 @@ OPTIONS.info_dict = None
+ 
+ 
+ # Values for "certificate" in apkcerts that mean special things.
+-SPECIAL_CERT_STRINGS = ("PRESIGNED", "EXTERNAL")
++SPECIAL_CERT_STRINGS = ("PRESIGNED", "EXTERNAL", "SBSIGN")
++IGNORE_CERT_STRINGS = ("IGNORE")
+ 
+ 
+ class ExternalError(RuntimeError): pass
+@@ -396,11 +397,24 @@ def GetKeyPasswords(keylist):
+       no_passwords.append(k)
+       continue
+ 
+-    p = Run(["openssl", "pkcs8", "-in", k+".pk8",
+-             "-inform", "DER", "-nocrypt"],
++    cmd = ["openssl", "pkcs8", "-in"]
++
++    if os.path.isfile(k + ".key"):
++      cmd.append(k + ".key")
++      cmd.append("-inform")
++      cmd.append("PEM");
++    else:
++      cmd.append(k + ".pk8");
++      cmd.append("-inform")
++      cmd.append("DER");
++
++    cmd.append("-nocrypt");
++
++    p = Run(cmd,
+             stdin=devnull.fileno(),
+             stdout=devnull.fileno(),
+             stderr=subprocess.STDOUT)
++
+     p.communicate()
+     if p.returncode == 0:
+       no_passwords.append(k)
+@@ -458,6 +472,56 @@ def SignFile(input_name, output_name, key, password, align=None,
+     temp.close()
+ 
+ 
++def SbsignFile(input_name, output_name, key, password):
++  """Sign the input_name binary with sbsign, producing output_name.
++  Use the given key and password (the latter may be None if the key
++  does not have a password.
++  """
++
++  # sbsign needs PEM formatted key and certificate.
++  # may need to convert DER formatted private to PEM format.
++  key_data = GetPrivateKeyPEM(ReadPrivateKeyFile(key))
++  key_f = tempfile.NamedTemporaryFile()
++  key_f.write(key_data)
++  key_f.flush()
++
++  cert_data = GetCertificatePEM(ReadCertificateFile(key))
++  cert_f = tempfile.NamedTemporaryFile()
++  cert_f.write(cert_data)
++  cert_f.flush()
++
++  cmd = ["sbsign", "--key", key_f.name,
++           "--cert", cert_f.name,
++           "--output", output_name, input_name]
++
++  p = Run(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
++  if password is not None:
++    password += "\n"
++  p.communicate(password)
++  if p.returncode != 0:
++    raise ExternalError("sbsign failed: return code %s" % (p.returncode,))
++
++  key_f.close()
++  cert_f.close()
++
++
++def BinaryCertReplaceFile(input_name, output_name, key, password):
++  """Sign the input_name binary with sbsign, producing output_name.
++  Use the given key and password (the latter may be None if the key
++  does not have a password.
++  """
++
++  cmd = ["sbsign", "--key", key + ".key", "--cert", key + ".crt",
++           "--output", output_name, input_name]
++
++  p = Run(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
++  if password is not None:
++    password += "\n"
++  p.communicate(password)
++  if p.returncode != 0:
++    raise ExternalError("sbsign failed: return code %s" % (p.returncode,))
++
++
+ def CheckSize(data, target, info_dict):
+   """Check the data string passed against the max size limit, if
+   any, for the given target.  Raise exception if the data is too big.
+@@ -515,6 +579,165 @@ def ReadApkCerts(tf_zip):
+   return certmap
+ 
+ 
++def ReadSbsignCerts(tf_zip):
++  """Given a target_files ZipFile, parse the META/sbsign_certs.txt file
++  and return a {package: cert} dict."""
++  certmap = {}
++  for line in tf_zip.read("META/sbsign_certs.txt").split("\n"):
++    line = line.strip()
++    if not line: continue
++    m = re.match(r'^name="(.*)"\s+certificate="(.*)"\s+'
++                 r'private_key="(.*)"\s+'
++                 r'binary_replace_cert="(.*)"$', line)
++    if m:
++      name, cert, privkey, bin_replace = m.groups()
++      if cert and privkey:
++        certmap[name] = cert
++      elif cert not in IGNORE_CERT_STRINGS:
++        raise ValueError("failed to parse line from sbsign_certs.txt:\n" + line)
++  return certmap
++
++
++def ReadBinaryReplaceCerts(tf_zip):
++  """Given a target_files ZipFile, parse the META/sbsign_certs.txt file
++  and return a {package: binary_replace_cert} dict."""
++  replace_map = {}
++  for line in tf_zip.read("META/sbsign_certs.txt").split("\n"):
++    line = line.strip()
++    if not line: continue
++    m = re.match(r'^name="(.*)"\s+certificate="(.*)"\s+'
++                 r'private_key="(.*)"\s+'
++                 r'binary_replace_cert="(.*)"$', line)
++    if m:
++      name, cert, privkey, bin_replace = m.groups()
++      if bin_replace:
++        replace_map[name] = bin_replace
++  return replace_map
++
++
++def GetCertificateDER(data):
++  """Given the data of a certificate file in x.509,
++  convert to DER format if necessary using OpenSSL."""
++  if b'CERTIFICATE' in data:
++    cert_pem = tempfile.NamedTemporaryFile()
++    cert_pem.write(data)
++    cert_pem.flush()
++
++    cert_der = tempfile.NamedTemporaryFile()
++
++    p = Run(["openssl", "x509",
++              "-in", cert_pem.name,
++              "-inform", "PEM",
++              "-out", cert_der.name,
++              "-outform", "DER"],
++            stderr=subprocess.STDOUT)
++    p.communicate()
++    if not p.returncode == 0:
++      raise ExternalError("error converting certificate from PEM to DER")
++
++    output = cert_der.read()
++
++    cert_pem.close()
++    cert_der.close()
++  else:
++    output = data
++
++  return output
++
++
++def GetCertificatePEM(data):
++  """Given the data of a certificate file in x.509,
++  convert to PEM format if necessary using OpenSSL."""
++  if b'CERTIFICATE' not in data:
++    cert_der = tempfile.NamedTemporaryFile()
++    cert_der.write(data)
++    cert_der.flush()
++
++    cert_pem = tempfile.NamedTemporaryFile()
++
++    p = Run(["openssl", "x509",
++              "-in", cert_pem.name,
++              "-inform", "DER",
++              "-out", cert_der.name,
++              "-outform", "PEM"],
++            stderr=subprocess.STDOUT)
++    p.communicate()
++    if not p.returncode == 0:
++      raise ExternalError("error converting certificate from DER to PEM")
++
++    output = cert_pem.read()
++
++    cert_pem.close()
++    cert_der.close()
++  else:
++    output = data
++
++  return output
++
++
++def GetPrivateKeyPEM(data):
++  """Given the data of a private key file in pkcs8,
++  convert to PEM format if necessary using OpenSSL."""
++  if b'PRIVATE KEY' not in data:
++    cert_pem = tempfile.NamedTemporaryFile()
++    cert_pem.write(data)
++    cert_pem.flush()
++
++    cert_der = tempfile.NamedTemporaryFile()
++
++    p = Run(["openssl", "pkcs8",
++              "-in", cert_pem.name,
++              "-inform", "DER",
++              "-out", cert_der.name,
++              "-outform", "PEM",
++              "-nocrypt"],
++            stderr=subprocess.STDOUT)
++    p.communicate()
++    if not p.returncode == 0:
++      raise ExternalError("error converting certificate from DER to PEM")
++
++    output = cert_der.read()
++
++    cert_pem.close()
++    cert_der.close()
++  else:
++    output = data
++
++  return output
++
++
++def ReadCertificateFile(cert_prefix):
++  """Given the prefix to the filename of a certificate file
++  (ending with ".crt" or ".x509.pem"), read the content of
++  the certificate into memory."""
++  if (os.path.isfile(cert_prefix + ".crt")):
++    fn = cert_prefix + ".crt"
++  else:
++    fn = cert_prefix + ".x509.pem"
++
++  f = open(fn, "r+b")
++  data = f.read()
++  f.close()
++
++  return data
++
++
++def ReadPrivateKeyFile(key_prefix):
++  """Given the prefix to the filename of a certificate file
++  (ending with ".key" or ".pk8"), read the content of
++  the certificate into memory."""
++  if (os.path.isfile(key_prefix + ".key")):
++    fn = key_prefix + ".key"
++  else:
++    fn = key_prefix + ".pk8"
++
++  f = open(fn, "r+b")
++  data = f.read()
++  f.close()
++
++  return data
++
++
+ COMMON_DOCSTRING = """
+   -p  (--path)  <dir>
+       Prepend <dir>/bin to the list of places to search for binaries
+diff --git a/tools/releasetools/sign_target_files_apks b/tools/releasetools/sign_target_files_apks
+index eaad8a4..e385dcd 100755
+--- a/tools/releasetools/sign_target_files_apks
++++ b/tools/releasetools/sign_target_files_apks
+@@ -27,6 +27,19 @@ Usage:  sign_target_files_apks [flags] input_target_files output_target_files
+       in the apkcerts.txt file.  Option may be repeated to give
+       multiple extra packages.
+ 
++  -b  (--extra_sbsign)  <name,name,...=key>
++      Add extra sbsign name/key pairs as though they appeared in
++      sbsign_certs.txt (so mappings specified by -k and -d are applied).
++      Keys specified in -b override any value for that binary contained
++      in the sbsign_certs.txt file.  Option may be repeated to give
++      multiple extra binaries.
++
++  -r  (--extra_bin_cert_replace)  <name,name,...=old_cert:new_cert>
++      Add extra name/bin_replace pairs as though they appeared in
++      sbsign_certs.txt. Certs specified in -r override any value for
++      that binary contained in the sbsign_certs.txt file.  Option may
++      be repeated to give multiple extra binaries.
++
+   -k  (--key_mapping)  <src_key=dest_key>
+       Add a mapping from the key name as specified in apkcerts.txt (the
+       src_key) to the real key you wish to sign the package with
+@@ -41,6 +54,8 @@ Usage:  sign_target_files_apks [flags] input_target_files output_target_files
+         $devkey/media     ==>  $dir/media
+         $devkey/shared    ==>  $dir/shared
+         $devkey/platform  ==>  $dir/platform
++        uefi_shim_key     ==>  $dir/uefi_shim_key
++        uefi_bios_db_key  ==>  $dir/uefi_bios_db_key
+ 
+       where $devkey is the directory part of the value of
+       default_system_dev_certificate from the input target-files's
+@@ -84,6 +99,8 @@ import common
+ OPTIONS = common.OPTIONS
+ 
+ OPTIONS.extra_apks = {}
++OPTIONS.extra_sbsign = {}
++OPTIONS.extra_bin_cert_replace = {}
+ OPTIONS.key_map = {}
+ OPTIONS.replace_ota_keys = False
+ OPTIONS.tag_changes = ("-test-keys", "-dev-keys", "+release-keys")
+@@ -104,6 +121,65 @@ def GetApkCerts(tf_zip):
+   return certmap
+ 
+ 
++def GetSbsignCerts(tf_zip):
++  certmap = common.ReadSbsignCerts(tf_zip)
++
++  # apply the key remapping to the contents of the file
++  for binary, cert in certmap.iteritems():
++    certmap[binary] = OPTIONS.key_map.get(cert, cert)
++
++  # apply all the -b options, overriding anything in the file
++  for binary, cert in OPTIONS.extra_sbsign.iteritems():
++    if not cert:
++      cert = "IGNORE"
++    certmap[binary] = OPTIONS.key_map.get(cert, cert)
++
++  return certmap
++
++
++def GetBinaryReplaceCerts(tf_zip):
++  replace_map = common.ReadBinaryReplaceCerts(tf_zip)
++
++  discard = {}
++  replace = {}
++
++  for binary, dr in replace_map.iteritems():
++    if ':' in dr:
++      items = dr.split(':')
++      discard[binary] = items[0]
++      replace[binary] = items[1]
++    else:
++      raise ValueError("Error parsing for binary cert replacement: %s: %s" % (binary, dr))
++
++  # apply the key remapping for certificate
++  certmap = {}
++  for binary, cert in replace.iteritems():
++    certmap[binary] = OPTIONS.key_map.get(cert, cert)
++
++  # key to discard is under DISCARD/ in zip
++  discardmap = {}
++  for binary, cert in discard.iteritems():
++    discardmap[binary] = 'DISCARD/' + cert
++
++  # apply all the -b options, overriding anything in the file
++  for binary, cert in OPTIONS.extra_sbsign.iteritems():
++    if not cert:
++      cert = "IGNORE"
++    certmap[binary] = OPTIONS.key_map.get(cert, cert)
++
++  # apply all the -r options, overriding anything in the file
++  for binary, cert in OPTIONS.extra_bin_cert_replace.iteritems():
++    if not cert:
++      cert = "IGNORE"
++    discardmap[binary] = OPTIONS.key_map.get(cert, cert)
++
++  mapping = {}
++  for binary in replace_map:
++    mapping[binary] = [discardmap[binary], certmap[binary]]
++
++  return mapping
++
++
+ def CheckAllApksSigned(input_tf_zip, apk_key_map):
+   """Check that all the APKs we want to sign have keys specified, and
+   error out if they don't."""
+@@ -137,11 +213,72 @@ def SignApk(data, keyname, pw):
+   return data
+ 
+ 
+-def SignApks(input_tf_zip, output_tf_zip, apk_key_map, key_passwords):
++def SbsignBinary(data, keyname, pw):
++  unsigned = tempfile.NamedTemporaryFile()
++  unsigned.write(data)
++  unsigned.flush()
++
++  signed = tempfile.NamedTemporaryFile()
++
++  common.SbsignFile(unsigned.name, signed.name, keyname, pw)
++
++  data = signed.read()
++  unsigned.close()
++  signed.close()
++
++  return data
++
++
++def BinaryCertReplace(data, cert_discard_data, cert_replace_prefix):
++  old_cert_data = common.GetCertificateDER(cert_discard_data)
++
++  # Replace data
++  if old_cert_data in data:
++    new_cert_data = common.GetCertificateDER(common.ReadCertificateFile(cert_replace_prefix))
++
++    # cannot overwrite other data
++    if (len(new_cert_data) > len(old_cert_data)):
++      raise ValueError("length of new cert data is larger than the old cert")
++
++    # need to make sure the replacement is of same size
++    # or else the binary will be smaller!!
++    while (len(new_cert_data) < len(old_cert_data)):
++      new_cert_data = new_cert_data + b'\x00'
++
++    output = data.replace(old_cert_data, new_cert_data)
++  else:
++    raise ValueError("Old cert not found in binary. Cannot replace.");
++
++  return output
++
++
++def SignFiles(input_tf_zip, output_tf_zip, apk_key_map,
++              sbsign_key_map, binary_cert_replace_map,
++              key_passwords):
+   maxsize = max([len(os.path.basename(i.filename))
+                  for i in input_tf_zip.infolist()
+                  if i.filename.endswith('.apk')])
+ 
++  # Find all discard file and copy them out
++  discard_files = {};
++  for info in input_tf_zip.infolist():
++    if info.filename.startswith('DISCARD/') and \
++         not info.filename.endswith('/'):
++       discard_files[info.filename] = input_tf_zip.read(info.filename)
++  for name in binary_cert_replace_map:
++    cert = binary_cert_replace_map[name][0]
++    if not cert.startswith('DISCARD/'):
++      if os.path.isfile(cert + ".crt"):
++        cert_fn = cert + ".crt"
++      else:
++        cert_fn = cert + ".x509.pem"
++
++      print cert_fn
++      f = open(cert_fn, "rb")
++      discard_files[cert] = f.read()
++      f.close()
++
++  # Go through all the files and sign them
+   for info in input_tf_zip.infolist():
+     data = input_tf_zip.read(info.filename)
+     out_info = copy.copy(info)
+@@ -162,8 +299,39 @@ def SignApks(input_tf_zip, output_tf_zip, apk_key_map, key_passwords):
+       new_data = RewriteProps(data)
+       output_tf_zip.writestr(out_info, new_data)
+     else:
+-      # a non-APK file; copy it verbatim
+-      output_tf_zip.writestr(out_info, data)
++      # need to check if we need to replace cert embedded in file
++      # and/or if the binary needs to be re-signed using sbsign
++      name = os.path.basename(info.filename)
++      cert_replaced = False
++
++      if name in binary_cert_replace_map or name in sbsign_key_map:
++
++        # need to replace cert in binary
++        # and have to do this before re-signing
++        if name in binary_cert_replace_map:
++          cert = binary_cert_replace_map[name][1];
++          discard = binary_cert_replace_map[name][0];
++          print "   certchg:  %-*s (%s -> %s)" % (maxsize, name, discard, cert)
++          replaced_data = BinaryCertReplace(data, discard_files[discard], cert)
++          cert_replaced = True
++
++        # need to re-sign the binary
++        if name in sbsign_key_map:
++          key = sbsign_key_map[name]
++          print "    sbsign:  %-*s (%s)" % (maxsize, name, key)
++          if cert_replaced:
++            tosign_data = replaced_data
++          else:
++            tosign_data = data
++
++          signed_data = SbsignBinary(tosign_data, key, key_passwords[key])
++          output_tf_zip.writestr(out_info, signed_data)
++
++      else:
++        # a non-APK file; copy it verbatim
++        # if they are not under DISCARD/
++        if not info.filename.startswith('DISCARD/'):
++          output_tf_zip.writestr(out_info, data)
+ 
+ 
+ def EditTags(tags):
+@@ -276,6 +444,8 @@ def BuildKeyMap(misc_info, key_mapping_options):
+           devkeydir + "/media":    d + "/media",
+           devkeydir + "/shared":   d + "/shared",
+           devkeydir + "/platform": d + "/platform",
++          "uefi_shim_key":         d + "/uefi_shim_key",
++          "uefi_bios_db_key":      d + "/uefi_bios_db_key",
+           })
+     else:
+       OPTIONS.key_map[s] = d
+@@ -291,6 +461,16 @@ def main(argv):
+       names = names.split(",")
+       for n in names:
+         OPTIONS.extra_apks[n] = key
++    elif o in ("-b", "--extra_sbsign"):
++      names, key = a.split("=")
++      names = names.split(",")
++      for n in names:
++        OPTIONS.extra_sbsign[n] = key
++    elif o in ("-r", "--extra_bin_cert_replace"):
++      names, key = a.split("=")
++      names = names.split(",")
++      for n in names:
++        OPTIONS.extra_bin_cert_replace[n] = key
+     elif o in ("-d", "--default_key_mappings"):
+       key_mapping_options.append((None, a))
+     elif o in ("-k", "--key_mapping"):
+@@ -310,8 +490,10 @@ def main(argv):
+     return True
+ 
+   args = common.ParseOptions(argv, __doc__,
+-                             extra_opts="e:d:k:ot:",
++                             extra_opts="e:b:r:d:k:ot:",
+                              extra_long_opts=["extra_apks=",
++                                              "extra_sbsign=",
++                                              "extra_bin_cert_replace=",
+                                               "default_key_mappings=",
+                                               "key_mapping=",
+                                               "replace_ota_keys",
+@@ -332,8 +514,14 @@ def main(argv):
+   apk_key_map = GetApkCerts(input_zip)
+   CheckAllApksSigned(input_zip, apk_key_map)
+ 
++  binary_cert_replace_map = GetBinaryReplaceCerts(input_zip)
++  sbsign_key_map = GetSbsignCerts(input_zip)
++
+   key_passwords = common.GetKeyPasswords(set(apk_key_map.values()))
+-  SignApks(input_zip, output_zip, apk_key_map, key_passwords)
++  key_passwords.update(common.GetKeyPasswords(set(sbsign_key_map.values())))
++
++  SignFiles(input_zip, output_zip, apk_key_map, sbsign_key_map,
++            binary_cert_replace_map, key_passwords)
+ 
+   if OPTIONS.replace_ota_keys:
+     ReplaceOtaKeys(input_zip, output_zip, misc_info)
+-- 
+1.7.4.1
+

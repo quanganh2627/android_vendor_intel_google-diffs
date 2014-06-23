@@ -1,0 +1,345 @@
+From cb38cd3338a890fe913ff65b7910370e694dff35 Mon Sep 17 00:00:00 2001
+From: Bijoy Jose <bijoy.a.jose@intel.com>
+Date: Thu, 21 Mar 2013 18:07:14 -0700
+Subject: Dalvik: Constant initialization for 64 bit moves and float computations
+
+BZ: 94647
+
+Constant initialization for float add,sub,mul,div and cmp operations.
+Constant initialization applied to moving 64 bit immediate to VR for
+float and double types. Some log format changes.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I798deb651275688f582b6dd503e42aaaefb5e734
+Orig-MCG-Change-Id: I9c4263a27846263107f6f51a0324c310d8053a90
+Signed-off-by: Bijoy Jose <bijoy.a.jose@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/codegen/x86/AnalysisO1.h         |    3 +-
+ vm/compiler/codegen/x86/CodegenInterface.cpp |   36 +++----
+ vm/compiler/codegen/x86/LowerHelper.cpp      |  137 ++++++++++++++++++++++++--
+ vm/compiler/codegen/x86/Schedule.cpp         |    6 +-
+ 4 files changed, 146 insertions(+), 36 deletions(-)
+
+diff --git a/vm/compiler/codegen/x86/AnalysisO1.h b/vm/compiler/codegen/x86/AnalysisO1.h
+index ec965ef..4776fb2 100644
+--- a/vm/compiler/codegen/x86/AnalysisO1.h
++++ b/vm/compiler/codegen/x86/AnalysisO1.h
+@@ -205,8 +205,7 @@ typedef struct ConstInfo {
+     int valueH;             /**< @brief The higher 32 bits of the constant */
+     int regNum;             /**< @brief The register number of the constant */
+     int offsetAddr;         /**< @brief The offset from start of instruction */
+-    char* streamAddr;       /**< @brief The address of instruction in stream before scheduling */
+-    char* schedAddr;        /**< @brief The address of memory location to patch after scheduling */
++    char* streamAddr;       /**< @brief The address of instruction in stream */
+     char* constAddr;        /**< @brief The address of the constant at the end of trace */
+     struct ConstInfo *next; /**< @brief The pointer to the next 64 bit constant */
+ } ConstInfo;
+diff --git a/vm/compiler/codegen/x86/CodegenInterface.cpp b/vm/compiler/codegen/x86/CodegenInterface.cpp
+index fdff23b..71f36b5 100644
+--- a/vm/compiler/codegen/x86/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/CodegenInterface.cpp
+@@ -1314,7 +1314,6 @@ void addNewToConstList(struct ConstInfo** listPtr, int constL, int constH, int r
+     tmpPtr->offsetAddr = 0;
+     tmpPtr->streamAddr = NULL;
+     tmpPtr->constAddr = NULL;
+-    tmpPtr->schedAddr = NULL;
+     tmpPtr->next = *listPtr;
+     *listPtr = tmpPtr;
+     assert(*listPtr != NULL);
+@@ -1332,10 +1331,10 @@ void addNewToConstList(struct ConstInfo** listPtr, int constL, int constH, int r
+  */
+ bool saveAddrToConstList(struct ConstInfo** listPtr, int constL, int constH, int reg, char* patchAddr, int offset) {
+     struct ConstInfo* tmpPtr = *listPtr;
+-    while (tmpPtr != NULL) {    // check all elements of the structure
++    while (tmpPtr != NULL) {                // check all elements of the structure
+         if (tmpPtr->valueL == constL && tmpPtr->valueH == constH && tmpPtr->regNum == reg && tmpPtr->streamAddr==NULL) {
+             tmpPtr->streamAddr = patchAddr; // save address of instruction in jit stream
+-            tmpPtr->offsetAddr = offset; // save offset to memory location to patch for the instruction
++            tmpPtr->offsetAddr = offset;    // save offset to memory location to patch for the instruction
+ #ifdef DEBUG_CONST
+             ALOGD("**Save constants for VR# %d containing constant (%x):(%x) streamAddr is (%d)%x, offset %d",
+                              tmpPtr->regNum, tmpPtr->valueL, tmpPtr->valueH,
+@@ -1384,10 +1383,7 @@ int patchConstToStream(struct ConstInfo *constListTemp, CompilationUnit *cUnit)
+ 
+     while (constListTemp != NULL){
+         /* iterate through the generated code to patch constants */
+-        if (gDvmJit.scheduling== true)
+-            iaddr = static_cast<char*>(constListTemp->schedAddr);
+-        else
+-            iaddr = static_cast<char*>(constListTemp->streamAddr+constListTemp->offsetAddr);
++        iaddr = static_cast<char*>(constListTemp->streamAddr+constListTemp->offsetAddr);
+ 
+         writeval = reinterpret_cast<unsigned int*>(iaddr);
+         unsigned int dispAddr =  getGlobalDataAddr("64bits");
+@@ -1397,8 +1393,8 @@ int patchConstToStream(struct ConstInfo *constListTemp, CompilationUnit *cUnit)
+ #ifdef DEBUG_CONST
+             ALOGI("Patched location of VR# %d with constant (%x):(%x)",
+                             constListTemp->regNum, constListTemp->valueL, constListTemp->valueH);
+-            ALOGI("Address is streamAddr %p, schedAddr %p, offset %d with constAddr %p",
+-                       constListTemp->streamAddr,constListTemp->schedAddr, constListTemp->offsetAddr, constListTemp->constAddr);
++            ALOGI("Address is streamAddr %p,  offset %d with constAddr %p",
++                       constListTemp->streamAddr, constListTemp->offsetAddr, constListTemp->constAddr);
+ #endif
+             pResult++;              /* keep count of successful patches in stream */
+         } else {
+@@ -1406,8 +1402,8 @@ int patchConstToStream(struct ConstInfo *constListTemp, CompilationUnit *cUnit)
+ #ifdef DEBUG_CONST
+             ALOGI("Tried patching VR# %d with constant (%x):(%x)",
+                             constListTemp->regNum, constListTemp->valueL, constListTemp->valueH);
+-            ALOGI("Address is streamAddr %p, schedAddr %p, offset %d with constAddr %p",
+-                    constListTemp->streamAddr,constListTemp->schedAddr, constListTemp->offsetAddr, constListTemp->constAddr);
++            ALOGI("Address is streamAddr %p, offset %d with constAddr %p",
++                    constListTemp->streamAddr, constListTemp->offsetAddr, constListTemp->constAddr);
+ #endif
+             ALOGI("JIT_INFO: Constant init opt could not patch all required locations");
+             return -1;              /* incorrect data found at patch location, reject trace */
+@@ -1931,20 +1927,20 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+     gDvmJit.codeCacheByteUsed += (stream - streamStart);
+ 
+     int patchCount = 0;       // Store number of constants initialized in a trace
++    int constSize = 0;        // size of constant data section in bytes
+     ConstInfo *constListTemp; // Temp ptr for constant initialization
+     unsigned int *intaddr = reinterpret_cast<unsigned int *>(stream);
+ 
+     if(((gDvmJit.disableOpt & (1 << kElimConstInitOpt)) == false) && cUnit->constListHead != NULL ) {
+ 
+-        int constSize = 0; // size of constant data section in bytes
+         constListTemp = cUnit->constListHead;
+         while(constListTemp != NULL){
+             constSize = constSize + 8; // 4 bytes each for higher and lower 32 bits
+             constListTemp = constListTemp->next;
+         }
+ 
+-        //  Sum of bytes used in code cache, constant data section and padding should be lower than code cache size
+-        if(gDvmJit.codeCacheByteUsed + constSize + CODE_CACHE_PADDING > gDvmJit.codeCacheSize) {
++        //  Sum of bytes used in code cache, constant data section should be lower than code cache size
++        if(gDvmJit.codeCacheByteUsed + constSize > gDvmJit.codeCacheSize) {
+             ALOGE("JIT_ERROR: Code cache full after ChainingCellCounts and constant data section");
+             SET_JIT_ERROR(kJitErrorCodeCacheFull);
+             gDvmJit.codeCacheFull = true;
+@@ -1985,18 +1981,16 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+     if((gDvmJit.disableOpt & (1 << kElimConstInitOpt)) == false) {
+         if ((cUnit->printMe && (patchCount > 0) ) == true) {
+             ALOGD("-------- Constant Data Section ------");
+-            intaddr = reinterpret_cast<unsigned int*>(static_cast<unsigned char *>(gDvmJit.codeCache) + gDvmJit.codeCacheByteUsed);
++             unsigned long long *longaddr = reinterpret_cast<unsigned long long*>(static_cast<unsigned char *>(gDvmJit.codeCache) + gDvmJit.codeCacheByteUsed);
+             constListTemp = cUnit->constListHead;
+             while(constListTemp != NULL){
+-                ALOGD("**  %p: %d (%x)", intaddr, *intaddr, *intaddr); // print lower 32 bits of constant
+-                intaddr++;
+-                ALOGD("**  %p: %d (%x)", intaddr, *intaddr, *intaddr); // print higher 32 bits of constant
+-                intaddr++;
++                ALOGD("**  %p: %d (%x)", longaddr, *longaddr, *longaddr); // print each constant
++                longaddr++;
+                 constListTemp = constListTemp->next;
+             }
+         }
+-        gDvmJit.codeCacheByteUsed += (patchCount*8); // adjust cache byte used to include constants 4bytesL, 4bytesH
+-        stream = stream + (patchCount*8);            // move stream pointer to end of constant section of trace
++        gDvmJit.codeCacheByteUsed += constSize; // adjust code cache byte used to include constants
++        stream = stream + constSize;            // move stream pointer to end of constant section of trace
+         cUnit->totalSize = (stream - streamStart);   // adjust cUnit->totalSize to include constants
+         cUnit->constListHead = NULL;
+ 
+diff --git a/vm/compiler/codegen/x86/LowerHelper.cpp b/vm/compiler/codegen/x86/LowerHelper.cpp
+index 65ca37e..896f0de 100644
+--- a/vm/compiler/codegen/x86/LowerHelper.cpp
++++ b/vm/compiler/codegen/x86/LowerHelper.cpp
+@@ -1330,8 +1330,38 @@ void compare_VR_reg_all(OpndSize size,
+                 ALOGI("VR is const and SS in compare_VR_reg");
+ #endif
+                 writeBackConstVR(vA, tmpValue[0]);
+-                //dumpImmToMem(vA+1, OpndSize_32, 0); //CHECK necessary? will overwrite vA+1!!!
+-                dump_mem_reg(m, ATOM_NORMAL, size, 4*vA, PhysicalReg_FP, true, MemoryAccess_VR, vA, reg, isPhysical, pType, NULL);
++                bool storedAddr = false;
++                if((gDvmJit.disableOpt & (1 << kElimConstInitOpt)) == false){
++                    tmpValue[1] = 0;// set higher 32 bits to zero
++
++                    // create a new record of a constant
++                    addNewToConstList(&(gCompilationUnit->constListHead), tmpValue[0], tmpValue[1], vA);
++
++                    // save mem access location in constList
++                    const int offset = 3; // offset is 3 for COMISS
++                    storedAddr = saveAddrToConstList(&(gCompilationUnit->constListHead), tmpValue[0], tmpValue[1], vA, stream, offset);
++
++                    ConstInfo* tmpPtr = gCompilationUnit->constListHead;
++                    if (storedAddr == true){
++#ifdef DEBUG_CONST
++                        ALOGD("constVRList regnum %d, valueL %d(%x) valueH %d(%x)",
++                                tmpPtr->regNum, tmpPtr->valueL, tmpPtr->valueL,
++                                tmpPtr->valueH, tmpPtr->valueH);
++#endif
++                    } else {
++                        ALOGI("JIT_INFO: Error creating constant failed for VR %d, regnum %d, valueL %d(%x) valueH %d(%x)",
++                                tmpPtr->regNum, tmpPtr->valueL, tmpPtr->valueL,
++                                tmpPtr->valueH, tmpPtr->valueH);
++                    }
++                }
++                // Lower mem_reg instruction with constant to be accessed from constant data section
++                if (storedAddr == true) {
++                    int dispAddr =  getGlobalDataAddr("64bits");
++                    dump_mem_reg(m, ATOM_NORMAL, OpndSize_32, dispAddr, PhysicalReg_Null, true,
++                                     MemoryAccess_VR, vA, reg, isPhysical, pType, &(gCompilationUnit->constListHead));
++                } else {
++                    dump_mem_reg(m, ATOM_NORMAL, size, 4*vA, PhysicalReg_FP, true, MemoryAccess_VR, vA, reg, isPhysical, pType, NULL);
++                }
+                 return;
+             }
+             else if(size != OpndSize_64) {
+@@ -1933,9 +1963,38 @@ void alu_sd_binary_VR_reg(ALU_Opcode opc, int vA, int reg, bool isPhysical, bool
+         if(isConst == 3 && !isSD) {
+             //isConst can be 0 or 3, mem32, use xmm
+             writeBackConstVR(vA, tmpValue[0]);
+-            dump_mem_reg(m, ATOM_NORMAL_ALU, OpndSize_32, 4*vA, PhysicalReg_FP, true,
+-                       MemoryAccess_VR, vA, reg, isPhysical,
+-                       LowOpndRegType_xmm, NULL);
++
++            bool storedAddr = false;
++            if((gDvmJit.disableOpt & (1 << kElimConstInitOpt)) == false){
++                tmpValue[1] = 0;// set higher 32 bits to zero
++
++                // create a new record of a constant
++                addNewToConstList(&(gCompilationUnit->constListHead), tmpValue[0], tmpValue[1], vA);
++
++                // save mem access location in constList
++                const int offset = 4; // offset is 4 for OPC_(ADD,SUB,MUL,DIV) float operations
++                storedAddr = saveAddrToConstList(&(gCompilationUnit->constListHead), tmpValue[0], tmpValue[1], vA, stream, offset);
++
++                ConstInfo* tmpPtr = gCompilationUnit->constListHead;
++                if (storedAddr == true){ // creating constant record and saving address to constant list was successful
++#ifdef DEBUG_CONST
++                    ALOGD("constVRList regnum %d, valueL %d(%x) valueH %d(%x)",
++                            tmpPtr->regNum, tmpPtr->valueL, tmpPtr->valueL, tmpPtr->valueH, tmpPtr->valueH);
++#endif
++                } else {
++                    ALOGI("JIT_INFO: Error creating constant failed for VR %d, regnum %d, valueL %d(%x) valueH %d(%x)",
++                            tmpPtr->regNum, tmpPtr->valueL, tmpPtr->valueL, tmpPtr->valueH, tmpPtr->valueH);
++                }
++            }
++            // Lower mem_reg instruction with constant to be accessed from constant data section
++            if (storedAddr == true){
++                int dispAddr =  getGlobalDataAddr("64bits");
++                dump_mem_reg(m, ATOM_NORMAL_ALU, OpndSize_32, dispAddr, PhysicalReg_Null, true,
++                                   MemoryAccess_VR, vA, reg, isPhysical, LowOpndRegType_xmm, &(gCompilationUnit->constListHead));
++            } else {
++                 dump_mem_reg(m, ATOM_NORMAL_ALU, OpndSize_32, 4*vA, PhysicalReg_FP, true,
++                                MemoryAccess_VR, vA, reg, isPhysical, LowOpndRegType_xmm, NULL);
++            }
+             return;
+         }
+         if(isConst == 3 && isSD) {
+@@ -1952,7 +2011,7 @@ void alu_sd_binary_VR_reg(ALU_Opcode opc, int vA, int reg, bool isPhysical, bool
+                 storedAddr = saveAddrToConstList(&(gCompilationUnit->constListHead), tmpValue[0], tmpValue[1], vA, stream, offset);
+ 
+                 ConstInfo* tmpPtr = gCompilationUnit->constListHead;
+-                if (storedAddr == true){ // creating constant record and saving address to constant list was successfull
++                if (storedAddr == true){ // creating constant record and saving address to constant list was successful
+ #ifdef DEBUG_CONST
+                     ALOGD("constVRList regnum %d, valueL %d(%x) valueH %d(%x)",
+                             tmpPtr->regNum, tmpPtr->valueL, tmpPtr->valueL, tmpPtr->valueH, tmpPtr->valueH);
+@@ -2431,17 +2490,75 @@ void get_virtual_reg_all(u2 vR, OpndSize size, int reg, bool isPhysical, Mnemoni
+             if(m == Mnemonic_MOVSS) { //load 32 bits from VR
+                 //VR is not mapped to a register but in memory
+                 writeBackConstVR(vR, tmpValue[0]);
++
++                bool storedAddr = false;
++                if((gDvmJit.disableOpt & (1 << kElimConstInitOpt)) == false){
++                    tmpValue[1] = 0;// set higher 32 bits to zero
++
++                    // create a new record of a constant
++                    addNewToConstList(&(gCompilationUnit->constListHead), tmpValue[0], tmpValue[1], vR);
++
++                    // save mem access location in constList
++                    const int offset = 4; // offset is 4 for MOVSS operations
++                    storedAddr = saveAddrToConstList(&(gCompilationUnit->constListHead), tmpValue[0], tmpValue[1], vR, stream, offset);
++
++                    ConstInfo* tmpPtr = gCompilationUnit->constListHead;
++                    if (storedAddr == true){ // creating constant record and saving address to constant list was successful
++#ifdef DEBUG_CONST
++                        ALOGD("constVRList regnum %d, valueL %d(%x) valueH %d(%x)",
++                                tmpPtr->regNum, tmpPtr->valueL, tmpPtr->valueL, tmpPtr->valueH, tmpPtr->valueH);
++#endif
++                    } else {
++                        ALOGI("JIT_INFO: Error creating constant failed for VR %d, regnum %d, valueL %d(%x) valueH %d(%x)",
++                                tmpPtr->regNum, tmpPtr->valueL, tmpPtr->valueL, tmpPtr->valueH, tmpPtr->valueH);
++                    }
++                }
++                // Lower mem_reg instruction with constant to be accessed from constant data section
++                if (storedAddr == true){
++                    int dispAddr =  getGlobalDataAddr("64bits");
++                    dump_mem_reg(m, ATOM_NORMAL, size, dispAddr, PhysicalReg_Null, true,
++                                       MemoryAccess_VR, vR, reg, isPhysical, pType, &(gCompilationUnit->constListHead));
++                } else {
+                 //temporary reg has "pType" (which is xmm)
+-                dump_mem_reg(m, ATOM_NORMAL, size, 4*vR, PhysicalReg_FP, true,
+-                    MemoryAccess_VR, vR, reg, isPhysical, pType, NULL);
++                    dump_mem_reg(m, ATOM_NORMAL, size, 4*vR, PhysicalReg_FP, true,
++                                       MemoryAccess_VR, vR, reg, isPhysical, pType, NULL);
++                }
+                 return;
+             }
+             else if(m == Mnemonic_MOVSD || size == OpndSize_64) {
+                 //VR is not mapped to a register but in memory
+                 writeBackConstVR(vR, tmpValue[0]);
+                 writeBackConstVR(vR+1, tmpValue[1]);
+-                dump_mem_reg(m, ATOM_NORMAL, size, 4*vR, PhysicalReg_FP, true,
+-                    MemoryAccess_VR, vR, reg, isPhysical, pType, NULL);
++                bool storedAddr = false;
++                if((gDvmJit.disableOpt & (1 << kElimConstInitOpt)) == false){
++
++                    // create a new record of a constant
++                    addNewToConstList(&(gCompilationUnit->constListHead), tmpValue[0], tmpValue[1], vR);
++
++                    // save mem access location in constList
++                    const int offset = 4; // offset is 4 for MOVSD operations
++                    storedAddr = saveAddrToConstList(&(gCompilationUnit->constListHead), tmpValue[0], tmpValue[1], vR, stream, offset);
++
++                    ConstInfo* tmpPtr = gCompilationUnit->constListHead;
++                    if (storedAddr == true){ // creating constant record and saving address to constant list was successful
++#ifdef DEBUG_CONST
++                        ALOGD("constVRList regnum %d, valueL %d(%x) valueH %d(%x)",
++                                tmpPtr->regNum, tmpPtr->valueL, tmpPtr->valueL, tmpPtr->valueH, tmpPtr->valueH);
++#endif
++                    } else {
++                        ALOGI("JIT_INFO: Error creating constant failed for VR %d, regnum %d, valueL %d(%x) valueH %d(%x)",
++                                tmpPtr->regNum, tmpPtr->valueL, tmpPtr->valueL, tmpPtr->valueH, tmpPtr->valueH);
++                    }
++                }
++                // Lower mem_reg instruction with constant to be accessed from constant data section
++                if (storedAddr == true){
++                    int dispAddr =  getGlobalDataAddr("64bits");
++                    dump_mem_reg(m, ATOM_NORMAL, size, dispAddr, PhysicalReg_Null, true,
++                                       MemoryAccess_VR, vR, reg, isPhysical, pType, &(gCompilationUnit->constListHead));
++                } else {
++                    dump_mem_reg(m, ATOM_NORMAL, size, 4*vR, PhysicalReg_FP, true,
++                                       MemoryAccess_VR, vR, reg, isPhysical, pType, NULL);
++                }
+                 return;
+             }
+             else if(size != OpndSize_64) {
+diff --git a/vm/compiler/codegen/x86/Schedule.cpp b/vm/compiler/codegen/x86/Schedule.cpp
+index cbc5227..ab9b8f9 100644
+--- a/vm/compiler/codegen/x86/Schedule.cpp
++++ b/vm/compiler/codegen/x86/Schedule.cpp
+@@ -1435,9 +1435,9 @@ void Scheduler::generateAssembly(LowOp * op) {
+         // Constant initialization for 64 bit data requires saving stream address location
+         struct ConstInfo* tmpPtr;
+         tmpPtr = regmem_op->constLink;
+-        if (tmpPtr != NULL && tmpPtr->constAddr == NULL && tmpPtr->schedAddr == NULL){
+-            // save final address as (start of instruction + offset to memory access)
+-            tmpPtr->schedAddr = stream + tmpPtr->offsetAddr;
++        if (tmpPtr != NULL && tmpPtr->constAddr == NULL){
++            // save address of instruction post scheduling
++            tmpPtr->streamAddr = stream;
+         }
+ 
+         if (regmem_op->regDest.regType == LowOpndRegType_fs)
+-- 
+1.7.4.1
+

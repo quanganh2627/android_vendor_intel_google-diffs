@@ -1,0 +1,214 @@
+From d34f19c8b688a7bc258cc3a2247a582e2fc9e114 Mon Sep 17 00:00:00 2001
+From: Eric Dittert <eric.dittert@intel.com>
+Date: Fri, 20 Dec 2013 19:46:52 -0800
+Subject: Dalvik: Infrastructure for JIT code generator selection
+
+BZ: 159340
+
+This patch provides build-time and run-time controls for selecting
+which code generator (LCG or PCG) to use for the JIT compiler.
+The build-time choice is controlled by the makefile variable
+DEFAULT_JIT_CODE_GENERATOR.  The build-time choice can be overridden
+at run-time with the command line argument "-Xjitcodegen:<LCG|PCG>".
+
+DEFAULT_JIT_CODE_GENERATOR should be set in a device-specific makefile.
+If this is not done, DEFAULT_JIT_CODE_GENERATOR will be set to "LCG".
+
+Change-Id: I41e858d3d5eb16b8a7988da4f8d51e59274533fe
+Category: device enablement
+Domain: AOSP.Dalvik-Other
+Origin: internal
+Upstream-Candidate: no, need rework
+Signed-off-by: Eric Dittert <eric.dittert@intel.com>
+---
+ vm/Dvm.mk                  |   11 ++++++-
+ vm/Globals.h               |   14 ++++++++++
+ vm/Init.cpp                |   60 ++++++++++++++++++++++++++++++++++++++++++++
+ vm/compiler/PassDriver.cpp |    7 +++--
+ 4 files changed, 87 insertions(+), 5 deletions(-)
+
+diff --git a/vm/Dvm.mk b/vm/Dvm.mk
+index ea0925a..e88bb3e 100644
+--- a/vm/Dvm.mk
++++ b/vm/Dvm.mk
+@@ -98,12 +98,19 @@ ifeq ($(PROFILE_OPCODE),true)
+         LOCAL_CFLAGS += -DPROFILE_OPCODE
+ endif
+ 
+-# If WITH_JIT variable is false it is not possible to collect any info
+-# about JIT. Thus support for VTune Amplifier should not be enabled.
++# Items that only apply if the JIT is being included
+ ifeq ($(WITH_JIT),true)
++  # If WITH_JIT variable is false it is not possible to collect any info
++  # about JIT. Thus support for VTune Amplifier should not be enabled.
+   ifeq ($(VTUNE_DALVIK),true)
+     LOCAL_CFLAGS += -DVTUNE_DALVIK
+   endif
++
++  # Set default code generator to LCG if not otherwise specified.
++  DEFAULT_JIT_CODE_GENERATOR ?= LCG
++  # Set preprocessor symbol for selecting JIT code generator base on
++  # makefile variable.
++  LOCAL_CFLAGS += -DDEFAULT_JIT_CODE_GENERATOR=$(DEFAULT_JIT_CODE_GENERATOR)
+ endif
+ 
+ LOCAL_SRC_FILES := \
+diff --git a/vm/Globals.h b/vm/Globals.h
+index 1ed9a41..8e02036 100644
+--- a/vm/Globals.h
++++ b/vm/Globals.h
+@@ -886,6 +886,14 @@ typedef struct sJitFramework
+ }SJitFramework;
+ 
+ /*
++ * Values for gDvmJit.codeGenerator.
++ */
++enum CodeGenerators {
++    LCG = 0,
++    PCG,
++};
++
++/*
+  * JIT-specific global state
+  */
+ struct DvmJitGlobals {
+@@ -1076,6 +1084,12 @@ struct DvmJitGlobals {
+     /* Structure to handle the Jit framework */
+     SJitFramework jitFramework;
+ 
++    /* Selector for code generator to use
++     * This is used only during initializaton to choose how to set up
++     * function pointers in the 'jitFramework' structure
++     */
++    CodeGenerators codeGenerator;
++
+     /*
+      * Flag to control maximum number of registerization requests when
+      * backend registerization is enabled.
+diff --git a/vm/Init.cpp b/vm/Init.cpp
+index fe8ddcc..03c433c 100644
+--- a/vm/Init.cpp
++++ b/vm/Init.cpp
+@@ -173,6 +173,7 @@ static void usage(const char* progName)
+     dvmFprintf(stderr, "  -Xjit[no]scheduling (Turn on/off Atom Instruction Scheduling)\n");
+     dvmFprintf(stderr, "  -Xjituserplugin:<file.so> (Handle a user plugin file)\n");
+     dvmFprintf(stderr, "  -Xjituserpluginfatal (Is failure to load a user plugin fatal?\n");
++    dvmFprintf(stderr, "  -Xjitcodegen:<LCG|PCG> (Select code generator for JIT.)\n");
+     dvmFprintf(stderr, "  -Xjitarenatrimstyle:<none|onlyOne|average|user> (Select arena triming style)\n");
+     dvmFprintf(stderr, "  -Xjitarenatrimvalue:<value> (The value for the user based arena trim style)\n");
+     dvmFprintf(stderr, "  -Xjitnestedloops (Allows nested loops to be compiled or not)\n");
+@@ -1733,6 +1734,19 @@ int processOptions(int argc, const char* const argv[], bool ignoreUnrecognized)
+             const char *file = argv[i] + 16;
+             //Send off to handle user pass
+             dvmCompilerHandleUserPlugin (file);
++        } else if (strncmp (argv[i], "-Xjitcodegen:", 13) == 0) {
++            const char *cgSelection = argv[i] + 13;
++            if (strlen(cgSelection) == 3) {
++                if (strcmp(cgSelection,"LCG")==0){
++                    gDvmJit.codeGenerator = LCG;
++                }else if (strcmp(cgSelection,"PCG")==0){
++                    gDvmJit.codeGenerator = PCG;
++                }else{
++                    dvmFprintf (stderr, "Invalid code generator name %s.", argv[i]);
++                }
++            }else{
++                dvmFprintf (stderr, "Invalid code generator name %s.", argv[i]);
++            }
+ #endif
+         } else if (strncmp (argv[i], "-Xjitabortonerror", 17) == 0) {
+             gDvmJit.abortOnCompilerError = true;
+@@ -2088,6 +2102,11 @@ static void setCommandLineDefaults()
+     gDvmJit.debugPasses = 0;
+     gDvmJit.debugAllPasses = false;
+ #if defined(ARCH_IA32)
++#if defined(DEFAULT_JIT_CODE_GENERATOR)
++    gDvmJit.codeGenerator = DEFAULT_JIT_CODE_GENERATOR;
++#else
++#error DEFAULT_JIT_CODE_GENERATOR must be LCG or PCG
++#endif
+     //Set the jit framework in place
+     setJitFramework ();
+ 
+@@ -2322,6 +2341,47 @@ std::string dvmStartup(int argc, const char* const argv[],
+     ALOGV("Using executionMode %d", gDvm.executionMode);
+     dvmCheckAsmConstants();
+ 
++#if defined(ARCH_IA32)
++#if defined(WITH_JIT)
++    // Set up the selected code generator for the JIT
++    switch (gDvmJit.codeGenerator) {
++    case LCG:
++        /* Currently, the JIT framework is set up for LCG earlier
++         * in initialization in 'SetupJitFramework', which is called
++         * in 'setCommandLineDefaults'.
++         */
++        break;
++    case PCG:
++        /* Load the PCG-based backend library.
++         * This will reset some of the items in the JIT framework so
++         * that the PCG-based code generator is used.
++         * Abort if the .so cannot be loaded.
++         */
++        if (access ("/system/lib/libpcgdvmjit.so", F_OK) == 0)
++        {
++            dvmCompilerHandleUserPlugin ("/system/lib/libpcgdvmjit.so");
++        }
++        else
++        {
++            /* For building the host version.  */
++            dvmCompilerHandleUserPlugin ("libpcgdvmjit.so");
++        }
++        if (gDvmJit.userpluginfailed == true) {
++            dvmAbort();
++        }
++        break;
++    default:
++        /* This should not happen, but just in case, issue an error message
++         * and fall back to LCG (which happens if we do nothing).
++         */
++        ALOGE("Bad value for gDvmJit.codeGenerator: %d.", gDvmJit.codeGenerator);
++        break;
++    }
++
++#endif
++#endif
++
++
+     /*
+      * Initialize components.
+      */
+diff --git a/vm/compiler/PassDriver.cpp b/vm/compiler/PassDriver.cpp
+index 42dca34..27646e1 100644
+--- a/vm/compiler/PassDriver.cpp
++++ b/vm/compiler/PassDriver.cpp
+@@ -758,7 +758,7 @@ void dvmCompilerHandleUserPlugin (const char *fileName)
+ 
+         if (tmp == 0)
+         {
+-            ALOGD ("Problem with %s, cannot find dalvikPluginInit function\n", fileName);
++            ALOGD ("PLUGIN: Problem with %s, cannot find dalvikPluginInit function\n", fileName);
+ 
+             //Set failure flag
+             failure = true;
+@@ -774,8 +774,8 @@ void dvmCompilerHandleUserPlugin (const char *fileName)
+     }
+     else
+     {
+-        ALOGD ("Problem opening user plugin file %s", fileName);
+-        ALOGD ("dlerror() reports %s", dlerror());
++        ALOGD ("PLUGIN: Problem opening user plugin file %s", fileName);
++        ALOGD ("PLUGIN: dlerror() reports %s", dlerror());
+ 
+         //Set failure flag
+         failure = true;
+@@ -784,6 +784,7 @@ void dvmCompilerHandleUserPlugin (const char *fileName)
+     //If the failure flag is on
+     if (failure == true)
+     {
++        ALOGD ("PLUGIN: Initialization function in %s failed", fileName);
+         //Is the failure on the user plugin fatal?
+         if (gDvmJit.userpluginfatal == true)
+         {
+-- 
+1.7.4.1
+

@@ -1,0 +1,266 @@
+From 3f57aed40dc97ab5a7b2b70b08ce3392e5a00e24 Mon Sep 17 00:00:00 2001
+From: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Date: Mon, 11 Mar 2013 15:54:04 -0700
+Subject: Dalvik: Turning On Registerization for Simple Loops
+
+BZ: 92843
+
+Turn on Registerization for Simple Loops
+
+Init.cpp:
+ - Turn on registerization
+
+LoopOpt.cpp, Registerization.cpp:
+ - Add gate to the registerization pass to only allow it for simple loops
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I4b71dc3d39cc57e828fa402f338380af01375d96
+Orig-MCG-Change-Id: Ia61ed168d6a05d5616cb337fa08c3b7b4810de80
+Signed-off-by: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/Init.cpp                       |    7 +-
+ vm/compiler/LoopOpt.cpp           |    2 +-
+ vm/compiler/RegisterizationME.cpp |  168 +++++++++++++++++++++++++++++++++++++
+ vm/compiler/RegisterizationME.h   |    7 ++
+ 4 files changed, 178 insertions(+), 6 deletions(-)
+
+diff --git a/vm/Init.cpp b/vm/Init.cpp
+index cb1f3cc..7f495b4 100644
+--- a/vm/Init.cpp
++++ b/vm/Init.cpp
+@@ -1431,11 +1431,8 @@ static void setCommandLineDefaults()
+     gDvmJit.nestedLoops = false;
+     gDvmJit.branchLoops = false;
+     gDvmJit.oldLoopDetection = false;
+-
+-    // TODO Backend registerization is disabled because it does not pass
+-    // MTBF testing. It should be enabled once problem is addressed.
+-    gDvmJit.backEndRegisterization = false;
+-    gDvmJit.maximumRegisterization = 0;
++    gDvmJit.backEndRegisterization = true;
++    gDvmJit.maximumRegisterization = UINT_MAX;
+ 
+     gDvmJit.ignorePasses = 0;
+ #if defined(ARCH_IA32)
+diff --git a/vm/compiler/LoopOpt.cpp b/vm/compiler/LoopOpt.cpp
+index 2b1cde4..a119a9a 100644
+--- a/vm/compiler/LoopOpt.cpp
++++ b/vm/compiler/LoopOpt.cpp
+@@ -58,7 +58,7 @@ START_PASSES
+     //Note: merge block and reorder are safe and should be after
+     //We do registerization for all traces to provide spill information to the BE
+     NEW_PASS ("Write Back Registers", kAllNodes, 0, 0, 0, 0, dvmCompilerWriteBackAll, 0, 0),
+-    NEW_PASS ("Registerization ME", kAllNodes, 0, dvmCompilerTraceIsLoopNewSystem,
++    NEW_PASS ("Registerization ME", kAllNodes, 0, dvmCompilerRegisterizeGate,
+                 0, dvmCompilerRegisterize, 0, 0, 0),
+     NEW_PASS ("Merge Blocks", kAllNodes, 0, 0,
+                 0, 0, dvmCompilerMergeBasicBlocks, 0, kOptimizationBasicBlockChange),
+diff --git a/vm/compiler/RegisterizationME.cpp b/vm/compiler/RegisterizationME.cpp
+index 4318ddb..41b5373 100644
+--- a/vm/compiler/RegisterizationME.cpp
++++ b/vm/compiler/RegisterizationME.cpp
+@@ -18,6 +18,7 @@
+ #include "Dataflow.h"
+ #include "CompilerIR.h"
+ #include "LoopInformation.h"
++#include "LoopOpt.h"
+ #include "RegisterizationME.h"
+ 
+ #include <algorithm>
+@@ -501,3 +502,170 @@ void dvmCompilerRegisterize (CompilationUnit *cUnit, Pass *currentPass)
+     //Unused argument
+     (void) currentPass;
+ }
++
++/**
++ * @brief Parse a BasicBlock of the loop
++ * @param bb the BasicBlock of the loop
++ * @return whether the BasicBlock contains any opcodes we don't want to support for registerization
++ */
++static bool parseBlock (BasicBlock *bb)
++{
++    //Go through the instructions
++    for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        int opcode = mir->dalvikInsn.opcode;
++
++        switch (opcode)
++        {
++            case kMirOpPhi:
++            case OP_MUL_INT:
++            case OP_ADD_INT:
++            case OP_ADD_INT_2ADDR:
++            case OP_ADD_INT_LIT8:
++            case OP_GOTO:
++            case OP_CONST_16:
++            case OP_CONST_WIDE:
++            case OP_IF_GE:
++            case OP_IF_GEZ:
++            case OP_INT_TO_BYTE:
++            case OP_INT_TO_SHORT:
++            case OP_MUL_DOUBLE:
++            case OP_ADD_DOUBLE_2ADDR:
++            case OP_MUL_LONG:
++            case OP_ADD_LONG_2ADDR:
++            case OP_MUL_FLOAT:
++            case OP_ADD_FLOAT_2ADDR:
++            case OP_CONST_WIDE_HIGH16:
++            case OP_CONST_HIGH16:
++            case OP_CONST_WIDE_16:
++            case OP_CMPG_FLOAT:
++            case OP_CMPG_DOUBLE:
++            case OP_CMP_LONG:
++                break;
++
++            default:
++                //Not accepted, refuse the block
++                return false;
++        }
++    }
++
++    //Got to here, we can accept
++    return true;
++}
++
++/**
++ * @brief Check a loop: is it ok to registerize
++ * @param info the LoopInformation
++ * @return whether it is acceptable for registerization
++ */
++static bool checkLoop (const CompilationUnit *cUnit, const LoopInformation *info)
++{
++    const BitVector *blocks = info->getBasicBlocks ();
++
++    int elems = dvmCountSetBits (blocks);
++
++    //If more than one block, quit
++    if (elems > 2)
++    {
++        return false;
++    }
++
++    //Go through each block
++    BitVectorIterator bvIterator;
++
++    dvmBitVectorIteratorInit( (BitVector *) blocks, &bvIterator);
++    while (true) {
++        int blockIdx = dvmBitVectorIteratorNext(&bvIterator);
++
++        //If done, bail
++        if (blockIdx == -1)
++        {
++            break;
++        }
++
++        //Get BasicBlock
++        BasicBlock *bb = (BasicBlock *) dvmGrowableListGetElement(&cUnit->blockList, blockIdx);
++
++        //Paranoid
++        if (bb == 0)
++        {
++            break;
++        }
++
++        //If we don't accept this one, refuse everything
++        if (parseBlock (bb) == false)
++        {
++            return false;
++        }
++    }
++
++    //Got here so we are good
++    return true;
++}
++
++/**
++ * @brief Wrapper around testing if we want to registerize the loop, it handles loop nests as well
++ * @param cUnit the CompilationUnit
++ * @param info the LoopInformation
++ * @return whether or not to registerize
++ */
++static bool wouldRegisterize (const CompilationUnit *cUnit, const LoopInformation *info)
++{
++    //If info is 0, there is nothing to do
++    if (info == 0)
++    {
++        return false;
++    }
++
++    //Search in the children if anybody includes them
++    unsigned int nbr = info->getNestedNbr ();
++
++    //Is it the inner loop ?
++    if (nbr == 0)
++    {
++        //Actually registerize the loop
++        return checkLoop (cUnit, info);
++    }
++    else
++    {
++        //Only accept perfectly nested loops
++        if (nbr > 1)
++        {
++            return false;
++        }
++
++        LoopInformation *inner = info->getNested (0);
++
++        //Paranoid
++        assert (inner != 0);
++
++        return wouldRegisterize (cUnit, inner);
++    }
++}
++
++/**
++ * @brief Should we registerize ?
++ * @param cUnit the CompilationUnit
++ * @param currentPass the Pass
++ * @return whether or not to registerize
++ */
++bool dvmCompilerRegisterizeGate (const CompilationUnit *cUnit, const Pass *currentPass)
++{
++    //Is it a loop
++    if (dvmCompilerTraceIsLoopNewSystem (cUnit, currentPass) == false)
++    {
++        return false;
++    }
++
++    //Now let's go through the loop information
++    LoopInformation *info = cUnit->loopInformation;
++
++    //Now registerize it
++    bool res = wouldRegisterize (cUnit, info);
++
++    //Unused argument
++    (void) currentPass;
++
++    //Return result
++    return res;
++}
+diff --git a/vm/compiler/RegisterizationME.h b/vm/compiler/RegisterizationME.h
+index 4746512..561ccfb 100644
+--- a/vm/compiler/RegisterizationME.h
++++ b/vm/compiler/RegisterizationME.h
+@@ -37,4 +37,11 @@ void dvmCompilerRegisterize (CompilationUnit *cUnit, Pass *pass);
+  */
+ bool dvmCompilerWriteBackAll (CompilationUnit *cUnit, BasicBlock *bb);
+ 
++/**
++ * @brief Should we registerize ? Currently simple loops with certain opcodes are accepted
++ * @param cUnit the CompilationUnit
++ * @param currentPass the Pass
++ * @return whether or not to registerize
++ */
++bool dvmCompilerRegisterizeGate (const CompilationUnit *cUnit, const Pass *currentPass);
+ #endif
+-- 
+1.7.4.1
+

@@ -1,0 +1,218 @@
+From 0e18ca3e9a9e7c3ced708fcf5bcdf2db90e04c29 Mon Sep 17 00:00:00 2001
+From: Andrew Boie <andrew.p.boie@intel.com>
+Date: Tue, 27 Nov 2012 13:21:38 -0800
+Subject: init: wildcard matching for chmod/chown in init.rc
+
+Implement wildcard matching for the builtin command
+chmod and chown for use in init.rc.
+
+For security reason, the number of slashes has to match.
+For example, to match /dir_a/dir_b/dir_c/dir_d/file,
+the path needs to be /dir_a/*/*/*/file. Simply doing
+/dir_a/*/file does not work.
+
+Issue: AXIA-576
+Change-Id: I21b5aa58b3d3142725bc73ff31afb65d4fd4bc99
+Signed-off-by: Daniel Leung <daniel.leung@intel.com>
+---
+ init/builtins.c |  151 +++++++++++++++++++++++++++++++++++++++++++++++++------
+ 1 files changed, 135 insertions(+), 16 deletions(-)
+
+diff --git a/init/builtins.c b/init/builtins.c
+index 71eea43..7a9339c 100644
+--- a/init/builtins.c
++++ b/init/builtins.c
+@@ -51,6 +51,13 @@
+ 
+ #include <private/android_filesystem_config.h>
+ 
++enum builtin_cmds {
++    DO_CHOWN,
++    DO_CHMOD,
++};
++
++#define MAX_RECUR_DEPTH 15
++
+ void add_environment(const char *name, const char *value);
+ 
+ extern int init_module(void *, unsigned long, const char *);
+@@ -89,17 +96,24 @@ static int _open(const char *path)
+     return fd;
+ }
+ 
+-static int _chown(const char *path, unsigned int uid, unsigned int gid)
++/* chown or chmod for one item (file, directory, etc.) */
++static int __chown_chmod_one(enum builtin_cmds action, const char *path,
++                             unsigned int uid, unsigned int gid, mode_t mode)
+ {
+     int fd;
+-    int ret;
++    int ret = -1;
+ 
+     fd = _open(path);
+     if (fd < 0) {
+         return -1;
+     }
+ 
+-    ret = fchown(fd, uid, gid);
++    if (action == DO_CHOWN) {
++        ret = fchown(fd, uid, gid);
++    } else if (action == DO_CHMOD) {
++        ret = fchmod(fd, mode);
++    }
++
+     if (ret < 0) {
+         int errno_copy = errno;
+         close(fd);
+@@ -109,30 +123,135 @@ static int _chown(const char *path, unsigned int uid, unsigned int gid)
+ 
+     close(fd);
+ 
+-    return 0;
++    return ret;
+ }
+ 
+-static int _chmod(const char *path, mode_t mode)
++/* do chown or chmod recursively with pattern matching */
++static int __chown_chmod_recur(enum builtin_cmds action, const char *matching_path,
++                               unsigned int uid, unsigned int gid, mode_t mode,
++                               const char *cur_path, int depth)
+ {
+-    int fd;
+-    int ret;
++    DIR* dirp;
++    struct dirent *de;
++    char* child_path = NULL;
++    int len;
++    int ret = 0;
+ 
+-    fd = _open(path);
+-    if (fd < 0) {
++    if (!matching_path) {
++        return -1;
++    }
++    if (!cur_path) {
+         return -1;
+     }
++    if (depth > MAX_RECUR_DEPTH) {
++        /* prevent this from doing infinitely recurison */
++        return 0;
++    }
+ 
+-    ret = fchmod(fd, mode);
+-    if (ret < 0) {
+-        int errno_copy = errno;
+-        close(fd);
+-        errno = errno_copy;
++    dirp = opendir(cur_path);
++    if (dirp) {
++        while ((de = readdir(dirp))) {
++            if ((de->d_type == DT_DIR) &&
++                (de->d_name[0] == '.') &&
++                ((de->d_name[1] == '\0') ||
++                 ((de->d_name[1] == '.') && (de->d_name[2] == '\0')))) {
++                /* ignore directories "." and ".." */
++                continue;
++            }
++
++            /* prepare path */
++            len = asprintf(&child_path, "%s/%s", cur_path, de->d_name);
++
++            if (len != -1) {
++                if (de->d_type == DT_DIR) {
++                    /* recurse into lowering level directory */
++                    ret += __chown_chmod_recur(action, matching_path,
++                                               uid, gid, mode, child_path,
++                                               (depth + 1));
++                } else {
++                    if (fnmatch(matching_path, child_path, FNM_PATHNAME) == 0) {
++                        /* FNM_PATHNAME: need to have the same number of '/' */
++                        ret += __chown_chmod_one(action, child_path,
++                                                 uid, gid, mode);
++                    }
++                }
++
++                free(child_path);
++                child_path = NULL;
++            } else {
++                /* failed to allocate space for child_path, */
++                /* count as one failure.                    */
++                ret += -1;
++            }
++        }
++
++        closedir(dirp);
++    }
++
++    return ret;
++}
++
++static int __chown_chmod(unsigned int action, const char *path,
++                         unsigned int uid, unsigned int gid, mode_t mode)
++{
++    char* leading_path = NULL;
++    char* tmp = NULL;
++    int do_wildcard = 0;
++    int len;
++    int ret;
++
++    if (!path) {
+         return -1;
+     }
+ 
+-    close(fd);
++    /* need wildcard matching? */
++    tmp = strchr(path, '*');
++    if (tmp) {
++        /* this block shorten the path for matching purpose */
+ 
+-    return 0;
++        leading_path = strdup(path);
++        if (!leading_path) {
++            return -1;
++        }
++
++        do_wildcard = 1;
++
++        /* get path before '*' */
++        tmp = strchr(leading_path, '*');
++        if (tmp) {
++            *tmp = '\0';
++        }
++
++        /* remove up to and including the last '/' */
++        tmp = strrchr(leading_path, '/');
++        if (tmp) {
++            *tmp = '\0';
++            do_wildcard = 1;
++        }
++    }
++
++    if (do_wildcard) {
++        ret = __chown_chmod_recur(action, path,
++                                   uid, gid, mode, leading_path, 0);
++
++        if (leading_path) {
++            free(leading_path);
++        }
++
++        return ret;
++    } else {
++        return __chown_chmod_one(action, path, uid, gid, mode);
++    }
++}
++
++static int _chown(const char *path, unsigned int uid, unsigned int gid)
++{
++    return __chown_chmod(DO_CHOWN, path, uid, gid, 0);
++}
++
++static int _chmod(const char *path, mode_t mode)
++{
++    return __chown_chmod(DO_CHMOD, path, -1, -1, mode);
+ }
+ 
+ static int insmod(const char *filename, char *options)
+-- 
+1.7.4.1
+

@@ -1,0 +1,143 @@
+From 0c6d4df586d81093653849e9db0c72d591b628e9 Mon Sep 17 00:00:00 2001
+From: Serguei Katkov <serguei.i.katkov@intel.com>
+Date: Thu, 7 Nov 2013 13:10:36 +0700
+Subject: Revert "Fix the protection of code cache for x86 JIT"
+
+BZ: AXIA-4795
+
+This reverts commit 9cf04e3569d48dae36e0492226250da04699f8d4.
+
+AOSP code has implemented JIT code cache protections which
+is not supported by x86 at this moment. We should revert this
+patch, apply all our patches over AOSP and then enable JIT
+code cache protection by separate patch.
+
+It will simplify the merging process and we can be sure that
+binaries will be working after each commit.
+Otherwise we are risky to break this.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I7a6b54d9364e3883d6ea3c00e30fb191f23d500f
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/Compiler.cpp                     |   16 ++++++++--------
+ vm/compiler/codegen/x86/CodegenInterface.cpp |   18 +++++++++---------
+ 2 files changed, 17 insertions(+), 17 deletions(-)
+
+diff --git a/vm/compiler/Compiler.cpp b/vm/compiler/Compiler.cpp
+index f5b96b1..e18e6e6 100644
+--- a/vm/compiler/Compiler.cpp
++++ b/vm/compiler/Compiler.cpp
+@@ -213,6 +213,14 @@ bool dvmCompilerSetupCodeCache(void)
+     /* Only flush the part in the code cache that is being used now */
+     dvmCompilerCacheFlush((intptr_t) gDvmJit.codeCache,
+                           (intptr_t) gDvmJit.codeCache + templateSize, 0);
++
++    int result = mprotect(gDvmJit.codeCache, gDvmJit.codeCacheSize,
++                          PROTECT_CODE_CACHE_ATTRS);
++
++    if (result == -1) {
++        ALOGE("Failed to remove the write permission for the code cache");
++        dvmAbort();
++    }
+ #else
+     gDvmJit.codeCacheByteUsed = 0;
+     stream = (char*)gDvmJit.codeCache + gDvmJit.codeCacheByteUsed;
+@@ -224,14 +232,6 @@ bool dvmCompilerSetupCodeCache(void)
+     ALOGV("stream = %p after initJIT", stream);
+ #endif
+ 
+-    int result = mprotect(gDvmJit.codeCache, gDvmJit.codeCacheSize,
+-                          PROTECT_CODE_CACHE_ATTRS);
+-
+-    if (result == -1) {
+-        ALOGE("Failed to remove the write permission for the code cache");
+-        dvmAbort();
+-    }
+-
+     return true;
+ }
+ 
+diff --git a/vm/compiler/codegen/x86/CodegenInterface.cpp b/vm/compiler/codegen/x86/CodegenInterface.cpp
+index 337bd61..451c5e5 100644
+--- a/vm/compiler/codegen/x86/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/CodegenInterface.cpp
+@@ -1085,14 +1085,14 @@ void dvmCompilerMIR2LIR(CompilationUnit *cUnit, JitTranslationInfo *info)
+ 
+     info->codeAddress = NULL;
+     stream = (char*)gDvmJit.codeCache + gDvmJit.codeCacheByteUsed;
+-    streamStart = stream; /* trace start before alignment */
+ 
+     // TODO: compile into a temporary buffer and then copy into the code cache.
+     // That would let us leave the code cache unprotected for a shorter time.
+     size_t unprotected_code_cache_bytes =
+-            gDvmJit.codeCacheSize - gDvmJit.codeCacheByteUsed;
+-    UNPROTECT_CODE_CACHE(streamStart, unprotected_code_cache_bytes);
++            gDvmJit.codeCacheSize - gDvmJit.codeCacheByteUsed - CODE_CACHE_PADDING;
++    UNPROTECT_CODE_CACHE(stream, unprotected_code_cache_bytes);
+ 
++    streamStart = stream; /* trace start before alignment */
+     stream += EXTRA_BYTES_FOR_CHAINING; /* This is needed for chaining. Add the bytes before the alignment */
+     stream = (char*)(((unsigned int)stream + 0xF) & ~0xF); /* Align trace to 16-bytes */
+     streamMethodStart = stream; /* code start */
+@@ -1252,7 +1252,7 @@ void dvmCompilerMIR2LIR(CompilationUnit *cUnit, JitTranslationInfo *info)
+             if(cg_ret < 0) {
+                 endOfTrace(true/*freeOnly*/);
+                 cUnit->baseAddr = NULL;
+-                PROTECT_CODE_CACHE(streamStart, unprotected_code_cache_bytes);
++                PROTECT_CODE_CACHE(stream, unprotected_code_cache_bytes);
+                 return;
+             }
+         } else {
+@@ -1293,7 +1293,7 @@ void dvmCompilerMIR2LIR(CompilationUnit *cUnit, JitTranslationInfo *info)
+                     gDvmJit.codeCacheFull = true;
+                     cUnit->baseAddr = NULL;
+                     endOfTrace(true/*freeOnly*/);
+-                    PROTECT_CODE_CACHE(streamStart, unprotected_code_cache_bytes);
++                    PROTECT_CODE_CACHE(stream, unprotected_code_cache_bytes);
+                     return;
+                 }
+             }
+@@ -1387,7 +1387,7 @@ gen_fallthrough:
+                 gDvmJit.codeCacheFull = true;
+                 cUnit->baseAddr = NULL;
+                 endOfTrace(true); /* need to free structures */
+-                PROTECT_CODE_CACHE(streamStart, unprotected_code_cache_bytes);
++                PROTECT_CODE_CACHE(stream, unprotected_code_cache_bytes);
+                 return;
+             }
+         }
+@@ -1403,7 +1403,7 @@ gen_fallthrough:
+          */
+         ALOGI("JIT code cache full after endOfTrace (trace uses %uB)", (stream - streamStart));
+         cUnit->baseAddr = NULL;
+-        PROTECT_CODE_CACHE(streamStart, unprotected_code_cache_bytes);
++        PROTECT_CODE_CACHE(stream, unprotected_code_cache_bytes);
+         return;
+     }
+ 
+@@ -1425,7 +1425,7 @@ gen_fallthrough:
+         ALOGI("JIT code cache full after ChainingCellCounts (trace uses %uB)", (stream - streamStart));
+         gDvmJit.codeCacheFull = true;
+         cUnit->baseAddr = NULL;
+-        PROTECT_CODE_CACHE(streamStart, unprotected_code_cache_bytes);
++        PROTECT_CODE_CACHE(stream, unprotected_code_cache_bytes);
+         return;
+     }
+ 
+@@ -1434,7 +1434,7 @@ gen_fallthrough:
+     *pOffset = streamCountStart - streamMethodStart; /* from codeAddr */
+     pOffset[1] = streamChainingStart - streamMethodStart;
+ 
+-    PROTECT_CODE_CACHE(streamStart, unprotected_code_cache_bytes);
++    PROTECT_CODE_CACHE(stream, unprotected_code_cache_bytes);
+ 
+     gDvmJit.codeCacheByteUsed += (stream - streamStart);
+     if (cUnit->printMe) {
+-- 
+1.7.4.1
+

@@ -1,0 +1,184 @@
+From ba2aa5189f3afa002fe51819b9e75d49754563e1 Mon Sep 17 00:00:00 2001
+From: Guillaume Betous <guillaumex.betous@intel.com>
+Date: Wed, 19 Dec 2012 09:48:37 +0100
+Subject: [PORT FROM MAIN] Add parsing of props.rc in init
+
+BZ: 81976
+
+In order to allow to define SPID based properties, we add props.rc
+This file is parsed, then the properties are set *before* default props are evaluated.
+
+Sanity check is done to only have setprop implemented in this props.rc
+
+TODO : implement new sanity check to allow ro properties only
+
+Change-Id: Iea6cfe3416a51f9a37e8a04fbf5a360783c29549
+Orig-Change-Id: I8ed51d8c013368714a91d2651bf735f5cb06ae7b
+Category: aosp improvement
+Domain: PUPDR-Flashing
+Origin: internal
+Upstream-Candidate: no, proprietary
+Orig-Change-Id: I9d8da8967b70d0e0fd598761be34fd75c80bfcf4
+Signed-off-by: Guillaume Betous <guillaumex.betous@intel.com>
+Reviewed-on: http://android.intel.com:8080/82743
+Reviewed-by: cactus <cactus@intel.com>
+Reviewed-by: Chen, HuaqiangX <huaqiangx.chen@intel.com>
+Reviewed-by: Tardy, Pierre <pierre.tardy@intel.com>
+Tested-by: Afantenos, Marie Cecile <marie.cecile.afantenos@intel.com>
+Reviewed-by: Gozalvez Herrero, Juan AntonioX <juan.antoniox.gozalvez.herrero@intel.com>
+Tested-by: Gozalvez Herrero, Juan AntonioX <juan.antoniox.gozalvez.herrero@intel.com>
+---
+ init/init.c        |   27 +++++++++++++++++++++++++++
+ init/init_parser.c |   27 +++++++++++++++++++++++++++
+ init/init_parser.h |    5 +++++
+ 3 files changed, 59 insertions(+), 0 deletions(-)
+
+diff --git a/init/init.c b/init/init.c
+index 858f557..53be596 100644
+--- a/init/init.c
++++ b/init/init.c
+@@ -49,6 +49,7 @@
+ 
+ #include <sys/system_properties.h>
+ 
++#include "keywords.h"
+ #include "devices.h"
+ #include "init.h"
+ #include "log.h"
+@@ -96,6 +97,8 @@ static time_t process_needs_restart;
+ 
+ static const char *ENV[32];
+ 
++static void action_execute_all_setprops(struct action *act);
++
+ /* add_environment - add "key=value" to the current environment */
+ int add_environment(const char *key, const char *val)
+ {
+@@ -422,6 +425,8 @@ void property_changed(const char *name, const char *value)
+ {
+     if (property_triggers_enabled)
+         queue_property_triggers(name, value);
++    else
++        action_for_each_property_trigger(name, value, action_execute_all_setprops);
+ }
+ 
+ static void restart_service_if_needed(struct service *svc)
+@@ -583,6 +588,20 @@ out:
+     for (i--; i > 0; i--)
+         free(args[i]);
+ }
++static void action_execute_all_setprops(struct action *act)
++{
++    struct command *c;
++    c = get_first_command(act);
++    while(c)
++    {
++        if (c->func == do_setprop) {
++            int ret = c->func(c->nargs, c->args);
++        } else {
++            ERROR("error: /props.rc action %s must only have setprops commands!\n", act->name);
++        }
++        c = get_next_command(act, c);
++    }
++}
+ 
+ static int wait_for_coldboot_done_action(int nargs, char **args)
+ {
+@@ -1079,6 +1098,9 @@ int main(int argc, char **argv)
+     klog_init();
+     property_init();
+ 
++    INFO("reading property config file\n");
++    init_parse_config_file("/props.rc");
++
+     get_hardware_name(hardware, &revision);
+ 
+     process_kernel_cmdline();
+@@ -1106,6 +1128,11 @@ int main(int argc, char **argv)
+     if (!is_charger)
+         property_load_boot_defaults();
+ 
++    /* Clear the init.props action list. All the properties
++     * derivation is now done. No need to overload further action_list
++     * processing
++     */
++    clear_action_list();
+     INFO("reading config file\n");
+     init_parse_config_file("/init.rc");
+ 
+diff --git a/init/init_parser.c b/init/init_parser.c
+index 4373222..588e408 100644
+--- a/init/init_parser.c
++++ b/init/init_parser.c
+@@ -22,6 +22,7 @@
+ #include <string.h>
+ #include <stddef.h>
+ #include <ctype.h>
++#include <fnmatch.h>
+ 
+ #include "init.h"
+ #include "parser.h"
+@@ -584,6 +585,32 @@ void queue_property_triggers(const char *name, const char *value)
+     }
+ }
+ 
++void action_for_each_property_trigger(const char *name, const char *value,
++                                      void (*func)(struct action *act))
++{
++    struct listnode *node;
++    struct action *act;
++
++    if (strncmp(name, "ro.", 3)!=0) return ;
++
++    list_for_each(node, &action_list) {
++        act = node_to_item(node, struct action, alist);
++        if (!strncmp(act->name, "property:", strlen("property:"))) {
++            const char *test = act->name + strlen("property:");
++            int name_length = strlen(name);
++
++            if (!strncmp(name, test, name_length) &&
++                    test[name_length] == '=' &&
++                    !fnmatch(test + name_length + 1, value, 0)) {
++                func(act);
++            }
++        }
++    }
++}
++void clear_action_list() {
++    list_init(&action_list);
++}
++
+ void queue_all_property_triggers()
+ {
+     struct listnode *node;
+diff --git a/init/init_parser.h b/init/init_parser.h
+index d978ee6..873b229 100644
+--- a/init/init_parser.h
++++ b/init/init_parser.h
+@@ -21,18 +21,23 @@
+ 
+ #define INIT_PARSER_MAXARGS 64
+ 
++#include <stdbool.h>
++
+ struct action;
+ 
+ struct action *action_remove_queue_head(void);
+ void action_add_queue_tail(struct action *act);
+ void action_for_each_trigger(const char *trigger,
+                              void (*func)(struct action *act));
++void action_for_each_property_trigger(const char *name, const char *value,
++                                      void (*func)(struct action *act));
+ int action_queue_empty(void);
+ void queue_property_triggers(const char *name, const char *value);
+ void queue_all_property_triggers();
+ void queue_builtin_action(int (*func)(int nargs, char **args), char *name);
+ void queue_device_added_removed_triggers(const char *name, bool dev_added);
+ void queue_all_device_triggers();
++void clear_action_list();
+ int init_parse_config_file(const char *fn);
+ char *expand_references(const char *src);
+ #endif
+-- 
+1.7.4.1
+

@@ -1,0 +1,406 @@
+From 986d0b862b0ec4bcc41d5e8ec6ea9ab4d12affdf Mon Sep 17 00:00:00 2001
+From: Dmitry Petrochenko <dmitry.petrochenko@intel.com>
+Date: Wed, 20 Mar 2013 18:46:16 +0700
+Subject: Dalvik: Delay VRs freeing until exit to interpreter is generated.
+
+BZ: 82833
+
+The VRs freeing is delayed (VRDELAY_CAN_THROW) for opcodes, which potentially
+can generate exception. It affects only VRs which are on their's last bytecode
+of live range. The delay is canceled after the opcode generation by default.
+As an "optimization" delay cancelling happens in beforeCall function, thus
+after potential exit to interpreter the VRs are freed immediately.
+The MemoryVRInfo.delayFreeFlags are refactored to delayFreeCounters in order to
+support multiple delay calls with the same reason, e.g. separate delay request
+for null and range checks.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I20acb434080f1cba4bb8fb16952bc68c5a91c9e1
+Orig-MCG-Change-Id: I74ebb10cf387df6608b8794d46fce4be0a75e8b4
+Signed-off-by: Dmitry Petrochenko <dmitry.petrochenko@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/codegen/x86/AnalysisO1.cpp |  131 +++++++++++++++++++++++++++----
+ vm/compiler/codegen/x86/AnalysisO1.h   |   16 +++--
+ vm/compiler/codegen/x86/Lower.cpp      |   68 ++++++++++++++++-
+ vm/compiler/codegen/x86/Lower.h        |    9 ++-
+ 4 files changed, 198 insertions(+), 26 deletions(-)
+
+diff --git a/vm/compiler/codegen/x86/AnalysisO1.cpp b/vm/compiler/codegen/x86/AnalysisO1.cpp
+index df8cd0b..93e1c44 100644
+--- a/vm/compiler/codegen/x86/AnalysisO1.cpp
++++ b/vm/compiler/codegen/x86/AnalysisO1.cpp
+@@ -534,7 +534,9 @@ bool initializeMemVRTable(void) {
+             memVRTable[num_memory_vr].boundCheck.checkDone = false;
+             memVRTable[num_memory_vr].num_ranges = 0;
+             memVRTable[num_memory_vr].ranges = NULL;
+-            memVRTable[num_memory_vr].delayFreeFlags = VRDELAY_NONE;
++            for(int c=0; c<VRDELAY_COUNT; c++) {
++                memVRTable[num_memory_vr].delayFreeCounters[c] = 0;
++            }
+ 
+             DEBUG_MEMORYVR(ALOGD("Initializing state of v%d %sin memory",
+                     memVRTable[num_memory_vr].regNum,
+@@ -556,7 +558,9 @@ bool initializeMemVRTable(void) {
+             memVRTable[num_memory_vr].boundCheck.checkDone = false;
+             memVRTable[num_memory_vr].num_ranges = 0;
+             memVRTable[num_memory_vr].ranges = NULL;
+-            memVRTable[num_memory_vr].delayFreeFlags = VRDELAY_NONE;
++            for(int c=0; c<VRDELAY_COUNT; c++) {
++                memVRTable[num_memory_vr].delayFreeCounters[c] = 0;
++            }
+ 
+             DEBUG_MEMORYVR(ALOGD("Initializing state of v%d %sin memory",
+                     memVRTable[num_memory_vr].regNum,
+@@ -4182,6 +4186,70 @@ void clearVRNullCheck(int regNum, OpndSize size) {
+     }
+ }
+ 
++//! Extend life for all VRs
++
++//! Affects only VRs, stored in physical reg on last bytecode of their live range
++//! @see VRFreeDelayCounters
++//! @param reason explains what freeing delay request should be canceled.
++//! A single VRFreeDelayCounters index should be used.
++//! @return true if at least one VR changed it's state
++bool requestVRFreeDelayAll(u4 reason) {
++    bool state_changed = false;
++    // Delay only VRs, which could be freed by freeReg
++    for(int k = 0; k < num_compile_entries; k++) {
++
++        if(compileTable[k].physicalReg != PhysicalReg_Null) {
++
++            if(isVirtualReg(compileTable[k].physicalType) == true) {
++                bool freeCrit = isLastByteCodeOfLiveRange(k);
++
++                if(freeCrit == true) {
++                    int res = requestVRFreeDelay(compileTable[k].regNum, reason);
++                    if(res >= 0) {
++                        state_changed = true;
++                    }
++                }
++            }
++        }
++    }
++#ifdef DEBUG_REGALLOC
++    if(state_changed) {
++        ALOGI("requestVRFreeDelayAll: state_changed=%i", state_changed);
++    }
++#endif
++    return state_changed;
++}
++
++//! Cancel request for all VR life extension
++
++//! Affects only VRs, stored in physical reg on last bytecode of theirs live range
++//! @see VRFreeDelayCounters
++//! @param reason explains what freeing delay request should be canceled.
++//! A single VRFreeDelayCounters index should be used.
++//! @return true if at least one VR changed it's state
++bool cancelVRFreeDelayRequestAll(u4 reason) {
++    bool state_changed = false;
++    // Cancel delay for VRs only
++    for(int k = 0; k < num_compile_entries; k++) {
++        if(isVirtualReg(compileTable[k].physicalType) == true) {
++            bool freeCrit = isLastByteCodeOfLiveRange(k);
++
++            if(freeCrit == true) {
++                int res = cancelVRFreeDelayRequest(compileTable[k].regNum, reason);
++                if(res >= 0) {
++                    state_changed = true;
++                }
++            }
++        }
++    }
++#ifdef DEBUG_REGALLOC
++    if(state_changed) {
++        ALOGI("cancelVRFreeDelayRequestAll: state_changed=%i", state_changed);
++    }
++#endif
++    return state_changed;
++}
++
+ //! Extend Virtual Register life
+ 
+ //! Requests that the life of a specific virtual register be extended. This ensures
+@@ -4190,21 +4258,30 @@ void clearVRNullCheck(int regNum, OpndSize size) {
+ //! VRs are used)
+ //! @see cancelVRFreeDelayRequest
+ //! @see getVRFreeDelayRequested
+-//! @see VRFreeDelayFlags
++//! @see VRFreeDelayCounters
+ //! @param regNum is the VR number
+-//! @param reason explains why freeing must be delayed. A single or combination
+-//! of VRFreeDelayFlags should be used.
++//! @param reason explains why freeing must be delayed.
++//! A single VRFreeDelayCounters index should be used.
+ //! @return negative value if request failed
+ int requestVRFreeDelay(int regNum, u4 reason) {
+-    //TODO Add 64-bit operand support when needed
++    // TODO Add 64-bit operand support when needed
+     int indexL = searchMemTable(regNum);
+     if(indexL >= 0) {
+-        memVRTable[indexL].delayFreeFlags |= reason;
++        if(reason >= 0 && reason <= VRDELAY_COUNT) {
++#ifdef DEBUG_REGALLOC
++            ALOGI("requestFreeDelay: reason=%i VR=%d count=%i", reason, regNum, memVRTable[indexL].delayFreeCounters[reason]);
++#endif
++            memVRTable[indexL].delayFreeCounters[reason]++;
++        } else {
++            ALOGE("JIT_ERROR: At requestVRFreeDelay: reason %i is unknown (VR=%d)", reason, regNum);
++            return -1;
++        }
+     } else {
+         ALOGI("JIT_INFO: At requestVRFreeDelay: VR %d not in memVRTable", regNum);
+         SET_JIT_ERROR(kJitErrorRegAllocFailed);
+         return -1;
+     }
++
+     return indexL;
+ }
+ 
+@@ -4216,23 +4293,37 @@ int requestVRFreeDelay(int regNum, u4 reason) {
+ //! NOTE: This does not support 64-bit values (when two adjacent VRs are used)
+ //! @see requestVRFreeDelay
+ //! @see getVRFreeDelayRequested
+-//! @see VRFreeDelayFlags
++//! @see VRFreeDelayCounters
+ //! @param regNum is the VR number
+-//! @param reason explains what freeing delay request should be canceled. A single
+-//! or combination of VRFreeDelayFlags should be used.
+-void cancelVRFreeDelayRequest(int regNum, u4 reason) {
++//! @param reason explains what freeing delay request should be canceled.
++//! A single VRFreeDelayCounters index should be used.
++//! @return negative value if request failed
++int cancelVRFreeDelayRequest(int regNum, u4 reason) {
+     //TODO Add 64-bit operand support when needed
+     bool needCallToFreeReg = false;
+     int indexL = searchMemTable(regNum);
+     if(indexL >= 0) {
+-        if((memVRTable[indexL].delayFreeFlags & reason) != VRDELAY_NONE) { // don't cancel delay if it wasn't requested
+-            memVRTable[indexL].delayFreeFlags ^= reason; // only cancel this particular reason, not all others
+-            if(memVRTable[indexL].delayFreeFlags == VRDELAY_NONE)
+-                needCallToFreeReg = true; // freeReg might want to free this VR now if there is no longer a valid delay
++        if(reason >= 0 && reason <= VRDELAY_COUNT) { // don't cancel delay if it wasn't requested
++            if(memVRTable[indexL].delayFreeCounters[reason] > 0) {
++#ifdef DEBUG_REGALLOC
++                ALOGI("cancelVRFreeDelay: reason=%i VR=%d count=%i", reason, regNum, memVRTable[indexL].delayFreeCounters[reason]);
++#endif
++                memVRTable[indexL].delayFreeCounters[reason]--; // only cancel this particular reason, not all others
++
++                // freeReg might want to free this VR now if there is no longer a valid delay
++                needCallToFreeReg = !getVRFreeDelayRequested(regNum);
++            } else {
++                return -1;
++            }
++        } else {
++            ALOGE("JIT_ERROR: At cancelVRFreeDelay: reason %i is unknown (VR: %d)", reason, regNum);
++            return -1;
+         }
+     }
+     if(needCallToFreeReg)
+         freeReg(false);
++
++    return indexL;
+ }
+ 
+ //! Gets status of virtual register free delay request
+@@ -4247,8 +4338,11 @@ bool getVRFreeDelayRequested(int regNum) {
+     //TODO Add 64-bit operand support when needed
+     int indexL = searchMemTable(regNum);
+     if(indexL >= 0) {
+-        if(memVRTable[indexL].delayFreeFlags != VRDELAY_NONE)
+-            return true;
++        for(int c=0; c<VRDELAY_COUNT; c++) {
++            if(memVRTable[indexL].delayFreeCounters[c] != 0) {
++                return true;
++            }
++        }
+         return false;
+     }
+     return false;
+@@ -4671,6 +4765,9 @@ int beforeCall(const char* target) { //spill all live registers
+        compileTable[indexForGlue].physicalReg == PhysicalReg_Null) {
+         unspillLogicalReg(indexForGlue, PhysicalReg_EBP); //load %ebp
+     }
++
++    cancelVRFreeDelayRequestAll(VRDELAY_CAN_THROW);
++
+ #ifdef DEBUG_REGALLOC
+     ALOGI("exit beforeCall");
+ #endif
+diff --git a/vm/compiler/codegen/x86/AnalysisO1.h b/vm/compiler/codegen/x86/AnalysisO1.h
+index b79f02b..ec965ef 100644
+--- a/vm/compiler/codegen/x86/AnalysisO1.h
++++ b/vm/compiler/codegen/x86/AnalysisO1.h
+@@ -97,11 +97,12 @@ typedef enum VRState {
+   VRSTATE_UPDATED,
+   VRSTATE_CLEAN
+ } VRState;
+-//! helper state to determine if freeing VRs needs to be delayed
+-enum VRDelayFreeFlags {
+-  VRDELAY_NONE = 0, // used when VR can be freed from using physical register if needed
+-  VRDELAY_NULLCHECK = 1 << 0, // used when VR is used for null check and freeing must be delayed
+-  VRDELAY_BOUNDCHECK = 1 << 1 // used when VR is used for bound check and freeing must be delayed
++//! helper state indexes to determine if freeing VRs needs to be delayed
++enum VRDelayFreeCounters {
++  VRDELAY_NULLCHECK = 0, // used when VR is used for null check and freeing must be delayed
++  VRDELAY_BOUNDCHECK = 1, // used when VR is used for bound check and freeing must be delayed
++  VRDELAY_CAN_THROW = 2, // used when bytecode can throw exception, in fact delays freeing any VR
++  VRDELAY_COUNT = 3, // Count of delay reasons
+ };
+ typedef enum TRState { //state of temporary registers
+   TRSTATE_SPILLED,
+@@ -237,7 +238,7 @@ typedef struct MemoryVRInfo {
+   BoundCheckIndex boundCheck;   /**< @brief Bound check information for the VR */
+   int num_ranges;               /**< @brief Number of ranges, used as a size for ranges */
+   LiveRange* ranges;            /**< @brief Live range information for the entry */
+-  u4 delayFreeFlags;            /**< @brief Used with flags defined by VRDelayFreeFlags enum to delay freeing */
++  int delayFreeCounters[VRDELAY_COUNT]; /**< @brief Used with indexes defined by VRDelayFreeCounters enum to delay freeing */
+ } MemoryVRInfo;
+ 
+ //!information of a temporary
+@@ -430,5 +431,8 @@ int spillLogicalReg(int spill_index, bool updateTable);
+ 
+ // Search in the memory table for a register
+ int searchMemTable(int regNum);
++
++//! check whether the current bytecode is the last access to a VR within a live
++bool isLastByteCodeOfLiveRange(int compileIndex);
+ #endif
+ 
+diff --git a/vm/compiler/codegen/x86/Lower.cpp b/vm/compiler/codegen/x86/Lower.cpp
+index 1cb3c28..2170ec3 100644
+--- a/vm/compiler/codegen/x86/Lower.cpp
++++ b/vm/compiler/codegen/x86/Lower.cpp
+@@ -37,6 +37,7 @@
+ #endif
+ #include "Singleton.h"
+ #include "ExceptionHandling.h"
++#include "compiler/Dataflow.h"
+ 
+ //statistics for optimization
+ int num_removed_nullCheck;
+@@ -276,7 +277,7 @@ int ncgMethodFake(Method* method) {
+         *tmp = i;
+         inst = FETCH(0);
+         char* tmpStart = stream;
+-        lowerByteCode(method); //use inst, rPC, method, modify rPC
++        lowerByteCodeCanThrowCheck(method); //use inst, rPC, method, modify rPC
+         int size_in_u2 = rPC - rStart;
+         if(stream - tmpStart  > 0)
+             ALOGI("LOWER bytecode %x size in u2: %d ncg size in byte: %d", i, size_in_u2, stream - tmpStart);
+@@ -441,7 +442,7 @@ ExecutionMode origMode;
+  */
+ bool lowerByteCodeJit(const Method* method, const MIR * mir,
+         const u2 * dalvikPC) {
+-    int retCode = lowerByteCode(method, mir, dalvikPC);
++    int retCode = lowerByteCodeCanThrowCheck(method, mir, dalvikPC);
+     freeShortMap();
+     if(retCode >= 0) return false; //handled
+     return true; //not handled
+@@ -505,6 +506,69 @@ void endOfTrace(bool freeOnly) {
+     gCompilationUnit = 0;
+ }
+ 
++int lowerByteCodeCanThrowCheck(const Method* method, const MIR * mir, const u2 * dalvikPC) {
++    bool delay_requested = false;
++    // Delay free VRs if we potentially can exit to interpreter
++    // We do not activate delay if VRs state is not changed
++    if ((int)(mir->dalvikInsn.opcode) < (int)kMirOpFirst // Not applicable to extended MIR
++        && (dexGetFlagsFromOpcode(mir->dalvikInsn.opcode) & kInstrCanThrow)!=0
++    ) {
++        int dfAttributes = dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
++
++        if ( (dfAttributes & DF_IS_CALL) == 0) { // Not applicable to calls
++            int mirOptFlags = mir->OptimizationFlags;
++
++            // Avoid delay if we null/range check optimized
++            if ( (dfAttributes & DF_HAS_NR_CHECKS) != 0 ) {
++                // Both null check and range check applicable
++
++                if( (mirOptFlags & MIR_IGNORE_NULL_CHECK) == 0 ) {
++                    // Null check is not optimized, request delay
++                    if(requestVRFreeDelayAll(VRDELAY_CAN_THROW) == true) {
++                        delay_requested = true;
++                    }
++                }
++
++                if( (mirOptFlags & MIR_IGNORE_RANGE_CHECK) == 0 ) {
++                    // Range check is not optimized, put additional request delay
++                    if(requestVRFreeDelayAll(VRDELAY_CAN_THROW) == true) {
++                        delay_requested = true;
++                    }
++                }
++            } else if ( (dfAttributes & DF_HAS_OBJECT_CHECKS) != 0 ) {
++                // Only null check applicable to opcode
++
++                if( (mirOptFlags & MIR_IGNORE_NULL_CHECK) == 0 ) {
++                    // Null check is not optimized, request delay
++                    if(requestVRFreeDelayAll(VRDELAY_CAN_THROW) == true) {
++                        delay_requested = true;
++                    }
++                }
++            } else {
++                // Can exit to interpreter but have no null/range checks
++                if(requestVRFreeDelayAll(VRDELAY_CAN_THROW) == true) {
++                    delay_requested = true;
++                }
++            }
++        }
++    }
++
++    int retCode = lowerByteCode(method, mir, dalvikPC);
++
++    if(delay_requested == true) {
++        bool state_changed = cancelVRFreeDelayRequestAll(VRDELAY_CAN_THROW);
++        if(state_changed==true) {
++            // Not optimized case (delay was not canceled inside bytecode generation)
++            ALOGI("JIT_INFO: VRDELAY_CAN_THROW cancel was not optimized for bytecode=0x%x",
++                  mir->dalvikInsn.opcode);
++            // Release all remaining VRDELAY_CAN_THROW requests
++            do {
++                state_changed = cancelVRFreeDelayRequestAll(VRDELAY_CAN_THROW);
++            } while (state_changed == true);
++        }
++    }
++    return retCode;
++}
+ /**
+  * @brief Generates native code for the bytecode.
+  * @details May update code stream.
+diff --git a/vm/compiler/codegen/x86/Lower.h b/vm/compiler/codegen/x86/Lower.h
+index 8c3d86e..28555d0 100644
+--- a/vm/compiler/codegen/x86/Lower.h
++++ b/vm/compiler/codegen/x86/Lower.h
+@@ -720,7 +720,12 @@ bool isVRNullCheck(int regNum, OpndSize size);
+ void setVRBoundCheck(int vr_array, int vr_index);
+ bool isVRBoundCheck(int vr_array, int vr_index);
+ int requestVRFreeDelay(int regNum, u4 reason);
+-void cancelVRFreeDelayRequest(int regNum, u4 reason);
++int cancelVRFreeDelayRequest(int regNum, u4 reason);
++
++// Update delay flag for all VRs, stored in physical registers
++bool requestVRFreeDelayAll(u4 reason);
++bool cancelVRFreeDelayRequestAll(u4 reason);
++
+ bool getVRFreeDelayRequested(int regNum);
+ bool isGlueHandled(int glue_reg);
+ int resetGlue(int glue_reg);
+@@ -1102,6 +1107,8 @@ int common_errStringIndexOutOfBounds();
+ void sendLabelInfoToVTune(int startStreamPtr, int endStreamPtr, const char* labelName);
+ #endif
+ 
++// Delay VRs freeing if bytecode can throw exception, then call lowerByteCode
++int lowerByteCodeCanThrowCheck(const Method* method, const MIR * mir, const u2 * dalvikPC);
+ //lower a bytecode
+ int lowerByteCode(const Method* method, const MIR * mir, const u2 * dalvikPC);
+ 
+-- 
+1.7.4.1
+

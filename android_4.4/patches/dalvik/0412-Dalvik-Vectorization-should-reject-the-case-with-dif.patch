@@ -1,0 +1,259 @@
+From cfa3a448045571aaa532aae6cc00c5de12ef78f3 Mon Sep 17 00:00:00 2001
+From: Serguei Katkov <serguei.i.katkov@intel.com>
+Date: Mon, 18 Nov 2013 13:37:41 +0700
+Subject: Dalvik: Vectorization should reject the case with different types
+
+BZ: 141170
+
+Vectorization optimization detects type of vectorization basing on
+cast bytecodes in exit block. It does not take into account that
+for int type there is no cast bytecode. As a result rejection of the
+case with integer type and non integer type is not detected.
+
+The patch check the type for each output.
+
+Change-Id: I95072c09f3dee17386ede4d295a194738735ca72
+Category: device enablement
+Domain: AOSP.Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, need rework
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/Vectorization.cpp |  142 ++++++++++++++++++++++++-----------------
+ 1 files changed, 83 insertions(+), 59 deletions(-)
+
+diff --git a/vm/compiler/Vectorization.cpp b/vm/compiler/Vectorization.cpp
+index 1358ac5..8a39ad6 100644
+--- a/vm/compiler/Vectorization.cpp
++++ b/vm/compiler/Vectorization.cpp
+@@ -36,6 +36,7 @@
+         } \
+     } while (false)
+ 
++//The elements must be ordered by size
+ enum VectorizedType
+ {
+     kVectorizedNoType = 0,
+@@ -421,9 +422,10 @@ static void setOutputRegister (VectorizationInfo *info, int vr, bool value)
+  * @brief Find type for the vectorization
+  * @param cUnit the CompilationUnit
+  * @param loopInfo the LoopInformation
++ * @param info points to all known outputs
+  * @return the type for the vectorization
+  */
+-static VectorizedType findType (const CompilationUnit * const cUnit, LoopInformation *loopInfo)
++static VectorizedType findType (const CompilationUnit * const cUnit, LoopInformation *loopInfo, VectorizationInfo *info)
+ {
+     BasicBlock *loopBB = loopInfo->getEntryBlock ();
+ 
+@@ -445,8 +447,9 @@ static VectorizedType findType (const CompilationUnit * const cUnit, LoopInforma
+         }
+     }
+ 
+-    //Now check the loop exit blocks, and see if there are casts there. If we do, we should have
+-    //only one kind
++    //Now we want to find a common type for all output VRs
++
++    //Now check the loop exit blocks, and see if there are casts there
+     BasicBlock *exitBlock = loopInfo->getExitBlock(cUnit);
+ 
+     if (exitBlock == 0)
+@@ -454,11 +457,8 @@ static VectorizedType findType (const CompilationUnit * const cUnit, LoopInforma
+         return kVectorizedNoType;
+     }
+ 
+-    //We record the cast bytecodes here
+-    Opcode targetOpcode = OP_NOP;
+-
+     //Go through all the MIR's of the BB and see if there is a cast
+-    //We record the first one we see, and then only approve that type for others
++    std::map<int, Opcode> cast4vr;
+     for (MIR *mir = exitBlock->firstMIRInsn; mir != 0; mir = mir->next)
+     {
+         Opcode opcode = mir->dalvikInsn.opcode;
+@@ -466,41 +466,71 @@ static VectorizedType findType (const CompilationUnit * const cUnit, LoopInforma
+         //Check if this is a cast
+         if (opcode >= OP_INT_TO_LONG && opcode <= OP_INT_TO_SHORT)
+         {
+-            if (targetOpcode == OP_NOP)
+-            {
+-                targetOpcode = opcode;
+-            }
+-            else
++            int vr = mir->dalvikInsn.vA;
++
++            std::map <int, Opcode>::iterator it = cast4vr.find (vr);
++            if (it != cast4vr.end ())
+             {
+-                //We saw two different casts:
+-                if (targetOpcode != opcode)
++                //Second cast to the same VR?
++                if (it->second != opcode)
+                 {
++                    VECTORIZATION_LOG (cUnit, "Two casts for the same VR", reportFailure);
+                     return kVectorizedNoType;
+                 }
+             }
++            else
++            {
++                cast4vr[vr] = opcode;
++            }
+         }
+     }
+ 
+-    //Now return the appropriate type of VectorizationInfo
+-    //depending on the opcode
+-    if (targetOpcode == OP_INT_TO_BYTE)
++    //Now find common VectorizedType for all outputs
++    VectorizedType type = kVectorizedNoType;
++    std::map<int, RegisterAssociation> &registers = info->registers;
++    for (std::map<int, RegisterAssociation>::const_iterator it = registers.begin (); it != registers.end (); it++)
+     {
+-        return kVectorizedByte;
+-    }
++        //Get the output VR
++        const RegisterAssociation &association = it->second;
+ 
+-    if (targetOpcode == OP_INT_TO_SHORT)
+-    {
+-        return kVectorizedShort;
+-    }
++        //Only care if it is an output
++        if (association.output == true)
++        {
++            int vr = it->first;
+ 
+-    //If we saw no casts, return int type
+-    if (targetOpcode == OP_NOP)
+-    {
+-        return kVectorizedInt;
++            std::map<int, Opcode>::iterator iter = cast4vr.find (vr);
++            if (iter != cast4vr.end ())
++            {
++                Opcode opcode = iter->second;
++
++                //Determine type basing on cast
++                VectorizedType cast2type = kVectorizedNoType;
++                if (opcode == OP_INT_TO_BYTE)
++                {
++                    cast2type = kVectorizedByte;
++                }
++                else if (opcode == OP_INT_TO_SHORT)
++                {
++                    cast2type = kVectorizedShort;
++                }
++                else
++                {
++                    VECTORIZATION_LOG (cUnit, "Not supported cast", reportFailure);
++                    return kVectorizedNoType;
++                }
++
++                //Use the highest type
++                type = (cast2type > type) ? cast2type : type;
++            }
++            else
++            {
++                //No cast found so we must use kVectorizedInt as a highest type
++                type = kVectorizedInt;
++            }
++        }
+     }
+ 
+-    //We don't care about other casts
+-    return kVectorizedNoType;
++    return type;
+ }
+ 
+ /**
+@@ -756,6 +786,23 @@ static bool fillVectorizationInformation (const CompilationUnit * const cUnit, L
+     //We have added the IV as an output due to the PHI node. Remove it now
+     setOutputRegister (info, vrIV, false);
+ 
++    //Find the type for the vectorization
++    info->type = findType (cUnit, loopInformation, info);
++
++    //If no type, we are done
++    if (info->type == kVectorizedNoType)
++    {
++        return false;
++    }
++
++    //Since this is the IV increment, we will multiply it by the number of iterations we are able
++    //to skip using vectorization
++    increment *= convertTypeToHowManyPerIteration (info->type);
++
++    //Add it as a constant
++    //Add 0, the proper XMM value will be filled up later
++    info->constants[increment] = 0;
++
+     return true;
+ }
+ 
+@@ -1373,23 +1420,6 @@ static bool vectorizationGate (const CompilationUnit * const cUnit, LoopInformat
+     // Now we have a free scratch register to use, remember it in VectorizationInfo
+     info->scratchVrForTest = scratchVrForTest;
+ 
+-    //Find the type for the vectorization
+-    info->type = findType (cUnit, loopInfo);
+-
+-    //If no type, we are done
+-    if (info->type == kVectorizedNoType)
+-    {
+-        VECTORIZATION_LOG (cUnit, "Could not determine vectorization type", reportFailure);
+-        return false;
+-    }
+-
+-    //Does the vectorization in the BE support the size
+-    if (dvmCompilerArchSupportsVectorizedPackedSize (convertTypeToSize (info->type)) == false )
+-    {
+-        VECTORIZATION_LOG (cUnit, "No architecture support for Vectorization type", reportFailure);
+-        return false;
+-    }
+-
+     //For the moment we only handle count-up loops
+     if (loopInfo->getCountUpLoop () == false)
+     {
+@@ -1407,18 +1437,6 @@ static bool vectorizationGate (const CompilationUnit * const cUnit, LoopInformat
+         return false;
+     }
+ 
+-    //How many iterations would we have vectorized at max?
+-    unsigned int cnt = (info->upperBound > 0) ? info->upperBound : - info->upperBound;
+-
+-    //How many are done at the same time
+-    unsigned int howManyPerIteration = convertTypeToHowManyPerIteration (info->type);
+-
+-    //Paranoid
+-    assert (howManyPerIteration != 0);
+-
+-    //Calculate how many vectorized iterations
+-    cnt /= howManyPerIteration;
+-
+     if (info->upperBound < gDvmJit.minVectorizedIterations)
+     {
+         VECTORIZATION_LOG (cUnit, "Not enough iterations in the vectorized loop", reportFailure);
+@@ -1432,7 +1450,6 @@ static bool vectorizationGate (const CompilationUnit * const cUnit, LoopInformat
+         return false;
+     }
+ 
+-
+     //First job: gather input, output, constants
+     if (fillVectorizationInformation (cUnit, loopInfo, bb, info) == false)
+     {
+@@ -1440,6 +1457,13 @@ static bool vectorizationGate (const CompilationUnit * const cUnit, LoopInformat
+         return false;
+     }
+ 
++    //Does the vectorization in the BE support the size
++    if (dvmCompilerArchSupportsVectorizedPackedSize (convertTypeToSize (info->type)) == false )
++    {
++        VECTORIZATION_LOG (cUnit, "No architecture support for Vectorization type", reportFailure);
++        return false;
++    }
++
+     //Now check if we have enough vectorized registers for this
+     unsigned int count = info->registers.size () + info->constants.size ();
+     if (count >= gDvmJit.vectorRegisters)
+-- 
+1.7.4.1
+

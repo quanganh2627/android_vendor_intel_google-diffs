@@ -1,0 +1,232 @@
+From 76e33984e2fd6d9f1cab05f5edac0a5d5264f7cc Mon Sep 17 00:00:00 2001
+From: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Date: Thu, 12 Dec 2013 14:21:18 -0800
+Subject: Dalvik: Algorithms include switch blocks when iterating through children
+
+BZ: 158735
+
+Many of the middle-end algorithms have been updated to use the child block
+iterator which ensures that when successor list is used, those children are
+visited as well. In addition to that, two issues have been addressed:
+-SSA transformation takes into account targets of switches
+-Block insertion can now insert block in between switch block and its target
+
+Change-Id: I2be6f1130916131fc1495485f3ea14af61943286
+Category: device enablement
+Domain: AOSP.Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: yes
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+---
+ vm/compiler/Dataflow.cpp          |   16 ++++---
+ vm/compiler/IntermediateRep.cpp   |    2 +-
+ vm/compiler/Loop.cpp              |   35 +++------------
+ vm/compiler/SSATransformation.cpp |   83 +++++++++++++++----------------------
+ 4 files changed, 51 insertions(+), 85 deletions(-)
+
+diff --git a/vm/compiler/Dataflow.cpp b/vm/compiler/Dataflow.cpp
+index 8445bcb..3d8a96b 100644
+--- a/vm/compiler/Dataflow.cpp
++++ b/vm/compiler/Dataflow.cpp
+@@ -2347,15 +2347,17 @@ bool dvmCompilerDoSSAConversion(CompilationUnit *cUnit, BasicBlock *bb)
+         }
+     }
+ 
+-    //Now call for the children
+-    if (bb->taken != 0)
+-    {
+-        dvmCompilerDoSSAConversion (cUnit, bb->taken);
+-    }
++    //Create iterator for visiting children
++    ChildBlockIterator childIter (bb);
+ 
+-    if (bb->fallThrough != 0)
++    //Now iterate through the children to do the SSA conversion
++    for (BasicBlock **childPtr = childIter.getNextChildPtr (); childPtr != 0; childPtr = childIter.getNextChildPtr ())
+     {
+-        dvmCompilerDoSSAConversion (cUnit, bb->fallThrough);
++        BasicBlock *child = *childPtr;
++
++        assert (child != 0);
++
++        dvmCompilerDoSSAConversion (cUnit, child);
+     }
+ 
+     //If we have a successor list, process that
+diff --git a/vm/compiler/IntermediateRep.cpp b/vm/compiler/IntermediateRep.cpp
+index de3e9a1..7881f20 100644
+--- a/vm/compiler/IntermediateRep.cpp
++++ b/vm/compiler/IntermediateRep.cpp
+@@ -814,7 +814,7 @@ bool dvmCompilerInsertBasicBlockBetween (BasicBlock *newBlock, BasicBlock *paren
+                     assert (succBB != 0);
+                     if (succBB == child)
+                     {
+-                        dvmGrowableListSetLastIterator (&iterator, (intptr_t)child);
++                        successorBlockInfo->block = newBlock;
+                         dvmCompilerUpdatePredecessors (parent, child, newBlock);
+                         found = true;
+                         break;
+diff --git a/vm/compiler/Loop.cpp b/vm/compiler/Loop.cpp
+index d2e201c..c2053ff 100644
+--- a/vm/compiler/Loop.cpp
++++ b/vm/compiler/Loop.cpp
+@@ -2170,38 +2170,17 @@ static bool calculatePredecessorsHelper (CompilationUnit *cUnit, BasicBlock *bb)
+         return false;
+     }
+ 
+-    //Go through taken and fallthrough
+-    if (bb->taken != 0)
+-    {
+-        dvmCompilerSetBit (bb->taken->predecessors, bb->id);
+-    }
++    //Create iterator for visiting children
++    ChildBlockIterator childIter (bb);
+ 
+-    if (bb->fallThrough != 0)
++    //Now iterate through the children to set the predecessor bits
++    for (BasicBlock **childPtr = childIter.getNextChildPtr (); childPtr != 0; childPtr = childIter.getNextChildPtr ())
+     {
+-        dvmCompilerSetBit (bb->fallThrough->predecessors, bb->id);
+-    }
++        BasicBlock *child = *childPtr;
+ 
+-    // Go through successor blocks of bb which contains switch bytecode
+-    if (bb->successorBlockList.blockListType == kPackedSwitch ||
+-        bb->successorBlockList.blockListType == kSparseSwitch) {
++        assert (child != 0);
+ 
+-        GrowableListIterator iterator;
+-        dvmGrowableListIteratorInit(&bb->successorBlockList.blocks, &iterator);
+-
+-        // set predecessor info for successor blocks of current bb
+-        while (true) {
+-            SuccessorBlockInfo *successorBlockInfo =
+-              (SuccessorBlockInfo *)dvmGrowableListIteratorNext(&iterator);
+-            if (successorBlockInfo == NULL) {
+-                break;
+-            }
+-
+-            BasicBlock *succBlock = successorBlockInfo->block;
+-
+-            if (succBlock != 0) {
+-                dvmCompilerSetBit (succBlock->predecessors, bb->id);
+-            }
+-        }
++        dvmCompilerSetBit (child->predecessors, bb->id);
+     }
+ 
+     //We did change something but not our own basic block
+diff --git a/vm/compiler/SSATransformation.cpp b/vm/compiler/SSATransformation.cpp
+index 6cb7f5c..dfa84d5 100644
+--- a/vm/compiler/SSATransformation.cpp
++++ b/vm/compiler/SSATransformation.cpp
+@@ -33,20 +33,19 @@ static void recordDFSPreOrder(CompilationUnit *cUnit, BasicBlock *block)
+     /* Enqueue the block id */
+     dvmInsertGrowableList(&cUnit->dfsOrder, block->id);
+ 
+-    if (block->fallThrough) recordDFSPreOrder(cUnit, block->fallThrough);
+-    if (block->taken) recordDFSPreOrder(cUnit, block->taken);
+-    if (block->successorBlockList.blockListType != kNotUsed) {
+-        GrowableListIterator iterator;
+-        dvmGrowableListIteratorInit(&block->successorBlockList.blocks,
+-                                    &iterator);
+-        while (true) {
+-            SuccessorBlockInfo *successorBlockInfo =
+-                (SuccessorBlockInfo *) dvmGrowableListIteratorNext(&iterator);
+-            if (successorBlockInfo == NULL) break;
+-            BasicBlock *succBB = successorBlockInfo->block;
+-            recordDFSPreOrder(cUnit, succBB);
+-        }
++    //Create iterator for visiting children
++    ChildBlockIterator childIter (block);
++
++    //Now iterate through the children to record pre-order
++    for (BasicBlock **childPtr = childIter.getNextChildPtr (); childPtr != 0; childPtr = childIter.getNextChildPtr ())
++    {
++        BasicBlock *child = *childPtr;
++
++        assert (child != 0);
++
++        recordDFSPreOrder (cUnit, child);
+     }
++
+     return;
+ }
+ 
+@@ -175,24 +174,17 @@ static bool computeDominanceFrontier(CompilationUnit *cUnit, BasicBlock *bb)
+ {
+     GrowableList *blockList = &cUnit->blockList;
+ 
+-    /* Calculate DF_local */
+-    if (bb->taken) {
+-        checkForDominanceFrontier(bb, bb->taken);
+-    }
+-    if (bb->fallThrough) {
+-        checkForDominanceFrontier(bb, bb->fallThrough);
+-    }
+-    if (bb->successorBlockList.blockListType != kNotUsed) {
+-        GrowableListIterator iterator;
+-        dvmGrowableListIteratorInit(&bb->successorBlockList.blocks,
+-                                    &iterator);
+-        while (true) {
+-            SuccessorBlockInfo *successorBlockInfo =
+-                (SuccessorBlockInfo *) dvmGrowableListIteratorNext(&iterator);
+-            if (successorBlockInfo == NULL) break;
+-            BasicBlock *succBB = successorBlockInfo->block;
+-            checkForDominanceFrontier(bb, succBB);
+-        }
++    //Create iterator for visiting children
++    ChildBlockIterator childIter (bb);
++
++    //Now iterate through the children to check for dominance
++    for (BasicBlock **childPtr = childIter.getNextChildPtr (); childPtr != 0; childPtr = childIter.getNextChildPtr ())
++    {
++        BasicBlock *child = *childPtr;
++
++        assert (child != 0);
++
++        checkForDominanceFrontier (bb, child);
+     }
+ 
+     /* Calculate DF_up */
+@@ -444,26 +436,19 @@ static bool computeBlockLiveIns(CompilationUnit *cUnit, BasicBlock *bb)
+     //Clear the temp
+     dvmClearAllBits (tempDalvikRegisterV);
+ 
+-    if (bb->taken != 0 && bb->taken->dataFlowInfo != 0) {
+-        dvmUnifyBitVectors (tempDalvikRegisterV, tempDalvikRegisterV, bb->taken->dataFlowInfo->liveInV);
+-    }
++    //Create iterator for visiting children
++    ChildBlockIterator childIter (bb);
+ 
+-    if (bb->fallThrough != 0 && bb->fallThrough->dataFlowInfo != 0) {
+-        dvmUnifyBitVectors (tempDalvikRegisterV, tempDalvikRegisterV, bb->fallThrough->dataFlowInfo->liveInV);
+-    }
++    //Now iterate through the children to include their live-ins
++    for (BasicBlock **childPtr = childIter.getNextChildPtr (); childPtr != 0; childPtr = childIter.getNextChildPtr ())
++    {
++        BasicBlock *child = *childPtr;
+ 
+-    if (bb->successorBlockList.blockListType != kNotUsed) {
+-        GrowableListIterator iterator;
+-        dvmGrowableListIteratorInit(&bb->successorBlockList.blocks,
+-                                    &iterator);
+-        while (true) {
+-            SuccessorBlockInfo *successorBlockInfo =
+-                (SuccessorBlockInfo *) dvmGrowableListIteratorNext(&iterator);
+-            if (successorBlockInfo == NULL) break;
+-            BasicBlock *succBB = successorBlockInfo->block;
+-            if (succBB->dataFlowInfo) {
+-                dvmUnifyBitVectors (tempDalvikRegisterV, tempDalvikRegisterV, succBB->dataFlowInfo->liveInV);
+-            }
++        assert (child != 0);
++
++        if (child->dataFlowInfo != 0)
++        {
++            dvmUnifyBitVectors (tempDalvikRegisterV, tempDalvikRegisterV, child->dataFlowInfo->liveInV);
+         }
+     }
+ 
+-- 
+1.7.4.1
+

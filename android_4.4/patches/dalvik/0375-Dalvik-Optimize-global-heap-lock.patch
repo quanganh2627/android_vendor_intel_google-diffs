@@ -1,0 +1,189 @@
+From 8b7c829bb0cc1c02d8faa078b5375aa8aeebed36 Mon Sep 17 00:00:00 2001
+From: stasson <sebastien.tasson@intel.com>
+Date: Fri, 18 Oct 2013 12:04:17 +0200
+Subject: Dalvik: Optimize global heap lock.
+
+BZ: 141463
+
+- inline lock/unlock fast-path
+- for SMP case, do a short spin to avoid ctx switches
+
+Category: device-enablement
+Domain: AOSP-Dalvik-GC
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I1e63fbb275e59089ba54c3c85f720da9a117a31f
+Orig-MCG-Change-Id: Ie12a7dc35d9ccd14212dcd0834ca7812678b4510
+Signed-off-by: stasson <sebastien.tasson@intel.com>
+Reviewed-on: http://android.intel.com:8080/134689
+Reviewed-by: He, Yunan <yunan.he@intel.com>
+Reviewed-by: Wang, Zuo <zuo.wang@intel.com>
+Reviewed-by: Beyler, Jean Christophe <jean.christophe.beyler@intel.com>
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: lab_aqa <lab_aqa@intel.com>
+Reviewed-by: Semukhina, Elena V <elena.v.semukhina@intel.com>
+Reviewed-by: Lupusoru, Razvan A <razvan.a.lupusoru@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/alloc/Heap.cpp       |   63 ++++++++++++++++++++++++++++++++++++----------
+ vm/alloc/HeapInternal.h |   20 +++++++++++++-
+ 2 files changed, 67 insertions(+), 16 deletions(-)
+
+diff --git a/vm/alloc/Heap.cpp b/vm/alloc/Heap.cpp
+index c10982e..f2d62d7 100644
+--- a/vm/alloc/Heap.cpp
++++ b/vm/alloc/Heap.cpp
+@@ -173,25 +173,55 @@ void dvmHeapThreadShutdown()
+  * Grab the lock, but put ourselves into THREAD_VMWAIT if it looks like
+  * we're going to have to wait on the mutex.
+  */
+-bool dvmLockHeap()
++bool dvmHeapLockSlow()
+ {
+-    if (dvmTryLockMutex(&gDvm.gcHeapLock) != 0) {
+-        Thread *self;
+-        ThreadStatus oldStatus;
++    Thread *self;
++    ThreadStatus oldStatus;
+ 
+-        self = dvmThreadSelf();
+-        oldStatus = dvmChangeStatus(self, THREAD_VMWAIT);
+-        dvmLockMutex(&gDvm.gcHeapLock);
+-        dvmChangeStatus(self, oldStatus);
+-    }
++    self = dvmThreadSelf();
++    oldStatus = dvmChangeStatus(self, THREAD_VMWAIT);
++
++#if ANDROID_SMP != 0
++    /*
++     * Multi-processor case: spin a little to avoid rescheduling
++     * in case of short alloc/alloc or alloc/sweep lock collision.
++     * 100 us is enough to capture most collisions while still
++     * reasonable compared to scheduler freq (1/1000).
++     * GC pause times can be way over the 100 us range, so in the
++     * case of collision with GC pauses we skip the spinning
++     * and give back hand to the kernel.
++     *
++     * TODO: May be worth to try true kernel adaptive mutex if
++     * bionic ever supports it.
++     */
++    const int kHeapLockSpinTime = 100;
++    u8 spinUntil  = dvmGetRelativeTimeUsec() + kHeapLockSpinTime;
++    while (dvmTryLockMutex(&gDvm.gcHeapLock) != 0)
++    {
++#ifdef ARCH_IA32
++        /* pause cpu to reduce spinning overhead */
++        __asm__ ( "pause;" );
++#endif
++        /*
++         * stop spinning if dvmSuspendAllThreads(SUSPEND_FOR_GC) pending
++         * or spin time has elapsed.
++         */
++        if (       (gDvm.gcHeap->suspendForGC == true)
++                || (dvmGetRelativeTimeUsec() > spinUntil) )
++        {
++            dvmLockMutex(&gDvm.gcHeapLock);
++            break;
++        }
++     }
++#else
++    dvmLockMutex(&gDvm.gcHeapLock);
++#endif
++
++    dvmChangeStatus(self, oldStatus);
+ 
+     return true;
+ }
+ 
+-void dvmUnlockHeap()
+-{
+-    dvmUnlockMutex(&gDvm.gcHeapLock);
+-}
+ 
+ /* Do a full garbage collection, which may grow the
+  * heap as a side-effect if the live set is large.
+@@ -539,6 +569,7 @@ void dvmCollectGarbageInternal(const GcSpec* spec)
+     }
+ 
+     gcHeap->gcRunning = true;
++    gcHeap->suspendForGC = true;
+ 
+     rootStart = dvmGetRelativeTimeMsec();
+     ATRACE_BEGIN("GC: Threads Suspended"); // Suspend A
+@@ -610,6 +641,7 @@ void dvmCollectGarbageInternal(const GcSpec* spec)
+          * Resume threads while tracing from the roots.  We unlock the
+          * heap to allow mutator threads to allocate from free space.
+          */
++        gcHeap->suspendForGC = false;
+         dvmUnlockHeap();
+         dvmResumeAllThreads(SUSPEND_FOR_GC);
+         ATRACE_END(); // Suspend A
+@@ -634,6 +666,7 @@ void dvmCollectGarbageInternal(const GcSpec* spec)
+          */
+         dirtyStart = dvmGetRelativeTimeMsec();
+         dvmLockHeap();
++        gcHeap->suspendForGC = true;
+         ATRACE_BEGIN("GC: Threads Suspended"); // Suspend B
+         dvmSuspendAllThreads(SUSPEND_FOR_GC);
+ 
+@@ -718,6 +751,7 @@ void dvmCollectGarbageInternal(const GcSpec* spec)
+     }
+ 
+     if (spec->isConcurrent) {
++        gcHeap->suspendForGC = false;
+         dvmUnlockHeap();
+         dvmResumeAllThreads(SUSPEND_FOR_GC);
+         ATRACE_END(); // Suspend B
+@@ -765,6 +799,7 @@ void dvmCollectGarbageInternal(const GcSpec* spec)
+     }
+ 
+     if (!spec->isConcurrent) {
++        gcHeap->suspendForGC = false;
+         dvmResumeAllThreads(SUSPEND_FOR_GC);
+         ATRACE_END(); // Suspend A
+         dirtyEnd = dvmGetRelativeTimeMsec();
+diff --git a/vm/alloc/HeapInternal.h b/vm/alloc/HeapInternal.h
+index a29fb20..1293a19 100644
+--- a/vm/alloc/HeapInternal.h
++++ b/vm/alloc/HeapInternal.h
+@@ -73,6 +73,10 @@ struct GcHeap {
+      */
+     bool gcRunning;
+ 
++    /* Is the GC suspending all Threads ?
++     */
++    bool suspendForGC;
++
+     /*
+      * Debug control values
+      */
+@@ -87,8 +91,20 @@ struct GcHeap {
+ 
+ };
+ 
+-bool dvmLockHeap(void);
+-void dvmUnlockHeap(void);
++/** dvmLockHeap slow path fallback.*/
++bool dvmHeapLockSlow(void);
++
++/** Lock the global Heap mutex. */
++INLINE bool dvmLockHeap(void)
++{
++    return (dvmTryLockMutex(&gDvm.gcHeapLock) != 0) ? dvmHeapLockSlow(): true;
++}
++
++/** Unlock the global Heap mutex. */
++INLINE void dvmUnlockHeap(void)
++{
++    dvmUnlockMutex(&gDvm.gcHeapLock);
++}
+ 
+ /*
+  * Logging helpers
+-- 
+1.7.4.1
+

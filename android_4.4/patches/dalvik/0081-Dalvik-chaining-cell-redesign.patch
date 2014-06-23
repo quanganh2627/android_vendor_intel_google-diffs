@@ -1,0 +1,1748 @@
+From 430481a0ea808e28c1c7ac76a3556e20d6da78d1 Mon Sep 17 00:00:00 2001
+From: Yixin Shou <yixin.shou@intel.com>
+Date: Tue, 12 Feb 2013 04:53:54 -0800
+Subject: Dalvik: chaining cell redesign
+
+BZ: 73873
+
+chaining cell used in x86 code generator is redesigned in this patch.
+chaining cell structure are changed and chaining, unchaining procedure
+for normal, backward, hot and singleton chaining cell are all changed
+for this new desgin. Instead of the control jumping to the chaining
+cell and then jump to the target address, the new design allow the
+control to directly jump to the target address.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME; AOSP-Dalvik-Interpreter
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I55ec09cea54a049a41cd59ba43adce954427bfb3
+Orig-MCG-Change-Id: I6a2c9891511f9071051f25e5ae5e82091e049ed7
+Signed-off-by: Yixin Shou <yixin.shou@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/CompilerIR.h                       |    1 +
+ vm/compiler/Frontend.cpp                       |    1 +
+ vm/compiler/InlineTransformation.cpp           |    4 +
+ vm/compiler/codegen/CompilerCodegen.h          |    4 +
+ vm/compiler/codegen/x86/AnalysisO1.h           |    1 +
+ vm/compiler/codegen/x86/CodegenInterface.cpp   |  389 +++++++++++++++++-------
+ vm/compiler/codegen/x86/Lower.h                |   32 ++-
+ vm/compiler/codegen/x86/LowerHelper.cpp        |   89 +++---
+ vm/compiler/codegen/x86/LowerInvoke.cpp        |    8 +-
+ vm/compiler/codegen/x86/LowerJump.cpp          |  149 ++++++++--
+ vm/compiler/codegen/x86/NcgAot.cpp             |   12 +
+ vm/compiler/codegen/x86/NcgAot.h               |    2 +
+ vm/compiler/codegen/x86/NcgHelper.h            |    3 +-
+ vm/compiler/codegen/x86/Schedule.cpp           |  126 +++++++-
+ vm/compiler/codegen/x86/Scheduler.h            |    4 +-
+ vm/compiler/codegen/x86/libenc/enc_wrapper.cpp |   11 +
+ vm/compiler/codegen/x86/libenc/enc_wrapper.h   |    1 +
+ vm/interp/Interp.cpp                           |    4 +-
+ vm/interp/InterpState.h                        |    2 +-
+ vm/mterp/out/InterpAsm-x86.S                   |   48 ++--
+ vm/mterp/x86/footer.S                          |   48 ++--
+ 21 files changed, 699 insertions(+), 240 deletions(-)
+
+diff --git a/vm/compiler/CompilerIR.h b/vm/compiler/CompilerIR.h
+index 89d2c4a..fe50c75 100644
+--- a/vm/compiler/CompilerIR.h
++++ b/vm/compiler/CompilerIR.h
+@@ -239,6 +239,7 @@ typedef struct CompilationUnit {
+     const Method *method;
+ #ifdef ARCH_IA32
+     int exceptionBlockId;               /**< @brief The block corresponding to exception handling */
++    bool singletonInlined;              /**< @brief TRUE if singleton call inlined */
+ #endif
+     const JitTraceDescription *traceDesc;
+     LIR *firstLIRInsn;
+diff --git a/vm/compiler/Frontend.cpp b/vm/compiler/Frontend.cpp
+index 2f32e4a..3fc6316 100644
+--- a/vm/compiler/Frontend.cpp
++++ b/vm/compiler/Frontend.cpp
+@@ -200,6 +200,7 @@ static inline bool isUnconditionalBranch(MIR *insn)
+ {
+     switch (insn->dalvikInsn.opcode) {
+         case OP_RETURN_VOID:
++        case OP_RETURN_VOID_BARRIER:
+         case OP_RETURN:
+         case OP_RETURN_WIDE:
+         case OP_RETURN_OBJECT:
+diff --git a/vm/compiler/InlineTransformation.cpp b/vm/compiler/InlineTransformation.cpp
+index 2f0d054..1feb658 100644
+--- a/vm/compiler/InlineTransformation.cpp
++++ b/vm/compiler/InlineTransformation.cpp
+@@ -356,6 +356,10 @@ void dvmCompilerInlineMIR(CompilationUnit *cUnit, JitTranslationInfo *info)
+         if (calleeMethod) {
+             bool inlined = tryInlineSingletonCallsite(cUnit, calleeMethod,
+                                                       lastMIRInsn, bb, isRange);
++#ifdef ARCH_IA32
++            if (inlined)
++               cUnit->singletonInlined = true;
++#endif
+             if (!inlined &&
+                 !(gDvmJit.disableOpt & (1 << kMethodJit)) &&
+                 !dvmIsNativeMethod(calleeMethod)) {
+diff --git a/vm/compiler/codegen/CompilerCodegen.h b/vm/compiler/codegen/CompilerCodegen.h
+index 6fc7d7c..869171c 100644
+--- a/vm/compiler/codegen/CompilerCodegen.h
++++ b/vm/compiler/codegen/CompilerCodegen.h
+@@ -37,6 +37,10 @@ void dvmCompilerAssembleLIR(CompilationUnit *cUnit, JitTranslationInfo *info);
+ /* Perform translation chain operation. */
+ extern "C" void* dvmJitChain(void* tgtAddr, u4* branchAddr);
+ 
++#ifdef ARCH_IA32
++/** @brief Perform chaining operation using static address */
++extern "C" void* dvmJitChain_staticAddr(void* tgtAddr, u4* branchAddr);
++#endif
+ /* Install class objects in the literal pool */
+ void dvmJitInstallClassObjectPointers(CompilationUnit *cUnit,
+                                       char *codeAddress);
+diff --git a/vm/compiler/codegen/x86/AnalysisO1.h b/vm/compiler/codegen/x86/AnalysisO1.h
+index f1cd80d..ae0aed0 100644
+--- a/vm/compiler/codegen/x86/AnalysisO1.h
++++ b/vm/compiler/codegen/x86/AnalysisO1.h
+@@ -282,6 +282,7 @@ typedef struct BasicBlock_O1 {
+   Edge_O1* out_edges[MAX_NUM_EDGE_PER_BB];
+   int num_out_edges;
+ #else
++  char *streamStart;        //Where the code generation started for the BasicBlock
+   int pc_end;
+   BasicBlock* jitBasicBlock;
+ #endif
+diff --git a/vm/compiler/codegen/x86/CodegenInterface.cpp b/vm/compiler/codegen/x86/CodegenInterface.cpp
+index f10fe00..9ff5f7f 100644
+--- a/vm/compiler/codegen/x86/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/CodegenInterface.cpp
+@@ -52,10 +52,10 @@ Opcode jitNotSupportedOpcode[] = {
+      * so a divergence will falsely occur when interp executes and sets
+      * the virtual registers (in memory ).
+      *
+-     * const/*
++     * const*
+      * return
+      *
+-     * const/*
++     * const*
+      * invoke_*
+      */
+     OP_CONST_4,
+@@ -476,12 +476,14 @@ void unconditional_jump_rel32(void * target) {
+ }
+ 
+ // works whether instructions for target basic block are generated or not
+-LowOp* jumpToBasicBlock(char* instAddr, int targetId) {
++LowOp* jumpToBasicBlock(char* instAddr, int targetId,
++        bool targetIsChainingCell) {
+     stream = instAddr;
+     bool unknown;
+     OpndSize size;
+     if(gDvmJit.scheduling) {
+-        unconditional_jump_block(targetId);
++        // If target is chaining cell, we must align the immediate
++        unconditional_jump_block(targetId, targetIsChainingCell);
+     } else {
+         int relativeNCG = getRelativeNCG(targetId, JmpCall_uncond, &unknown, &size);
+         unconditional_jump_int(relativeNCG, size);
+@@ -489,12 +491,14 @@ LowOp* jumpToBasicBlock(char* instAddr, int targetId) {
+     return NULL;
+ }
+ 
+-LowOp* condJumpToBasicBlock(char* instAddr, ConditionCode cc, int targetId) {
++LowOp* condJumpToBasicBlock(char* instAddr, ConditionCode cc, int targetId,
++        bool targetIsChainingCell) {
+     stream = instAddr;
+     bool unknown;
+     OpndSize size;
+     if(gDvmJit.scheduling) {
+-        conditional_jump_block(cc, targetId);
++        // If target is chaining cell, we must align the immediate
++        conditional_jump_block(cc, targetId, targetIsChainingCell);
+     } else {
+         int relativeNCG = getRelativeNCG(targetId, JmpCall_cond, &unknown, &size);
+         conditional_jump_int(cc, relativeNCG, size);
+@@ -707,6 +711,15 @@ done:
+     return method;
+ }
+ 
++#define BYTES_OF_NORMAL_CHAINING 13
++#define BYTES_OF_BACKWARDBRANCH_CHAINING 21
++#define BYTES_OF_HOT_CHAINING 17
++#define BYTES_OF_SINGLETON_CHAINING 13
++#define BYTES_OF_PREDICTED_CHAINING 20
++#define OFFSET_OF_PATCHADDR 9 // offset in chaining cell to the field for the location to be patched
++#define OFFSET_OF_VRSTORECODEPTR 17 // offset in backward chaining cell to the field for the location of deferred VR store
++#define OFFSET_OF_ISMOVEFLAG 13  // offset in hot chaining cell to the ismove_flag field
++#define BYTES_OF_32BITS 4
+ /*
+  * Unchain a trace given the starting address of the translation
+  * in the code cache.  Refer to the diagram in dvmCompilerAssembleLIR.
+@@ -727,37 +740,75 @@ u4* dvmJitUnchain(void* codeAddr)
+     int i,j;
+     PredictedChainingCell *predChainCell;
+     int padding;
++    u1* patchAddr;
++    int relativeNCG;
++    int ismove_flag = 0;
++    u1* vrStoreCodePtr;
+ 
+     /* Locate the beginning of the chain cell region */
+     pChainCells = (u1 *)((char*)codeAddr + chainCellOffset);
+ 
+     /* The cells are sorted in order - walk through them and reset */
+     for (i = 0; i < kChainingCellGap; i++) {
+-        /* for hot, normal, singleton chaining:
+-               nop  //padding.
+-               jmp 0
+-               mov imm32, reg1
+-               mov imm32, reg2
+-               call reg2
++        /* for normal chaining:
++               call imm32
++               rPC
++               codePtr (offset address of jmp/jcc)
+            after chaining:
+-               nop
+-               jmp imm
+-               mov imm32, reg1
+-               mov imm32, reg2
+-               call reg2
++               codePtr is filled with a relative offset to the target
+            after unchaining:
+-               nop
+-               jmp 0
+-               mov imm32, reg1
+-               mov imm32, reg2
+-               call reg2
+-           Space occupied by the chaining cell in bytes: nop is for padding,
+-                jump 0, the target 0 is 4 bytes aligned.
++              codePtr is filled with original relative offset to the chaining cell
++
++           for backward chaining:
++               call imm32
++               rPC
++               codePtr (offset address of jmp/jcc)
++               loop header address
++               vrStoreCodePtr (code address of deferred VR store)
++           after chaining:
++               codePtr is filled with a relative offset to the loop header
++           after unchaining:
++               if (vrStoreCodePtr)
++                   codePtr is filled with relative offset to the deferred vr store
++               else
++                   codePtr is filled with relative offset to the chaining cell
++
++          for singleton chaining:
++               call imm32
++               rPC
++               codePtr (offset address of movl)
++           after chaining:
++               codePtr is filled with absolute address to the target
++           after unchaining:
++               codePtr is filled with absolute adress of the chaining cell
++
++           for hot chaining:
++               call imm32
++               rPC
++               codePtr (offset address of jmp or movl)
++               ismove_flag
++           after chaining:
++               if (ismove_flag)
++                 codePtr is filled with a relative offset to the target
++               else
++                 codePtr is filled with absolute address to the target
++           after unchaining:
++               if (ismove_flag)
++                 codePtr is filled with original relative offset to the chaining cell
++               else
++                 codePtr is filled with absolute adress of the chaining cell
++
++           Space occupied by the chaining cell in bytes:
++                normal, singleton: 5+4+4
++                backward: 5+4+4+4+4
++                hot: 5+4+4+4
++                codePtr should be within 16B line.
++
+            Space for predicted chaining: 5 words = 20 bytes
+         */
+         int elemSize = 0;
+         if (i == kChainingCellInvokePredicted) {
+-            elemSize = 20;
++            elemSize = BYTES_OF_PREDICTED_CHAINING;
+         }
+         COMPILER_TRACE_CHAINING(
+             ALOGI("Jit Runtime: unchaining type %d count %d", i, pChainCellCounts->u.count[i]));
+@@ -765,14 +816,45 @@ u4* dvmJitUnchain(void* codeAddr)
+         for (j = 0; j < pChainCellCounts->u.count[i]; j++) {
+             switch(i) {
+                 case kChainingCellNormal:
++                    COMPILER_TRACE_CHAINING(
++                        ALOGI("Jit Runtime: unchaining of normal"));
++                    elemSize = BYTES_OF_NORMAL_CHAINING;
++                    patchAddr = (u1 *)(*(int *)((char*)pChainCells + OFFSET_OF_PATCHADDR));
++                    relativeNCG = (pChainCells - patchAddr) - BYTES_OF_32BITS;
++                    if (patchAddr)
++                       *(int*)patchAddr = relativeNCG;
++                    break;
+                 case kChainingCellHot:
++                    COMPILER_TRACE_CHAINING(
++                        ALOGI("Jit Runtime: unchaining of hot"));
++                    elemSize = BYTES_OF_HOT_CHAINING;
++                    patchAddr = (u1 *)(*(int *)((char*)pChainCells + OFFSET_OF_PATCHADDR));
++                    ismove_flag = *(int *)((char*)pChainCells + OFFSET_OF_ISMOVEFLAG);
++                    if (patchAddr) {
++                        if (ismove_flag) {
++                            relativeNCG = (pChainCells - patchAddr) - BYTES_OF_32BITS;
++                            *(int*)patchAddr = relativeNCG;
++                        }
++                        else
++                            *(int*)patchAddr = (int)pChainCells;
++                    }
++                    break;
+                 case kChainingCellInvokeSingleton:
++                    COMPILER_TRACE_CHAINING(
++                        ALOGI("Jit Runtime: unchaining of singleton"));
++                    elemSize = BYTES_OF_SINGLETON_CHAINING;
++                    patchAddr = (u1 *)(*(int *)((char*)pChainCells + OFFSET_OF_PATCHADDR));
++                    if (patchAddr)
++                        *(int*)patchAddr = (int)pChainCells;
++                    break;
+                 case kChainingCellBackwardBranch:
+                     COMPILER_TRACE_CHAINING(
+-                        ALOGI("Jit Runtime: unchaining of normal, hot, or singleton"));
+-                    pChainCells = (u1*) (((uint)pChainCells + 4)&(~0x03));
+-                    elemSize = 4+5+5+2;
+-                    memset(pChainCells, 0, 4);
++                        ALOGI("Jit Runtime: unchaining of backward"));
++                    elemSize = BYTES_OF_BACKWARDBRANCH_CHAINING;
++                    patchAddr = (u1 *)(*(int *)((char*)pChainCells + OFFSET_OF_PATCHADDR));
++                    vrStoreCodePtr = (u1 *)(*(int *)((char*)pChainCells + OFFSET_OF_VRSTORECODEPTR));
++                    relativeNCG = (vrStoreCodePtr - patchAddr) - BYTES_OF_32BITS;
++                    *(int*)patchAddr = relativeNCG;
+                     break;
+                 case kChainingCellInvokePredicted:
+                     COMPILER_TRACE_CHAINING(
+@@ -830,28 +912,15 @@ void dvmJitUnchainAll()
+     gDvmJit.hasNewChain = false;
+ }
+ 
+-#define P_GPR_1 PhysicalReg_EBX
+-/* Add an additional jump instruction, keeping jump target 4 bytes aligned. Returns the amount of nop padding used before chaining cell head*/
+-static int insertJumpHelp()
+-{
+-    int rem = (uint)stream % 4;
+-    int nop_size = 3 - rem;
+-    dump_nop(nop_size);
+-    unconditional_jump_int(0, OpndSize_32);
+-    return nop_size;
+-}
+-
+ /* Chaining cell for code that may need warmup. */
+ /* ARM assembly: ldr r0, [r6, #76] (why a single instruction to access member of glue structure?)
+                  blx r0
+                  data 0xb23a //bytecode address: 0x5115b23a
+                  data 0x5115
+    IA32 assembly:
+-                  jmp  0 //5 bytes
+-                  movl address, %ebx
+-                  movl dvmJitToInterpNormal, %eax
+-                  call %eax
+-                  <-- return address
++                  call imm32 //relative offset to dvmJitToInterpNormal
++                  rPC
++                  codePtr
+ */
+ static int handleNormalChainingCell(CompilationUnit *cUnit,
+                                      unsigned int offset, int blockId, LowOpBlockLabel* labelList)
+@@ -861,24 +930,27 @@ static int handleNormalChainingCell(CompilationUnit *cUnit,
+     if(dump_x86_inst)
+         ALOGI("LOWER NormalChainingCell at offsetPC %x offsetNCG %x @%p",
+               offset, stream - streamMethodStart, stream);
+-    /* Add one additional "jump 0" instruction, it may be modified during jit chaining. This helps
+-     * reslove the multithreading issue.
+-     */
+-    int nop_size = insertJumpHelp();
+-    move_imm_to_reg(OpndSize_32, (int) (cUnit->method->insns + offset), P_GPR_1, true);
+-    scratchRegs[0] = PhysicalReg_EAX;
+ #ifndef WITH_SELF_VERIFICATION
+     call_dvmJitToInterpNormal();
+ #else
+     call_dvmJitToInterpBackwardBranch();
+ #endif
+-    //move_imm_to_reg(OpndSize_32, (int) (cUnit->method->insns + offset), P_GPR_1, true); /* used when unchaining */
+-    return nop_size;
++    unsigned int *ptr = (unsigned int*)stream;
++    *ptr++ = (unsigned int)(cUnit->method->insns + offset);
++    char* codePtr = searchNCGWorklist(blockId);
++    *ptr++ = (unsigned int)codePtr;
++    stream = (char*)ptr;
++    return 0;
+ }
+ 
+ /*
+  * Chaining cell for instructions that immediately following already translated
+  * code.
++   IA32 assembly:
++                  call imm32 // relative offset to dvmJitToInterpNormal or dvmJitToInterpTraceSelect
++                  rPC
++                  codePtr
++                  ismove_flag
+  */
+ static int handleHotChainingCell(CompilationUnit *cUnit,
+                                   unsigned int offset, int blockId, LowOpBlockLabel* labelList)
+@@ -888,38 +960,72 @@ static int handleHotChainingCell(CompilationUnit *cUnit,
+     if(dump_x86_inst)
+         ALOGI("LOWER HotChainingCell at offsetPC %x offsetNCG %x @%p",
+               offset, stream - streamMethodStart, stream);
+-    /* Add one additional "jump 0" instruction, it may be modified during jit chaining. This helps
+-     * reslove the multithreading issue.
+-     */
+-    int nop_size = insertJumpHelp();
+-    move_imm_to_reg(OpndSize_32, (int) (cUnit->method->insns + offset), P_GPR_1, true);
+-    scratchRegs[0] = PhysicalReg_EAX;
+-    call_dvmJitToInterpTraceSelect();
+-    //move_imm_to_reg(OpndSize_32, (int) (cUnit->method->insns + offset), P_GPR_1, true); /* used when unchaining */
+-    return nop_size;
++
++    int ismove_flag = 0;
++    char* codePtr = searchChainingWorklist(blockId);
++    if (codePtr == NULL) {
++        codePtr = searchNCGWorklist(blockId);
++        if (codePtr) {
++            call_dvmJitToInterpNormal();
++            ismove_flag = 1;
++        }
++        else call_dvmJitToInterpTraceSelect();
++    }
++    else
++        call_dvmJitToInterpTraceSelect();
++    unsigned int *ptr = (unsigned int*)stream;
++    *ptr++ = (unsigned int)(cUnit->method->insns + offset);
++    *ptr++ = (unsigned int)codePtr;
++    *ptr++ = (unsigned int)ismove_flag;
++    stream = (char*)ptr;
++    return 0;
+ }
+ 
+-/* Chaining cell for branches that branch back into the same basic block */
++/* Chaining cell for branches that branch back into the same basic block
++   IA32 assembly:
++                  call imm32 //relative offset to dvmJitToInterpBackwardBranch
++                  rPC
++                  codePtr
++                  loop header address
++                  vrStoreCodePtr
++*/
+ static int handleBackwardBranchChainingCell(CompilationUnit *cUnit,
+-                                     unsigned int offset, int blockId, LowOpBlockLabel* labelList)
++                                     unsigned int offset, int blockId, LowOpBlockLabel* labelList, char *loopHeaderAddr)
++
+ {
+     ALOGV("In handleBackwardBranchChainingCell for method %s block %d BC offset %x NCG offset %x",
+           cUnit->method->name, blockId, offset, stream - streamMethodStart);
+     if(dump_x86_inst)
+         ALOGI("LOWER BackwardBranchChainingCell at offsetPC %x offsetNCG %x @%p",
+               offset, stream - streamMethodStart, stream);
+-    /* Add one additional "jump 0" instruction, it may be modified during jit chaining. This helps
+-     * reslove the multithreading issue.
+-     */
+-    int nop_size = insertJumpHelp();
+-    move_imm_to_reg(OpndSize_32, (int) (cUnit->method->insns + offset), P_GPR_1, true);
+-    scratchRegs[0] = PhysicalReg_EAX;
+-    call_dvmJitToInterpNormal();
+-    //move_imm_to_reg(OpndSize_32, (int) (cUnit->method->insns + offset), P_GPR_1, true); /* used when unchaining */
+-    return nop_size;
++
++    char* vrStoreCodePtr = NULL;
++    char* chainingCellHead = stream;
++    call_dvmJitToInterpBackwardBranch();
++    unsigned int *ptr = (unsigned int*)stream;
++    *ptr++ = (unsigned int)(cUnit->method->insns + offset);
++    char* codePtr = searchLabelWorklist(".vr_store_at_loop_back");
++    if (codePtr == NULL)
++        codePtr = searchNCGWorklist(blockId);
++    else {
++        vrStoreCodePtr = findCodeForLabel(".vr_store_at_loop_back");
++    }
++    *ptr++ = (unsigned int)codePtr;
++    *ptr++ = (unsigned int)loopHeaderAddr;
++    if (vrStoreCodePtr)
++        *ptr++ = (int)vrStoreCodePtr;
++    else
++        *ptr++ = (int)chainingCellHead;
++    stream = (char*)ptr;
++    return 0;
+ }
+ 
+-/* Chaining cell for monomorphic method invocations. */
++/* Chaining cell for monomorphic method invocations.
++   IA32 assembly:
++                  call imm32 // relative offset to dvmJitToInterpTraceSelect
++                  rPC
++                  codePtr
++*/
+ static int handleInvokeSingletonChainingCell(CompilationUnit *cUnit,
+                                               const Method *callee, int blockId, LowOpBlockLabel* labelList)
+ {
+@@ -928,17 +1034,15 @@ static int handleInvokeSingletonChainingCell(CompilationUnit *cUnit,
+     if(dump_x86_inst)
+         ALOGI("LOWER InvokeSingletonChainingCell at block %d offsetNCG %x @%p",
+               blockId, stream - streamMethodStart, stream);
+-    /* Add one additional "jump 0" instruction, it may be modified during jit chaining. This helps
+-     * reslove the multithreading issue.
+-     */
+-    int nop_size = insertJumpHelp();
+-    move_imm_to_reg(OpndSize_32, (int) (callee->insns), P_GPR_1, true);
+-    scratchRegs[0] = PhysicalReg_EAX;
++
+     call_dvmJitToInterpTraceSelect();
+-    //move_imm_to_reg(OpndSize_32, (int) (callee->insns), P_GPR_1, true); /* used when unchaining */
+-    return nop_size;
++    unsigned int *ptr = (unsigned int*)stream;
++    *ptr++ = (unsigned int)(callee->insns);
++    char* codePtr = searchChainingWorklist(blockId);
++    *ptr++ = (unsigned int)codePtr;
++    stream = (char*)ptr;
++    return 0;
+ }
+-#undef P_GPR_1
+ 
+ /* Chaining cell for monomorphic method invocations. */
+ static void handleInvokePredictedChainingCell(CompilationUnit *cUnit, int blockId)
+@@ -1116,7 +1220,8 @@ static void handleFallThroughBranch (CompilationUnit *cUnit, BasicBlock *bb, Bas
+ 
+     if (needFallThroughBranch == true)
+     {
+-        jumpToBasicBlock (stream, nextFallThrough->id);
++        jumpToBasicBlock(stream, nextFallThrough->id,
++                isBasicBlockAChainingCell(nextFallThrough));
+     }
+     //Clear it
+     *ptrNextFallThrough = 0;
+@@ -1134,6 +1239,18 @@ static bool generateCode (CompilationUnit *cUnit, BasicBlock *bb, BasicBlock **n
+     ALOGV("Get ready to handle JIT bb %d type %d hidden %d",
+             bb->id, bb->blockType, bb->hidden);
+ 
++    /* We want to update the stream start to remember it for future backward chaining cells */
++    for (int k = 0; k < num_bbs_for_method; k++)
++    {
++        if(method_bbs_sorted[k]->jitBasicBlock == bb)
++        {
++            BasicBlock_O1 *currentBB = method_bbs_sorted[k];
++
++            //Now we can update the stream for it
++            currentBB->streamStart = stream;
++        }
++    }
++
+     //If in O1, not the entry block, and actually have an instruction
+     if(gDvm.executionMode == kExecutionModeNcgO1 &&
+             bb->blockType != kEntryBlock &&
+@@ -1256,7 +1373,42 @@ static bool generateCode (CompilationUnit *cUnit, BasicBlock *bb, BasicBlock **n
+     return true;
+ }
+ 
+-/* 4 is the number of additional bytes needed for chaining information for trace:
++static char* searchStreamStart(BasicBlock* bb)
++{
++    char* streamStart = NULL;
++
++    assert(bb != 0);
++
++    /* We want to update the stream start to remember it for future backward chaining cells */
++    for (int k = 0; k < num_bbs_for_method; k++) {
++        if(method_bbs_sorted[k]->jitBasicBlock == bb) {
++            BasicBlock_O1 *currentBB = method_bbs_sorted[k];
++
++            //Now we can update the stream for it
++            streamStart = currentBB->streamStart;
++        }
++    }
++    return streamStart;
++}
++
++/*
++ * Get loop header block from backward branch chaining cell. StartOffset of backward chaining BB
++   is set to be the same as the loop header BB. This property is assumed to be maintained by middle
++   end in MIR CFG
++*/
++static BasicBlock * getLoopHeaderFromBBChaining(CompilationUnit *cUnit, BasicBlock* chainingBB) {
++    BasicBlock * bb;
++    GrowableList *blockList = &cUnit->blockList;
++
++    for (int i = 0; i < blockList->numUsed; i++) {
++        bb = (BasicBlock *) blockList->elemList[i];
++        if(bb->blockType == kDalvikByteCode && bb->startOffset == chainingBB->startOffset)
++            return bb;
++    }
++    return NULL;
++}
++
++/* 4 is the number  f additional bytes needed for chaining information for trace:
+  * 2 bytes for chaining cell count offset and 2 bytes for chaining cell offset */
+ #define EXTRA_BYTES_FOR_CHAINING 4
+ 
+@@ -1311,6 +1463,7 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+     stream += EXTRA_BYTES_FOR_CHAINING; /* This is needed for chaining. Add the bytes before the alignment */
+     stream = (char*)(((unsigned int)stream + 0xF) & ~0xF); /* Align trace to 16-bytes */
+     streamMethodStart = stream; /* code start */
++
+     for (i = 0; i < ((unsigned int) cUnit->numBlocks); i++) {
+         labelList[i].lop.generic.offset = -1;
+     }
+@@ -1324,8 +1477,7 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+     if(gDvm.executionMode == kExecutionModeNcgO1) {
+         for (i = 0; i < blockList->numUsed; i++) {
+             bb = (BasicBlock *) blockList->elemList[i];
+-            if(bb->blockType == kDalvikByteCode &&
+-               bb->firstMIRInsn != NULL) {
++            if(bb->blockType == kDalvikByteCode) {
+                 int retCode = preprocessingBB(bb);
+                 if (retCode < 0) {
+                     endOfTrace(true/*freeOnly*/);
+@@ -1425,11 +1577,14 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+                 dvmInsertGrowableList(&chainingListByType[kChainingCellNormal], i);
+                 break;
+             case kChainingCellInvokeSingleton:
+-                labelList[i].lop.opCode2 = ATOM_PSEUDO_CHAINING_CELL_INVOKE_SINGLETON;
+-                labelList[i].immOpnd.value = (int) bb->containingMethod;
+-                /* Handle the codegen later */
+-                dvmInsertGrowableList(
+-                        &chainingListByType[kChainingCellInvokeSingleton], i);
++                    if (!cUnit->singletonInlined) {
++                        labelList[i].lop.opCode2 =
++                            ATOM_PSEUDO_CHAINING_CELL_INVOKE_SINGLETON;
++                        labelList[i].immOpnd.value = (int) bb->containingMethod;
++                        /* Handle the codegen later */
++                        dvmInsertGrowableList(
++                            &chainingListByType[kChainingCellInvokeSingleton], i);
++                    }
+                 break;
+             case kChainingCellInvokePredicted:
+                 labelList[i].lop.opCode2 = ATOM_PSEUDO_CHAINING_CELL_INVOKE_PREDICTED;
+@@ -1460,6 +1615,8 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+         }
+ 
+     char* streamChainingStart = (char*)stream;
++    char* loopHeaderAddr = NULL;
++
+     /* Handle the chaining cells in predefined order */
+     for (i = 0; i < kChainingCellGap; i++) {
+         size_t j;
+@@ -1508,8 +1665,15 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+                     labelList[blockId].lop.generic.offset += nop_size; //skip over nop
+                     break;
+                 case kChainingCellBackwardBranch:
++                    loopHeaderAddr = searchStreamStart(getLoopHeaderFromBBChaining(cUnit, chainingBlock));
++                    if (loopHeaderAddr == NULL){
++                        SET_JIT_ERROR(kJitErrorCodegen);
++                        endOfTrace(true/*freeOnly*/);
++                        cUnit->baseAddr = NULL;
++                        return;
++                    }
+                     nop_size = handleBackwardBranchChainingCell(cUnit,
+-                        chainingBlock->startOffset, blockId, labelList);
++                        chainingBlock->startOffset, blockId, labelList, loopHeaderAddr);
+                     labelList[blockId].lop.generic.offset += nop_size; //skip over nop
+                     break;
+                 default:
+@@ -1641,25 +1805,15 @@ void dvmCompilerMIR2LIR(CompilationUnit *cUnit, JitTranslationInfo *info) {
+ void* dvmJitChain(void* tgtAddr, u4* branchAddr)
+ {
+ #ifdef JIT_CHAIN
+-    int relOffset = (int) tgtAddr - (int)branchAddr;
++    int relOffset;
+ 
+     if ((gDvmJit.pProfTable != NULL) && (gDvm.sumThreadSuspendCount == 0) &&
+         (gDvmJit.codeCacheFull == false)) {
+ 
+         gDvmJit.translationChains++;
+ 
+-        //OpndSize immSize = estOpndSizeFromImm(relOffset);
+-        //relOffset -= getJmpCallInstSize(immSize, JmpCall_uncond);
+-        /* Hard coded the jump opnd size to 32 bits, This instruction will replace the "jump 0" in
+-         * the original code sequence.
+-         */
+-        relOffset -= 5;
+-        //can't use stream here since it is used by the compilation thread
+-        UNPROTECT_CODE_CACHE(branchAddr, sizeof(*branchAddr));
+-        dump_imm_update(relOffset, (char*) branchAddr, false); // An update is done instead of an encode
+-                                                                // because the Jmp instruction is already
+-                                                                // part of chaining cell.
+-        PROTECT_CODE_CACHE(branchAddr, sizeof(*branchAddr));
++        relOffset = (int) tgtAddr - (int)branchAddr - 4; // 32bit offset
++        *(int*)branchAddr = relOffset;
+ 
+         gDvmJit.hasNewChain = true;
+ 
+@@ -1672,6 +1826,29 @@ void* dvmJitChain(void* tgtAddr, u4* branchAddr)
+ }
+ 
+ /*
++ * Perform chaining operation. Patched branchAddr using static address tgtAddr
++ */
++void* dvmJitChain_staticAddr(void* tgtAddr, u4* branchAddr)
++{
++#ifdef JIT_CHAIN
++    if ((gDvmJit.pProfTable != NULL) && (gDvm.sumThreadSuspendCount == 0) &&
++        (gDvmJit.codeCacheFull == false)) {
++
++        gDvmJit.translationChains++;
++
++        *(int*)branchAddr = (int)tgtAddr;
++
++        gDvmJit.hasNewChain = true;
++
++        COMPILER_TRACE_CHAINING(
++            ALOGI("Jit Runtime: chaining 0x%x to %p\n",
++                 (int) branchAddr, tgtAddr));
++    }
++#endif
++    return tgtAddr;
++}
++
++/*
+  * Accept the work and start compiling.  Returns true if compilation
+  * is attempted.
+  */
+diff --git a/vm/compiler/codegen/x86/Lower.h b/vm/compiler/codegen/x86/Lower.h
+index ecd8f31..9a359f1 100644
+--- a/vm/compiler/codegen/x86/Lower.h
++++ b/vm/compiler/codegen/x86/Lower.h
+@@ -402,6 +402,8 @@ struct LowOpndImm {
+ struct LowOpndBlock {
+     //! \brief Holds id of MIR level basic block.
+     s4 value;
++    //! \brief Whether the immediate needs to be aligned within 16-bytes
++    bool immediateNeedsAligned;
+ };
+ 
+ //! \brief Defines maximum length of string holding label name.
+@@ -823,8 +825,8 @@ void conditional_jump(ConditionCode cc, const char* target, bool isShortTerm);
+ void unconditional_jump(const char* target, bool isShortTerm);
+ void conditional_jump_int(ConditionCode cc, int target, OpndSize size);
+ void unconditional_jump_int(int target, OpndSize size);
+-void conditional_jump_block(ConditionCode cc, int targetBlockId);
+-void unconditional_jump_block(int targetBlockId);
++void conditional_jump_block(ConditionCode cc, int targetBlockId, bool immediateNeedsAligned = false);
++void unconditional_jump_block(int targetBlockId, bool immediateNeedsAligned = false);
+ void unconditional_jump_reg(int reg, bool isPhysical);
+ void unconditional_jump_rel32(void * target);
+ void call(const char* target);
+@@ -1005,9 +1007,10 @@ int call_dvmJitHandlePackedSwitch();
+ int call_dvmJitHandleSparseSwitch();
+ int call_dvmJitToInterpTraceSelectNoChain();
+ int call_dvmJitToPatchPredictedChain();
+-int call_dvmJitToInterpNormal();
+-int call_dvmJitToInterpBackwardBranch(void);
+-int call_dvmJitToInterpTraceSelect();
++void call_dvmJitToInterpNormal();
++/** @brief helper function to call dvmJitToInterpBackwardBranch */
++void call_dvmJitToInterpBackwardBranch();
++void call_dvmJitToInterpTraceSelect();
+ int call_dvmQuasiAtomicSwap64();
+ int call_dvmQuasiAtomicRead64();
+ int call_dvmCanPutArrayElement();
+@@ -1055,6 +1058,12 @@ void performChainingWorklist();
+ void freeNCGWorklist();
+ void freeDataWorklist();
+ void freeLabelWorklist();
++/** @brief search globalNCGWorklist to find the jmp/jcc offset address */
++char* searchNCGWorklist(int blockId);
++/** @brief search chainingWorklist to return instruction offset address in move instruction */
++char* searchChainingWorklist(int blockId);
++/** @brief search globalWorklist to find the jmp/jcc offset address */
++char* searchLabelWorklist(char* label);
+ void freeChainingWorklist();
+ 
+ int common_backwardBranch();
+@@ -1313,7 +1322,8 @@ void set_mem_opnd(LowOpndMem* mem, int disp, int base, bool isPhysical);
+ void set_mem_opnd_scale(LowOpndMem* mem, int base, bool isPhysical, int disp, int index, bool indexPhysical, int scale);
+ LowOpImm* dump_imm(Mnemonic m, OpndSize size, int imm);
+ void dump_imm_update(int imm, char* codePtr, bool updateSecondOperand);
+-LowOpBlock* dump_blockid_imm(Mnemonic m, int targetBlockId);
++LowOpBlock* dump_blockid_imm(Mnemonic m, int targetBlockId,
++        bool immediateNeedsAligned);
+ LowOpMem* dump_mem(Mnemonic m, AtomOpCode m2, OpndSize size,
+                int disp, int base_reg, bool isBasePhysical);
+ LowOpReg* dump_reg(Mnemonic m, AtomOpCode m2, OpndSize size,
+@@ -1384,8 +1394,8 @@ extern JitMode traceMode;
+ extern bool branchInLoop;
+ void startOfTrace(const Method* method, LowOpBlockLabel* labelList, int, CompilationUnit*);
+ void endOfTrace(bool freeOnly);
+-LowOp* jumpToBasicBlock(char* instAddr, int targetId);
+-LowOp* condJumpToBasicBlock(char* instAddr, ConditionCode cc, int targetId);
++LowOp* jumpToBasicBlock(char* instAddr, int targetId, bool targetIsChainingCell = false);
++LowOp* condJumpToBasicBlock(char* instAddr, ConditionCode cc, int targetId, bool targetIsChainingCell = false);
+ bool jumpToException(const char* target);
+ int codeGenBasicBlockJit(const Method* method, BasicBlock* bb);
+ void endOfBasicBlock(struct BasicBlock* bb);
+@@ -1393,6 +1403,8 @@ void handleExtendedMIR(CompilationUnit *cUnit, MIR *mir);
+ int insertChainingWorklist(int bbId, char * codeStart);
+ void startOfTraceO1(const Method* method, LowOpBlockLabel* labelList, int exceptionBlockId, CompilationUnit *cUnit);
+ void endOfTraceO1();
++/** @brief search globalMap to find the entry for the given label */
++char* findCodeForLabel(const char* label);
+ #endif
+ int isPowerOfTwo(int imm);
+ void move_chain_to_mem(OpndSize size, int imm,
+@@ -1413,7 +1425,9 @@ OpndSize estOpndSizeFromImm(int target);
+ 
+ int preprocessingBB(BasicBlock* bb);
+ int preprocessingTrace();
+-void dump_nop(int size);
++/** @brief align the relative offset of jmp/jcc and movl within 16B */
++void alignOffset(int cond);
++bool isBasicBlockAChainingCell(BasicBlock * bb);
+ #endif
+ 
+ void pushCallerSavedRegs(void);
+diff --git a/vm/compiler/codegen/x86/LowerHelper.cpp b/vm/compiler/codegen/x86/LowerHelper.cpp
+index 8958b20..da3362a 100644
+--- a/vm/compiler/codegen/x86/LowerHelper.cpp
++++ b/vm/compiler/codegen/x86/LowerHelper.cpp
+@@ -184,7 +184,9 @@ LowOpLabel* dump_label(Mnemonic m, OpndSize size, int imm, const char* label,
+ //! \pre Instruction scheduling must be enabled
+ //! \param m x86 mnemonic
+ //! \param targetBlockId id of the MIR block
+-LowOpBlock* dump_blockid_imm(Mnemonic m, int targetBlockId) {
++//! \param immediateNeedsAligned if the immediate in the instruction need to be aligned within 16B
++LowOpBlock* dump_blockid_imm(Mnemonic m, int targetBlockId,
++        bool immediateNeedsAligned) {
+     assert(gDvmJit.scheduling && "Scheduling must be turned on before "
+                 "calling dump_blockid_imm");
+     LowOpBlock* op = singletonPtr<Scheduler>()->allocateNewEmptyLIR<LowOpBlock>();
+@@ -193,6 +195,7 @@ LowOpBlock* dump_blockid_imm(Mnemonic m, int targetBlockId) {
+     op->opndSrc.type = LowOpndType_BlockId;
+     op->numOperands = 1;
+     op->blockIdOpnd.value = targetBlockId;
++    op->blockIdOpnd.immediateNeedsAligned = immediateNeedsAligned;
+     singletonPtr<Scheduler>()->updateUseDefInformation_imm(op);
+     return op;
+ }
+@@ -2812,37 +2815,38 @@ int call_dvmJitToInterpPunt() {
+     return 0;
+ }
+ 
+-int call_dvmJitToInterpNormal() {
++void call_dvmJitToInterpNormal() {
+     typedef void (*vmHelper)(int);
+     vmHelper funcPtr = dvmJitToInterpNormal;
+     if(gDvm.executionMode == kExecutionModeNcgO1) {
+         beforeCall("dvmJitToInterpNormal");
+-        callFuncPtr((int)funcPtr, "dvmJitToInterpNormal");
++        callFuncPtrImm((int)funcPtr);
+         afterCall("dvmJitToInterpNormal");
+         touchEbx();
+     } else {
+-        callFuncPtr((int)funcPtr, "dvmJitToInterpNormal");
++        callFuncPtrImm((int)funcPtr);
+     }
+-    return 0;
++    return;
+ }
+ 
+-//! Generate a call out to dvmJitToInterpBackwardBranch.
+-//! This transition to the interpreter is required for
+-//! self-verification, in particular, in order to check
+-//! for control or data divergence for each loop iteration.
+-int call_dvmJitToInterpBackwardBranch(void) {
++/*
++ * helper function for generating the call to dvmJitToInterpBackwardBranch
++ * This transition to the interpreter is also required for
++ * self-verification, in particular, in order to check
++ * for control or data divergence for each loop iteration.
++ */
++void call_dvmJitToInterpBackwardBranch() {
+     if(gDvm.executionMode == kExecutionModeNcgO1) {
+         beforeCall("dvmJitToInterpBackwardBranch");
+     }
+     typedef void (*vmHelper)(int);
+     vmHelper funcPtr = dvmJitToInterpBackwardBranch;
+-    callFuncPtr((int)funcPtr, "dvmJitToInterpBackwardBranch");
++    callFuncPtrImm((int)funcPtr);
+     if(gDvm.executionMode == kExecutionModeNcgO1) {
+         afterCall("dvmJitToInterpBackwardBranch");
+-    }
+-    if(gDvm.executionMode == kExecutionModeNcgO1) touchEbx();
+-    return 0;
+-}
++   }
++   return;
++ }
+ 
+ int call_dvmJitToInterpTraceSelectNoChain() {
+     typedef void (*vmHelper)(int);
+@@ -2858,18 +2862,18 @@ int call_dvmJitToInterpTraceSelectNoChain() {
+     return 0;
+ }
+ 
+-int call_dvmJitToInterpTraceSelect() {
++void call_dvmJitToInterpTraceSelect() {
+     typedef void (*vmHelper)(int);
+     vmHelper funcPtr = dvmJitToInterpTraceSelect;
+     if(gDvm.executionMode == kExecutionModeNcgO1) {
+         beforeCall("dvmJitToInterpTraceSelect");
+-        callFuncPtr((int)funcPtr, "dvmJitToInterpTraceSelect");
++        callFuncPtrImm((int)funcPtr);
+         afterCall("dvmJitToInterpTraceSelect");
+         touchEbx();
+     } else {
+-        callFuncPtr((int)funcPtr, "dvmJitToInterpTraceSelect");
++        callFuncPtrImm((int)funcPtr);
+     }
+-    return 0;
++    return;
+ }
+ 
+ int call_dvmJitToPatchPredictedChain() {
+@@ -3526,25 +3530,34 @@ int popAllRegs() {
+     return 0;
+ }
+ 
+-void dump_nop(int size) {
+-    switch(size) {
+-        case 1:
+-          *stream = 0x90;
+-          break;
+-        case 2:
+-          *stream = 0x66;
+-          *(stream +1) = 0x90;
+-          break;
+-        case 3:
+-          *stream = 0x0f;
+-          *(stream + 1) = 0x1f;
+-          *(stream + 2) = 0x00;
+-          break;
+-        default:
+-          //TODO: add more cases.
+-          break;
++/* align the relative offset of jmp/jcc and movl within 16B */
++void alignOffset(int offset) {
++    int rem, nop_size;
++
++    if ((uint)(stream + offset) % 16 > 12) {
++        rem = (uint)(stream + offset) % 16;
++        nop_size = (16 - rem) % 16;
++        stream = encoder_nops(nop_size, stream);
++    }
++}
++
++/**
++ * @brief Returns whether the BB is a chaining cell
++ * @param bb Basic Block to look at
++ * @return true if BB is chaining cell
++ */
++bool isBasicBlockAChainingCell(BasicBlock * bb) {
++    // Get type for this BB
++    int type = static_cast<int>(bb->blockType);
++
++    // See if its type falls into the range of the different chaining
++    //cell definitions
++    if (type >= static_cast<int>(kChainingCellNormal)
++            && type < static_cast<int>(kChainingCellLast)) {
++        return true;
++    } else {
++        return false;
+     }
+-    stream += size;
+ }
+ 
+ #ifdef WITH_SELF_VERIFICATION
+diff --git a/vm/compiler/codegen/x86/LowerInvoke.cpp b/vm/compiler/codegen/x86/LowerInvoke.cpp
+index ce7cfa5..ad10ce6 100644
+--- a/vm/compiler/codegen/x86/LowerInvoke.cpp
++++ b/vm/compiler/codegen/x86/LowerInvoke.cpp
+@@ -706,12 +706,16 @@ int common_invokeMethod_Jmp(ArgsDoneType form) {
+     //    start of HotChainingCell for next bytecode: -4(%esp)
+     //    start of InvokeSingletonChainingCell for callee: -8(%esp)
+     load_effective_addr(-8, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
+-    if(!gDvmJit.scheduling)
++    if(!gDvmJit.scheduling) {
++        alignOffset(4); // 4 is (the instruction size of "mov imm32, 4(esp)" - sizeof(imm32))
+         insertChainingWorklist(traceCurrentBB->fallThrough->id, stream);
++    }
+     move_chain_to_mem(OpndSize_32, traceCurrentBB->fallThrough->id, 4, PhysicalReg_ESP, true);
+     // for honeycomb: JNI call doesn't need a chaining cell, so the taken branch is null
+-    if(!gDvmJit.scheduling && traceCurrentBB->taken)
++    if(!gDvmJit.scheduling && traceCurrentBB->taken) {
++        alignOffset(3); // 3 is (the instruction size of "mov imm32, 0(esp)" - sizeof(imm32))
+         insertChainingWorklist(traceCurrentBB->taken->id, stream);
++    }
+     int takenId = traceCurrentBB->taken ? traceCurrentBB->taken->id : 0;
+     move_chain_to_mem(OpndSize_32, takenId, 0, PhysicalReg_ESP, true);
+     if(form == ArgsDone_Full)
+diff --git a/vm/compiler/codegen/x86/LowerJump.cpp b/vm/compiler/codegen/x86/LowerJump.cpp
+index 1cccf6e..c4bf49a 100644
+--- a/vm/compiler/codegen/x86/LowerJump.cpp
++++ b/vm/compiler/codegen/x86/LowerJump.cpp
+@@ -301,6 +301,27 @@ int insertGlobalPCWorklist(char * offset, char * codeStart)
+     return 0;
+ }
+ 
++/*
++ * search chainingWorklist to return instruction offset address in move instruction
++ */
++char* searchChainingWorklist(int blockId) {
++    LabelMap* ptr = chainingWorklist;
++    unsigned instSize;
++
++    while (ptr != NULL) {
++       if (blockId == ptr->addend) {
++           instSize = encoder_get_inst_size(ptr->codePtr);
++           assert((uint)(ptr->codePtr + instSize - 4) % 16 <= 12);
++           return (ptr->codePtr + instSize - 4); // 32bit relative offset
++       }
++       ptr = ptr->nextItem;
++    }
++#ifdef DEBUG_NCG
++    ALOGI("can't find item for blockId %d in searchChainingWorklist\n", blockId);
++#endif
++    return NULL;
++}
++
+ int insertChainingWorklist(int bbId, char * codeStart)
+ {
+     LabelMap* item = (LabelMap*)malloc(sizeof(LabelMap));
+@@ -390,6 +411,47 @@ void freeChainingWorklist() {
+     }
+ }
+ 
++/*
++ *search globalWorklist to find the jmp/jcc offset address
++ */
++char* searchLabelWorklist(char* label) {
++    LabelMap* ptr = globalWorklist;
++    unsigned instSize;
++
++    while(ptr != NULL) {
++        if(!strcmp(label, ptr->label)) {
++            instSize = encoder_get_inst_size(ptr->codePtr);
++            assert((uint)(ptr->codePtr + instSize - 4) % 16 <= 12);
++            return (ptr->codePtr + instSize - 4); // 32bit relative offset
++        }
++        ptr = ptr->nextItem;
++   }
++#ifdef DEBUG_NCG
++    ALOGI("can't find item for label %s in searchLabelWorklist\n", label);
++#endif
++    return NULL;
++}
++
++// delete the node with label "vr_store_at_loop_back" from globalMap
++static void deleteVRStoreLabelGlobalMap()
++{
++    LabelMap * ptr = globalMap;
++    LabelMap * prePtr = NULL;
++
++    while(ptr != NULL) {
++        if (!strcmp(ptr->label, ".vr_store_at_loop_back")) {
++            if (prePtr == NULL)
++                globalMap = ptr->nextItem;
++            else
++                prePtr->nextItem = ptr->nextItem;
++            free(ptr);
++            return;
++        }
++        prePtr = ptr;
++        ptr = ptr->nextItem;
++    }
++}
++
+ //Work only for initNCG
+ void performLabelWorklist() {
+     LabelMap* ptr = globalWorklist;
+@@ -407,7 +469,9 @@ void performLabelWorklist() {
+         free(ptr);
+         ptr = globalWorklist;
+     }
++    deleteVRStoreLabelGlobalMap();
+ }
++
+ void freeLabelWorklist() {
+     LabelMap* ptr = globalWorklist;
+     while(ptr != NULL) {
+@@ -663,18 +727,23 @@ void unconditional_jump_int(int target, OpndSize size) {
+ //! This should only be used when instruction scheduling is enabled.
+ //! \param cc type of conditional jump
+ //! \param targetBlockId id of MIR basic block
+-void conditional_jump_block(ConditionCode cc, int targetBlockId) {
++//! \param immediateNeedsAlignedWhether the immediate needs to be aligned
++//! within 16-bytes
++void conditional_jump_block(ConditionCode cc, int targetBlockId,
++        bool immediateNeedsAligned) {
+     Mnemonic m = (Mnemonic)(Mnemonic_Jcc + cc);
+-    dump_blockid_imm(m, targetBlockId);
++    dump_blockid_imm(m, targetBlockId, immediateNeedsAligned);
+ }
+ 
+ //! Used to generate a single native instruction for unconditionally
+ //! jumping to a block when the immediate is not yet known.
+ //! This should only be used when instruction scheduling is enabled.
+ //! \param targetBlockId id of MIR basic block
+-void unconditional_jump_block(int targetBlockId) {
++//! \param immediateNeedsAligned Whether the immediate needs to be aligned
++//! within 16-bytes
++void unconditional_jump_block(int targetBlockId, bool immediateNeedsAligned) {
+     Mnemonic m = Mnemonic_JMP;
+-    dump_blockid_imm(m, targetBlockId);
++    dump_blockid_imm(m, targetBlockId, immediateNeedsAligned);
+ }
+ 
+ /*!
+@@ -751,6 +820,29 @@ int insertNCGWorklist(s4 relativePC, OpndSize immSize) {
+     globalNCGWorklist = item;
+     return 0;
+ }
++
++
++/*
++ *search globalNCGWorklist to find the jmp/jcc offset address
++ */
++char* searchNCGWorklist(int blockId) {
++    NCGWorklist* ptr = globalNCGWorklist;
++    unsigned instSize;
++
++    while (ptr != NULL) {
++      if (blockId == ptr->relativePC) {
++           instSize = encoder_get_inst_size(ptr->codePtr);
++           assert((uint)(ptr->codePtr + instSize - 4) % 16 <= 12);
++           return (ptr->codePtr + instSize - 4); // 32bit relative offset
++       }
++       ptr = ptr->nextItem;
++    }
++#ifdef DEBUG_NCG
++    ALOGI("can't find item for blockId %d in searchNCGWorklist\n", blockId);
++#endif
++    return NULL;
++}
++
+ #ifdef ENABLE_TRACING
+ int insertMapWorklist(s4 BCOffset, s4 NCGOffset, int isStartOfPC) {
+     return 0;
+@@ -1087,7 +1179,9 @@ int common_goto(s4 targetBlockId) {
+         return retCode;
+ 
+     if(gDvmJit.scheduling) {
+-        unconditional_jump_block((int)targetBlockId);
++        // Assuming that gotos never go to chaining cells because they are not
++        // part of the bytecode and are just for trace transitions
++        unconditional_jump_block((int)targetBlockId, false);
+     } else {
+         int relativeNCG = getRelativeNCG(targetBlockId, JmpCall_uncond, &unknown, &size);
+         unconditional_jump_int(relativeNCG, size);
+@@ -1101,24 +1195,32 @@ int common_if(s4 tmp, ConditionCode cc_next, ConditionCode cc) {
+     int relativeNCG;
+ 
+     if (traceMode == kJitLoop && !branchInLoop && hasVRStoreExitOfLoop()) {
+-        if (traceCurrentBB->taken && traceCurrentBB->taken->blockType == kChainingCellNormal) {
+-            conditional_jump(cc, ".vr_store_at_loop_exit", true);
++        if (traceCurrentBB->taken && traceCurrentBB->taken->blockType == kChainingCellBackwardBranch) {
++            if(gDvmJit.scheduling)
++                singletonPtr<Scheduler>()->signalEndOfNativeBasicBlock();
++            rememberState(1);
++            alignOffset(2); // 2 is (instruction size of "jcc rel32" - sizeof(rel32))
++            conditional_jump(cc, ".vr_store_at_loop_back", false);
++            storeVRExitOfLoop();
+ 
+             if(gDvmJit.scheduling && traceCurrentBB->fallThrough) {
+-                unconditional_jump_block(traceCurrentBB->fallThrough->id);
++                unconditional_jump_block(traceCurrentBB->fallThrough->id,
++                        isBasicBlockAChainingCell(traceCurrentBB->fallThrough));
+             } else {
++                alignOffset(1); // 1 is (instruction size of "jmp rel32" - sizeof(rel32))
+                 relativeNCG = traceCurrentBB->fallThrough ? traceCurrentBB->fallThrough->id : 0;
+                 if(traceCurrentBB->fallThrough)
+                     relativeNCG = getRelativeNCG(traceCurrentBB->fallThrough->id, JmpCall_uncond, &unknown, &size);
+                 unconditional_jump_int(relativeNCG, size);
+             }
+ 
+-            if (insertLabel(".vr_store_at_loop_exit", true) == -1)
++            if (insertLabel(".vr_store_at_loop_back", false) == -1)
+                 return -1;
++            goToState(1);
+             storeVRExitOfLoop();
+ 
+             if(gDvmJit.scheduling && traceCurrentBB->taken) {
+-                unconditional_jump_block(traceCurrentBB->taken->id);
++                unconditional_jump_block(traceCurrentBB->taken->id, false);
+             } else {
+                 relativeNCG = traceCurrentBB->taken ? traceCurrentBB->taken->id : 0;
+                 if(traceCurrentBB->taken)
+@@ -1126,24 +1228,32 @@ int common_if(s4 tmp, ConditionCode cc_next, ConditionCode cc) {
+                 unconditional_jump_int(relativeNCG, size);
+             }
+         }
+-        else if (traceCurrentBB->fallThrough && traceCurrentBB->fallThrough->blockType == kChainingCellNormal) {
+-            conditional_jump(cc_next, ".vr_store_at_loop_exit", true);
++        else if (traceCurrentBB->fallThrough && traceCurrentBB->fallThrough->blockType == kChainingCellBackwardBranch) {
++            if(gDvmJit.scheduling)
++                singletonPtr<Scheduler>()->signalEndOfNativeBasicBlock();
++            rememberState(1);
++            alignOffset(2);
++            conditional_jump(cc_next, ".vr_store_at_loop_back", false);
++            storeVRExitOfLoop();
+ 
+             if(gDvmJit.scheduling && traceCurrentBB->taken) {
+-                unconditional_jump_block(traceCurrentBB->taken->id);
++                unconditional_jump_block(traceCurrentBB->taken->id,
++                        isBasicBlockAChainingCell(traceCurrentBB->taken));
+             } else {
++                alignOffset(1);
+                 relativeNCG = traceCurrentBB->taken ? traceCurrentBB->taken->id : 0;
+                 if(traceCurrentBB->taken)
+                     relativeNCG = getRelativeNCG(traceCurrentBB->taken->id, JmpCall_uncond, &unknown, &size);
+                 unconditional_jump_int(relativeNCG, size);
+             }
+ 
+-            if (insertLabel(".vr_store_at_loop_exit", true) == -1)
++            if (insertLabel(".vr_store_at_loop_back", false) == -1)
+                 return -1;
++            goToState(1);
+             storeVRExitOfLoop();
+ 
+             if(gDvmJit.scheduling && traceCurrentBB->fallThrough) {
+-                unconditional_jump_block(traceCurrentBB->fallThrough->id);
++                unconditional_jump_block(traceCurrentBB->fallThrough->id, false);
+             } else {
+                 relativeNCG = traceCurrentBB->fallThrough ? traceCurrentBB->fallThrough->id : 0;
+                 if(traceCurrentBB->fallThrough)
+@@ -1160,15 +1270,18 @@ int common_if(s4 tmp, ConditionCode cc_next, ConditionCode cc) {
+     else {
+         if(gDvmJit.scheduling) {
+             if(traceCurrentBB->taken)
+-                conditional_jump_block(cc, traceCurrentBB->taken->id);
++                conditional_jump_block(cc, traceCurrentBB->taken->id,
++                        isBasicBlockAChainingCell(traceCurrentBB->taken));
+             if(traceCurrentBB->fallThrough)
+-                unconditional_jump_block(traceCurrentBB->fallThrough->id);
++                unconditional_jump_block(traceCurrentBB->fallThrough->id,
++                        isBasicBlockAChainingCell(traceCurrentBB->fallThrough));
+         } else {
++            alignOffset(2);
+             relativeNCG = traceCurrentBB->taken ? traceCurrentBB->taken->id : 0;
+             if(traceCurrentBB->taken)
+                 relativeNCG = getRelativeNCG(traceCurrentBB->taken->id, JmpCall_cond, &unknown, &size);
+             conditional_jump_int(cc, relativeNCG, size);
+-
++            alignOffset(1);
+             relativeNCG = traceCurrentBB->fallThrough ? traceCurrentBB->fallThrough->id : 0;
+             if(traceCurrentBB->fallThrough)
+                 relativeNCG = getRelativeNCG(traceCurrentBB->fallThrough->id, JmpCall_uncond, &unknown, &size);
+diff --git a/vm/compiler/codegen/x86/NcgAot.cpp b/vm/compiler/codegen/x86/NcgAot.cpp
+index d1d1a87..6e1f1df 100644
+--- a/vm/compiler/codegen/x86/NcgAot.cpp
++++ b/vm/compiler/codegen/x86/NcgAot.cpp
+@@ -18,6 +18,8 @@
+ #include "Lower.h"
+ #include "NcgAot.h"
+ #include "NcgHelper.h"
++#include "Scheduler.h"
++#include "Singleton.h"
+ 
+ //returns # of ops generated by this function
+ //entries relocatable: eip + relativePC
+@@ -102,6 +104,16 @@ void callFuncPtr(int funcPtr, const char* funcName) {
+     move_imm_to_reg(OpndSize_32, (int)funcPtr, C_SCRATCH_1, isScratchPhysical);
+     call_reg(C_SCRATCH_1, isScratchPhysical);
+ }
++
++/* generate a "call imm32" */
++void callFuncPtrImm(int funcPtr) {
++    Mnemonic m = Mnemonic_CALL;
++    if(gDvmJit.scheduling)
++        singletonPtr<Scheduler>()->signalEndOfNativeBasicBlock();
++    int relOffset = funcPtr - (int)stream - 5; // 5: Bytes of "call imm32"
++    dump_imm(m, OpndSize_32, relOffset);
++}
++
+ //.const_string_resolve: input in %eax, output in %eax
+ //.const_string_helper:
+ //.class_resolve: input in %eax, output in %eax
+diff --git a/vm/compiler/codegen/x86/NcgAot.h b/vm/compiler/codegen/x86/NcgAot.h
+index 5cc541f..4d3d978 100644
+--- a/vm/compiler/codegen/x86/NcgAot.h
++++ b/vm/compiler/codegen/x86/NcgAot.h
+@@ -26,6 +26,8 @@ int jumpToInterpNoChain();
+ int jumpToInterpPunt();
+ int jumpToExceptionThrown(int exceptionNum);
+ void callFuncPtr(int funcPtr, const char* funcName);
++/** @brief generate a "call imm32"*/
++void callFuncPtrImm(int funcPtr);
+ int call_helper_API(const char* helperName);
+ int conditional_jump_global_API(
+                                 ConditionCode cc, const char* target,
+diff --git a/vm/compiler/codegen/x86/NcgHelper.h b/vm/compiler/codegen/x86/NcgHelper.h
+index d53a761..ba20485 100644
+--- a/vm/compiler/codegen/x86/NcgHelper.h
++++ b/vm/compiler/codegen/x86/NcgHelper.h
+@@ -28,11 +28,12 @@ extern "C" void dvmNcgInvokeNcg(int pc);
+ #if defined(WITH_JIT)
+ extern "C" void dvmJitHelper_returnFromMethod();
+ extern "C" void dvmJitToInterpNormal(int targetpc); //in %ebx
++/** @brief interface function between FI and JIT for backward chaining cell */
++extern "C" void dvmJitToInterpBackwardBranch(int targetpc);
+ extern "C" void dvmJitToInterpTraceSelect(int targetpc); //in %ebx
+ extern "C" void dvmJitToInterpTraceSelectNoChain(int targetpc); //in %ebx
+ extern "C" void dvmJitToInterpNoChain(int targetpc); //in %eax
+ extern "C" void dvmJitToInterpNoChainNoProfile(int targetpc); //in %eax
+-extern "C" void dvmJitToInterpBackwardBranch(int targetpc); //in %ebx
+ extern "C" void dvmJitToInterpPunt(int targetpc); //in currentPc
+ extern "C" void dvmJitToExceptionThrown(int targetpc); //in currentPc
+ #endif
+diff --git a/vm/compiler/codegen/x86/Schedule.cpp b/vm/compiler/codegen/x86/Schedule.cpp
+index 7d28044..baf6a81 100644
+--- a/vm/compiler/codegen/x86/Schedule.cpp
++++ b/vm/compiler/codegen/x86/Schedule.cpp
+@@ -856,6 +856,37 @@ void inline Scheduler::handleFloatDependencyUpdate(LowOp* op) {
+             Latency_None, op);
+ }
+ 
++//! \brief Sets up dependencies on resources that must be live out.
++//! \details Last write to a resource should be ensured to be live
++//! out.
++void Scheduler::setupLiveOutDependencies() {
++    // Handle live out control flags. Namely, make sure that last flag
++    // writer depends on all previous flag writers.
++    if (ctrlEntries.size() != 0) {
++        // If the ctrlEntries list is empty, it means we have no flag producers
++        // that we need to update. This is caused if there really were not flag
++        // producers or a flag reader has already cleared this list which means
++        // the flag read already will be the one live out.
++        LowOp* lastFlagWriter = (queuedLIREntries[ctrlEntries.back()]);
++
++        // Don't include last flag writer in the iteration
++        for (int iter = 0; iter < ctrlEntries.size() - 1; iter++) {
++            // Add a WAW dependency to the last flag writer from all other
++            // flag writers
++            DependencyInformation ds;
++            ds.dataHazard = Dependency_WAW;
++            ds.lowopSlotId = ctrlEntries[iter];
++            ds.causeOfEdgeLatency = Latency_None;
++            ds.edgeLatency = mapLatencyReasonToValue[Latency_None];
++            dependencyAssociation[lastFlagWriter].predecessorDependencies.push_back(
++                    ds);
++        }
++    }
++
++    //! @todo Take care of live out dependencies for all types of resources
++    //! including physical registers.
++}
++
+ //! \brief Updates dependency graph with the implicit dependencies on eax
+ //! and edx for imul, mul, div, idiv, and cdq
+ //! \warning Assumes that operand size is 32 bits
+@@ -1247,17 +1278,45 @@ void Scheduler::generateAssembly(LowOp * op) {
+             op->opndSrc.size = size;
+             stream = encoder_imm(op->opCode, op->opndSrc.size, imm, stream);
+         } else if (op->opndSrc.type == LowOpndType_BlockId) {
++            LowOpBlock * blockOp = reinterpret_cast<LowOpBlock *>(op);
++
++            // If the immediate needs aligned, then do a test dump to see
++            // if the immediate will cross the 16-byte boundary. If we plan
++            // on aligning immediate, we expect that its size will be 32-bit
++            if (blockOp->blockIdOpnd.immediateNeedsAligned) {
++                // Dump to stream but don't update stream pointer
++                char * newStream = encoder_imm(blockOp->opCode, OpndSize_32, 0,
++                        stream);
++
++                // Immediates are assumed to be at end of instruction, so just check
++                // that the updated stream pointer does not break up the 32-bit immediate
++                unsigned int bytesCrossing =
++                        reinterpret_cast<unsigned int>(newStream) % 16;
++                bool needNops =
++                        (bytesCrossing > OpndSize_Null
++                                && bytesCrossing < OpndSize_32) ? true : false;
++
++                if (needNops)
++                    stream = encoder_nops(OpndSize_32 - bytesCrossing, stream);
++            }
++
+             bool unknown;
+-            OpndSize size;
++            OpndSize actualSize = OpndSize_Null;
+             int imm;
+-            if (op->opCode == Mnemonic_JMP)
+-                imm = getRelativeNCG(((LowOpBlock*) op)->blockIdOpnd.value,
+-                        JmpCall_uncond, &unknown, &size);
++            if (blockOp->opCode == Mnemonic_JMP)
++                imm = getRelativeNCG(blockOp->blockIdOpnd.value,
++                        JmpCall_uncond, &unknown, &actualSize);
+             else
+-                imm = getRelativeNCG(((LowOpBlock*) op)->blockIdOpnd.value,
+-                        JmpCall_cond, &unknown, &size);
+-            op->opndSrc.size = size;
+-            stream = encoder_imm(op->opCode, op->opndSrc.size, imm, stream);
++                imm = getRelativeNCG(blockOp->blockIdOpnd.value,
++                        JmpCall_cond, &unknown, &actualSize);
++
++            // When we need to align, we expect that the size of the immediate is
++            // 32-bit so we make sure of that now.
++            blockOp->opndSrc.size =
++                    blockOp->blockIdOpnd.immediateNeedsAligned ?
++                            OpndSize_32 : actualSize;
++
++            stream = encoder_imm(blockOp->opCode, blockOp->opndSrc.size, imm, stream);
+         } else if (op->opndSrc.type == LowOpndType_Imm) {
+             stream = encoder_imm(op->opCode, op->opndSrc.size,
+                     ((LowOpImm*) op)->immOpnd.value, stream);
+@@ -1286,9 +1345,29 @@ void Scheduler::generateAssembly(LowOp * op) {
+                 ((LowOpImmReg*) op)->regDest.regType, stream);
+     } else if (op->opndDest.type == LowOpndType_Reg
+             && op->opndSrc.type == LowOpndType_Chain) {
+-#if defined(WITH_JIT)
++        // The immediates used for chaining must be aligned within a 16-byte
++        // region so we need to ensure that now.
++
++        // First, dump to code stream but do not update stream pointer
++        char * newStream = encoder_imm_reg(op->opCode, op->opndDest.size,
++                ((LowOpImmReg*) op)->immSrc.value,
++                ((LowOpImmReg*) op)->regDest.regNum,
++                ((LowOpImmReg*) op)->regDest.isPhysical,
++                ((LowOpImmReg*) op)->regDest.regType, stream);
++
++        // Immediates are assumed to be at end of instruction, so just check
++        // that the updated stream pointer does not break up the immediate
++        unsigned int bytesCrossing =
++                reinterpret_cast<unsigned int>(newStream) % 16;
++        bool needNops =
++                (bytesCrossing > OpndSize_Null
++                        && bytesCrossing < op->opndDest.size) ? true : false;
++
++        if (needNops)
++            stream = encoder_nops(op->opndDest.size - bytesCrossing, stream);
++
++        // Now we are ready to do the actual encoding
+         insertChainingWorklist(((LowOpImmReg*) op)->immSrc.value, stream);
+-#endif
+         stream = encoder_imm_reg(op->opCode, op->opndDest.size,
+                 ((LowOpImmReg*) op)->immSrc.value,
+                 ((LowOpImmReg*) op)->regDest.regNum,
+@@ -1303,9 +1382,29 @@ void Scheduler::generateAssembly(LowOp * op) {
+                 ((LowOpImmMem*) op)->memDest.m_base.isPhysical, stream);
+     } else if (op->opndDest.type == LowOpndType_Mem
+             && op->opndSrc.type == LowOpndType_Chain) {
+-#if defined(WITH_JIT)
++        // The immediates used for chaining must be aligned within a 16-byte
++        // region so we need to ensure that now.
++
++        // First, dump to code stream but do not update stream pointer
++        char * newStream = encoder_imm_mem(op->opCode, op->opndDest.size,
++                ((LowOpImmMem*) op)->immSrc.value,
++                ((LowOpImmMem*) op)->memDest.m_disp.value,
++                ((LowOpImmMem*) op)->memDest.m_base.regNum,
++                ((LowOpImmMem*) op)->memDest.m_base.isPhysical, stream);
++
++        // Immediates are assumed to be at end of instruction, so just check
++        // that the updated stream pointer does not break up the immediate
++        unsigned int bytesCrossing =
++                reinterpret_cast<unsigned int>(newStream) % 16;
++        bool needNops =
++                (bytesCrossing > OpndSize_Null
++                        && bytesCrossing < op->opndDest.size) ? true : false;
++
++        if (needNops)
++            stream = encoder_nops(op->opndDest.size - bytesCrossing, stream);
++
++        // Now we are ready to do the actual encoding
+         insertChainingWorklist(((LowOpImmMem*) op)->immSrc.value, stream);
+-#endif
+         stream = encoder_imm_mem(op->opCode, op->opndDest.size,
+                 ((LowOpImmMem*) op)->immSrc.value,
+                 ((LowOpImmMem*) op)->memDest.m_disp.value,
+@@ -1538,6 +1637,9 @@ void Scheduler::schedule() {
+     BitVector * scheduledOps = dvmCompilerAllocBitVector(queuedLIREntries.size(), false);
+     dvmClearAllBits(scheduledOps);
+ 
++    // Set up the live out dependencies
++    setupLiveOutDependencies();
++
+     // Predecessor dependencies have already been initialized in the dependency graph building.
+     // Now, initialize successor dependencies to complete dependency graph.
+     for (lirID = 0; lirID < queuedLIREntries.size(); ++lirID) {
+diff --git a/vm/compiler/codegen/x86/Scheduler.h b/vm/compiler/codegen/x86/Scheduler.h
+index 3571f99..e19b4f6 100644
+--- a/vm/compiler/codegen/x86/Scheduler.h
++++ b/vm/compiler/codegen/x86/Scheduler.h
+@@ -88,7 +88,8 @@ private:
+     //! \see UseDefUserEntry
+     std::vector<UseDefUserEntry> userEntries;
+ 
+-    //! \brief Used to keep track of dependencies on control flags.
++    //! \brief Used to keep track of dependencies on control flags. It keeps a
++    //! a list of all flag writers until a flag reader is seen.
+     //! \details This is used only during dependency building but corresponding
+     //! LIRs are also updated to keep track of their own dependencies which is
+     //! used during scheduling. This list holds values from LowOp::slotId.
+@@ -105,6 +106,7 @@ private:
+     void handlePushDependencyUpdate(LowOp* op);
+     void handleFloatDependencyUpdate(LowOp* op);
+     void handleImplicitDependenciesEaxEdx(LowOp* op);
++    void setupLiveOutDependencies();
+ 
+     bool isBasicBlockDelimiter(Mnemonic m);
+     void generateAssembly(LowOp * op);
+diff --git a/vm/compiler/codegen/x86/libenc/enc_wrapper.cpp b/vm/compiler/codegen/x86/libenc/enc_wrapper.cpp
+index 02e4271..f324a3c 100644
+--- a/vm/compiler/codegen/x86/libenc/enc_wrapper.cpp
++++ b/vm/compiler/codegen/x86/libenc/enc_wrapper.cpp
+@@ -532,6 +532,17 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_moves_reg_to_reg(OpndSize size,
+     return stream;
+ }
+ 
++/**
++ * @brief Generates variable sized nop instructions.
++ * @param numBytes Number of bytes for the nop instruction. If this value is
++ * larger than 9 bytes, more than one nop instruction will be generated.
++ * @param stream Instruction stream where to place the nops
++ * @return Updated instruction stream pointer after generating the nops
++ */
++extern "C" ENCODER_DECLARE_EXPORT char * encoder_nops(unsigned numBytes, char * stream) {
++    return EncoderBase::nops(stream, numBytes);
++}
++
+ // Disassemble the operand "opnd" and put the readable format in "strbuf"
+ // up to a string length of "len".
+ unsigned int DisassembleOperandToBuf(const EncoderBase::Operand& opnd, char* strbuf, unsigned int len)
+diff --git a/vm/compiler/codegen/x86/libenc/enc_wrapper.h b/vm/compiler/codegen/x86/libenc/enc_wrapper.h
+index b5d52b3..d2c1b19 100644
+--- a/vm/compiler/codegen/x86/libenc/enc_wrapper.h
++++ b/vm/compiler/codegen/x86/libenc/enc_wrapper.h
+@@ -244,6 +244,7 @@ ENCODER_DECLARE_EXPORT char * encoder_movez_reg_to_reg(OpndSize size,
+ ENCODER_DECLARE_EXPORT char * encoder_moves_reg_to_reg(OpndSize size,
+                       int reg, bool isPhysical, int reg2,
+                       bool isPhysical2, LowOpndRegType type, char * stream);
++ENCODER_DECLARE_EXPORT char * encoder_nops(unsigned numBytes, char * stream);
+ ENCODER_DECLARE_EXPORT int decodeThenPrint(char* stream_start);
+ ENCODER_DECLARE_EXPORT char* decoder_disassemble_instr(char* stream, char* strbuf, unsigned int len);
+ #ifdef __cplusplus
+diff --git a/vm/interp/Interp.cpp b/vm/interp/Interp.cpp
+index 42e2eca..a21a6e6 100644
+--- a/vm/interp/Interp.cpp
++++ b/vm/interp/Interp.cpp
+@@ -50,7 +50,7 @@ extern "C" void dvmJitToInterpNoChain();
+ extern "C" void dvmJitToInterpPunt();
+ extern "C" void dvmJitToInterpSingleStep();
+ extern "C" void dvmJitToInterpTraceSelect();
+-#if defined(WITH_SELF_VERIFICATION)
++#if defined(ARCH_IA32) || defined(WITH_SELF_VERIFICATION)
+ extern "C" void dvmJitToInterpBackwardBranch();
+ #endif
+ #endif
+@@ -1629,7 +1629,7 @@ void dvmInitInterpreterState(Thread* self)
+         dvmJitToInterpPunt,
+         dvmJitToInterpSingleStep,
+         dvmJitToInterpTraceSelect,
+-#if defined(WITH_SELF_VERIFICATION)
++#if defined(ARCH_IA32) || defined(WITH_SELF_VERIFICATION)
+         dvmJitToInterpBackwardBranch,
+ #else
+         NULL,
+diff --git a/vm/interp/InterpState.h b/vm/interp/InterpState.h
+index 8d2c224..e5935c4 100644
+--- a/vm/interp/InterpState.h
++++ b/vm/interp/InterpState.h
+@@ -153,7 +153,7 @@ struct JitToInterpEntries {
+     void (*dvmJitToInterpPunt)(void);
+     void (*dvmJitToInterpSingleStep)(void);
+     void (*dvmJitToInterpTraceSelect)(void);
+-#if defined(WITH_SELF_VERIFICATION)
++#if defined(ARCH_IA32) || defined(WITH_SELF_VERIFICATION)
+     void (*dvmJitToInterpBackwardBranch)(void);
+ #else
+     void (*unused)(void);  // Keep structure size constant
+diff --git a/vm/mterp/out/InterpAsm-x86.S b/vm/mterp/out/InterpAsm-x86.S
+index 6421b41..90c63ca 100644
+--- a/vm/mterp/out/InterpAsm-x86.S
++++ b/vm/mterp/out/InterpAsm-x86.S
+@@ -16732,52 +16732,52 @@ dvmJitToInterpTraceSelectNoChain:
+  */
+     .global dvmJitToInterpTraceSelect
+ dvmJitToInterpTraceSelect:
+-    movl   0(%esp), %eax          # get return address
+-    movl   %ebx, rPC              # get first argument (target rPC)
++    movl   0(%esp), %ebx          # get return address
++    movl   (%ebx), rPC              # get first argument (target rPC)
+ 
+-    ## TODO, need to clean up stack manipulation ... this isn't signal safe and
+-    ## doesn't use the calling conventions of header.S
+     lea    4(%esp), %esp #to recover the esp update due to function call
+-
+-    ## An additional 5B instruction "jump 0" was added for a thread-safe
+-    ## chaining cell update in JIT code cache. So the offset is now -17=-12-5.
+-    lea    -17(%eax), %ebx #$JIT_OFFSET_CHAIN_START(%eax), %ebx
+-    lea    -4(%esp), %esp
+     movl   rSELF, %eax
+     movl   rPC,OUT_ARG0(%esp)
+     movl   %eax,OUT_ARG1(%esp)
+     call   dvmJitGetTraceAddrThread # (pc, self)
+-    lea    4(%esp), %esp
+     cmpl   $0,%eax
+     movl   rSELF, %ecx
+     movl   %eax,offThread_inJitCodeCache(%ecx)  # set inJitCodeCache flag
+     jz     1b                 # no - ask for one
+     movl   %eax,OUT_ARG0(%esp)
++    movl   4(%ebx), %ebx
+     movl   rINST,OUT_ARG1(%esp)
+-    call   dvmJitChain        # Attempt dvmJitChain(codeAddr,chainAddr)
++    call   dvmJitChain_staticAddr        # Attempt dvmJitChain_staticAddr(codeAddr,chainAddr)
+     cmpl   $0,%eax           # Success?
+     jz     toInterpreter      # didn't chain - interpret
+     jmp    *%eax
+     # won't return
+ 
+-/*
+- * Placeholder entries for x86 JIT
+- */
+     .global dvmJitToInterpBackwardBranch
+ dvmJitToInterpBackwardBranch:
++    movl        0(%esp), %eax          # get return address
++    movl        (%eax), rPC              # get first argument (target rPC)
++    lea         4(%esp), %esp
++    movl        rSELF, %ecx
++    cmpb        $0, offThread_breakFlags(%ecx)
++    jne         1f
++    movl        8(%eax), %ebx          #loop header address
++    movl        %ebx, offThread_inJitCodeCache(%ecx)  # set inJitCodeCache flag
++    movl        4(%eax), %eax           # patch address
++    movl        %eax, OUT_ARG1(%esp)    # %ebx live through dvmJitGetTraceAddrThread, address waiting to be patched
++    movl        %ebx, OUT_ARG0(%esp)    # first argument, target address
++    call        dvmJitChain
++    jmp         *%eax                   #to native address
++1:
++    movl        $0, offThread_inJitCodeCache(%ecx)  # set inJitCodeCache flag
++    jmp         toInterpreter
+ 
+     .global dvmJitToInterpNormal
+ dvmJitToInterpNormal:
+ /* one input: the target rPC value */
+-    movl        0(%esp), %eax          # get return address
+-    movl        %ebx, rPC              # get first argument (target rPC)
+-
+-    ## TODO, need to clean up stack manipulation ... this isn't signal safe and
+-    ## doesn't use the calling conventions of header.S
++    movl        0(%esp), %ebx          # get return address
++    movl        (%ebx), rPC              # get first argument (target rPC)
+ 
+-    ## An additional 5B instruction "jump 0" was added for a thread-safe
+-    ## chaining cell update in JIT code cache. So the offset is now -17=-12-5.
+-    lea         -17(%eax), %ebx #$JIT_OFFSET_CHAIN_START(%eax), %ebx
+     lea         4(%esp), %esp
+     movl        rPC, OUT_ARG0(%esp)
+     movl        rSELF, %ecx
+@@ -16787,14 +16787,12 @@ dvmJitToInterpNormal:
+     ## JIT code cache flag
+     movl        rSELF, %ecx
+     movl        %eax, offThread_inJitCodeCache(%ecx)  # set inJitCodeCache flag
+-    #lea         4(%esp), %esp
+     cmp         $0, %eax
+     je          toInterpreter
+-    #lea         -8(%esp), %esp
++    movl        4(%ebx), %ebx
+     movl        %ebx, OUT_ARG1(%esp)    # %ebx live thorugh dvmJitGetTraceAddrThread
+     movl        %eax, OUT_ARG0(%esp)    # first argument
+     call        dvmJitChain
+-    #lea         8(%esp), %esp
+     cmp         $0, %eax
+     je          toInterpreter
+     jmp         *%eax                   #to native address
+diff --git a/vm/mterp/x86/footer.S b/vm/mterp/x86/footer.S
+index 1d18e12..9d9f5d8 100644
+--- a/vm/mterp/x86/footer.S
++++ b/vm/mterp/x86/footer.S
+@@ -254,52 +254,52 @@ dvmJitToInterpTraceSelectNoChain:
+  */
+     .global dvmJitToInterpTraceSelect
+ dvmJitToInterpTraceSelect:
+-    movl   0(%esp), %eax          # get return address
+-    movl   %ebx, rPC              # get first argument (target rPC)
++    movl   0(%esp), %ebx          # get return address
++    movl   (%ebx), rPC              # get first argument (target rPC)
+ 
+-    ## TODO, need to clean up stack manipulation ... this isn't signal safe and
+-    ## doesn't use the calling conventions of header.S
+     lea    4(%esp), %esp #to recover the esp update due to function call
+-
+-    ## An additional 5B instruction "jump 0" was added for a thread-safe
+-    ## chaining cell update in JIT code cache. So the offset is now -17=-12-5.
+-    lea    -17(%eax), %ebx #$$JIT_OFFSET_CHAIN_START(%eax), %ebx
+-    lea    -4(%esp), %esp
+     movl   rSELF, %eax
+     movl   rPC,OUT_ARG0(%esp)
+     movl   %eax,OUT_ARG1(%esp)
+     call   dvmJitGetTraceAddrThread # (pc, self)
+-    lea    4(%esp), %esp
+     cmpl   $$0,%eax
+     movl   rSELF, %ecx
+     movl   %eax,offThread_inJitCodeCache(%ecx)  # set inJitCodeCache flag
+     jz     1b                 # no - ask for one
+     movl   %eax,OUT_ARG0(%esp)
++    movl   4(%ebx), %ebx
+     movl   rINST,OUT_ARG1(%esp)
+-    call   dvmJitChain        # Attempt dvmJitChain(codeAddr,chainAddr)
++    call   dvmJitChain_staticAddr        # Attempt dvmJitChain_staticAddr(codeAddr,chainAddr)
+     cmpl   $$0,%eax           # Success?
+     jz     toInterpreter      # didn't chain - interpret
+     jmp    *%eax
+     # won't return
+ 
+-/*
+- * Placeholder entries for x86 JIT
+- */
+     .global dvmJitToInterpBackwardBranch
+ dvmJitToInterpBackwardBranch:
++    movl        0(%esp), %eax          # get return address
++    movl        (%eax), rPC              # get first argument (target rPC)
++    lea         4(%esp), %esp
++    movl        rSELF, %ecx
++    cmpb        $$0, offThread_breakFlags(%ecx)
++    jne         1f
++    movl        8(%eax), %ebx          #loop header address
++    movl        %ebx, offThread_inJitCodeCache(%ecx)  # set inJitCodeCache flag
++    movl        4(%eax), %eax           # patch address
++    movl        %eax, OUT_ARG1(%esp)    # %ebx live through dvmJitGetTraceAddrThread, address waiting to be patched
++    movl        %ebx, OUT_ARG0(%esp)    # first argument, target address
++    call        dvmJitChain
++    jmp         *%eax                   #to native address
++1:
++    movl        $$0, offThread_inJitCodeCache(%ecx)  # set inJitCodeCache flag
++    jmp         toInterpreter
+ 
+     .global dvmJitToInterpNormal
+ dvmJitToInterpNormal:
+ /* one input: the target rPC value */
+-    movl        0(%esp), %eax          # get return address
+-    movl        %ebx, rPC              # get first argument (target rPC)
+-
+-    ## TODO, need to clean up stack manipulation ... this isn't signal safe and
+-    ## doesn't use the calling conventions of header.S
++    movl        0(%esp), %ebx          # get return address
++    movl        (%ebx), rPC              # get first argument (target rPC)
+ 
+-    ## An additional 5B instruction "jump 0" was added for a thread-safe
+-    ## chaining cell update in JIT code cache. So the offset is now -17=-12-5.
+-    lea         -17(%eax), %ebx #$$JIT_OFFSET_CHAIN_START(%eax), %ebx
+     lea         4(%esp), %esp
+     movl        rPC, OUT_ARG0(%esp)
+     movl        rSELF, %ecx
+@@ -309,14 +309,12 @@ dvmJitToInterpNormal:
+     ## JIT code cache flag
+     movl        rSELF, %ecx
+     movl        %eax, offThread_inJitCodeCache(%ecx)  # set inJitCodeCache flag
+-    #lea         4(%esp), %esp
+     cmp         $$0, %eax
+     je          toInterpreter
+-    #lea         -8(%esp), %esp
++    movl        4(%ebx), %ebx
+     movl        %ebx, OUT_ARG1(%esp)    # %ebx live thorugh dvmJitGetTraceAddrThread
+     movl        %eax, OUT_ARG0(%esp)    # first argument
+     call        dvmJitChain
+-    #lea         8(%esp), %esp
+     cmp         $$0, %eax
+     je          toInterpreter
+     jmp         *%eax                   #to native address
+-- 
+1.7.4.1
+

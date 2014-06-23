@@ -1,0 +1,199 @@
+From c981caea52a79440f4f5d6dfc94e40ca4e26bde4 Mon Sep 17 00:00:00 2001
+From: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Date: Wed, 22 May 2013 17:00:52 -0700
+Subject: Dalvik: Fix exit block live outs for data flow
+
+BZ: 110200
+
+Trace JIT requires that unless proven, all virtual registers defined are live
+out. This is now reflected for the dataflow analysis by adding fake uses in
+each exit block of all reachable defines. By adding fake uses we allow for the
+live-out virtual registers to be calculated as live-ins into the exit blocks.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I630ee8558c9ee0ea9931f086aa742ae32548003a
+Orig-MCG-Change-Id: I55ab2ccb2c3760afa39bf01808a29a0dceec4664
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/Compiler.h            |    1 +
+ vm/compiler/Dataflow.cpp          |  118 +++++++++++++++++++++++++++++++++++++
+ vm/compiler/SSATransformation.cpp |    4 +
+ 3 files changed, 123 insertions(+), 0 deletions(-)
+
+diff --git a/vm/compiler/Compiler.h b/vm/compiler/Compiler.h
+index 8044a1f..f6bd26e 100644
+--- a/vm/compiler/Compiler.h
++++ b/vm/compiler/Compiler.h
+@@ -243,6 +243,7 @@ bool dvmCompilerInsertBackwardChaining(struct CompilationUnit *cUnit);
+ void dvmCompilerNonLoopAnalysis(struct CompilationUnit *cUnit);
+ bool dvmCompilerFindLocalLiveIn(struct CompilationUnit *cUnit,
+                                 struct BasicBlock *bb);
++bool dvmCompilerInitializeExitUses (CompilationUnit *cUnit, BasicBlock *bb);
+ bool dvmCompilerDoSSAConversion(struct CompilationUnit *cUnit,
+                                 struct BasicBlock *bb);
+ bool dvmCompilerDoConstantPropagation(struct CompilationUnit *cUnit,
+diff --git a/vm/compiler/Dataflow.cpp b/vm/compiler/Dataflow.cpp
+index d6c6075..113dadd 100644
+--- a/vm/compiler/Dataflow.cpp
++++ b/vm/compiler/Dataflow.cpp
+@@ -23,6 +23,7 @@
+ 
+ #include <queue>
+ #include <vector>
++#include <set>
+ 
+ /*
+  * Main table containing data flow attributes for each bytecode. The
+@@ -1573,6 +1574,119 @@ bool dvmCompilerFindLocalLiveIn(CompilationUnit *cUnit, BasicBlock *bb)
+     return true;
+ }
+ 
++/**
++ * @brief Updates the uses vector to include the defines from current BB and its predecessors.
++ * @param cUnit The compilation unit
++ * @param bb The basic block whose defines we want to include in the uses of the exit
++ * @param uses Updated by function to include virtual register definitions that are reaching
++ * @param visited Keeps track of basic blocks we visited so we don't get stuck in cycles
++ * @return If any changes were made to the uses vector.
++ */
++static bool initializeExitUsesHelper (CompilationUnit *cUnit, BasicBlock *bb, BitVector *uses,
++        std::set<BasicBlock *> &visited)
++{
++    //We have nothing to do if we already visited this
++    if (visited.find (bb) != visited.end ())
++    {
++        return false;
++    }
++
++    //Mark current BB as visited
++    visited.insert (bb);
++
++    //Eagerly assume we don't update anything
++    bool changes = false;
++
++    //If we have information about our defines then we must ensure those are added to the uses vector
++    if (bb->dataFlowInfo != 0 && bb->dataFlowInfo->defV != 0)
++    {
++        //Update the uses to include the defines
++        dvmUnifyBitVectors (uses, uses, bb->dataFlowInfo->defV);
++
++        //Assume that the unify leads to changes
++        changes = true;
++    }
++
++    //Now we want to capture the defines from all predecessors so get them
++    BitVector *predecessors = bb->predecessors;
++
++    //If we have no predecessors we have nothing to do
++    if (predecessors == 0)
++    {
++        return changes;
++    }
++
++    //Create iterator
++    BitVectorIterator bvIterator;
++    dvmBitVectorIteratorInit (predecessors, &bvIterator);
++
++    //Walk through the predecessors
++    while (true)
++    {
++        //Get the block index
++        int blockIdx = dvmBitVectorIteratorNext (&bvIterator);
++
++        //When index is -1, we are done looking through the blocks
++        if (blockIdx == -1)
++        {
++            break;
++        }
++
++        //Get the predecessor block
++        BasicBlock *predecessor = reinterpret_cast<BasicBlock *> (dvmGrowableListGetElement (&cUnit->blockList,
++                blockIdx));
++
++        //Paranoid
++        assert (predecessor != 0);
++
++        //Initialize uses using information from predecessor
++        bool initPred = initializeExitUsesHelper (cUnit, predecessor, uses, visited);
++
++        //Make sure we keep track if we made any changes
++        changes = changes || initPred;
++    }
++
++    return changes;
++}
++
++/**
++ * @brief If the basic block is an exit block then we set up all reachable defines as uses.
++ * @details Because we work within a trace context, we take the conservative approach that all
++ * defined registers are live-out; so by adding them to the uses, the dataflow will make them
++ * as live-in for the exit blocks.
++ * @param cUnit The compilation unit.
++ * @param bb The basic block we want to look at.
++ * @return Returns if any changes were done to the basic blocks.
++ */
++bool dvmCompilerInitializeExitUses (CompilationUnit *cUnit, BasicBlock *bb)
++{
++    //This must be an exit block so it can be exit type, chaining cell, or exception block
++    bool isChainingCell = (bb->blockType >= kChainingCellNormal && bb->blockType <= kChainingCellLast);
++    bool isExitBlock = (bb->blockType == kExitBlock);
++    bool isExceptionBlock = (bb->blockType == kExceptionHandling);
++
++    if (isChainingCell == true || isExitBlock == true || isExceptionBlock == true)
++    {
++        //Make sure that dataflow information has been initialized
++        if (bb->dataFlowInfo != 0)
++        {
++            if (bb->dataFlowInfo->useV == 0)
++            {
++                //Allocate space for the uses information
++                bb->dataFlowInfo->useV = dvmCompilerAllocBitVector (cUnit->numDalvikRegisters, false);
++            }
++
++            std::set <BasicBlock *> visited;
++
++            //Initialize the uses for this BB to be the reaching defines
++            return initializeExitUsesHelper (cUnit, bb, bb->dataFlowInfo->useV, visited);
++        }
++    }
++
++    //If we make it here we did not change anything for this basic block
++    return false;
++}
++
+ /* Find out the latest SSA register for a given Dalvik register */
+ static void handleSSAUse(CompilationUnit *cUnit, int *uses, int dalvikReg,
+                          int regIndex)
+@@ -2718,4 +2832,8 @@ void dvmCompilerNonLoopAnalysis(CompilationUnit *cUnit)
+     dvmCompilerDataFlowAnalysisDispatcher(cUnit, dvmCompilerFindLocalLiveIn,
+                                           kAllNodes,
+                                           false /* isIterative */);
++
++    dvmCompilerDataFlowAnalysisDispatcher (cUnit, dvmCompilerInitializeExitUses,
++                                          kAllNodes,
++                                          false /* isIterative */);
+ }
+diff --git a/vm/compiler/SSATransformation.cpp b/vm/compiler/SSATransformation.cpp
+index 2054e68..0294609 100644
+--- a/vm/compiler/SSATransformation.cpp
++++ b/vm/compiler/SSATransformation.cpp
+@@ -109,6 +109,10 @@ static void computeDefBlockMatrix(CompilationUnit *cUnit)
+                                           kAllNodes,
+                                           false /* isIterative */);
+ 
++    dvmCompilerDataFlowAnalysisDispatcher (cUnit, dvmCompilerInitializeExitUses,
++                                          kAllNodes,
++                                          false /* isIterative */);
++
+     dvmCompilerDataFlowAnalysisDispatcher(cUnit, fillDefBlockMatrix,
+                                           kAllNodes,
+                                           false /* isIterative */);
+-- 
+1.7.4.1
+

@@ -1,0 +1,109 @@
+From 33562d198010211b8ae8f31283dfba1d42f84d9b Mon Sep 17 00:00:00 2001
+From: Qiming Shi <qiming.shi@intel.com>
+Date: Sat, 1 Jun 2013 14:39:23 +0800
+Subject: Dalvik: Bytecode PC value must be set before handling extended MIRs
+
+BZ: 61558
+
+The Dalvik PC is exported when handling extended MIRs for use in
+the exception handling path. However, if the branch bytecode is not
+handled before the extended MIRs, the PC value set will be
+incorrect.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I6f9f3057b2c09eb4f299c4b9c07e9a3b0de3d5c1
+Orig-MCG-Change-Id: I4eeadbcaa8d7d1b606b1220bd72624a4ee6759ac
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/Loop.cpp                         |   10 ++++++++++
+ vm/compiler/Loop.h                           |    1 +
+ vm/compiler/codegen/x86/CodegenInterface.cpp |    6 +++++-
+ 3 files changed, 16 insertions(+), 1 deletions(-)
+
+diff --git a/vm/compiler/Loop.cpp b/vm/compiler/Loop.cpp
+index dc04a11..aaeca68 100644
+--- a/vm/compiler/Loop.cpp
++++ b/vm/compiler/Loop.cpp
+@@ -206,6 +206,10 @@ static bool isSimpleCountedLoop(CompilationUnit *cUnit)
+     MIR *branch = loopBackBlock->lastMIRInsn;
+     Opcode opcode = branch->dalvikInsn.opcode;
+ 
++    // Remember the offset of the branch MIR in order to use it
++    // when generating the extended MIRs
++    loopAnalysis->loopBranchMIROffset = branch->offset;
++
+     /* Last instruction is not a conditional branch - bail */
+     if (dexGetFlagsFromOpcode(opcode) != (kInstrCanContinue|kInstrCanBranch)) {
+         return false;
+@@ -454,6 +458,8 @@ static void genHoistedChecks(CompilationUnit *cUnit)
+         rangeCheckMIR->dalvikInsn.arg[0] = arrayAccessInfo->maxC;
+         rangeCheckMIR->dalvikInsn.arg[1] = arrayAccessInfo->minC;
+         rangeCheckMIR->dalvikInsn.arg[2] = loopAnalysis->loopBranchOpcode;
++        // set offset of the extended MIR to match the loop branch MIR
++        rangeCheckMIR->offset = loopAnalysis->loopBranchMIROffset;
+         dvmCompilerAppendMIR(entry, rangeCheckMIR);
+         if (arrayAccessInfo->maxC > globalMaxC) {
+             globalMaxC = arrayAccessInfo->maxC;
+@@ -469,6 +475,8 @@ static void genHoistedChecks(CompilationUnit *cUnit)
+             boundCheckMIR->dalvikInsn.opcode = (Opcode)kMirOpLowerBound;
+             boundCheckMIR->dalvikInsn.vA = idxReg;
+             boundCheckMIR->dalvikInsn.vB = globalMinC;
++            // set offset of the extended MIR to match the loop branch MIR
++            boundCheckMIR->offset = loopAnalysis->loopBranchMIROffset;
+             dvmCompilerAppendMIR(entry, boundCheckMIR);
+         } else {
+             if (loopAnalysis->loopBranchOpcode == OP_IF_LT ||
+@@ -477,6 +485,8 @@ static void genHoistedChecks(CompilationUnit *cUnit)
+                 boundCheckMIR->dalvikInsn.opcode = (Opcode)kMirOpLowerBound;
+                 boundCheckMIR->dalvikInsn.vA = loopAnalysis->endConditionReg;
+                 boundCheckMIR->dalvikInsn.vB = globalMinC;
++                // set offset of the extended MIR to match the loop branch MIR
++                boundCheckMIR->offset = loopAnalysis->loopBranchMIROffset;
+                 /*
+                  * If the end condition is ">" in the source, the check in the
+                  * Dalvik bytecode is OP_IF_LE. In this case add 1 back to the
+diff --git a/vm/compiler/Loop.h b/vm/compiler/Loop.h
+index 8032093..0608633 100644
+--- a/vm/compiler/Loop.h
++++ b/vm/compiler/Loop.h
+@@ -28,6 +28,7 @@ typedef struct LoopAnalysis {
+     int ssaBIV;                         // basic IV in SSA name
+     bool isCountUpLoop;                 // count up or down loop
+     Opcode loopBranchOpcode;            // OP_IF_XXX for the loop back branch
++    int loopBranchMIROffset;            // MIR offset in method for loop back branch
+     int endConditionReg;                // vB in "vA op vB"
+     LIR *branchToBody;                  // branch over to the body from entry
+     LIR *branchToPCR;                   // branch over to the PCR cell
+diff --git a/vm/compiler/codegen/x86/CodegenInterface.cpp b/vm/compiler/codegen/x86/CodegenInterface.cpp
+index 6dad924..e8a47f6 100644
+--- a/vm/compiler/codegen/x86/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/CodegenInterface.cpp
+@@ -1354,6 +1354,10 @@ void dvmCompilerMIR2LIR(CompilationUnit *cUnit, JitTranslationInfo *info)
+             }
+         } else {
+         for (mir = bb->firstMIRInsn; mir; mir = mir->next) {
++            // Global variable rPC that's holding the Dalvik PC
++            // needs to be updated here because we are iterating
++            // through the MIRs of this BB.
++            rPC = const_cast<u2 *>(cUnit->method->insns) + mir->offset;
+             startOfBasicBlock(bb); //why here for O0
+             Opcode dalvikOpCode = mir->dalvikInsn.opcode;
+             if((int)dalvikOpCode >= (int)kMirOpFirst) {
+@@ -1390,7 +1394,7 @@ void dvmCompilerMIR2LIR(CompilationUnit *cUnit, JitTranslationInfo *info)
+             } else {
+                 codePtr = startCodePtr + mir->offset;
+                 //lower each byte code, update LIR
+-                notHandled = lowerByteCodeJit(cUnit->method, cUnit->method->insns+mir->offset, mir);
++                notHandled = lowerByteCodeJit(cUnit->method, rPC , mir);
+                 if(gDvmJit.codeCacheByteUsed + (stream - streamStart) +
+                    CODE_CACHE_PADDING > gDvmJit.codeCacheSize) {
+                     ALOGI("JIT code cache full after lowerByteCodeJit (trace uses %uB)", (stream - streamStart));
+-- 
+1.7.4.1
+

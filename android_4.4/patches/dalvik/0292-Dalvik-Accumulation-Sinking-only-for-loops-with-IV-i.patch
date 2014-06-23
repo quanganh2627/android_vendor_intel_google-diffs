@@ -1,0 +1,215 @@
+From b9f48f29d110e06f791ed0e58fd3f07d2b0c76f4 Mon Sep 17 00:00:00 2001
+From: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Date: Sat, 17 Aug 2013 11:03:15 -0700
+Subject: Dalvik: Accumulation Sinking only for loops with IV increment of 1
+
+BZ: 132495
+
+Accumulation sinking should only be applied if the loop has a single IV,
+and the IV is incremented by 1. This check has been added into the
+accumulation sinking gate. The LoopInformation class received a new
+method isUniqueIVIncrementingBy1 in order to provide the information
+for the check.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I7d19125a7fcfe57c1ca06f554809b367d3869315
+Orig-MCG-Change-Id: I8552f32c4468c310a9d8e42a35995e23f001087c
+Signed-off-by: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Reviewed-on: http://android.intel.com:8080/125984
+Reviewed-by: Lupusoru, Razvan A <razvan.a.lupusoru@intel.com>
+Reviewed-by: Provodin, Vitaly A <vitaly.a.provodin@intel.com>
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/AccumulationSinking.cpp |   31 +++++++++++++++++++++++---
+ vm/compiler/AccumulationSinking.h   |    7 ++++++
+ vm/compiler/LoopInformation.cpp     |   40 ++++++++++++++++++++++++++++++++--
+ vm/compiler/LoopInformation.h       |    7 +++++-
+ vm/compiler/LoopOpt.h               |    8 -------
+ 5 files changed, 77 insertions(+), 16 deletions(-)
+
+diff --git a/vm/compiler/AccumulationSinking.cpp b/vm/compiler/AccumulationSinking.cpp
+index 157b18d..bc888b9 100644
+--- a/vm/compiler/AccumulationSinking.cpp
++++ b/vm/compiler/AccumulationSinking.cpp
+@@ -528,10 +528,15 @@ static bool checkUsage (const MIR *mir)
+     {
+         SUsedChain *chain = chains[i];
+ 
+-        //Basically, we fail if the chain has a next
+-        if (chain != 0 && chain->nextUse != 0)
++        //Basically, we fail if the chain has a next and if the next is in the same BB
++        if (chain != 0 && chain->nextUse != 0 && chain->nextUse->mir->bb == mir->bb)
+         {
+-            return false;
++            //We ignore the phi node because in the case of an accumulation it is fine to have a nextUse
++            //as a phi node that is in the same BB
++            if (chain->nextUse->mir->dalvikInsn.opcode != static_cast<Opcode> (kMirOpPhi))
++            {
++                return false;
++            }
+         }
+     }
+ 
+@@ -917,6 +922,24 @@ static bool compilerSinkAccumulationsGateHelper(const CompilationUnit *cUnit, Lo
+         {
+             return false;
+         }
++
++        //We only accept one BB
++        if (dvmCountSetBits (info->getBasicBlocks ()) > 1)
++        {
++            return false;
++        }
++
++        //If more than one IV, we bail
++        if (info->getNumBasicIV (const_cast<CompilationUnit *> (cUnit)) != 1)
++        {
++            return false;
++        }
++
++        //TODO wrap this into loop information
++        if (info->isUniqueIVIncrementingBy1 () == false)
++        {
++            return false;
++        }
+     }
+ 
+     //All good!
+@@ -926,7 +949,7 @@ static bool compilerSinkAccumulationsGateHelper(const CompilationUnit *cUnit, Lo
+ bool dvmCompilerSinkAccumulationsGate(const CompilationUnit *cUnit, const Pass *curPass)
+ {
+     //First, make sure we are in the new loop detection system
+-    if ( dvmCompilerTraceIsLoopNewSystem(cUnit, curPass) == false )
++    if (dvmCompilerTraceIsLoopNewSystem(cUnit, curPass) == false)
+     {
+         return false;
+     }
+diff --git a/vm/compiler/AccumulationSinking.h b/vm/compiler/AccumulationSinking.h
+index 77bd5ca..cb0ea2c 100644
+--- a/vm/compiler/AccumulationSinking.h
++++ b/vm/compiler/AccumulationSinking.h
+@@ -29,4 +29,11 @@ class Pass;
+  */
+ void dvmCompilerAccumulationSinking (CompilationUnit *cUnit, Pass *pass);
+ 
++/**
++ * @brief Verify that the loop is capable of having the accumulations sunk
++ * @param cUnit the CompilationUnit
++ * @param curPass the Pass
++ * @return whether the sink accumulation sinking
++ */
++bool dvmCompilerSinkAccumulationsGate (const CompilationUnit *cUnit, const Pass *curPass);
+ #endif
+diff --git a/vm/compiler/LoopInformation.cpp b/vm/compiler/LoopInformation.cpp
+index 6a34774..c9cb11f 100644
+--- a/vm/compiler/LoopInformation.cpp
++++ b/vm/compiler/LoopInformation.cpp
+@@ -1078,12 +1078,11 @@ bool LoopInformation::hasFreeScratchRegisters (CompilationUnit *cUnit, unsigned
+ }
+ 
+ /* Get number of basic IVs */
+-int LoopInformation::getNumBasicIV(CompilationUnit* cUnit) const
++int LoopInformation::getNumBasicIV(CompilationUnit* cUnit)
+ {
+-    LoopInformation* loopInfo = cUnit->loopInformation;
+     InductionVariableInfo *ivInfo;
+     //Get the IV list
+-    GrowableList* ivList = &loopInfo->getInductionVariableList ();
++    GrowableList* ivList = & (getInductionVariableList ());
+     unsigned int i;
+     unsigned int number = 0;
+     for (i = 0; i < ivList->numUsed; i++) {
+@@ -1405,3 +1404,38 @@ void LoopInformation::invalidatePeeling (void)
+ {
+     iterate (invalidatePeelingHelper);
+ }
++
++bool LoopInformation::isUniqueIVIncrementingBy1 (void)
++{
++    GrowableList* ivList = & (getInductionVariableList ());
++    unsigned int number = 0;
++
++    for (unsigned int i = 0; i < ivList->numUsed; i++)
++    {
++        InductionVariableInfo *ivInfo;
++
++        ivInfo = GET_ELEM_N (ivList, InductionVariableInfo*, i);
++
++        //Is it a basic IV?
++        if (ivInfo->ssaReg == ivInfo->basicSSAReg)
++        {
++            //Increment count
++            number++;
++
++            //Is the increment not 1?
++            if (ivInfo->inc != 1)
++            {
++                return false;
++            }
++
++            //If we already had one, bail
++            if (number > 1)
++            {
++                return false;
++            }
++        }
++    }
++
++    //Result is: we did get only one right?
++    return (number == 1);
++}
+diff --git a/vm/compiler/LoopInformation.h b/vm/compiler/LoopInformation.h
+index 98ec08f..359aaab 100644
+--- a/vm/compiler/LoopInformation.h
++++ b/vm/compiler/LoopInformation.h
+@@ -490,7 +490,7 @@ class LoopInformation
+           * @brief get number of basic IV
+           * @return number of basic IV
+           */
+-         int getNumBasicIV (CompilationUnit* cUnit) const;
++         int getNumBasicIV (CompilationUnit* cUnit);
+ 
+          /**
+           * @brief Check if the loop is counted up/down
+@@ -528,6 +528,11 @@ class LoopInformation
+           */
+          void setLoopBranchOpcode (Opcode op) {loopBranchOpcode = op;}
+ 
++         /**
++          * @brief Does the loop only have a single basic induction variable and is it incremented by 1?
++          * @return whether it does or does not
++          */
++         bool isUniqueIVIncrementingBy1 (void);
+ };
+ 
+ /**
+diff --git a/vm/compiler/LoopOpt.h b/vm/compiler/LoopOpt.h
+index 39430e0..494113e 100644
+--- a/vm/compiler/LoopOpt.h
++++ b/vm/compiler/LoopOpt.h
+@@ -72,14 +72,6 @@ void dvmCompilerPrintPassNames (void);
+ void dvmCompilerPrintIgnorePasses (void);
+ 
+ /**
+- * @brief Verify that the loop is capable of having the accumulations sunk
+- * @param cUnit the CompilationUnit
+- * @param curPass the Pass
+- * @return whether the sink accumulation sinking
+- */
+-bool dvmCompilerSinkAccumulationsGate (const CompilationUnit *cUnit, const Pass *curPass);
+-
+-/**
+  * @brief Check if the loops are formed the way we want (nested / branches on / off)
+  * @param cUnit the CompilationUnit
+  * @param curPass the Pass
+-- 
+1.7.4.1
+

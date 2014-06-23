@@ -1,0 +1,263 @@
+From 2a2c26409b00c4244b0fd0a581fac613ba23b1c2 Mon Sep 17 00:00:00 2001
+From: Vladimir Kostyukov <vladimir.kostyukov@intel.com>
+Date: Mon, 2 Sep 2013 18:42:29 +0700
+Subject: Dalvik: Predecessors-First Traversal support
+
+BZ: 131016
+
+After the enabling nested loops in Dalvik, we met the problems with
+optimizations based on CFG traversal (i.e. "Check Removal"). The
+thing is we have to support a Predecessors-First Traversal for such
+optimizations, instead of using BFS/DFS, which are not working for
+the cases of complicated nested structure of loops. For the case
+of "Check Removal" we want to eliminate checks in basic block only
+when the information about all it's predecessors available.
+Otherwise, we can make a wrong decision (what is happened in
+referenced BZ).
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Ic3d98f1ebf23534fc32846dd40fdd3ee6096f818
+Orig-MCG-Change-Id: I1ce134202f9dae6d9d36733ff6e0827f086f6525
+Signed-off-by: Vladimir Kostyukov <vladimir.kostyukov@intel.com>
+Reviewed-on: http://android.intel.com:8080/133000
+Reviewed-by: Beyler, Jean Christophe <jean.christophe.beyler@intel.com>
+Reviewed-by: lab_aqa <lab_aqa@intel.com>
+Reviewed-by: Banerji, Udayan <udayan.banerji@intel.com>
+Reviewed-by: Popov, Ivan G <ivan.g.popov@intel.com>
+Reviewed-by: Lupusoru, Razvan A <razvan.a.lupusoru@intel.com>
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/Compiler.h            |    1 +
+ vm/compiler/Dataflow.cpp          |  154 +++++++++++++++++++++++++++++++++++++
+ vm/compiler/LoopOpt.cpp           |    2 +-
+ vm/compiler/SSATransformation.cpp |    2 +-
+ 4 files changed, 157 insertions(+), 2 deletions(-)
+
+diff --git a/vm/compiler/Compiler.h b/vm/compiler/Compiler.h
+index 080e1a3..43b2962 100644
+--- a/vm/compiler/Compiler.h
++++ b/vm/compiler/Compiler.h
+@@ -182,6 +182,7 @@ typedef enum DataFlowAnalysisMode {
+     kPostOrderDOMTraversal,     // Dominator tree / Post-Order
+     kBreadthFirstTraversal,     // Breadth-First Traversal
+     kAllNodesAndNew,            // All nodes and new added during traversal
++    kPredecessorsFirstTraversal,// Predecessors-First Traversal
+ } DataFlowAnalysisMode;
+ 
+ typedef struct CompilerMethodStats {
+diff --git a/vm/compiler/Dataflow.cpp b/vm/compiler/Dataflow.cpp
+index 14a00d7..02126e3 100644
+--- a/vm/compiler/Dataflow.cpp
++++ b/vm/compiler/Dataflow.cpp
+@@ -20,6 +20,7 @@
+ #include "LoopInformation.h"
+ #include "libdex/DexOpcodes.h"
+ #include "SSAWalkData.h"
++#include "Utility.h"
+ 
+ #include <queue>
+ #include <vector>
+@@ -3071,6 +3072,152 @@ bool dvmCompilerClearVisitedFlag(struct CompilationUnit *cUnit,
+     return true;
+ }
+ 
++ /**
++  * @brief Performs the Predecessors-First Traversal of CFG
++  * @param cUnit the CompilationUnit
++  * @param func the BasicBlock's visitor function
++  * @return whether the traversal change CFG or not
++  */
++static bool predecessorsFirstTraversal(CompilationUnit *cUnit,  bool (*func)(CompilationUnit *, BasicBlock *))
++{
++    bool change = false;
++    std::queue<BasicBlock *> q;
++    std::set<BasicBlock *> s;
++
++    //Clear the nodes
++    dvmCompilerDataFlowAnalysisDispatcher (cUnit,
++                     dvmCompilerClearVisitedFlag, kAllNodes, false);
++
++    //Start with entry block
++    q.push (cUnit->entryBlock);
++    s.insert (cUnit->entryBlock);
++
++    while (q.size () > 0)
++    {
++        //Get top
++        BasicBlock *bb = q.front ();
++        q.pop ();
++
++        //It might be a null
++        if (bb == 0)
++        {
++            continue;
++        }
++
++        //Paranoid
++        assert (bb->visited == false);
++        assert (bb->hidden == false);
++
++        //Push all the successors into the queue
++        ChildBlockIterator succIter (bb);
++        BasicBlock **succPtr = succIter.getNextChildPtr ();
++        while (succPtr != 0)
++        {
++            BasicBlock *successor = *succPtr;
++
++            //Paranoid
++            assert (successor != 0);
++
++            //Push the seccessor
++            //It doesn't make sense to have duplicates in the queue
++            //So, we use set to avoid this
++            if (s.find (successor) == s.end ())
++            {
++                //We're interested only in unvisited and visible blocks
++                if (successor->visited == false && successor->hidden == false)
++                {
++                    q.push (successor);
++                    s.insert (successor);
++                }
++            }
++
++            //Take next successor
++            succPtr = succIter.getNextChildPtr ();
++        }
++
++        //We have to make sure all the bb's predeccessors (except for backward branch) visited
++        bool allPredecessorsVisited = true;
++
++        //Get bb's predecessors
++        BitVector *predecessors = bb->predecessors;
++        if (predecessors != 0)
++        {
++            //Init predecessor's interator
++            BitVectorIterator predIter;
++            dvmBitVectorIteratorInit (predecessors, &predIter);
++
++            //We want to visit all the predecessors in order to
++            //push the unvisited ones into the queue
++            while (true)
++            {
++                //Take next predecessor
++                BasicBlock *predecessor = dvmCompilerGetNextBasicBlockViaBitVector (predIter, cUnit->blockList);
++
++                //We've done with predecessors
++                if (predecessor == 0)
++                {
++                    break;
++                }
++
++                //We can skip predecessors without dominators
++                if (predecessor->dominators == 0)
++                {
++                    continue;
++                }
++
++                //Skip the backward branch
++                if (dvmIsBitSet (predecessor->dominators, bb->id) != 0)
++                {
++                    continue;
++                }
++
++                //Skip the hidden blocks
++                if (predecessor->hidden == true)
++                {
++                    continue;
++                }
++
++                //Accumulate the flag
++                allPredecessorsVisited &= predecessor->visited;
++
++                //If there is an unvisited predecessor
++                if (predecessor->visited == false)
++                {
++                    //We'd like to visit it first before the visiting bb
++                    //It doesn't make sense to have duplicates in the queue
++                    //So, we use set to avoid this
++                    if (s.find (predecessor) == s.end ())
++                    {
++                        q.push (predecessor);
++                        s.insert (predecessor);
++                    }
++                }
++            }
++        }
++
++        if (allPredecessorsVisited == true)
++        {
++            //We've visited all the predecessors. So, we can visit it
++            change |= (*func)(cUnit, bb);
++            bb->visited = true;
++            s.erase (bb);
++        }
++        else
++        {
++            //It is not a right time to handle this.
++            //We'll push it into the end of queue.
++            q.push (bb);
++        }
++    }
++
++    //Clear the nodes
++    dvmCompilerDataFlowAnalysisDispatcher (cUnit,
++                  dvmCompilerClearVisitedFlag, kAllNodes, false);
++
++    //Return change flag
++    return change;
++}
++
+ void dvmCompilerDataFlowAnalysisDispatcher(CompilationUnit *cUnit,
+                 bool (*func)(CompilationUnit *, BasicBlock *),
+                 DataFlowAnalysisMode dfaMode,
+@@ -3219,6 +3366,13 @@ void dvmCompilerDataFlowAnalysisDispatcher(CompilationUnit *cUnit,
+                 change |= (*func)(cUnit, bb);
+             }
+         }
++        /*
++         *
++         */
++        else if (dfaMode == kPredecessorsFirstTraversal) {
++            //Call the helper function
++            change = predecessorsFirstTraversal (cUnit, func);
++        }
+ 
+         /* If isIterative is false, exit the loop after the first iteration */
+         change &= isIterative;
+diff --git a/vm/compiler/LoopOpt.cpp b/vm/compiler/LoopOpt.cpp
+index c5d6c06..20ca123 100644
+--- a/vm/compiler/LoopOpt.cpp
++++ b/vm/compiler/LoopOpt.cpp
+@@ -62,7 +62,7 @@ START_PASSES
+     //This loop formation is used when the old loop filtering is active
+     NEW_PASS ("Old_Loop_Formation", kAllNodesAndNew, 0, dvmCompilerTraceIsLoopOldSystem,
+                 dvmCompilerFormOldLoop, 0, 0, 0, kOptimizationBasicBlockChange | kLoopStructureChange),
+-    NEW_PASS ("Check_Removal", kAllNodes, 0, 0,
++    NEW_PASS ("Check_Removal", kPredecessorsFirstTraversal, 0, 0,
+                 dvmCompilerStartCheckRemoval, dvmCompilerEndCheckRemoval, dvmCompilerCheckRemoval, 0, kOptimizationDefUsesChange),
+     //The 2addr pass should come before any pass that need register rewriting.
+     NEW_PASS ("Convert_2addr_to_normal", kAllNodes, 0, 0,
+diff --git a/vm/compiler/SSATransformation.cpp b/vm/compiler/SSATransformation.cpp
+index f82abf3..ed61c30 100644
+--- a/vm/compiler/SSATransformation.cpp
++++ b/vm/compiler/SSATransformation.cpp
+@@ -1081,7 +1081,7 @@ bool dvmCompilerCalculateBasicBlockInformation (CompilationUnit *cUnit, bool fil
+ 
+     //Once this is done, we fill in the def/use chain and topological order for the MIRs
+     //We suppose here that SSA has been done already
+-    dvmCompilerDataFlowAnalysisDispatcher (cUnit, dvmCompilerBuildDefUseChain, kBreadthFirstTraversal, false);
++    dvmCompilerDataFlowAnalysisDispatcher (cUnit, dvmCompilerBuildDefUseChain, kPredecessorsFirstTraversal, false);
+ 
+     //Before anything else: any value without a definition might have one now, handle them now
+     data.handleNoDefinitions ();
+-- 
+1.7.4.1
+

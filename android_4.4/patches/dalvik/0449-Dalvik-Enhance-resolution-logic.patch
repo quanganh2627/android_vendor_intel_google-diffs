@@ -1,0 +1,150 @@
+From bca24b5ea92687f4213396ee56261db9a8ea6b9e Mon Sep 17 00:00:00 2001
+From: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Date: Thu, 12 Dec 2013 13:47:21 -0800
+Subject: Dalvik: Enhance resolution logic
+
+BZ: 158737
+
+The pass that checks that references have been resolved, has been updated
+with three changes:
+-Can now skip bytecodes whose resolution is not required
+-Can now resolve base method of virtual invokes
+-Volatile getters and setters have been included in check logic
+
+Change-Id: I11bc2e8523fd8eda54fca6f75562bf7db44a3b5e
+Category: device enablement
+Domain: AOSP.Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, need rework
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+---
+ vm/compiler/PassDriver.cpp |   43 +++++++++++++++++++++++++++++++++++++++++++
+ vm/compiler/Utility.cpp    |   33 ++++++++++++++++++++++++++++++++-
+ 2 files changed, 75 insertions(+), 1 deletions(-)
+
+diff --git a/vm/compiler/PassDriver.cpp b/vm/compiler/PassDriver.cpp
+index 27646e1..44ab092 100644
+--- a/vm/compiler/PassDriver.cpp
++++ b/vm/compiler/PassDriver.cpp
+@@ -522,16 +522,59 @@ bool checkLoopsGate (const CompilationUnit *cUnit, Pass *curPass)
+     return dvmCompilerCheckLoops (const_cast<CompilationUnit *>(cUnit));
+ }
+ 
++/**
++ * @brief Used to check whether resolution is required for opcode
++ * @param opcode The opcode to check
++ * @return Returns true if resolution is required. Returns false if backend can handle no resolution.
++ */
++static bool mustResolve (Opcode opcode)
++{
++    switch (opcode)
++    {
++        case OP_IGET_QUICK:
++        case OP_IGET_WIDE_QUICK:
++        case OP_IGET_OBJECT_QUICK:
++        case OP_IPUT_QUICK:
++        case OP_IPUT_WIDE_QUICK:
++        case OP_IPUT_OBJECT_QUICK:
++        case OP_INVOKE_VIRTUAL_QUICK:
++        case OP_INVOKE_VIRTUAL_QUICK_RANGE:
++        case OP_INVOKE_SUPER_QUICK:
++        case OP_INVOKE_SUPER_QUICK_RANGE:
++            //Quick versions do not need resolution because they use index generated
++            //during the verification stage.
++            return false;
++        case OP_INVOKE_INTERFACE:
++        case OP_INVOKE_INTERFACE_RANGE:
++            //The backends generate code that can look up method invoked which
++            //includes being able to do resolution.
++            return false;
++        default:
++            break;
++    }
++
++    return true;
++}
++
+ bool dvmCompilerCheckReferences (CompilationUnit *cUnit, BasicBlock *bb)
+ {
+     //Check all of the MIRs in this basic block
+     for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
+     {
++        //Skip bytecodes whose resolution we do not care about
++        if (mustResolve (mir->dalvikInsn.opcode) == false)
++        {
++            continue;
++        }
++
+         bool resolved = dvmCompilerCheckResolvedReferences (cUnit->method, &mir->dalvikInsn,
+                 false /*tryToResolve*/);
+ 
+         if (resolved == false)
+         {
++            PASS_LOG (ALOGD, cUnit, "Check_References: Failed to resolve references for %s",
++                    dvmCompilerGetDalvikDisassembly (&mir->dalvikInsn, 0));
++
+             //We found an unresolved reference
+             cUnit->quitLoopMode = true;
+ 
+diff --git a/vm/compiler/Utility.cpp b/vm/compiler/Utility.cpp
+index b6f9c52..7bba371 100644
+--- a/vm/compiler/Utility.cpp
++++ b/vm/compiler/Utility.cpp
+@@ -762,8 +762,27 @@ const Method *dvmCompilerCheckResolvedMethod (const Method *methodContainingInvo
+             callee = dvmFindDirectMethodByDescriptor (gDvm.classJavaLangObject, "<init>", "()V");
+             break;
+ 
++        case OP_INVOKE_VIRTUAL:
++        case OP_INVOKE_VIRTUAL_RANGE:
++        {
++            //Get the base method
++            Method *baseMethod = dvmDexGetResolvedMethod (methodContainingInvoke->clazz->pDvmDex, methodIdx);
++
++            //Try to resolve the base method if needed
++            if (tryToResolve == true && baseMethod == 0)
++            {
++                baseMethod = dvmResolveMethod (methodContainingInvoke->clazz, methodIdx, METHOD_VIRTUAL);
++            }
++
++            //Without the actual object pointer, we cannot figure the actual method being invoked
++            //since we need to be able to look at the vtable. Thus we simply return our base method
++            //since maybe we were able to resolve that.
++            callee = baseMethod;
++
++            break;
++        }
+         default:
+-            //For virtual invokes we cannot figure out method callee without access to the this pointer
++            //For interface invokes we cannot figure out method callee without access to the this pointer
+             break;
+     }
+ 
+@@ -829,6 +848,12 @@ bool dvmCompilerCheckResolvedReferences (const Method *method, const DecodedInst
+         case OP_SPUT_BYTE:
+         case OP_SPUT_CHAR:
+         case OP_SPUT_SHORT:
++        case OP_SGET_VOLATILE:
++        case OP_SPUT_VOLATILE:
++        case OP_SGET_OBJECT_VOLATILE:
++        case OP_SPUT_OBJECT_VOLATILE:
++        case OP_SGET_WIDE_VOLATILE:
++        case OP_SPUT_WIDE_VOLATILE:
+         {
+             u4 ref = insn->vB;
+             StaticField *sField =
+@@ -877,6 +902,12 @@ bool dvmCompilerCheckResolvedReferences (const Method *method, const DecodedInst
+         case OP_IPUT_BYTE:
+         case OP_IPUT_CHAR:
+         case OP_IPUT_SHORT:
++        case OP_IGET_VOLATILE:
++        case OP_IPUT_VOLATILE:
++        case OP_IGET_OBJECT_VOLATILE:
++        case OP_IPUT_OBJECT_VOLATILE:
++        case OP_IGET_WIDE_VOLATILE:
++        case OP_IPUT_WIDE_VOLATILE:
+         {
+             u4 ref = insn->vC;
+             InstField *iField = reinterpret_cast <InstField*> (dvmDexGetResolvedField(method->clazz->pDvmDex, ref));
+-- 
+1.7.4.1
+

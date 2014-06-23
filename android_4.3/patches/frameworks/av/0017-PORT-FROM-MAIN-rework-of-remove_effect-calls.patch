@@ -1,0 +1,156 @@
+From 12498aaa91bd38b154838d8989c7bf658e4bda8c Mon Sep 17 00:00:00 2001
+From: Andrei V. FOMITCHEV <andreix.fomitchev@intel.com>
+Date: Fri, 19 Oct 2012 18:17:10 +0200
+Subject: [PORT FROM MAIN] rework of remove_effect calls
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+  Francois' comments:
+  We used to have segfault without this… need to check again
+  if not corrected by google…
+
+BZ: 61296
+
+Bug issue is (probably, because unable to reproduce) caused by a
+desynchronization of threads: a thread indirectly frees memory of
+an "input stream" object then another thread continues to use
+"intput stream" object. Because these threads do not share Mutex::Autolock
+object, the solution to issue is rework of "input stream" usage. I.e.
+currently, a thread calls a first time a function of "input stream" and
+later, the same threads recalls a second time the same function of "input
+stream". This second call is useless and can be avoided.
+
+So the purpose of this patch is
+ - addition of a boolean attribute to "thread" which indicates if
+"input stream" function has been called or not
+ - pooling of calls to "input stream" function following boolean
+
+Feature: AudioComms, AudioEffects
+Category: Integration
+Purpose: PV-Enabler
+Origin: Internal
+Upstream-candidate: yes
+Change-Id: I5b6ea27ff5e44f6036ba7a1bfaa0d5abda1553b9
+Orig-Change-Id: I437c4c2ab0b067f4c2bf05736f4e43c1b4135cf3
+Signed-off-by: Andrei V. FOMITCHEV <andreix.fomitchev@intel.com>
+Reviewed-on: http://android.intel.com:8080/76846
+Reviewed-by: Barthes, FabienX <fabienx.barthes@intel.com>
+Tested-by: Barthes, FabienX <fabienx.barthes@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+---
+ services/audioflinger/Effects.cpp |   36 ++++++++++++++++++++++--------------
+ services/audioflinger/Effects.h   |    2 ++
+ 2 files changed, 24 insertions(+), 14 deletions(-)
+
+diff --git a/services/audioflinger/Effects.cpp b/services/audioflinger/Effects.cpp
+index d66294c..c566d7a 100644
+--- a/services/audioflinger/Effects.cpp
++++ b/services/audioflinger/Effects.cpp
+@@ -65,7 +65,7 @@ AudioFlinger::EffectModule::EffectModule(ThreadBase *thread,
+       mStatus(NO_INIT), mState(IDLE),
+       // mMaxDisableWaitCnt is set by configure() and not used before then
+       // mDisableWaitCnt is set by process() and updateState() and not used before then
+-      mSuspended(false)
++      mSuspended(false), mStopped(false)
+ {
+     ALOGV("Constructor %p", this);
+     int lStatus;
+@@ -92,18 +92,12 @@ Error:
+ 
+ AudioFlinger::EffectModule::~EffectModule()
+ {
++    Mutex::Autolock _l(mLock);
++
+     ALOGV("Destructor %p", this);
+     if (mEffectInterface != NULL) {
+-        if ((mDescriptor.flags & EFFECT_FLAG_TYPE_MASK) == EFFECT_FLAG_TYPE_PRE_PROC ||
+-                (mDescriptor.flags & EFFECT_FLAG_TYPE_MASK) == EFFECT_FLAG_TYPE_POST_PROC) {
+-            sp<ThreadBase> thread = mThread.promote();
+-            if (thread != 0) {
+-                audio_stream_t *stream = thread->stream();
+-                if (stream != NULL) {
+-                    stream->remove_audio_effect(stream, mEffectInterface);
+-                }
+-            }
+-        }
++        //stop effect if it has not already stopped
++        stop_effect_l();
+         // release effect engine
+         EffectRelease(mEffectInterface);
+     }
+@@ -467,6 +461,7 @@ status_t AudioFlinger::EffectModule::start_l()
+             audio_stream_t *stream = thread->stream();
+             if (stream != NULL) {
+                 stream->add_audio_effect(stream, mEffectInterface);
++                mStopped = false;
+             }
+         }
+     }
+@@ -487,7 +482,7 @@ status_t AudioFlinger::EffectModule::stop_l()
+     if (mStatus != NO_ERROR) {
+         return mStatus;
+     }
+-    status_t cmdStatus;
++    status_t cmdStatus = 0;
+     uint32_t size = sizeof(status_t);
+     status_t status = (*mEffectInterface)->command(mEffectInterface,
+                                                    EFFECT_CMD_DISABLE,
+@@ -498,7 +493,19 @@ status_t AudioFlinger::EffectModule::stop_l()
+     if (status == 0) {
+         status = cmdStatus;
+     }
+-    if (status == 0 &&
++    if (status == 0) {
++        stop_effect_l();
++    }
++    return status;
++}
++
++status_t AudioFlinger::EffectModule::stop_effect_l()
++{
++    if (mEffectInterface == NULL) {
++        return NO_INIT;
++    }
++
++    if (mStopped == false &&
+             ((mDescriptor.flags & EFFECT_FLAG_TYPE_MASK) == EFFECT_FLAG_TYPE_PRE_PROC ||
+              (mDescriptor.flags & EFFECT_FLAG_TYPE_MASK) == EFFECT_FLAG_TYPE_POST_PROC)) {
+         sp<ThreadBase> thread = mThread.promote();
+@@ -506,10 +513,11 @@ status_t AudioFlinger::EffectModule::stop_l()
+             audio_stream_t *stream = thread->stream();
+             if (stream != NULL) {
+                 stream->remove_audio_effect(stream, mEffectInterface);
++                mStopped = true;
+             }
+         }
+     }
+-    return status;
++    return 0;
+ }
+ 
+ status_t AudioFlinger::EffectModule::command(uint32_t cmdCode,
+diff --git a/services/audioflinger/Effects.h b/services/audioflinger/Effects.h
+index 91303ee..1c17392 100644
+--- a/services/audioflinger/Effects.h
++++ b/services/audioflinger/Effects.h
+@@ -126,6 +126,7 @@ protected:
+ 
+     status_t start_l();
+     status_t stop_l();
++    status_t stop_effect_l();
+ 
+ mutable Mutex               mLock;      // mutex for process, commands and handles list protection
+     wp<ThreadBase>      mThread;    // parent thread
+@@ -143,6 +144,7 @@ mutable Mutex               mLock;      // mutex for process, commands and handl
+                                     // sending disable command.
+     uint32_t mDisableWaitCnt;       // current process() calls count during disable period.
+     bool     mSuspended;            // effect is suspended: temporarily disabled by framework
++    bool     mStopped;              // effect has been stopped. permamently disabled by framework
+ };
+ 
+ // The EffectHandle class implements the IEffect interface. It provides resources
+-- 
+1.7.4.1
+

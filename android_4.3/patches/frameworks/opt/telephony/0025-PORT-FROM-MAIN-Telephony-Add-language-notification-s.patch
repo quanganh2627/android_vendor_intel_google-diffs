@@ -1,0 +1,174 @@
+From 5e1c1cdf582375d21ce9a398c3e7dce0b4535a2a Mon Sep 17 00:00:00 2001
+From: Javen Ni <javen.ni@borqs.com>
+Date: Thu, 25 Apr 2013 15:24:08 +0300
+Subject: [PORT FROM MAIN] Telephony: Add language notification support
+
+BZ: 71124
+
+UICC uses the language notification proactive
+command to notify the terminal about the
+language currently used for any text string
+whithin proactive commands or envelope
+command responses.
+
+As per the ETSI TS 102 223 section 6.4.25,
+notified language stays valid whithin the
+terminal until the end of the session or upon
+executing another Language Notification command.
+
+Change-Id: I122d1940d6e9c084d7460a229ab9855eeedf5657
+Orig-Change-Id: I93b37e26bd5bc8c5283e2a4f8837f784e6d88a40
+Signed-off-by: Javen Ni <javen.ni@borqs.com>
+Signed-off-by: Arun Ravindran <arun.ravindran@intel.com>
+---
+ .../internal/telephony/cat/AppInterface.java       |    1 +
+ .../android/internal/telephony/cat/CatService.java |   30 ++++++++++++++++++
+ .../internal/telephony/cat/CommandParams.java      |    8 +++++
+ .../telephony/cat/CommandParamsFactory.java        |   32 ++++++++++++++++++++
+ 4 files changed, 71 insertions(+), 0 deletions(-)
+
+diff --git a/src/java/com/android/internal/telephony/cat/AppInterface.java b/src/java/com/android/internal/telephony/cat/AppInterface.java
+index 02481df..e96eebe 100644
+--- a/src/java/com/android/internal/telephony/cat/AppInterface.java
++++ b/src/java/com/android/internal/telephony/cat/AppInterface.java
+@@ -69,6 +69,7 @@ public interface AppInterface {
+         SET_UP_MENU(0x25),
+         SET_UP_CALL(0x10),
+         PROVIDE_LOCAL_INFORMATION(0x26),
++        LANGUAGE_NOTIFICATION(0x35),
+         OPEN_CHANNEL(0x40),
+         CLOSE_CHANNEL(0x41),
+         RECEIVE_DATA(0x42),
+diff --git a/src/java/com/android/internal/telephony/cat/CatService.java b/src/java/com/android/internal/telephony/cat/CatService.java
+index e2bd39e..0f99a14 100644
+--- a/src/java/com/android/internal/telephony/cat/CatService.java
++++ b/src/java/com/android/internal/telephony/cat/CatService.java
+@@ -16,14 +16,18 @@
+ 
+ package com.android.internal.telephony.cat;
+ 
++import android.app.ActivityManagerNative;
++import android.app.IActivityManager;
+ import android.content.Context;
+ import android.content.Intent;
+ import android.content.pm.PackageManager;
+ import android.content.pm.ResolveInfo;
++import android.content.res.Configuration;
+ import android.os.AsyncResult;
+ import android.os.Handler;
+ import android.os.HandlerThread;
+ import android.os.Message;
++import android.os.RemoteException;
+ import android.os.SystemProperties;
+ 
+ import com.android.internal.telephony.CommandsInterface;
+@@ -286,6 +290,19 @@ public class CatService extends Handler implements AppInterface {
+                     ((CallSetupParams) cmdParams).mConfirmMsg.text = message.toString();
+                 }
+                 break;
++            case LANGUAGE_NOTIFICATION:
++                String preLang = SystemProperties.get("persist.sys.language");
++                if ((cmdParams.mCmdDet.commandQualifier & 0x01) == 0x01) {
++                    String language = ((LanguageParams)cmdParams).lang;
++                    if (language != null && language.length() == 2
++                            && !language.equals(preLang)) {
++                        updateLanguage(new Locale(language));
++                    }
++                } else {
++                    updateLanguage(new Locale(preLang));
++                }
++                sendTerminalResponse(cmdParams.mCmdDet, ResultCode.OK, false, 0, null);
++                return;
+             case OPEN_CHANNEL:
+             case CLOSE_CHANNEL:
+             case RECEIVE_DATA:
+@@ -747,4 +764,17 @@ public class CatService extends Handler implements AppInterface {
+ 
+         return (numReceiver > 0);
+     }
++
++    private void updateLanguage(Locale locale) {
++        CatLog.d(this, "change locale language to: " + locale);
++        IActivityManager am = ActivityManagerNative.getDefault();
++        try {
++            Configuration config = am.getConfiguration();
++            config.locale = locale;
++            config.userSetLocale = false;
++            am.updateConfiguration(config);
++        } catch (RemoteException e) {
++            CatLog.d(this, "failed to change locale language");
++        }
++    }
+ }
+diff --git a/src/java/com/android/internal/telephony/cat/CommandParams.java b/src/java/com/android/internal/telephony/cat/CommandParams.java
+index cf206bb..3d9425d 100644
+--- a/src/java/com/android/internal/telephony/cat/CommandParams.java
++++ b/src/java/com/android/internal/telephony/cat/CommandParams.java
+@@ -177,6 +177,14 @@ class GetInputParams extends CommandParams {
+     }
+ }
+ 
++class LanguageParams extends CommandParams {
++    String lang;
++    LanguageParams(CommandDetails cmdDet, String lang) {
++        super(cmdDet);
++        this.lang = lang;
++    }
++}
++
+ /*
+  * BIP (Bearer Independent Protocol) is the mechanism for SIM card applications
+  * to access data connection through the mobile device.
+diff --git a/src/java/com/android/internal/telephony/cat/CommandParamsFactory.java b/src/java/com/android/internal/telephony/cat/CommandParamsFactory.java
+index 95f5c5a..dd7faba 100644
+--- a/src/java/com/android/internal/telephony/cat/CommandParamsFactory.java
++++ b/src/java/com/android/internal/telephony/cat/CommandParamsFactory.java
+@@ -180,6 +180,9 @@ class CommandParamsFactory extends Handler {
+              case SEND_DATA:
+                  cmdPending = processBIPClient(cmdDet, ctlvs);
+                  break;
++             case LANGUAGE_NOTIFICATION:
++                cmdPending = processLanguageNotification(cmdDet, ctlvs);
++                break;
+             default:
+                 // unsupported proactive commands
+                 mCmdParams = new CommandParams(cmdDet);
+@@ -896,6 +899,35 @@ class CommandParamsFactory extends Handler {
+         return false;
+     }
+ 
++    private boolean processLanguageNotification(CommandDetails cmdDet,
++            List<ComprehensionTlv> ctlvs) throws ResultException {
++        CatLog.d(this, "process LanguageNotification");
++        ComprehensionTlv ctlv = searchForTag(ComprehensionTlvTag.LANGUAGE,
++                ctlvs);
++        String lang = "";
++        if (ctlv != null) {
++            try {
++                byte[] rawValue = ctlv.getRawValue();
++                int valueIndex = ctlv.getValueIndex();
++                int valueLen = ctlv.getLength();
++                /*
++                 * As per ETSI TS 102 223 section 8.45, Each langugae code is
++                 * a pair of alpha-numeric characters defined in ISO 639. Each
++                 * alpha-numeric character shall be coded on one byte using the
++                 * SMS default -bit coded alphabet as defined in TS 23.038 [3] with
++                 * with bit 8 set to 0.
++                 */
++                if (valueLen > 0) {
++                    lang = GsmAlphabet.gsm8BitUnpackedToString(rawValue, valueIndex, valueLen);
++                }
++            } catch (IndexOutOfBoundsException e) {
++                throw new ResultException(ResultCode.CMD_DATA_NOT_UNDERSTOOD);
++            }
++        }
++        mCmdParams = new LanguageParams(cmdDet, lang);
++        return false;
++    }
++
+     private boolean processBIPClient(CommandDetails cmdDet,
+                                      List<ComprehensionTlv> ctlvs) throws ResultException {
+         AppInterface.CommandType commandType =
+-- 
+1.7.4.1
+

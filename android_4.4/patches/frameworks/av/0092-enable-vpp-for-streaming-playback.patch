@@ -1,0 +1,1230 @@
+From 317b5f7a3c70a2c423da83856034560e7885af1b Mon Sep 17 00:00:00 2001
+From: Yu, Linda <linda.yu@intel.com>
+Date: Fri, 18 Oct 2013 17:09:45 +0800
+Subject: enable vpp for streaming playback
+
+BZ: 117740
+
+1. enable VPP for HTTP streaming in AwesomePlayer
+2. enable VPP for HTTPLive and RTSP streaming in NuPlayer
+
+Category: feature differentiation
+Domain: Video.Media-VPP
+Origin:  internal
+Upstream-Candidate: No
+
+Change-Id: Ia8572383b2244c70e53465b104235de3c0815130
+Orig-Change-Id: Ic8281a96aedd3d9e88f5f74e752aef2ecdfdb08b
+Signed-off-by: Yu, Linda <linda.yu@intel.com>
+---
+ include/media/stagefright/ACodec.h                 |   18 +
+ media/libmediaplayerservice/Android.mk             |    8 +
+ media/libmediaplayerservice/nuplayer/Android.mk    |   10 +
+ media/libmediaplayerservice/nuplayer/NuPlayer.cpp  |   87 ++++-
+ media/libmediaplayerservice/nuplayer/NuPlayer.h    |    9 +
+ .../nuplayer/NuPlayerDecoder.h                     |    3 +
+ .../nuplayer/NuPlayerRenderer.cpp                  |  182 +++++++++
+ .../nuplayer/NuPlayerRenderer.h                    |   20 +
+ media/libstagefright/ACodec.cpp                    |  405 +++++++++++++++++++-
+ media/libstagefright/AwesomePlayer.cpp             |   29 +-
+ media/libstagefright/include/AwesomePlayer.h       |    2 +-
+ 11 files changed, 751 insertions(+), 22 deletions(-)
+
+diff --git a/include/media/stagefright/ACodec.h b/include/media/stagefright/ACodec.h
+index 7395055..3c2bc6b 100644
+--- a/include/media/stagefright/ACodec.h
++++ b/include/media/stagefright/ACodec.h
+@@ -31,6 +31,9 @@ namespace android {
+ 
+ struct ABuffer;
+ struct MemoryDealer;
++#ifdef TARGET_HAS_VPP
++struct NuPlayerVPPProcessor;
++#endif
+ 
+ struct ACodec : public AHierarchicalStateMachine {
+     enum {
+@@ -67,6 +70,11 @@ struct ACodec : public AHierarchicalStateMachine {
+ 
+     void signalRequestIDRFrame();
+ 
++#ifdef TARGET_HAS_VPP
++    void setVppBufferNum(uint32_t inBufNum, uint32_t outBufNum);
++    bool isVppBufferAvail();
++#endif
++
+     struct PortDescription : public RefBase {
+         size_t countBuffers();
+         IOMX::buffer_id bufferIDAt(size_t index) const;
+@@ -136,6 +144,9 @@ private:
+             OWNED_BY_UPSTREAM,
+             OWNED_BY_DOWNSTREAM,
+             OWNED_BY_NATIVE_WINDOW,
++#ifdef TARGET_HAS_VPP
++            OWNED_BY_VPP,
++#endif
+         };
+ 
+         IOMX::buffer_id mBufferID;
+@@ -146,6 +157,13 @@ private:
+         sp<GraphicBuffer> mGraphicBuffer;
+     };
+ 
++#ifdef TARGET_HAS_VPP
++    friend struct NuPlayerVPPProcessor;
++    uint32_t mVppInBufNum;
++    uint32_t mVppOutBufNum;
++#endif
++
++
+ #if TRACK_BUFFER_TIMING
+     struct BufferStats {
+         int64_t mEmptyBufferTimeUs;
+diff --git a/media/libmediaplayerservice/Android.mk b/media/libmediaplayerservice/Android.mk
+index 79a76b5..74bc563 100644
+--- a/media/libmediaplayerservice/Android.mk
++++ b/media/libmediaplayerservice/Android.mk
+@@ -44,6 +44,14 @@ LOCAL_STATIC_LIBRARIES :=       \
+     libstagefright_nuplayer     \
+     libstagefright_rtsp         \
+ 
++ifeq ($(TARGET_HAS_VPP),true)
++LOCAL_SHARED_LIBRARIES += libva \
++                          libva-android \
++                          libva-tpi \
++                          libui
++LOCAL_STATIC_LIBRARIES += libvpp
++endif
++
+ LOCAL_C_INCLUDES :=                                                 \
+     $(call include-path-for, graphics corecg)                       \
+     $(TOP)/frameworks/av/media/libstagefright/include               \
+diff --git a/media/libmediaplayerservice/nuplayer/Android.mk b/media/libmediaplayerservice/nuplayer/Android.mk
+index f946c1c..cc81d5e 100644
+--- a/media/libmediaplayerservice/nuplayer/Android.mk
++++ b/media/libmediaplayerservice/nuplayer/Android.mk
+@@ -20,6 +20,16 @@ LOCAL_C_INCLUDES := \
+ 	$(TOP)/frameworks/av/media/libstagefright/rtsp                \
+ 	$(TOP)/frameworks/native/include/media/openmax
+ 
++ifeq ($(TARGET_HAS_VPP),true)
++LOCAL_CFLAGS += -DTARGET_HAS_VPP -DGFX_BUF_EXT
++LOCAL_C_INCLUDES += \
++        $(TARGET_OUT_HEADERS)/libmedia_utils_vpp \
++        $(TARGET_OUT_HEADERS)/libva	\
++LOCAL_SHARED_LIBRARIES += libva \
++                          libva-android \
++                          libva-tpi
++endif
++
+ LOCAL_MODULE:= libstagefright_nuplayer
+ 
+ LOCAL_MODULE_TAGS := eng
+diff --git a/media/libmediaplayerservice/nuplayer/NuPlayer.cpp b/media/libmediaplayerservice/nuplayer/NuPlayer.cpp
+index fb2a0b6..5d5bdcc 100644
+--- a/media/libmediaplayerservice/nuplayer/NuPlayer.cpp
++++ b/media/libmediaplayerservice/nuplayer/NuPlayer.cpp
+@@ -29,7 +29,9 @@
+ #include "StreamingSource.h"
+ #include "GenericSource.h"
+ #include "mp4/MP4Source.h"
+-
++#ifdef TARGET_HAS_VPP
++#include <NuPlayerVPPProcessor.h>
++#endif
+ #include "ATSParser.h"
+ 
+ #include <cutils/properties.h> // for property_get
+@@ -161,6 +163,9 @@ NuPlayer::NuPlayer()
+       mVideoLateByUs(0ll),
+       mNumFramesTotal(0ll),
+       mNumFramesDropped(0ll),
++#ifdef TARGET_HAS_VPP
++      mIsVppInit(false),
++#endif
+       mVideoScalingMode(NATIVE_WINDOW_SCALING_MODE_SCALE_TO_WINDOW),
+       mStarted(false) {
+ }
+@@ -611,6 +616,14 @@ void NuPlayer::onMessageReceived(const sp<AMessage> &msg) {
+                     ALOGV("initiating %s decoder shutdown",
+                          audio ? "audio" : "video");
+ 
++/*#ifdef TARGET_HAS_VPP
++                    if (mVideoEOS) {
++                        mRenderer->releaseVppProcessor();
++                        mVPPProcessor.clear();
++                        mIsVppInit = false;
++                    }
++#endif*/
++
+                     (audio ? mAudioDecoder : mVideoDecoder)->initiateShutdown();
+ 
+                     if (audio) {
+@@ -741,6 +754,25 @@ void NuPlayer::onMessageReceived(const sp<AMessage> &msg) {
+                     mVideoEosErr = UNKNOWN_ERROR;
+                 }
+             } else if (what == ACodec::kWhatDrainThisBuffer) {
++#ifdef TARGET_HAS_VPP
++                // init VPP
++                if (!audio) {
++                    if (!mIsVppInit && mVideoDecoder != NULL && mVPPProcessor != NULL) {
++                        mIsVppInit = true;
++                        sp<ACodec> codec = mVideoDecoder->mCodec;
++                        bool success = codec->isVppBufferAvail();
++                        if (success) {
++                            if(mVPPProcessor->init(codec) != VPP_OK){
++                                mRenderer->releaseVppProcessor();
++                                mVPPProcessor.clear();
++                            }
++                        } else {
++                            mRenderer->releaseVppProcessor();
++                            mVPPProcessor.clear();
++                        }
++                    }
++                }
++#endif
+                 renderBuffer(audio, codecRequest);
+             } else if (what != ACodec::kWhatComponentAllocated
+                     && what != ACodec::kWhatComponentConfigured
+@@ -794,6 +826,7 @@ void NuPlayer::onMessageReceived(const sp<AMessage> &msg) {
+                         && (mVideoEOS || mVideoDecoder == NULL)) {
+                     notifyListener(MEDIA_PLAYBACK_COMPLETE, 0, 0);
+                 }
++
+             } else if (what == Renderer::kWhatPosition) {
+                 int64_t positionUs;
+                 CHECK(msg->findInt64("positionUs", &positionUs));
+@@ -832,6 +865,11 @@ void NuPlayer::onMessageReceived(const sp<AMessage> &msg) {
+         {
+             ALOGV("kWhatReset");
+ 
++#ifdef TARGET_HAS_VPP
++            if (mVPPProcessor != NULL) {
++                mVPPProcessor->flushShutdown();
++            }
++#endif
+             mDeferredActions.push_back(
+                     new ShutdownDecoderAction(
+                         true /* audio */, true /* video */));
+@@ -967,9 +1005,49 @@ status_t NuPlayer::instantiateDecoder(bool audio, sp<Decoder> *decoder) {
+ 
+     (*decoder)->configure(format);
+ 
++#ifdef TARGET_HAS_VPP
++    if (!audio) {
++        if(mVPPProcessor == NULL) {
++            mVPPProcessor = createVppProcessor();
++            if(mVPPProcessor != NULL) {
++                sp<ACodec> codec = (*decoder)->mCodec;
++                looper()->registerHandler(mVPPProcessor);
++                LOGE("mVPPProcessor->mInputBufferNum = %d, mVPPProcessor->mOutputBufferNum = %d",
++                        mVPPProcessor->mInputBufferNum, mVPPProcessor->mOutputBufferNum);
++                codec->setVppBufferNum(mVPPProcessor->mInputBufferNum, mVPPProcessor->mOutputBufferNum);
++            }
++        }
++    }
++#endif
++
+     return OK;
+ }
+ 
++#ifdef TARGET_HAS_VPP
++sp<NuPlayerVPPProcessor> NuPlayer::createVppProcessor() {
++    sp<NuPlayerVPPProcessor> processor = NULL;
++    if (NuPlayerVPPProcessor::isVppOn()) {
++        int32_t width = 0, height = 0, fps = 0;
++        VPPVideoInfo info;
++        memset(&info, 0, sizeof(VPPVideoInfo));
++
++        sp<AMessage> format = mSource->getFormat(false);
++        sp<MetaData> meta = new MetaData();
++        convertMessageToMetaData(format, meta);
++        CHECK(meta->findInt32(kKeyWidth, &width));
++        CHECK(meta->findInt32(kKeyHeight, &height));
++        if (!meta->findInt32(kKeyFrameRate, &fps))
++            fps = 0;
++        info.fps = fps;
++        info.width = width;
++        info.height = height;
++
++        processor = mRenderer->createVppProcessor(&info, mNativeWindow);
++    }
++    return processor;
++}
++#endif
++
+ status_t NuPlayer::feedDecoderInputData(bool audio, const sp<AMessage> &msg) {
+     sp<AMessage> reply;
+     CHECK(msg->findMessage("reply", &reply));
+@@ -1362,6 +1440,13 @@ void NuPlayer::performReset() {
+     CHECK(mAudioDecoder == NULL);
+     CHECK(mVideoDecoder == NULL);
+ 
++#ifdef TARGET_HAS_VPP
++    if (mVPPProcessor != NULL && mRenderer != NULL) {
++        mRenderer->releaseVppProcessor();
++        mVPPProcessor.clear();
++    }
++#endif
++
+     cancelPollDuration();
+ 
+     ++mScanSourcesGeneration;
+diff --git a/media/libmediaplayerservice/nuplayer/NuPlayer.h b/media/libmediaplayerservice/nuplayer/NuPlayer.h
+index 07d35b3..b0b473e 100644
+--- a/media/libmediaplayerservice/nuplayer/NuPlayer.h
++++ b/media/libmediaplayerservice/nuplayer/NuPlayer.h
+@@ -22,6 +22,10 @@
+ #include <media/stagefright/foundation/AHandler.h>
+ #include <media/stagefright/NativeWindowWrapper.h>
+ 
++#ifdef TARGET_HAS_VPP
++#include <NuPlayerVPPProcessor.h>
++#endif
++
+ namespace android {
+ 
+ struct ACodec;
+@@ -121,6 +125,11 @@ private:
+ 
+     List<sp<Action> > mDeferredActions;
+ 
++#ifdef TARGET_HAS_VPP
++    sp<NuPlayerVPPProcessor> mVPPProcessor;
++    bool mIsVppInit;
++    sp<NuPlayerVPPProcessor> createVppProcessor();
++#endif
+     bool mAudioEOS;
+     bool mVideoEOS;
+ 
+diff --git a/media/libmediaplayerservice/nuplayer/NuPlayerDecoder.h b/media/libmediaplayerservice/nuplayer/NuPlayerDecoder.h
+index a876148..a344c2d 100644
+--- a/media/libmediaplayerservice/nuplayer/NuPlayerDecoder.h
++++ b/media/libmediaplayerservice/nuplayer/NuPlayerDecoder.h
+@@ -42,6 +42,9 @@ protected:
+     virtual void onMessageReceived(const sp<AMessage> &msg);
+ 
+ private:
++#ifdef TARGET_HAS_VPP
++    friend class NuPlayer;
++#endif
+     enum {
+         kWhatCodecNotify        = 'cdcN',
+     };
+diff --git a/media/libmediaplayerservice/nuplayer/NuPlayerRenderer.cpp b/media/libmediaplayerservice/nuplayer/NuPlayerRenderer.cpp
+index c53330b..242c7bf 100644
+--- a/media/libmediaplayerservice/nuplayer/NuPlayerRenderer.cpp
++++ b/media/libmediaplayerservice/nuplayer/NuPlayerRenderer.cpp
+@@ -53,10 +53,20 @@ NuPlayer::Renderer::Renderer(
+       mVideoRenderingStartGeneration(0),
+       mAudioRenderingStartGeneration(0),
+       mLastPositionUpdateUs(-1ll),
++#ifdef TARGET_HAS_VPP
++      mDecodeCount(0),
++      mVPPProcCount(0),
++      mVPPRenderCount(0),
++      mVPPProcessor(NULL),
++#endif
+       mVideoLateByUs(0ll) {
+ }
+ 
+ NuPlayer::Renderer::~Renderer() {
++#ifdef TARGET_HAS_VPP
++    LOGI("===== mVPPProcCount = %d, mVPPRenderCount = %d =====", mVPPProcCount, mVPPRenderCount);
++    LOGI("===== decode %d frames totally =====", mDecodeCount);
++#endif
+ }
+ 
+ void NuPlayer::Renderer::queueBuffer(
+@@ -197,6 +207,20 @@ void NuPlayer::Renderer::onMessageReceived(const sp<AMessage> &msg) {
+             break;
+         }
+ 
++#ifdef TARGET_HAS_VPP
++        case kWhatVPPNotify:
++        {
++            int32_t what;
++            CHECK(msg->findInt32("what", &what));
++            if (what == NuPlayerVPPProcessor::kWhatUpdateVppOutput) {
++                onUpdateVideoQueue(msg);
++                postDrainVideoQueue();
++            } else if (what == NuPlayerVPPProcessor::kWhatUpdateVppInput)
++                onUpdateVPPInput(msg);
++            break;
++        }
++#endif
++
+         default:
+             TRESPASS();
+             break;
+@@ -328,6 +352,30 @@ bool NuPlayer::Renderer::onDrainAudioQueue() {
+ }
+ 
+ void NuPlayer::Renderer::postDrainVideoQueue() {
++#ifdef TARGET_HAS_VPP
++    if (mVPPProcessor != NULL) {
++        mVPPProcessor->invokeThreads();
++        List<QueueEntry>::iterator it;
++        for(it = mVideoQueue.begin(); it != mVideoQueue.end(); it++) {
++            if ((*it).mBuffer == NULL) break;
++            sp<AMessage> notifyConsumed = (*it).mNotifyConsumed;
++            int32_t input, output, notInput;
++            if (notifyConsumed->findInt32("vppInput", &input)
++                    || notifyConsumed->findInt32("vppOutput", &output)
++                    || notifyConsumed->findInt32("notVppInput", &notInput)) {
++                continue;
++            }
++            if (mVPPProcessor->canSetBufferToVPP() == VPP_OK) {
++                if (mVPPProcessor->setBufferToVPP((*it).mBuffer, notifyConsumed) == VPP_FAIL)
++                    break;
++            } else {
++                break;
++            }
++        }
++        mVPPProcessor->getBufferFromVPP();
++    }
++#endif
++
+     if (mDrainVideoQueuePending || mSyncQueues || mPaused) {
+         return;
+     }
+@@ -355,6 +403,7 @@ void NuPlayer::Renderer::postDrainVideoQueue() {
+         int64_t mediaTimeUs;
+         CHECK(entry.mBuffer->meta()->findInt64("timeUs", &mediaTimeUs));
+ 
++
+         if (mAnchorTimeMediaUs < 0) {
+             delayUs = 0;
+ 
+@@ -370,6 +419,7 @@ void NuPlayer::Renderer::postDrainVideoQueue() {
+         }
+     }
+ 
++
+     msg->post(delayUs);
+ 
+     mDrainVideoQueuePending = true;
+@@ -477,6 +527,10 @@ void NuPlayer::Renderer::onQueueBuffer(const sp<AMessage> &msg) {
+     } else {
+         mVideoQueue.push_back(entry);
+         postDrainVideoQueue();
++
++#ifdef TARGET_HAS_VPP
++        mDecodeCount++;
++#endif
+     }
+ 
+     if (!mSyncQueues || mAudioQueue.empty() || mVideoQueue.empty()) {
+@@ -515,6 +569,123 @@ void NuPlayer::Renderer::onQueueBuffer(const sp<AMessage> &msg) {
+     syncQueuesDone();
+ }
+ 
++#ifdef TARGET_HAS_VPP
++sp<NuPlayerVPPProcessor> NuPlayer::Renderer::createVppProcessor(VPPVideoInfo *info,
++        const sp<NativeWindowWrapper> &nativeWindow) {
++    if (info == NULL)
++        return NULL;
++
++    if (NuPlayerVPPProcessor::isVppOn()) {
++        if (mVPPProcessor == NULL) {
++            mVPPProcessor = new NuPlayerVPPProcessor(new AMessage(kWhatVPPNotify, id()), info, nativeWindow);
++        }
++        return mVPPProcessor;
++    }
++    return NULL;
++}
++
++void NuPlayer::Renderer::releaseVppProcessor() {
++    if (mVPPProcessor != NULL)
++        mVPPProcessor.clear();
++}
++
++void NuPlayer::Renderer::onUpdateVPPInput(const sp<AMessage> &msg) {
++    sp<AMessage> notifyConsumed;
++    CHECK(msg->findMessage("notifyConsumed", &notifyConsumed));
++
++    notifyConsumed->post();
++}
++
++
++void NuPlayer::Renderer::onUpdateVideoQueue(const sp<AMessage> &msg) {
++    sp<ABuffer> buffer;
++    CHECK(msg->findBuffer("buffer", &buffer));
++
++    sp<AMessage> notifyConsumed;
++    CHECK(msg->findMessage("notifyConsumed", &notifyConsumed));
++
++    int64_t timeUs;
++    CHECK(buffer->meta()->findInt64("timeUs", &timeUs));
++    CHECK(timeUs >= 0);
++
++    List<QueueEntry>::iterator it;
++    int64_t timeRenderList = 0;
++
++    if (mVideoQueue.empty()) {
++        LOGV("0. no item in render list, drop vpp buffer directly");
++        // ask NuPlayer::VPPProcessor to release buffer
++        sp<AMessage> vppNotifyConsumed;
++        CHECK(notifyConsumed->findMessage("vppNotifyConsumed", &vppNotifyConsumed));
++        vppNotifyConsumed->setInt32("reuse", true);
++        vppNotifyConsumed->post();
++        return;
++    }
++
++    for (it = mVideoQueue.begin(); it != mVideoQueue.end(); it++) {
++        if ((*it).mBuffer == NULL) {
++            // eos
++            break;
++        }
++        CHECK((*it).mBuffer->meta()->findInt64("timeUs", &timeRenderList));
++        if (timeUs <= timeRenderList)
++            break;
++    }
++
++    if (it == mVideoQueue.begin() && timeUs < timeRenderList) {
++        LOGV("1. vpp output comes too late, drop it. timeUs = %lld, timeRenderList = %lld", timeUs, timeRenderList);
++        // ask NuPlayer::VPPProcessor to release buffer
++        sp<AMessage> vppNotifyConsumed;
++        CHECK(notifyConsumed->findMessage("vppNotifyConsumed", &vppNotifyConsumed));
++        vppNotifyConsumed->setInt32("reuse", true);
++        vppNotifyConsumed->post();
++    } else if (timeUs > timeRenderList) {
++        LOGV("6. timeUs bigger than last frame, backward seek just happen, drop this frame");
++        // ask NuPlayer::VPPProcessor to release buffer
++        sp<AMessage> vppNotifyConsumed;
++        CHECK(notifyConsumed->findMessage("vppNotifyConsumed", &vppNotifyConsumed));
++        vppNotifyConsumed->setInt32("reuse", true);
++        vppNotifyConsumed->post();
++    } else {
++        QueueEntry entry;
++        entry.mBuffer = buffer;
++        entry.mNotifyConsumed = notifyConsumed;
++        entry.mOffset = 0;
++        entry.mFinalResult = OK;
++
++        if (timeUs == timeRenderList) {
++            int32_t notInput, output;
++            if (((*it).mNotifyConsumed->findInt32("notVppInput", &notInput) && (notInput == 1))
++                    || ((*it).mNotifyConsumed->findInt32("vppOutput", &output) && (output == 1))) {
++                LOGV("5. NEVER REPLACE \"NOT VPP INPUT FRAME\" or \"VPP OUTPUT FRAME\" , drop this output directly");
++
++                sp<AMessage> vppNotifyConsumed;
++                CHECK(notifyConsumed->findMessage("vppNotifyConsumed", &vppNotifyConsumed));
++                vppNotifyConsumed->setInt32("reuse", true);
++                vppNotifyConsumed->post();
++            }
++            else {
++                LOGV("2. insert into renderList, timeRenderList = %lld, timeUs = %lld, erase decoder buffer = %p, insert vpp buffer = %p", timeRenderList, timeUs, &*it, &entry);
++                List<QueueEntry>::iterator erase = mVideoQueue.erase(it);
++                mVideoQueue.insert(erase, entry);
++                mVPPProcCount ++;
++                mVPPRenderCount ++;
++            }
++
++        } else if (timeUs < timeRenderList) {
++            LOGV("3. insert into renderList, timeRenderList = %lld, timeUs = %lld, insert %p", timeRenderList, timeUs, &entry);
++            mVideoQueue.insert(it, entry);
++            mVPPRenderCount++;
++        } else if ((*it).mBuffer == NULL) {
++            LOGV("4. insert before eos, timeUs = %lld, insert %p", timeUs, &entry);
++            mVideoQueue.insert(it, entry);
++            mVPPRenderCount++;
++        }
++    }
++
++    return;
++}
++#endif
++
+ void NuPlayer::Renderer::syncQueuesDone() {
+     if (!mSyncQueues) {
+         return;
+@@ -558,6 +729,10 @@ void NuPlayer::Renderer::onQueueEOS(const sp<AMessage> &msg) {
+         }
+         mVideoQueue.push_back(entry);
+         postDrainVideoQueue();
++#ifdef TARGET_HAS_VPP
++        if (mVPPProcessor != NULL)
++            mVPPProcessor->setEOS();
++#endif
+     }
+ }
+ 
+@@ -606,7 +781,14 @@ void NuPlayer::Renderer::flushQueue(List<QueueEntry> *queue) {
+         QueueEntry *entry = &*queue->begin();
+ 
+         if (entry->mBuffer != NULL) {
++#ifdef TARGET_HAS_VPP
++            int32_t vppInput;
++            if (!entry->mNotifyConsumed->findInt32("vppInput", &vppInput)) {
++                entry->mNotifyConsumed->post();
++            }
++#else
+             entry->mNotifyConsumed->post();
++#endif
+         }
+ 
+         queue->erase(queue->begin());
+diff --git a/media/libmediaplayerservice/nuplayer/NuPlayerRenderer.h b/media/libmediaplayerservice/nuplayer/NuPlayerRenderer.h
+index 94a05ea..f1c67e7 100644
+--- a/media/libmediaplayerservice/nuplayer/NuPlayerRenderer.h
++++ b/media/libmediaplayerservice/nuplayer/NuPlayerRenderer.h
+@@ -19,6 +19,10 @@
+ #define NUPLAYER_RENDERER_H_
+ 
+ #include "NuPlayer.h"
++#ifdef TARGET_HAS_VPP
++#include <NuPlayerVPPProcessor.h>
++#include <VPPBuffer.h>
++#endif
+ 
+ namespace android {
+ 
+@@ -48,6 +52,11 @@ struct NuPlayer::Renderer : public AHandler {
+     void pause();
+     void resume();
+ 
++#ifdef TARGET_HAS_VPP
++    sp<NuPlayerVPPProcessor> createVppProcessor(VPPVideoInfo *info, const sp<NativeWindowWrapper> &nativeWindow);
++    void releaseVppProcessor();
++#endif
++
+     enum {
+         kWhatEOS                 = 'eos ',
+         kWhatFlushComplete       = 'fluC',
+@@ -71,6 +80,9 @@ private:
+         kWhatAudioSinkChanged   = 'auSC',
+         kWhatPause              = 'paus',
+         kWhatResume             = 'resm',
++#ifdef TARGET_HAS_VPP
++        kWhatVPPNotify          = 'vppN',
++#endif
+     };
+ 
+     struct QueueEntry {
+@@ -113,6 +125,14 @@ private:
+     int64_t mLastPositionUpdateUs;
+     int64_t mVideoLateByUs;
+ 
++#ifdef TARGET_HAS_VPP
++    uint32_t mDecodeCount;
++    uint32_t mVPPProcCount;
++    uint32_t mVPPRenderCount;
++    sp<NuPlayerVPPProcessor> mVPPProcessor;
++    void onUpdateVideoQueue(const sp<AMessage> &msg);
++    void onUpdateVPPInput(const sp<AMessage> &msg);
++#endif
+     bool onDrainAudioQueue();
+     void postDrainAudioQueue(int64_t delayUs = 0);
+ 
+diff --git a/media/libstagefright/ACodec.cpp b/media/libstagefright/ACodec.cpp
+index b8ba036..e3873ca 100644
+--- a/media/libstagefright/ACodec.cpp
++++ b/media/libstagefright/ACodec.cpp
+@@ -39,6 +39,10 @@
+ 
+ #include "include/avc_utils.h"
+ 
++#ifdef TARGET_HAS_VPP
++#include <NuPlayerVPPProcessor.h>
++#endif
++
+ namespace android {
+ 
+ template<class T>
+@@ -365,6 +369,10 @@ ACodec::ACodec()
+       mShutdownInProgress(false),
+       mEncoderDelay(0),
+       mEncoderPadding(0),
++#ifdef TARGET_HAS_VPP
++      mVppInBufNum(0),
++      mVppOutBufNum(0),
++#endif
+       mChannelMaskPresent(false),
+       mChannelMask(0),
+       mDequeueCounter(0),
+@@ -558,6 +566,18 @@ status_t ACodec::allocateBuffersOnPort(OMX_U32 portIndex) {
+     return OK;
+ }
+ 
++
++#ifdef TARGET_HAS_VPP
++void ACodec::setVppBufferNum(uint32_t inBufNum, uint32_t outBufNum) {
++    mVppInBufNum = inBufNum;
++    mVppOutBufNum = outBufNum;
++}
++
++bool ACodec::isVppBufferAvail() {
++    return (mVppInBufNum != 0);
++}
++#endif
++
+ status_t ACodec::configureOutputBuffersFromNativeWindow(
+         OMX_U32 *bufferCount, OMX_U32 *bufferSize,
+         OMX_U32 *minUndequeuedBuffers) {
+@@ -652,6 +672,46 @@ status_t ACodec::configureOutputBuffersFromNativeWindow(
+         }
+     }
+ 
++#ifdef TARGET_HAS_VPP
++    //add more buffers
++    bool isVppOn = NuPlayerVPPProcessor::isVppOn();
++    if (isVppOn) {
++        ALOGE("def.nBufferCountActual = %d",def.nBufferCountActual);
++        int totalBufferCount = def.nBufferCountActual + mVppInBufNum + mVppOutBufNum;
++
++        err = native_window_set_buffer_count(
++                mNativeWindow.get(), totalBufferCount);
++        if (err == 0) {
++            def.nBufferCountActual = totalBufferCount;
++            err = mOMX->setParameter(
++                    mNode, OMX_IndexParamPortDefinition, &def, sizeof(def));
++            if (err != OK) {
++                ALOGE("setting nBufferCountActual to %lu failed: %d",
++                    def.nBufferCountActual, err);
++                return err;
++            }
++        } else {
++            err = native_window_set_buffer_count(
++                mNativeWindow.get(), def.nBufferCountActual);
++            if (err == 0) {
++                mVppInBufNum = 0;
++                mVppOutBufNum = 0;
++            } else {
++                ALOGE("native_window_set_buffer_count failed: %s (%d)", strerror(-err),
++                        -err);
++                return err;
++            }
++        }
++    } else {
++        err = native_window_set_buffer_count(
++                mNativeWindow.get(), def.nBufferCountActual);
++        if (err != 0) {
++            ALOGE("native_window_set_buffer_count failed: %s (%d)", strerror(-err),
++                    -err);
++            return err;
++        }
++    }
++#else
+     err = native_window_set_buffer_count(
+             mNativeWindow.get(), def.nBufferCountActual);
+ 
+@@ -660,12 +720,14 @@ status_t ACodec::configureOutputBuffersFromNativeWindow(
+                 -err);
+         return err;
+     }
++#endif
+ 
+     *bufferCount = def.nBufferCountActual;
+     *bufferSize =  def.nBufferSize;
+     return err;
+ }
+ 
++
+ status_t ACodec::allocateOutputBuffersFromNativeWindow() {
+     OMX_U32 bufferCount, bufferSize, minUndequeuedBuffers;
+     status_t err = configureOutputBuffersFromNativeWindow(
+@@ -692,6 +754,7 @@ status_t ACodec::allocateOutputBuffersFromNativeWindow() {
+         info.mData = new ABuffer(NULL /* data */, bufferSize /* capacity */);
+         info.mGraphicBuffer = graphicBuffer;
+         mBuffers[kPortIndexOutput].push(info);
++        LOGV("index = %d, graphicBuffer = %p", i, graphicBuffer.get());
+ 
+         IOMX::buffer_id bufferId;
+         err = mOMX->useGraphicBuffer(mNode, kPortIndexOutput, graphicBuffer,
+@@ -719,7 +782,16 @@ status_t ACodec::allocateOutputBuffersFromNativeWindow() {
+         cancelEnd = mBuffers[kPortIndexOutput].size();
+     } else {
+         // Return the required minimum undequeued buffers to the native window.
++#ifdef TARGET_HAS_VPP
++        bool isVppOn = NuPlayerVPPProcessor::isVppOn();
++        if (isVppOn) {
++            cancelStart = bufferCount - minUndequeuedBuffers- mVppOutBufNum;
++        } else {
++            cancelStart = bufferCount - minUndequeuedBuffers;
++        }
++#else
+         cancelStart = bufferCount - minUndequeuedBuffers;
++#endif
+         cancelEnd = bufferCount;
+     }
+ 
+@@ -796,13 +868,13 @@ status_t ACodec::cancelBufferToNativeWindow(BufferInfo *info) {
+     ALOGV("[%s] Calling cancelBuffer on buffer %p",
+          mComponentName.c_str(), info->mBufferID);
+ 
++
+     int err = mNativeWindow->cancelBuffer(
+         mNativeWindow.get(), info->mGraphicBuffer.get(), -1);
+ 
+     CHECK_EQ(err, 0);
+ 
+     info->mStatus = BufferInfo::OWNED_BY_NATIVE_WINDOW;
+-
+     return OK;
+ }
+ 
+@@ -810,6 +882,40 @@ ACodec::BufferInfo *ACodec::dequeueBufferFromNativeWindow() {
+     ANativeWindowBuffer *buf;
+     int fenceFd = -1;
+     CHECK(mNativeWindow.get() != NULL);
++
++#if TARGET_HAS_VPP
++    int num = mVppInBufNum + 1;
++    while(num--) {
++        if (native_window_dequeue_buffer_and_wait(mNativeWindow.get(), &buf) != 0) {
++            ALOGE("dequeueBuffer failed.");
++            return NULL;
++        }
++
++        size_t i;
++        BufferInfo *info;
++        for (i = mBuffers[kPortIndexOutput].size(); i-- > 0;) {
++            info = &mBuffers[kPortIndexOutput].editItemAt(i);
++
++            if (info->mGraphicBuffer->handle == buf->handle) {
++                break;
++            }
++        }
++        if (i < 0) return NULL;
++        /*
++         * The buffer is still used as reference by VPP,
++         * go on dequeue next buffer, until we get a free one.
++         */
++        if (info->mStatus == BufferInfo::OWNED_BY_DOWNSTREAM) {
++            info->mData->meta()->setInt32("in_ref", 1);
++            continue;
++        }
++        CHECK_EQ((int)info->mStatus,
++                (int)BufferInfo::OWNED_BY_NATIVE_WINDOW);
++
++        info->mStatus = BufferInfo::OWNED_BY_US;
++        return info;
++    }
++#else
+     if (native_window_dequeue_buffer_and_wait(mNativeWindow.get(), &buf) != 0) {
+         ALOGE("dequeueBuffer failed.");
+         return NULL;
+@@ -863,7 +969,7 @@ ACodec::BufferInfo *ACodec::dequeueBufferFromNativeWindow() {
+ 
+         return oldest;
+     }
+-
++#endif
+     TRESPASS();
+ 
+     return NULL;
+@@ -2461,12 +2567,28 @@ bool ACodec::allYourBuffersAreBelongToUs(
+         OMX_U32 portIndex) {
+     for (size_t i = 0; i < mBuffers[portIndex].size(); ++i) {
+         BufferInfo *info = &mBuffers[portIndex].editItemAt(i);
+-
++#ifdef TARGET_HAS_VPP
++        if (info->mStatus == BufferInfo::OWNED_BY_DOWNSTREAM) {
++            LOGE("downstream buffer = %p", info->mGraphicBuffer.get());
++            int32_t processing;
++            if (info->mData->meta()->findInt32("processing", &processing) && (processing == 1)) {
++                continue;
++            }
++        }
++#endif
+         if (info->mStatus != BufferInfo::OWNED_BY_US
++#ifdef TARGET_HAS_VPP
++                && info->mStatus != BufferInfo::OWNED_BY_VPP
++#endif
+                 && info->mStatus != BufferInfo::OWNED_BY_NATIVE_WINDOW) {
+             ALOGV("[%s] Buffer %p on port %ld still has status %d",
+                     mComponentName.c_str(),
+                     info->mBufferID, portIndex, info->mStatus);
++            int64_t time;
++            info->mData->meta()->findInt64("timeUs", &time);
++            LOGV("[%s] Buffer %p on port %ld still has status %d, graphicBuffer = %p, timeUs = %lld",
++                    mComponentName.c_str(),
++                    info->mBufferID, portIndex, info->mStatus, info->mGraphicBuffer.get(), time);
+             return false;
+         }
+     }
+@@ -3423,6 +3545,265 @@ bool ACodec::BaseState::onOMXFillBufferDone(
+ }
+ 
+ void ACodec::BaseState::onOutputBufferDrained(const sp<AMessage> &msg) {
++#ifdef TARGET_HAS_VPP
++
++
++
++    IOMX::buffer_id bufferID;
++    CHECK(msg->findPointer("buffer-id", &bufferID));
++
++    ssize_t index;
++    BufferInfo *info =
++        mCodec->findBufferByID(kPortIndexOutput, bufferID, &index);
++
++    
++
++    /*TODO: debug info , to be deleted*/
++    int64_t time = -1;
++    info->mData->meta()->findInt64("timeUs", &time);
++    if (info->mGraphicBuffer.get() != NULL)
++        LOGV("info = %p, status = %d, time = %lld, graphicBuffer = %p", info, info->mStatus, time, info->mGraphicBuffer.get());
++    int output, input, r, once;
++    if (msg->findInt32("vppOutput", &output))
++        LOGV("is vpp output = %d\n", output);
++    if (msg->findInt32("vppInput", &input))
++        LOGV("is vpp input = %d\n", input);
++    if (msg->findInt32("render", &r))
++        LOGV("is render = %d\n", r);
++    if (msg->findInt32("processOnce", &once))
++        LOGV("is processOnce = %d\n", once);
++    /* debug info */
++
++    CHECK((info->mStatus == BufferInfo::OWNED_BY_DOWNSTREAM)
++            ||(info->mStatus == BufferInfo::OWNED_BY_VPP));
++
++
++    android_native_rect_t crop;
++    if (msg->findRect("crop",
++            &crop.left, &crop.top, &crop.right, &crop.bottom)) {
++        CHECK_EQ(0, native_window_set_crop(
++                mCodec->mNativeWindow.get(), &crop));
++    }
++
++    int32_t render;
++    // The client may choose not to render a buffer but we will
++    // need to apply the format change regardless as we would get
++    // only one format change call, associated with a buffer.
++    int32_t sentformat;
++    int32_t hide;
++    sp<AMessage> reply =
++        new AMessage(kWhatOutputBufferDrained, mCodec->id());
++
++    if (msg->findInt32("sent-format", &sentformat)) {
++        if (!sentformat) {
++            mCodec->sendFormatChange(reply);
++        }
++    }
++
++    int32_t vppOutput = 0;
++    // process vpp output
++    if (msg->findInt32("vppOutput", &vppOutput) && vppOutput == 1) {
++        sp<AMessage> vppNotifyConsumed;
++        CHECK(msg->findMessage("vppNotifyConsumed", &vppNotifyConsumed));
++
++        if (mCodec->mNativeWindow != NULL
++                && msg->findInt32("render", &render) && render != 0
++                && !msg->findInt32("hide", &hide)) {
++            // The client wants this buffer to be rendered.
++            status_t err;
++            if ((err = mCodec->mNativeWindow->queueBuffer(
++                            mCodec->mNativeWindow.get(),
++                            info->mGraphicBuffer.get(), -1)) == OK) {
++                info->mStatus = BufferInfo::OWNED_BY_NATIVE_WINDOW;
++
++                vppNotifyConsumed->setInt32("reuse", false);
++                vppNotifyConsumed->post();
++            } else {
++                mCodec->signalError(OMX_ErrorUndefined, err);
++                info->mStatus = BufferInfo::OWNED_BY_VPP;
++
++                vppNotifyConsumed->setInt32("reuse", true);
++                vppNotifyConsumed->post();
++            }
++        } else {
++            info->mStatus = BufferInfo::OWNED_BY_VPP;
++            vppNotifyConsumed->setInt32("reuse", true);
++            vppNotifyConsumed->post();
++        }
++    } else {
++        // process 1) vpp input; 2) buffers not send to vpp buffers.
++        int32_t vppInput = 0;
++        // The buffer which is not sent to VPP, only process once.
++        if(!msg->findInt32("vppInput", &vppInput)) {
++            if (mCodec->mNativeWindow != NULL
++                    && msg->findInt32("render", &render) && render != 0
++                    && !msg->findInt32("hide", &hide)) {
++                // The client wants this buffer to be rendered.
++
++                status_t err;
++                if ((err = mCodec->mNativeWindow->queueBuffer(
++                                mCodec->mNativeWindow.get(),
++                                info->mGraphicBuffer.get(), -1)) == OK) {
++                    info->mStatus = BufferInfo::OWNED_BY_NATIVE_WINDOW;
++                } else {
++                    mCodec->signalError(OMX_ErrorUndefined, err);
++                    info->mStatus = BufferInfo::OWNED_BY_US;
++                }
++            } else {
++                info->mStatus = BufferInfo::OWNED_BY_US;
++            }
++
++
++            PortMode mode = getPortMode(kPortIndexOutput);
++
++            switch (mode) {
++                case KEEP_BUFFERS:
++                    {
++                        // XXX fishy, revisit!!! What about the FREE_BUFFERS case below?
++
++                        if (info->mStatus == BufferInfo::OWNED_BY_NATIVE_WINDOW) {
++                            // We cannot resubmit the buffer we just rendered, dequeue
++                            // the spare instead.
++
++                            info = mCodec->dequeueBufferFromNativeWindow();
++                        }
++                        break;
++                    }
++
++                case RESUBMIT_BUFFERS:
++                    {
++                        if (!mCodec->mPortEOS[kPortIndexOutput]) {
++                            if (info->mStatus == BufferInfo::OWNED_BY_NATIVE_WINDOW) {
++                                // We cannot resubmit the buffer we just rendered, dequeue
++                                // the spare instead.
++
++                                info = mCodec->dequeueBufferFromNativeWindow();
++                            }
++
++                            if (info != NULL) {
++                                ALOGV("[%s] calling fillBuffer %p",
++                                        mCodec->mComponentName.c_str(), info->mBufferID);
++
++                                CHECK_EQ(mCodec->mOMX->fillBuffer(mCodec->mNode, info->mBufferID),
++                                        (status_t)OK);
++
++                                info->mStatus = BufferInfo::OWNED_BY_COMPONENT;
++                            }
++                        }
++                        break;
++                    }
++
++                default:
++                    {
++                        CHECK_EQ((int)mode, (int)FREE_BUFFERS);
++
++                        CHECK_EQ((status_t)OK,
++                                mCodec->freeBuffer(kPortIndexOutput, index));
++                        break;
++                    }
++            }
++        } else {
++            int32_t processOnce;
++            // The buffer which replace by VPP output, only process once.
++            if (mCodec->mNativeWindow == NULL
++                    || !msg->findInt32("render", &render)
++                    || msg->findInt32("hide", &hide)) {
++                //LOGE("The buffer which replace by VPP output, only process once");
++                processOnce = 1;
++                msg->setInt32("processOnce", processOnce);
++                info->mStatus = BufferInfo::OWNED_BY_VPP;
++            }
++            // The buffer which send to VPP and also rendered (when VPP speed does not catch up with decode speed)
++            if (!msg->findInt32("processOnce", &processOnce)) {
++                //LOGE("The buffer which send to VPP and also rendered (when VPP speed does not catch up with decode speed)");
++                processOnce = 1;
++                msg->setInt32("processOnce", processOnce);
++                if (mCodec->mNativeWindow != NULL
++                        && msg->findInt32("render", &render) && render != 0
++                        && !msg->findInt32("hide", &hide)) {
++                    // The client wants this buffer to be rendered.
++
++                    status_t err;
++                    if ((err = mCodec->mNativeWindow->queueBuffer(
++                                    mCodec->mNativeWindow.get(),
++                                    info->mGraphicBuffer.get(), -1)) == OK) {
++                        //                   info->mStatus = BufferInfo::OWNED_BY_NATIVE_WINDOW;
++                    } else {
++                        mCodec->signalError(OMX_ErrorUndefined, err);
++                        //                   info->mStatus = BufferInfo::OWNED_BY_US;
++                        info->mStatus = BufferInfo::OWNED_BY_VPP;
++                    }
++                } else {
++                    //               info->mStatus = BufferInfo::OWNED_BY_US;
++                    info->mStatus = BufferInfo::OWNED_BY_VPP;
++                }
++            } else if (processOnce == 1){
++                //LOGE("release second time %lld, status = %d", time, info->mStatus);
++                if (info->mStatus == BufferInfo::OWNED_BY_VPP) {
++                    info->mStatus =  BufferInfo::OWNED_BY_US;
++                } else if (info->mStatus == BufferInfo::OWNED_BY_DOWNSTREAM) {
++                    int32_t in_ref;
++                    if ((!(info->mData->meta()->findInt32("in_ref", &in_ref)))
++                            || (in_ref == 0)) {
++                        info->mStatus =  BufferInfo::OWNED_BY_NATIVE_WINDOW;
++                    } else if (in_ref == 1) {
++                        info->mStatus =  BufferInfo::OWNED_BY_US;
++                        info->mData->meta()->setInt32("in_ref", 0);
++                    }
++                }
++
++                PortMode mode = getPortMode(kPortIndexOutput);
++
++                switch (mode) {
++                    case KEEP_BUFFERS:
++                        {
++                            // XXX fishy, revisit!!! What about the FREE_BUFFERS case below?
++
++                            if (info->mStatus == BufferInfo::OWNED_BY_NATIVE_WINDOW) {
++                                // We cannot resubmit the buffer we just rendered, dequeue
++                                // the spare instead.
++
++                                info = mCodec->dequeueBufferFromNativeWindow();
++                            }
++                            break;
++                        }
++
++                    case RESUBMIT_BUFFERS:
++                        {
++                            if (!mCodec->mPortEOS[kPortIndexOutput]) {
++                                if (info->mStatus == BufferInfo::OWNED_BY_NATIVE_WINDOW) {
++                                    // We cannot resubmit the buffer we just rendered, dequeue
++                                    // the spare instead.
++
++                                    info = mCodec->dequeueBufferFromNativeWindow();
++                                }
++                                if (info != NULL) {
++                                    ALOGV("[%s] calling fillBuffer %p",
++                                            mCodec->mComponentName.c_str(), info->mBufferID);
++
++                                    CHECK_EQ(mCodec->mOMX->fillBuffer(mCodec->mNode, info->mBufferID),
++                                            (status_t)OK);
++
++                                    info->mStatus = BufferInfo::OWNED_BY_COMPONENT;
++                                }
++                            }
++                            break;
++                        }
++
++                    default:
++                        {
++                            CHECK_EQ((int)mode, (int)FREE_BUFFERS);
++
++                            CHECK_EQ((status_t)OK,
++                                    mCodec->freeBuffer(kPortIndexOutput, index));
++                            break;
++                        }
++                }
++            }
++
++        }
++    }
++#else
+     IOMX::buffer_id bufferID;
+     CHECK(msg->findPointer("buffer-id", &bufferID));
+ 
+@@ -3505,6 +3886,7 @@ void ACodec::BaseState::onOutputBufferDrained(const sp<AMessage> &msg) {
+             break;
+         }
+     }
++#endif
+ }
+ 
+ ////////////////////////////////////////////////////////////////////////////////
+@@ -4074,10 +4456,25 @@ void ACodec::ExecutingState::submitRegularOutputBuffers() {
+         BufferInfo *info = &mCodec->mBuffers[kPortIndexOutput].editItemAt(i);
+ 
+         if (mCodec->mNativeWindow != NULL) {
++#ifdef TARGET_HAS_VPP
++            if (info->mStatus == BufferInfo::OWNED_BY_DOWNSTREAM) {
++                int32_t processing;
++                if (info->mData->meta()->findInt32("processing", &processing) && (processing == 1)) {
++                    continue;
++                }
++            }
++#endif
+             CHECK(info->mStatus == BufferInfo::OWNED_BY_US
++#ifdef TARGET_HAS_VPP
++                    || info->mStatus == BufferInfo::OWNED_BY_VPP
++#endif
+                     || info->mStatus == BufferInfo::OWNED_BY_NATIVE_WINDOW);
+ 
+-            if (info->mStatus == BufferInfo::OWNED_BY_NATIVE_WINDOW) {
++            if (info->mStatus == BufferInfo::OWNED_BY_NATIVE_WINDOW
++#ifdef TARGET_HAS_VPP
++                    || info->mStatus == BufferInfo::OWNED_BY_VPP
++#endif
++            ) {
+                 continue;
+             }
+         } else {
+diff --git a/media/libstagefright/AwesomePlayer.cpp b/media/libstagefright/AwesomePlayer.cpp
+index 49d9c68..4073a1a 100644
+--- a/media/libstagefright/AwesomePlayer.cpp
++++ b/media/libstagefright/AwesomePlayer.cpp
+@@ -1622,7 +1622,7 @@ void AwesomePlayer::setVideoSource(sp<MediaSource> source) {
+ }
+ 
+ #ifdef TARGET_HAS_VPP
+-VPPProcessor* AwesomePlayer::createVppProcessor_l() {
++VPPProcessor* AwesomePlayer::createVppProcessor_l(OMXCodec *omxCodec) {
+     VPPProcessor* processor = NULL;
+ 
+     if (mNativeWindow == NULL)
+@@ -1650,7 +1650,7 @@ VPPProcessor* AwesomePlayer::createVppProcessor_l() {
+         info.fps = fps;
+         info.width = width;
+         info.height = height;
+-        OMXCodec* omxCodec = (OMXCodec*) (mVideoSource.get());
++
+         processor = new VPPProcessor(mNativeWindow, omxCodec, &info);
+     }
+     return processor;
+@@ -1742,25 +1742,19 @@ status_t AwesomePlayer::initVideoDecoder(uint32_t flags) {
+         }
+ 
+ #ifdef TARGET_HAS_VPP
+-        if (mVPPProcessor != NULL) {
+-            delete mVPPProcessor;
+-            mVPPProcessor = NULL;
+-        }
+-        mVPPProcessor = createVppProcessor_l();
+         OMXCodec* omxCodec;
+         if (mCachedSource != NULL) {
+-#if 1
+-            // FIXME: Disable VPP/FRC for http streaming so far
+-            if (mVPPProcessor != NULL) {
+-                delete mVPPProcessor;
+-                mVPPProcessor = NULL;
+-            }
+-#else
+             AsyncOMXCodecWrapper* wrapper = ((AsyncOMXCodecWrapper*) (mVideoSource.get()));
+             omxCodec = (OMXCodec*) ((wrapper->getOMXCodec()).get());
+-#endif
+         } else
+             omxCodec = (OMXCodec*) (mVideoSource.get());
++
++        if (mVPPProcessor != NULL) {
++            delete mVPPProcessor;
++            mVPPProcessor = NULL;
++        }
++        mVPPProcessor = createVppProcessor_l(omxCodec);
++
+         if (mVPPProcessor != NULL)
+             omxCodec->setVppBufferNum(mVPPProcessor->mInputBufferNum, mVPPProcessor->mOutputBufferNum);
+ #endif
+@@ -2021,7 +2015,10 @@ void AwesomePlayer::onVideoEvent() {
+             if (err != OK) {
+                 CHECK(mVideoBuffer == NULL);
+ 
+-                if (err == INFO_FORMAT_CHANGED) {
++                if (err == -EWOULDBLOCK) {
++                    postVideoEvent_l(10000);
++                    return;
++                } else if (err == INFO_FORMAT_CHANGED) {
+                     ALOGV("VideoSource signalled format change.");
+ 
+                     notifyVideoSize_l();
+diff --git a/media/libstagefright/include/AwesomePlayer.h b/media/libstagefright/include/AwesomePlayer.h
+index ddb68c4..a4e159c 100644
+--- a/media/libstagefright/include/AwesomePlayer.h
++++ b/media/libstagefright/include/AwesomePlayer.h
+@@ -276,7 +276,7 @@ private:
+ 
+     void setVideoSource(sp<MediaSource> source);
+ #ifdef TARGET_HAS_VPP
+-    VPPProcessor* createVppProcessor_l();
++    VPPProcessor* createVppProcessor_l(OMXCodec *omxCodec);
+ #endif
+     status_t initVideoDecoder(uint32_t flags = 0);
+ 
+-- 
+1.7.4.1
+

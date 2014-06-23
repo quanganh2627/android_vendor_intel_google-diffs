@@ -1,0 +1,413 @@
+From b7d5063e8e62387f0852d0433162e25561f8ac72 Mon Sep 17 00:00:00 2001
+From: Serguei Katkov <serguei.i.katkov@intel.com>
+Date: Mon, 9 Sep 2013 17:02:13 +0700
+Subject: Dalvik: Extend check to third parameter in Invariant_sinking pass
+
+BZ: 135615
+
+One of the checks in Invariant_sinking did not took into account
+third parameter of bytecode (e.g aput-char). As a result sinking
+of non-invariant happened in some special cases for arrays.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I8eae2cb8c4e6b800d628706e68b694a0cd508502
+Orig-MCG-Change-Id: I128b7241e5cdaa723db30d28cf3fec749477e254
+Signed-off-by: Dmitry Petrochenko <dmitry.petrochenko@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+Reviewed-on: http://android.intel.com:8080/132157
+Reviewed-by: lab_aqa <lab_aqa@intel.com>
+Reviewed-by: Beyler, Jean Christophe <jean.christophe.beyler@intel.com>
+Reviewed-by: Provodin, Vitaly A <vitaly.a.provodin@intel.com>
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+---
+ vm/compiler/InvariantRemoval.cpp |  193 ++++++++++++++++++++++++++++----------
+ vm/compiler/LoopInformation.cpp  |   47 ++++++---
+ vm/compiler/LoopInformation.h    |   12 ++-
+ 3 files changed, 184 insertions(+), 68 deletions(-)
+
+diff --git a/vm/compiler/InvariantRemoval.cpp b/vm/compiler/InvariantRemoval.cpp
+index 96084c6..be78816 100644
+--- a/vm/compiler/InvariantRemoval.cpp
++++ b/vm/compiler/InvariantRemoval.cpp
+@@ -1070,11 +1070,17 @@ bool dvmCompilerInvariantRemovalGate (const CompilationUnit *cUnit, Pass *curPas
+ 
+ /**
+  * @brief Finds all getters and setters in a given basic block
++ * @details This function iterates over MIRs of given BasicBlock
++ * and find all getters and setters basing on DataFlow attributes and whether
++ * the instruction is volatile. This set covers all getters and setters.
++ * Found instructions are places in STL vector of MIRs coming by data parameter.
+  * @param bb The basic block to check
+- * @param data A vector of MIR pointers where to store the getters and setters
+- * @return Returns true if successfully gone through basic block and filled data
++ * @param data A vector of MIR pointers where to store the getters and setters.
++ * Runtime type of this parameter should be (std::vector<MIR *> *).
++ * @return Returns true if successfully gone through basic block and filled data.
++ * However the vecore can be empty if no instruction were found.
+  */
+-static bool findGettersSetters (BasicBlock *bb, void *data)
++static bool findGettersSetters (CompilationUnit *cUnit, BasicBlock *bb, void *data)
+ {
+     if (data == 0)
+     {
+@@ -1129,11 +1135,16 @@ bool isObjectGetterSetter (int opcode)
+ 
+ /**
+  * @brief Goes through a basic block and checks if any of those MIRs clobber memory
++ * @details The function iterates over instructions of given BasicBlock and return false
++ * if it observes at least one instruction which clobbers memory. The function uses
++ * DataFlow attribute for clobbering instructions.
++ * Limitation: due to no enough information about setting/getting objects we consider
++ * such instructions as clobbering ones.
+  * @param bb The basic block whose MIRs to check
+  * @param data Unused argument
+  * @return Returns true if no memory is clobbered
+  */
+-static bool checkIfNoClobberMemory (BasicBlock *bb, void *data)
++static bool checkIfNoClobberMemory (CompilationUnit *cUnit, BasicBlock *bb, void *data)
+ {
+     for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
+     {
+@@ -1158,16 +1169,73 @@ static bool checkIfNoClobberMemory (BasicBlock *bb, void *data)
+ }
+ 
+ /**
+- * @brief Tries to select invariant setters for sinking
++ * @brief check whether SSA reg is the same as at start of bb
++ * @details this function checks whether given virtual register is not change up
++ * to the beginning of the given basic block. It is true if SSA subscript is the same
++ * on the entrance to the BasicBlock.
++ * @param bb The basic block where reg to check
++ * @param data STL (reg, subscript) pair
++ * @return Returns true if SSA subscript is same in use and start of BB
++ */
++static bool whetherSSARegIsTheSameOnEnter (CompilationUnit *cUnit, BasicBlock *bb, void *data)
++{
++    if (bb->dataFlowInfo == 0 || bb->dataFlowInfo->dalvikToSSAMapEntrance == 0)
++    {
++        //Cannot say for sure, so answer no
++        return false;
++    }
++    std::pair<int, int> *reg = (std::pair<int, int> *)data;
++
++    int exitRegVersion = DECODE_SUB (bb->dataFlowInfo->dalvikToSSAMapEntrance[reg->first]);
++
++    return reg->second == exitRegVersion;
++}
++
++/**
++ * @brief check whether basic block with id represented by data dominates bb
++ * @details If there is no domination information for the given Basickblock we consider
++ * that there is no domination. To use this function domination information should be avaiable.
++ * @param bb The dominated basic block
++ * @param data id of the block which dominates bb
++ * @return Returns true basic block with id represented by data dominates bb.
++ *  if there is no domination information return false.
++ */
++static bool whetherDominatesBasicBlock (CompilationUnit *cUnit, BasicBlock *bb, void *data)
++{
++    if (bb->dominators == 0)
++    {
++        //Cannot say for sure, so answer no
++        return false;
++    }
++    int *id = (int *)data;
++
++    return dvmIsBitSet (bb->dominators, *id);
++}
++
++/**
++ * @brief Tries to select invariant setters for sinking. Remove instruction if it can be sunk and put it into
++ * selection vector returned.
++ * @details This function iterates over given setters/getters and checks whether it can be sunk from the loop.
++ * The setter/getter can be sunk if it is not volatile instruction, otherwise according to specification
++ * other threads should see the value in memory immidiately. Also the instruction should be executed
++ * on the path to each loop exit because sunk instruction will be executed always and to avoid execution of
++ * wrong operation we must ensure that it was executed in a loop.
++ * The setter can be sunk if memory location of setter is invariant in a loop, this memory location is not used
++ * in a loop by other istructions and the value put in a loop is the same in the instruction and at the end of the loop.
++ * The getter can be sunk if memory location of getter is invariant, this memory location is not used
++ * in a loop by other istructions and defined register is not used in the loop.
++ * Limitations:
++ * 1) There is only one getter/setter - to avoid checking whether the same memory location
++ * is used in a loop.
++ * 2) Only setter is considered - to avoid checking whether the assigned register is used in a loop
++ * 3) Instruction should not have null or bound check - to avoid dealing with potential exception
+  * @param cUnit The compilation unit
+- * @param loopExit The exit block we try to sink to
++ * @param info The loop information
+  * @param gettersSetters The vector of all getters and setters in the loop
+  * @return Returns the MIRs selected for possible sinking
+  */
+-static std::vector<MIR *> selectInvariants (CompilationUnit *cUnit, BasicBlock *loopExit, std::vector<MIR *> &gettersSetters)
++static std::vector<MIR *> selectInvariants (CompilationUnit *cUnit, LoopInformation *info, std::vector<MIR *> &gettersSetters)
+ {
+-    assert (loopExit != 0);
+-
+     //Keep track of selections
+     std::vector<MIR *> selections;
+ 
+@@ -1206,59 +1274,67 @@ static std::vector<MIR *> selectInvariants (CompilationUnit *cUnit, BasicBlock *
+                 continue;
+             }
+ 
++            //Only sink if we dominate all the loop exits
++            if (info->iterateThroughLoopExitBlocks (cUnit, whetherDominatesBasicBlock, &mir->bb->id) == false)
++            {
++                continue;
++            }
++
+             //Determine start index where the object pointer register is
+             int startIndex = dvmCompilerGetStartUseIndex (mir->dalvikInsn.opcode);
+ 
+-            //If the number of uses is greater than the start index, it means that we do have an object
+-            //Otherwise we are most likely looking at a static setter
+-            if (mir->ssaRep->numUses > startIndex)
+-            {
+-                //Get the object register
+-                int objectSSAReg = mir->ssaRep->uses[startIndex];
++            //Assume we have no changes till end of the loop
++            bool isMemLocationIsInvariant = true;
+ 
+-                //Without coloring we can only prove the object is invariant if its ssa version is 0
+-                //The reason we can do this is that we have loop context and we know it is coming as that into
+-                //the loop and is not inter-iteration variant
+-                int objectRegVersion = dvmExtractSSASubscript (cUnit, objectSSAReg);
++            //We should check that all uses pointing to mem location are invariant in a loop
++            //There is a limitation here. Invariant detection pass has a stricter gate than ours.
++            //As a result we can reach here and do not have invariant info available. In this case
++            //we use backup check. We consider use is invariant if it is defined outside of the loop
++            //and leaves a loop with the same SSA subscript.
++            bool isInvariantInfoAvailable = info->getVariants () != 0;
+ 
+-                if (objectRegVersion != 0)
++            for (int use = startIndex; use < mir->ssaRep->numUses && isMemLocationIsInvariant == true; use++)
++            {
++                if (isInvariantInfoAvailable == true)
+                 {
+-                    continue;
++                    int ssaReg = mir->ssaRep->uses[use];
++                    isMemLocationIsInvariant = info->isInvariant (ssaReg);
+                 }
+-            }
++                else
++                {
++                    //Backup plan
++                    MIR *def = mir->ssaRep->defWhere[use];
++                    isMemLocationIsInvariant = def == 0 || info->contains (def->bb) == false;
+ 
+-            //We should have domination information nor dataflow info
+-            if (loopExit->dominators == 0 || loopExit->dataFlowInfo == 0 || loopExit->dataFlowInfo->dalvikToSSAMapExit == 0)
+-            {
+-                continue;
++                    //If we pass the check for def, check also out
++                    if (isMemLocationIsInvariant == true)
++                    {
++                        int useValue = mir->ssaRep->uses[use];
++                        std::pair<int, int> reg (dvmExtractSSARegister (cUnit, useValue), dvmExtractSSASubscript (cUnit, useValue));
++
++                        isMemLocationIsInvariant = info->iterateThroughLoopExitBlocks (cUnit, whetherSSARegIsTheSameOnEnter, &reg);
++                    }
++                }
+             }
+ 
+-            //Only sink if we dominate the loop exit
+-            if (dvmIsBitSet (loopExit->dominators, mir->bb->id) == false)
++            if (isMemLocationIsInvariant == false)
+             {
+                 continue;
+             }
+ 
+-            //Assume we have no version mismatch
+-            bool problemWithVersions = false;
++            //Assume we have no changes till end of the loop
++            bool isValueTheSameOnExit = true;
+ 
+-            //Now go through all of the uses to make sure that the version at the iput match the exit
+-            for (int use = 0; use < mir->ssaRep->numUses; use++)
++            //We should ensure that the value of the VR we plan to set will be the same at all loop exits.
++            for (int use = 0; use < startIndex && isValueTheSameOnExit == true; use++)
+             {
+-                int dalvikReg = dvmExtractSSARegister (cUnit, mir->ssaRep->uses[use]);
+-                int regVersion = dvmExtractSSASubscript (cUnit, mir->ssaRep->uses[use]);
++                int useValue = mir->ssaRep->uses[use];
++                std::pair<int, int> reg (dvmExtractSSARegister (cUnit, useValue), dvmExtractSSASubscript (cUnit, useValue));
+ 
+-                int exitRegVersion = DECODE_SUB (loopExit->dataFlowInfo->dalvikToSSAMapExit[dalvikReg]);
+-
+-                //The version the iput is using does not match exit version
+-                if (regVersion != exitRegVersion)
+-                {
+-                    problemWithVersions = true;
+-                    break;
+-                }
++                isValueTheSameOnExit = info->iterateThroughLoopExitBlocks (cUnit, whetherSSARegIsTheSameOnEnter, &reg);
+             }
+ 
+-            if (problemWithVersions == true)
++            if (isValueTheSameOnExit == false)
+             {
+                 continue;
+             }
+@@ -1349,7 +1425,16 @@ static void handleNullCheckHoisting (CompilationUnit *cUnit, LoopInformation *in
+ }
+ 
+ /**
+- * @brief Helper function that tries to sink invariants for a given loop
++ * @brief This is per-loop function for Invariant Sinking optimization. It drives the optimization and
++ * works as a gate for specific loop.
++ * @details For the given loop this function checks whether the optimization can be applied in general,
++ * tries to select some instructions for optimization, handle the null check hoisting and adds
++ * sunk instruction to all loop exit blocks
++ * Limitations:
++ * 1) Loop has exactly one exit block
++ * 2) Loop has exactly one backward branch
++ * 3) Loop does not contain instructions clobbering memory
++ * 4) handleNullCheckHoisting in reality does not work because instructions with null check are not selected
+  * @param cUnit The compilation unit
+  * @param info The loop for which to sink at exit
+  * @param data Unused argument
+@@ -1394,14 +1479,8 @@ static bool sinkInvariants (CompilationUnit *cUnit, LoopInformation *info, void
+         return true;
+     }
+ 
+-    //Get the loop exit block index
+-    int loopExitIdx = dvmHighestBitSet (info->getExitLoops ());
+-
+-    //Get the loop exit
+-    BasicBlock *loopExit = reinterpret_cast<BasicBlock *> (dvmGrowableListGetElement (&cUnit->blockList, loopExitIdx));
+-
+     //Fourth, select any setters that can be moved
+-    selections = selectInvariants (cUnit, loopExit, gettersSetters);
++    selections = selectInvariants (cUnit, info, gettersSetters);
+ 
+     //We have no work to do if we made no selections
+     if (selections.size () == 0)
+@@ -1418,6 +1497,12 @@ static bool sinkInvariants (CompilationUnit *cUnit, LoopInformation *info, void
+     return true;
+ }
+ 
++/**
++ * @brief This is entry function to Invariant Sinking optimization.
++ * @details The function simply iterates over loops and invokes the worker function sinkInvariants.
++ * @param cUnit The compilation unit
++ * @param curPass Unused argument
++ */
+ void dvmCompilerInvariantSinking (CompilationUnit *cUnit, Pass *curPass)
+ {
+     //Gate made sure that we have at least one loop
+@@ -1428,6 +1513,12 @@ void dvmCompilerInvariantSinking (CompilationUnit *cUnit, Pass *curPass)
+     info->iterate (cUnit, sinkInvariants);
+ }
+ 
++/**
++ * @brief This is gate for Invariant Sinking optimization.
++ * @details The optimization can be applied if trace is new system loop and actually has a loop.
++ * @param cUnit The compilation unit
++ * @param curPass pointer to current pass data structure
++ */
+ bool dvmCompilerInvariantSinkingGate (const CompilationUnit *cUnit, Pass *curPass)
+ {
+     //Unused argument
+diff --git a/vm/compiler/LoopInformation.cpp b/vm/compiler/LoopInformation.cpp
+index 475a83c..c383866 100644
+--- a/vm/compiler/LoopInformation.cpp
++++ b/vm/compiler/LoopInformation.cpp
+@@ -65,33 +65,48 @@ bool LoopInformation::iterate (CompilationUnit *cUnit, bool (*func)(CompilationU
+     return true;
+ }
+ 
+-bool LoopInformation::iterateThroughLoopBasicBlocks (CompilationUnit *cUnit, bool (*func) (BasicBlock *, void *), void *data)
++bool LoopInformation::iterateThroughLoopBasicBlocks (CompilationUnit *cUnit, bool (*func) (CompilationUnit *cUnit, BasicBlock *, void *), void *data)
+ {
++    BitVector *basicBlocks = getBasicBlocks ();
++    if (basicBlocks == 0)
++    {
++        return true;
++    }
++
+     //Create iterator to go through basic blocks
+     BitVectorIterator blockIter;
+-    dvmBitVectorIteratorInit (getBasicBlocks (), &blockIter);
++    dvmBitVectorIteratorInit (basicBlocks, &blockIter);
+ 
+-    while (true)
++    for (BasicBlock *bb = dvmCompilerGetNextBasicBlockViaBitVector (blockIter, cUnit->blockList); bb != 0;
++                     bb = dvmCompilerGetNextBasicBlockViaBitVector (blockIter, cUnit->blockList))
+     {
+-        int blockIdx = dvmBitVectorIteratorNext (&blockIter);
+-
+-        //If done, break out of loop
+-        if (blockIdx == -1)
++        //Call the worker function
++        if (func (cUnit, bb, data) == false)
+         {
+-            break;
++            return false;
+         }
++    }
++
++    return true;
++}
+ 
+-        //Get the actual basic block
+-        BasicBlock *bb = reinterpret_cast<BasicBlock *> (dvmGrowableListGetElement (&cUnit->blockList, blockIdx));
++bool LoopInformation::iterateThroughLoopExitBlocks (CompilationUnit *cUnit, bool (*func) (CompilationUnit *cUnit, BasicBlock *, void *), void *data)
++{
++    BitVector *loopExits = getExitLoops ();
++    if (loopExits == 0)
++    {
++        return true;
++    }
+ 
+-        //Paranoid
+-        if (bb == 0)
+-        {
+-            break;
+-        }
++    //Create iterator to go through exit blocks
++    BitVectorIterator blockIter;
++    dvmBitVectorIteratorInit (loopExits, &blockIter);
+ 
++    for (BasicBlock *bb = dvmCompilerGetNextBasicBlockViaBitVector (blockIter, cUnit->blockList); bb != 0;
++                     bb = dvmCompilerGetNextBasicBlockViaBitVector (blockIter, cUnit->blockList))
++    {
+         //Now call the worker function
+-        if (func (bb, data) == false)
++        if (func (cUnit, bb, data) == false)
+         {
+             return false;
+         }
+diff --git a/vm/compiler/LoopInformation.h b/vm/compiler/LoopInformation.h
+index 7856a1c..03d247a 100644
+--- a/vm/compiler/LoopInformation.h
++++ b/vm/compiler/LoopInformation.h
+@@ -507,7 +507,17 @@ class LoopInformation
+            * @param data user data passed to worker
+            * @return Returns false as soon as func returns false. Returns true if all calls to func return true.
+            */
+-        bool iterateThroughLoopBasicBlocks (CompilationUnit *cUnit, bool (*func) (BasicBlock *, void *),
++        bool iterateThroughLoopBasicBlocks (CompilationUnit *cUnit, bool (*func) (CompilationUnit *cUnit, BasicBlock *, void *),
++                void *data = 0);
++
++         /**
++           * @brief Helper function to iterate over loop exits
++           * @param cUnit the CompilationUnit
++           * @param func worker function
++           * @param data user data passed to worker
++           * @return Returns false as soon as func returns false. Returns true if all calls to func return true.
++           */
++        bool iterateThroughLoopExitBlocks (CompilationUnit *cUnit, bool (*func) (CompilationUnit *cUnit, BasicBlock *, void *),
+                 void *data = 0);
+ 
+          /**
+-- 
+1.7.4.1
+

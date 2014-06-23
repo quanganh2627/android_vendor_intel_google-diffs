@@ -1,0 +1,338 @@
+From 93440f153373892c6ff5178681c46074e976a5a7 Mon Sep 17 00:00:00 2001
+From: ywan171 <yi.a.wang@intel.com>
+Date: Thu, 17 Oct 2013 22:07:01 +0800
+Subject: libmediaplayerservice: add support to play h263 rtsp streaming from vlc server
+
+BZ:49295
+
+google can not support h263 rtsp streaming from vlc server for it can not parse
+dimension for SDP. add the function to parse it from first video AU
+
+orig-patch:
+32276:add pre-parse for H.263 ES in RTSP
+39366: when rtsp has not finished connection,RTSPSource can not process EOS
+47158:Avoid access unit drop when RTSP steaming
+
+Category: aosp improvement
+Domain: Video.Media-streaming
+Origin: internal
+Upstream-Candidate: yes
+
+Change-Id: I6c16670866f1ddfc6396f178d077c5b3ed872807
+Orig-Change-Id: I398926ca730213a1ddc7e194438001140473eb3a
+Signed-off-by: ywan171 <yi.a.wang@intel.com>
+Signed-off-by: Dan Liang <dan.liang@intel.com>
+---
+ .../libmediaplayerservice/nuplayer/RTSPSource.cpp  |    7 +
+ media/libstagefright/avc_utils.cpp                 |  149 ++++++++++++++++++++
+ media/libstagefright/include/avc_utils.h           |    3 +
+ media/libstagefright/rtsp/APacketSource.cpp        |   27 ++++-
+ media/libstagefright/rtsp/APacketSource.h          |    2 +
+ media/libstagefright/rtsp/MyHandler.h              |   27 ++++-
+ 6 files changed, 211 insertions(+), 4 deletions(-)
+
+diff --git a/media/libmediaplayerservice/nuplayer/RTSPSource.cpp b/media/libmediaplayerservice/nuplayer/RTSPSource.cpp
+index 2999747..f89bd1d 100644
+--- a/media/libmediaplayerservice/nuplayer/RTSPSource.cpp
++++ b/media/libmediaplayerservice/nuplayer/RTSPSource.cpp
+@@ -462,6 +462,13 @@ void NuPlayer::RTSPSource::onMessageReceived(const sp<AMessage> &msg) {
+ 
+         case MyHandler::kWhatEOS:
+         {
++            // If it is in conecting process, when receive bye rtcp,
++            // since mTracks has not been established, break the
++            // operation to mTracks.
++            if (mState == CONNECTING ) {
++                break;
++            }
++
+             int32_t finalResult;
+             CHECK(msg->findInt32("finalResult", &finalResult));
+             CHECK_NE(finalResult, (status_t)OK);
+diff --git a/media/libstagefright/avc_utils.cpp b/media/libstagefright/avc_utils.cpp
+index b822868..4d066fc 100644
+--- a/media/libstagefright/avc_utils.cpp
++++ b/media/libstagefright/avc_utils.cpp
+@@ -546,6 +546,155 @@ bool ExtractDimensionsFromVOLHeader(
+     return true;
+ }
+ 
++bool ExtractDimensionsFromH263Header(
++        const uint8_t *data, size_t size, int32_t *width, int32_t *height) {
++    ABitReader br(&data[0], size);
++    uint32_t codeword;
++    int32_t extended_PTYPE = 0;
++    int32_t UFEP = 0;
++    int32_t custom_PFMT = 0;
++    codeword = br.getBits(22);
++    if (codeword !=  0x20) {
++        return false;
++    }
++    br.skipBits(8); // TR
++
++    codeword = br.getBits(1);
++    if (codeword == 0) {
++        return false;
++    }
++
++    codeword = br.getBits(1);
++    if (codeword == 1) {
++        return false;
++    }
++
++    br.skipBits(1); // split_screen_indicator
++    br.skipBits(1); // document_freeze_camera
++    br.skipBits(1); // freeze_picture_release
++
++    // source format
++    codeword = br.getBits(3);
++    switch (codeword) {
++        case 1:
++            *width = 128;
++            *height = 96;
++            break;
++
++        case 2:
++            *width = 176;
++            *height = 144;
++            break;
++
++        case 3:
++            *width = 352;
++            *height = 288;
++            break;
++
++        case 4:
++            *width = 704;
++            *height = 576;
++            break;
++
++        case 5:
++            *width = 1408;
++            *height = 1152;
++            break;
++
++        case 7:
++            extended_PTYPE = 1;
++            break;
++        default:
++            // Msg("H.263 source format not legal\n");
++            return false;
++    }
++
++    if (extended_PTYPE == 0) {
++        return true;
++    }
++
++    // source format
++    UFEP = br.getBits(3);
++    if (UFEP == 1) {
++        codeword = br.getBits(3);
++        switch (codeword) {
++            case 1:
++                *width = 128;
++                *height = 96;
++                break;
++
++            case 2:
++                *width = 176;
++                *height = 144;
++                break;
++
++            case 3:
++                *width = 352;
++                *height = 288;
++                break;
++
++            case 4:
++                *width = 704;
++                *height = 576;
++                break;
++
++            case 5:
++                *width = 1408;
++                *height = 1152;
++                break;
++
++            case 6:
++                custom_PFMT = 1;
++                break;
++            default:
++                // Msg("H.263 source format not legal\n");
++                return false;
++        }
++        if (custom_PFMT == 0) {
++            return true;
++        }
++
++        br.skipBits(15);
++    }
++
++    if (UFEP == 0 || UFEP == 1){
++        br.skipBits(9);
++    } else {
++        return false;
++    }
++
++    if (br.getBits(1)) {
++        return false; // CPM
++    }
++    if (custom_PFMT == 1 && UFEP == 1) {
++        uint32_t DisplayWidth, Width, DisplayHeight, Height, Resolution;
++        codeword = br.getBits(4);
++        if (codeword == 0) {
++            return false;
++        }
++        if (codeword == 0xf) {
++            br.skipBits(16);
++        }
++        codeword = br.getBits(9);
++        DisplayWidth = (codeword + 1) << 2;
++        Width = (DisplayWidth + 15) & -16;
++
++        br.skipBits(1); // start code emulation
++
++        codeword = br.getBits(9);
++        if (codeword == 0) {
++            return false;
++        }
++        DisplayHeight = codeword << 2;
++        Height = (DisplayHeight + 15) & -16;
++
++        *width = Width;
++        *height = Height;
++    }
++
++    return true;
++}
++
+ bool GetMPEGAudioFrameSize(
+         uint32_t header, size_t *frame_size,
+         int *out_sampling_rate, int *out_channels,
+diff --git a/media/libstagefright/include/avc_utils.h b/media/libstagefright/include/avc_utils.h
+index d517320..d8f22fe 100644
+--- a/media/libstagefright/include/avc_utils.h
++++ b/media/libstagefright/include/avc_utils.h
+@@ -66,6 +66,9 @@ sp<MetaData> MakeAACCodecSpecificData(
+ bool ExtractDimensionsFromVOLHeader(
+         const uint8_t *data, size_t size, int32_t *width, int32_t *height);
+ 
++bool ExtractDimensionsFromH263Header(
++        const uint8_t *data, size_t size, int32_t *width, int32_t *height);
++
+ bool GetMPEGAudioFrameSize(
+         uint32_t header, size_t *frame_size,
+         int *out_sampling_rate = NULL, int *out_channels = NULL,
+diff --git a/media/libstagefright/rtsp/APacketSource.cpp b/media/libstagefright/rtsp/APacketSource.cpp
+index 462c384..0ebf994 100644
+--- a/media/libstagefright/rtsp/APacketSource.cpp
++++ b/media/libstagefright/rtsp/APacketSource.cpp
+@@ -461,8 +461,10 @@ APacketSource::APacketSource(
+ 
+         int32_t width, height;
+         if (!sessionDesc->getDimensions(index, PT, &width, &height)) {
+-            mInitCheck = ERROR_UNSUPPORTED;
+-            return;
++            ALOGV("There is no explicit framesize provided in SDP,"
++                "let decoder prase it out from bitstream then");
++            width = -1;
++            height = -1;
+         }
+ 
+         mFormat->setInt32(kKeyWidth, width);
+@@ -584,4 +586,25 @@ sp<MetaData> APacketSource::getFormat() {
+     return mFormat;
+ }
+ 
++void APacketSource::PreProcessAccessUnit(const uint8_t *data, size_t size) {
++    const char *mime;
++    CHECK(mFormat->findCString(kKeyMIMEType, &mime));
++    if (!strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_H263)) {
++        int32_t width;
++        int32_t height;
++        bool success = false;
++        CHECK(mFormat->findInt32(kKeyWidth, &width));
++        CHECK(mFormat->findInt32(kKeyHeight, &height));
++        if (width == -1 || height == -1) {
++            success =
++            ExtractDimensionsFromH263Header(data,size,&width,&height);
++            if (success) {
++                ALOGI("parse from AccessUnit, width = %d, height = %d\n",width, height);
++                mFormat->setInt32(kKeyWidth, width);
++                mFormat->setInt32(kKeyHeight, height);
++            }
++        }
++    }
++}
++
+ }  // namespace android
+diff --git a/media/libstagefright/rtsp/APacketSource.h b/media/libstagefright/rtsp/APacketSource.h
+index 530e537..fcaca91 100644
+--- a/media/libstagefright/rtsp/APacketSource.h
++++ b/media/libstagefright/rtsp/APacketSource.h
+@@ -33,6 +33,8 @@ struct APacketSource : public RefBase {
+ 
+     virtual sp<MetaData> getFormat();
+ 
++    void PreProcessAccessUnit(const uint8_t *data, size_t size);
++
+ protected:
+     virtual ~APacketSource();
+ 
+diff --git a/media/libstagefright/rtsp/MyHandler.h b/media/libstagefright/rtsp/MyHandler.h
+index 0f7879b..3298223 100644
+--- a/media/libstagefright/rtsp/MyHandler.h
++++ b/media/libstagefright/rtsp/MyHandler.h
+@@ -1477,6 +1477,7 @@ private:
+ 
+         uint32_t mNormalPlayTimeRTP;
+         int64_t mNormalPlayTimeUs;
++        bool mFirstAccessUnit;
+ 
+         sp<APacketSource> mPacketSource;
+ 
+@@ -1556,6 +1557,7 @@ private:
+         info->mNTPAnchorUs = -1;
+         info->mNormalPlayTimeRTP = 0;
+         info->mNormalPlayTimeUs = 0ll;
++        info->mFirstAccessUnit = false;
+ 
+         unsigned long PT;
+         AString formatDesc;
+@@ -1760,10 +1762,31 @@ private:
+             return;
+         }
+ 
+-        handleFirstAccessUnit();
+-
++        bool alltrackReceAccessUnit = true;
+         TrackInfo *track = &mTracks.editItemAt(trackIndex);
+ 
++        if (track->mFirstAccessUnit == false) {
++            track->mPacketSource->PreProcessAccessUnit(accessUnit->data(),accessUnit->size());
++        }
++        track->mFirstAccessUnit = true;
++        if (mFirstAccessUnit) {
++            // check if all track receive the first unit;
++            for (size_t i = 0; i < mTracks.size(); ++i) {
++                TrackInfo *trackinfo = &mTracks.editItemAt(i);
++                if (trackinfo->mFirstAccessUnit == false) {
++                    alltrackReceAccessUnit = false;
++                    break;
++                }
++            }
++        }
++        if (!alltrackReceAccessUnit) {
++            ALOGV("connection has not finished yet");
++            track->mPackets.push_back(accessUnit);
++            return;
++        }
++
++        handleFirstAccessUnit();
++
+         if (!mAllTracksHaveTime) {
+             ALOGV("storing accessUnit, no time established yet");
+             track->mPackets.push_back(accessUnit);
+-- 
+1.7.4.1
+

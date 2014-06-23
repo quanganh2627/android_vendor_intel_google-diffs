@@ -1,0 +1,420 @@
+From c1e283617e04e8821e6d352dc1f8d180044912f6 Mon Sep 17 00:00:00 2001
+From: Qiming Shi <qiming.shi@intel.com>
+Date: Mon, 3 Dec 2012 15:40:44 +0800
+Subject: Dalvik: Added support for VTune Amplifier for Android platform
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+BZ: 54569
+
+1. The patch adds “-Xjitvtuneinfo:{none,jit,dex,src}” option. It didn’t
+delete “-Xjitsepdalvik“ option because many customers use it.
+2. -Xjitvtuneinfo:none  is default and means that we don’t collect any
+JIT information. You should not see any overhead because additionally
+you will get only one extra “if” per a compiled trace. You should not
+see any regression as well. The code doesn’t work at all by default.
+3. -Xjitvtuneinfo:jit == -Xjitsepdalvik. Collect only basic information
+about the compiled trace: jit code, method name, method size and so on.
+4. -Xjitvtuneinfo:dex provides information about the compiled trace as
+-Xjitvtuneinfo:jit does + provides mapping from JIT code to DEX code.
+5. -Xjitvtuneinfo:src provides information about the compiled trace as
+-Xjitvtuneinfo:jit does + provides mapping from JIT code to Java source
+code. If the profiled benchmark doesn’t have information about Java
+source code the option has the same effect as “-Xjitvtuneinfo:jit”.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Ib678bf30b06b3372db3846b0193e409f2f04f79e
+Orig-MCG-Change-Id: I9b7855a29aba7c3c959896ab86de8b39ee3a5d73
+Signed-off-by: Nikita Manovich <nikita.manovich@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ Android.mk               |   13 +++
+ vm/Dvm.mk                |    8 ++-
+ vm/Globals.h             |   15 +++-
+ vm/Init.cpp              |   20 ++++-
+ vm/compiler/Compiler.h   |    3 -
+ vm/compiler/Frontend.cpp |  186 +++++++++++++++++++++++++++++++++++++++++++---
+ 6 files changed, 222 insertions(+), 23 deletions(-)
+
+diff --git a/Android.mk b/Android.mk
+index b2e2e15..5fbc399 100644
+--- a/Android.mk
++++ b/Android.mk
+@@ -18,6 +18,19 @@ WITH_JIT := $(strip $(WITH_JIT))
+ ifeq ($(WITH_JIT),)
+   ifeq ($(TARGET_ARCH),x86)
+     WITH_JIT := true
++
++  # For all builds, except for the -user build we will enable support for
++  # VTune Amplifier by default. To collect any information about JIT look
++  # at -Xjitvtuneinfo:<info> option. By default, -Xjitvtuneinfo:none is
++  # used and it doesn't affect JIT compiler (one extra 'if' per compiled
++  # trace).
++  ifneq ($(TARGET_BUILD_VARIANT),user)
++    VTUNE_DALVIK := $(strip $(VTUNE_DALVIK))
++    ifeq ($(VTUNE_DALVIK),)
++      VTUNE_DALVIK := true
++    endif
++  endif
++
+   else
+     WITH_JIT := false
+   endif
+diff --git a/vm/Dvm.mk b/vm/Dvm.mk
+index 76b297c..a7cedc2 100644
+--- a/vm/Dvm.mk
++++ b/vm/Dvm.mk
+@@ -91,8 +91,12 @@ ifeq ($(PROFILE_OPCODE),true)
+         LOCAL_CFLAGS += -DPROFILE_OPCODE
+ endif
+ 
+-ifeq ($(SEP_DALVIK),true)
+-        LOCAL_CFLAGS += -DSEP_DALVIK
++# If WITH_JIT variable is false it is not possible to collect any info
++# about JIT. Thus support for VTune Amplifier should not be enabled.
++ifeq ($(WITH_JIT),true)
++  ifeq ($(VTUNE_DALVIK),true)
++    LOCAL_CFLAGS += -DVTUNE_DALVIK
++  endif
+ endif
+ 
+ LOCAL_SRC_FILES := \
+diff --git a/vm/Globals.h b/vm/Globals.h
+index 143e72b..cb15d8c 100644
+--- a/vm/Globals.h
++++ b/vm/Globals.h
+@@ -764,6 +764,15 @@ enum NoChainExits {
+     kNoChainExitLast,
+ };
+ 
++#if defined(VTUNE_DALVIK)
++enum VTuneInfo {
++    kVTuneInfoDisabled = 0,   // don't collect information about JIT
++    kVTuneInfoNativeCode = 1, // common information about JIT code
++    kVTuneInfoByteCode = 2,   // mapping from JIT code to byte code
++    kVTuneInfoJavaCode = 3    // mapping from JIT code to Java code
++};
++#endif
++
+ /*
+  * JIT-specific global state
+  */
+@@ -900,9 +909,9 @@ struct DvmJitGlobals {
+     /* Flag to dump all compiled code */
+     bool printMe;
+ 
+-#ifdef SEP_DALVIK
+-    /* Flag to enable sep support for dalvik */
+-    bool sepDalvik;
++#if defined(VTUNE_DALVIK)
++    /* Flag to enable VTune support for Dalvik VM */
++    VTuneInfo vtuneInfo;
+ #endif
+ 
+     /* Flag to dump compiled binary code in bytes */
+diff --git a/vm/Init.cpp b/vm/Init.cpp
+index 597361e..7111bf7 100644
+--- a/vm/Init.cpp
++++ b/vm/Init.cpp
+@@ -150,8 +150,9 @@ static void usage(const char* progName)
+     dvmFprintf(stderr, "  -Xjitconfig:filename\n");
+     dvmFprintf(stderr, "  -Xjitcheckcg\n");
+     dvmFprintf(stderr, "  -Xjitverbose\n");
+-#ifdef SEP_DALVIK
+     dvmFprintf(stderr, "  -Xjitsepdalvik\n");
++#if defined(VTUNE_DALVIK)
++    dvmFprintf(stderr, "  -Xjitvtuneinfo:{none,jit,dex,src}\n");
+ #endif
+     dvmFprintf(stderr, "  -Xjitprofile\n");
+     dvmFprintf(stderr, "  -Xjitdisableopt\n");
+@@ -1149,9 +1150,22 @@ static int processOptions(int argc, const char* const argv[],
+             gDvmJit.printBinary = true;
+         } else if (strncmp(argv[i], "-Xjitverbose", 12) == 0) {
+             gDvmJit.printMe = true;
+-#ifdef SEP_DALVIK
++#if defined(VTUNE_DALVIK)
+         } else if (strncmp(argv[i], "-Xjitsepdalvik", 14) == 0) {
+-            gDvmJit.sepDalvik = true;
++            gDvmJit.vtuneInfo = kVTuneInfoNativeCode;
++        } else if (strncmp(argv[i], "-Xjitvtuneinfo:", 15) == 0) {
++            if (strcmp(argv[i] + 15, "none") == 0)
++                gDvmJit.vtuneInfo = kVTuneInfoDisabled;
++            else if (strcmp(argv[i] + 15, "dex") == 0)
++                gDvmJit.vtuneInfo = kVTuneInfoByteCode;
++            else if (strcmp(argv[i] + 15, "src") == 0)
++                gDvmJit.vtuneInfo = kVTuneInfoJavaCode;
++            else if (strcmp(argv[i] + 15, "jit") == 0)
++                gDvmJit.vtuneInfo = kVTuneInfoNativeCode;
++            else {
++                dvmFprintf(stderr, "Unrecognized option '%s'\n", argv[i]);
++                return -1;
++            }
+ #endif
+         } else if (strncmp(argv[i], "-Xjitprofile", 12) == 0) {
+             gDvmJit.profileMode = kTraceProfilingContinuous;
+diff --git a/vm/compiler/Compiler.h b/vm/compiler/Compiler.h
+index 7382f46..d279ab4 100644
+--- a/vm/compiler/Compiler.h
++++ b/vm/compiler/Compiler.h
+@@ -208,9 +208,6 @@ CompilerMethodStats *dvmCompilerAnalyzeMethodBody(const Method *method,
+ bool dvmCompilerCanIncludeThisInstruction(const Method *method,
+                                           const DecodedInstruction *insn);
+ bool dvmCompileMethod(const Method *method, JitTranslationInfo *info);
+-#ifdef SEP_DALVIK
+-void SendTraceInfoToVTune(CompilationUnit *cUnit, JitTraceDescription *desc);
+-#endif
+ bool dvmCompileTrace(JitTraceDescription *trace, int numMaxInsts,
+                      JitTranslationInfo *info, jmp_buf *bailPtr, int optHints);
+ void dvmCompilerDumpStats(void);
+diff --git a/vm/compiler/Frontend.cpp b/vm/compiler/Frontend.cpp
+index 9eb4a87..af11eed 100644
+--- a/vm/compiler/Frontend.cpp
++++ b/vm/compiler/Frontend.cpp
+@@ -23,15 +23,20 @@
+ 
+ #define BYTECODE_FILTER
+ 
+-#ifdef SEP_DALVIK
+-#include "JitProfiling.h"
+-#endif
+-
+ #ifdef PROFILE_OPCODE
+ #include "dalvikvm/ProfileOpcodes.h"
+ extern int opcodeJit[kNumPackedOpcodes];
+ #endif
+ 
++#if defined(VTUNE_DALVIK)
++#include "JitProfiling.h"
++#include <vector>
++#include <algorithm>
++
++static void SendTraceInfoToVTune(CompilationUnit *cUnit, JitTraceDescription *desc);
++#endif
++
++
+ static inline bool contentIsInsn(const u2 *codePtr) {
+     u2 instr = *codePtr;
+     Opcode opcode = (Opcode)(instr & 0xff);
+@@ -1614,10 +1619,9 @@ static bool compileLoop(CompilationUnit *cUnit, unsigned int startOffset,
+     methodStats->nativeSize += cUnit->totalSize;
+ #endif
+ 
+-
+-#ifdef SEP_DALVIK
++#if defined(VTUNE_DALVIK)
+     /* Send the loop trace information to the VTune */
+-    if(gDvmJit.sepDalvik) {
++    if(gDvmJit.vtuneInfo != kVTuneInfoDisabled) {
+         if(info->codeAddress) {
+             SendTraceInfoToVTune(cUnit, desc);
+         } else {
+@@ -1625,6 +1629,7 @@ static bool compileLoop(CompilationUnit *cUnit, unsigned int startOffset,
+         }
+     }
+ #endif
++
+     return info->codeAddress != NULL;
+ 
+ bail:
+@@ -2195,8 +2200,9 @@ bool dvmCompileTrace(JitTraceDescription *desc, int numMaxInsts,
+ #if defined(WITH_JIT_TUNING)
+     methodStats->nativeSize += cUnit.totalSize;
+ #endif
+-#ifdef SEP_DALVIK
+-    if(gDvmJit.sepDalvik) {
++
++#if defined(VTUNE_DALVIK)
++    if(gDvmJit.vtuneInfo != kVTuneInfoDisabled) {
+         if(info->codeAddress) {
+             SendTraceInfoToVTune(&cUnit, desc);
+         } else {
+@@ -2204,13 +2210,145 @@ bool dvmCompileTrace(JitTraceDescription *desc, int numMaxInsts,
+         }
+     }
+ #endif
++
+     return info->codeAddress != NULL;
+ }
+ 
+-#ifdef SEP_DALVIK
++#if defined(VTUNE_DALVIK)
++extern int mapFromBCtoNCG[]; /* declaration from Lower.h file */
++
++typedef std::vector<LineNumberInfo> LineNumberInfoList;
++
++struct SortLineNumberInfoByOffset {
++    bool operator()(LineNumberInfo const& lhs, LineNumberInfo const& rhs) {
++        return lhs.Offset < rhs.Offset;
++    }
++};
++
++static char* makeDexDumpMethodName(const Method* method)
++{
++    char const* name = method->name;
++    u4 name_len = strlen(name);
++    char* signature = dexProtoCopyMethodDescriptor(&method->prototype);
++    u4 signature_len = strlen(signature);
++    char const* classD = method->clazz->descriptor;
++    u4 classD_len = strlen(classD);
++    u4 fullSignature_offset = 0;
++
++    /* make the same name as dexdump output for DEX code */
++    u4 fullSignature_len = classD_len - 1 /* L */ + name_len + 1 /* : */
++        + signature_len + 1 /* '\0' */;
++    char *fullSignature = (char *)dvmCompilerNew(fullSignature_len, false);
++
++    strcpy(fullSignature, classD + 1 /* delete 'L' */);
++    fullSignature_offset = classD_len - 1;
++    for (u4 i = 0; i < fullSignature_offset; ++i) {
++        if (fullSignature[i] == ';' || fullSignature[i] == '/') {
++            fullSignature[i] = '.';
++        }
++    }
++    strcpy(fullSignature + fullSignature_offset, name);
++    fullSignature_offset += name_len;
++    fullSignature[fullSignature_offset++] = ':';
++    strcpy(fullSignature + fullSignature_offset, signature);
++    fullSignature_offset += signature_len + 1 /* '\0' */;
++    assert(fullSignature_len == fullSignature_offset);
++    free(signature);
++
++    return fullSignature;
++}
++
++static void getLineInfoForByteCode(const Method* method,
++    LineNumberInfoList& lineInfoList)
++{
++    const DexCode* dexCode = dvmGetMethodCode(method);
++    LineNumberInfo lineInfo;
++
++    for (u4 offset = 0, i = 1; offset < dexCode->insnsSize; ++i) {
++        if (mapFromBCtoNCG[offset] != -1) {
++            lineInfo.Offset = mapFromBCtoNCG[offset];
++            lineInfo.LineNumber = i;
++            lineInfoList.push_back(lineInfo);
++        }
++        offset += dexGetWidthFromInstruction(dexCode->insns + offset);
++    }
++}
++
++static void getLineInfoForJavaCode(const Method* method,
++    LineNumberInfoList& lineInfoList)
++{
++    const DexCode* dexCode = dvmGetMethodCode(method);
++    LineNumberInfo lineInfo;
++
++    DexFile* pDexFile = method->clazz->pDvmDex->pDexFile;
++    const u1 *dbgstream = dexGetDebugInfoStream(pDexFile, dexCode);
++    if (method->clazz->sourceFile != NULL && dbgstream != NULL) {
++        /* mapping from JITed code to Java source code */
++        int adjopcode;
++        u4 line, parametersSize, address = 0;
++        line = readUnsignedLeb128(&dbgstream);
++        parametersSize = readUnsignedLeb128(&dbgstream);
++
++        while (parametersSize-- != 0) {
++            readUnsignedLeb128(&dbgstream);
++        }
++
++        bool isEndSequence = false;
++        while (!isEndSequence)  {
++            u1 opcode = *dbgstream++;
++            switch (opcode) {
++            case DBG_END_SEQUENCE:
++                isEndSequence = true;
++                break;
++
++            case DBG_ADVANCE_PC:
++                address += readUnsignedLeb128(&dbgstream);
++                break;
++
++            case DBG_ADVANCE_LINE:
++                line += readSignedLeb128(&dbgstream);
++                break;
++
++            case DBG_START_LOCAL:
++            case DBG_START_LOCAL_EXTENDED:
++                readUnsignedLeb128(&dbgstream);
++                readUnsignedLeb128(&dbgstream);
++                readUnsignedLeb128(&dbgstream);
++
++                if (opcode == DBG_START_LOCAL_EXTENDED) {
++                    readUnsignedLeb128(&dbgstream);
++                }
++                break;
++
++            case DBG_END_LOCAL:
++            case DBG_RESTART_LOCAL:
++                readUnsignedLeb128(&dbgstream);
++                break;
++
++            case DBG_SET_PROLOGUE_END:
++            case DBG_SET_EPILOGUE_BEGIN:
++            case DBG_SET_FILE:
++                break;
++
++            default:
++                adjopcode = opcode - DBG_FIRST_SPECIAL;
++                address += adjopcode / DBG_LINE_RANGE;
++                line += DBG_LINE_BASE + (adjopcode % DBG_LINE_RANGE);
++
++                if (mapFromBCtoNCG[address] != -1) {
++                    lineInfo.Offset = mapFromBCtoNCG[address];
++                    lineInfo.LineNumber = line;
++                    lineInfoList.push_back(lineInfo);
++                }
++                break;
++            }
++        }
++    }
++}
++
+ /* Notify the trace formation and send the trace information to VTune
+ */
+-void SendTraceInfoToVTune(CompilationUnit *cUnit, JitTraceDescription *desc) {
++static void SendTraceInfoToVTune(CompilationUnit *cUnit, JitTraceDescription *desc) {
+     if (cUnit->printMe) {
+         LOGD("JIT API: write a trace of '%s' method in jit file.", cUnit->method->name);
+     }
+@@ -2238,7 +2376,31 @@ void SendTraceInfoToVTune(CompilationUnit *cUnit, JitTraceDescription *desc) {
+     jitMethod.method_size = *(u2 *)((char *)cUnit->baseAddr - 4);
+     jitMethod.source_file_name = (char*)(cUnit->method->clazz->sourceFile);
+ 
+-    //Send the trace load event to the VTune analyzer
++    const Method* method = cUnit->method;
++    LineNumberInfoList lineInfoList;
++
++    if (gDvmJit.vtuneInfo == kVTuneInfoByteCode) {
++        jitMethod.source_file_name = makeDexDumpMethodName(method);
++        getLineInfoForByteCode(method, lineInfoList);
++    } else
++    if (gDvmJit.vtuneInfo == kVTuneInfoJavaCode) {
++        getLineInfoForJavaCode(method, lineInfoList);
++    }
++
++    if (!lineInfoList.empty()) {
++        std::sort(lineInfoList.begin(), lineInfoList.end(),
++            SortLineNumberInfoByOffset());
++
++        for (unsigned i = 0; i < lineInfoList.size() - 1; ++i) {
++            lineInfoList[i].Offset = lineInfoList[i + 1].Offset;
++        }
++        lineInfoList[lineInfoList.size() - 1].Offset = jitMethod.method_size;
++
++        jitMethod.line_number_size = lineInfoList.size();
++        jitMethod.line_number_table = &lineInfoList[0];
++    }
++
++    // Send the trace load event to the VTune analyzer
+     int res = iJIT_NotifyEvent(iJVM_EVENT_TYPE_METHOD_LOAD_FINISHED, (void*)&jitMethod);
+     if (cUnit->printMe) {
+         if (res) {
+-- 
+1.7.4.1
+

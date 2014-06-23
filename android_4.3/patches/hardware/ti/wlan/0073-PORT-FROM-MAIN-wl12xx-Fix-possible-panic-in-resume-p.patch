@@ -1,0 +1,98 @@
+From 31d4e2ed23978828519930bd5f63927a13731c1d Mon Sep 17 00:00:00 2001
+From: Quentin Casasnovas <quentinx.casasnovas@intel.com>
+Date: Mon, 7 Jan 2013 12:18:49 +0100
+Subject: [PORT FROM MAIN] wl12xx: Fix possible panic in resume path
+
+BZ: 75240
+
+During resume, it is possible that there was a pending work when we suspended
+the chip. In this case it is important to do that work (i.e. running wl12xx_irq_locked())
+but it may happen that this work trigger a firmware recovery. In this case,
+it is very important to leave the function with an error and not try to resume
+the chip anyway (or send any command to the chip) as the firmware is already
+crashed.
+
+This patch makes sure we leave the function if treating the pending work triggers a
+recovery and also removes some dead code.
+
+Change-Id: I60efaf9982c374f60f16be0069ac82da8feee385
+Orig-Change-Id: I5a815ad5d7a15a108930f50749f978dd6dcaa6da
+Signed-off-by: Quentin Casasnovas <quentinx.casasnovas@intel.com>
+Reviewed-on: http://android.intel.com:8080/85337
+Reviewed-by: De Cesco, Jonathan <jonathan.de.cesco@intel.com>
+Tested-by: Zurmely, PierreX <pierrex.zurmely@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+---
+ wl12xx-compat/drivers/net/wireless/wl12xx/main.c |   38 ++++++++--------------
+ 1 files changed, 14 insertions(+), 24 deletions(-)
+
+diff --git a/wl12xx-compat/drivers/net/wireless/wl12xx/main.c b/wl12xx-compat/drivers/net/wireless/wl12xx/main.c
+index d6bb73d..1e5f79c 100644
+--- a/wl12xx-compat/drivers/net/wireless/wl12xx/main.c
++++ b/wl12xx-compat/drivers/net/wireless/wl12xx/main.c
+@@ -2315,10 +2315,11 @@ static int wl1271_op_quiesce(struct ieee80211_hw *hw)
+ static int wl1271_op_resume(struct ieee80211_hw *hw)
+ {
+ 	struct wl1271 *wl = hw->priv;
+-	struct wl12xx_vif *wlvif;
+-	bool run_irq_work = false, pending_recovery;
++	struct wl12xx_vif *wlvif = NULL;
+ 	int ret = 0;
+ 
++	mutex_lock(&wl->mutex);
++
+ 	wl1271_debug(DEBUG_MAC80211, "mac80211 resume wow=%d",
+ 		     wl->wow_enabled);
+ 
+@@ -2326,36 +2327,25 @@ static int wl1271_op_resume(struct ieee80211_hw *hw)
+ 	WARN_ON(!wl->wow_enabled);
+ 
+ 	clear_bit(WL1271_FLAG_SUSPENDED, &wl->flags);
+-	if (test_and_clear_bit(WL1271_FLAG_PENDING_WORK, &wl->flags))
+-		run_irq_work = true;
+-
+-	mutex_lock(&wl->mutex);
+ 
+-	/* test the recovery flag before calling any SDIO functions */
+-	pending_recovery = test_bit(WL1271_FLAG_RECOVERY_IN_PROGRESS,
+-				    &wl->flags);
++	/* Deal with the pending work now (work that woke us up, or there was a
++	   pending work when we suspended) */
++	if (test_and_clear_bit(WL1271_FLAG_PENDING_WORK, &wl->flags)) {
++		wl1271_debug(DEBUG_MAC80211, "run postponed irq_work directly");
+ 
+-	if (run_irq_work) {
+-		wl1271_debug(DEBUG_MAC80211,
+-			     "run postponed irq_work directly");
++		/* Log 2 packets after wake, typically ARP + IP */
++		wl->log_wake_pkts = 2;
+ 
+-		/* don't talk to the HW if recovery is pending */
+-		if (!pending_recovery) {
+-			wl->log_wake_pkts = 2; /* Log 2 packets after wake, typically ARP + IP */
+-			ret = wl12xx_irq_locked(wl);
+-			if (ret)
+-				wl12xx_queue_recovery_work(wl);
++		if ((ret = wl12xx_irq_locked(wl))) {
++			wl1271_warning("Recovery in resume path "
++				       "while dealing with pending work");
++			wl12xx_queue_recovery_work(wl);
++			goto out;
+ 		}
+ 
+ 		wl1271_enable_interrupts(wl);
+ 	}
+ 
+-	if (pending_recovery) {
+-		wl1271_warning("queuing forgotten recovery on resume");
+-		ieee80211_queue_work(wl->hw, &wl->recovery_work);
+-		goto out;
+-	}
+-
+ 	wl12xx_for_each_wlvif(wl, wlvif) {
+ 		wl1271_configure_resume(wl, wlvif);
+ 	}
+-- 
+1.7.4.1
+

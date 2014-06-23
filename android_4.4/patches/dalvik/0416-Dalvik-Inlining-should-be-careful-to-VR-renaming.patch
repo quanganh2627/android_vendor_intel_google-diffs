@@ -1,0 +1,208 @@
+From cea86fc761ca43715264603a27767929f0768bba Mon Sep 17 00:00:00 2001
+From: Serguei Katkov <serguei.i.katkov@intel.com>
+Date: Wed, 20 Nov 2013 13:53:28 +0700
+Subject: Dalvik: Inlining should be careful to VR renaming
+
+BZ: 152506
+
+In case of inlining simple method JIT should ensure that
+all registers in callee were renamed. The patch adds this check
+and if there are unmatched registers we fallback to inlining of
+non-simple method.
+
+Change-Id: I8041da5a6b8a2faeab795b32b6cb0da50204c830
+Category: device enablement
+Domain: AOSP.Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, need rework
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/InlineTransformation.cpp |   92 ++++++++++++++++++++++++++--------
+ 1 files changed, 71 insertions(+), 21 deletions(-)
+
+diff --git a/vm/compiler/InlineTransformation.cpp b/vm/compiler/InlineTransformation.cpp
+index 876f4db..f876c34 100755
+--- a/vm/compiler/InlineTransformation.cpp
++++ b/vm/compiler/InlineTransformation.cpp
+@@ -58,6 +58,7 @@ enum InliningFailure
+     kInliningCalleeNotLeaf,              //!< @brief Used when callee is not a leaf
+     kInliningMethodComplicated,          //!< @brief Used when method is too complicated for inliner
+     kInliningClassNotLoaded,             //!< @brief Used when we try to find class object but cannot because it is not loaded
++    kInliningUnmatchedLocals,            //!< @brief Used when we try to inline simple method but there are local VR in callee without pair in caller
+ };
+ 
+ /**
+@@ -164,6 +165,9 @@ static const char *getFailureMessage (InliningFailure failure)
+         case kInliningClassNotLoaded:
+             message = "cannot find class object needed to create devirtualization check";
+             break;
++        case kInliningUnmatchedLocals:
++            message = "cannot match all callee VRs to caller ones";
++            break;
+         default:
+             break;
+     }
+@@ -1152,11 +1156,15 @@ static MIR *findReturn (GrowableList &blockList, const BasicBlock *exit)
+  * @param moveResult The MIR for the move-result.
+  * @param returnMir The MIR for the return
+  * @param calleeToCaller Map of virtual registers of callee to that of caller
++ * @param calleeLocalsCount Number of locals in callee
+  * @return Returns inlining success/failure
+  */
+ static InliningFailure rewriteSingleInlinedMIR (MIR *newMir, const MIR *moveResult, const MIR *returnMir,
+-        const std::map<int, int> &calleeToCaller)
++        const std::map<int, int> &calleeToCaller, const int calleeLocalsCount)
+ {
++    //We need a local copy to ensure the original map is not changed
++    std::map<int, int> calleeToCallerLocal (calleeToCaller);
++
+     //Copy the decoded instruction
+     DecodedInstruction newInsn = newMir->dalvikInsn;
+ 
+@@ -1186,14 +1194,30 @@ static InliningFailure rewriteSingleInlinedMIR (MIR *newMir, const MIR *moveResu
+             {
+                 return kInliningDefNoMatchReturn;
+             }
+-            else
++
++            //We write directly into register desired by move-result
++            newInsn.vA = moveResult->dalvikInsn.vA;
++
++            //Keep renaming for def
++            calleeToCallerLocal[returnMir->dalvikInsn.vA] = moveResult->dalvikInsn.vA;
++            if ((newMirFlags & DF_DA_WIDE) != 0)
+             {
+-                //We write directly into register desired by move-result
+-                newInsn.vA = moveResult->dalvikInsn.vA;
++                calleeToCallerLocal[returnMir->dalvikInsn.vA + 1] = moveResult->dalvikInsn.vA + 1;
+             }
+         }
+     }
+ 
++    //Before rewriting we must ensure that all callee's VRs have corresponding caller VR
++    //Otherwise our inlined MIR will corrupt VR from caller
++    //We need to check only locals because other were filled in creation of map
++    for (int i = 0; i < calleeLocalsCount; i++)
++    {
++        if (calleeToCallerLocal.find (i) == calleeToCallerLocal.end ())
++        {
++            return kInliningUnmatchedLocals;
++        }
++    }
++
+     //Try to rewrite the uses now
+     if (dvmCompilerRewriteMirVRs (newInsn, calleeToCaller, true) == false)
+     {
+@@ -1214,10 +1238,12 @@ static InliningFailure rewriteSingleInlinedMIR (MIR *newMir, const MIR *moveResu
+  * @param invoke The invoke whose method we are inlining
+  * @param returnMir The return bytecode of the callee method
+  * @param moveResult The move-result following invoke
++ * @param calleeLocalsCount Number of locals in callee
+  * @return Returns inlining success/failure depending on whether rewriting went well
+  */
+ static InliningFailure locateAndRewriteSingleMIR (GrowableList &calleeBasicBlocks,
+-        const std::map<int, int> &calleeToCaller, const MIR *invoke, const MIR *returnMir, const MIR *moveResult)
++        const std::map<int, int> &calleeToCaller, const MIR *invoke, const MIR *returnMir,
++        const MIR *moveResult, const int calleeLocalsCount)
+ {
+     MIR *mirToInline = 0;
+ 
+@@ -1256,7 +1282,7 @@ static InliningFailure locateAndRewriteSingleMIR (GrowableList &calleeBasicBlock
+     if (mirToInline != 0)
+     {
+         //Now we need to rewrite the VRs for the MIR we wish to inline
+-        InliningFailure rewriting  = rewriteSingleInlinedMIR (mirToInline, moveResult, returnMir, calleeToCaller);
++        InliningFailure rewriting  = rewriteSingleInlinedMIR (mirToInline, moveResult, returnMir, calleeToCaller, calleeLocalsCount);
+ 
+         if (rewriting != kInliningNoError)
+         {
+@@ -1588,10 +1614,11 @@ static InliningFailure shiftRegisterWindow (CompilationUnit *cUnit, GrowableList
+  * @param invoke The MIR for the invoke
+  * @param isPredicted Whether method being invoked is predicted
+  * @param isVerySimple The inlined method only has one bytecode to inline
++ * @param complexCaseSupported whether complex case is supported
+  * @return Returns inlining success/failure
+  */
+ static InliningFailure doInline (CompilationUnit *cUnit, const Method *calleeMethod, MIR *invoke,
+-        bool isPredicted, bool isVerySimple)
++        bool isPredicted, bool isVerySimple, InliningFailure complexCaseSupported)
+ {
+     //Keep track of BBs of callee
+     BasicBlock *calleeEntry = 0, *calleeExit = 0;
+@@ -1675,8 +1702,20 @@ static InliningFailure doInline (CompilationUnit *cUnit, const Method *calleeMet
+     if (isVerySimple == true)
+     {
+         InliningFailure rewritten = locateAndRewriteSingleMIR (calleeBasicBlocks, calleeToCaller, invoke, returnMir,
+-                moveResult);
++                moveResult, calleeMethod->registersSize - calleeMethod->insSize);
+ 
++#ifdef ARCH_IA32
++        //Only x86 has register window shift implementation so we don't inline non-simple methods for anyone else
++        if (rewritten == kInliningUnmatchedLocals)
++        {
++            //Fallback to non-simple inline, we did not change anything so it is safe if it is supported
++            if (complexCaseSupported == kInliningSuccess)
++            {
++                rewritten = kInliningNoError;
++                isVerySimple = false;
++            }
++        }
++#endif
+         if (rewritten != kInliningNoError)
+         {
+             return rewritten;
+@@ -1740,27 +1779,38 @@ static InliningFailure tryInline (CompilationUnit *cUnit, const Method *calleeMe
+     {
+         inlined = kInliningFailedBefore;
+     }
+-    else if (isVerySimpleMethod (methodStats) == true)
++    else
+     {
+-        const bool isVerySimple = true;
+-        inlined = doInline (cUnit, calleeMethod, invoke, isPredicted, isVerySimple);
+-    }
++        //Now we should detect whether we will be able to use non very simple inline
++        //to let doInline know whether it can fallback to more complex case
++        InliningFailure complexCaseSupported = kInliningMethodComplicated;
++
+ #ifdef ARCH_IA32
+-    //Only x86 has register window shift implementation so we don't inline small methods for anyone else
+-    else if ((inlined = isSmallThrowFreeLeaf (methodStats)) == kInliningNoError)
+-    {
+-        //For methods that are not very simple, we need to make sure we don't overflow
+-        if (backendSupportsExtended != 0 && backendSupportsExtended (kMirOpCheckStackOverflow) == true)
++        //Only x86 has register window shift implementation so we don't inline small methods for anyone else
++        complexCaseSupported = isSmallThrowFreeLeaf (methodStats);
++        if (complexCaseSupported == kInliningNoError)
++        {
++            //For methods that are not very simple, we need to make sure we don't overflow
++            if (backendSupportsExtended == 0 || backendSupportsExtended (kMirOpCheckStackOverflow) == false)
++            {
++                complexCaseSupported = kInliningNoBackendExtendedOpSupport;
++            }
++            else
++            {
++                complexCaseSupported = kInliningSuccess;
++            }
++        }
++#endif
++        const bool isVerySimple = isVerySimpleMethod (methodStats);
++        if (isVerySimple == true || complexCaseSupported == kInliningSuccess)
+         {
+-            const bool isVerySimple = false;
+-            inlined = doInline (cUnit, calleeMethod, invoke, isPredicted, isVerySimple);
++            inlined = doInline (cUnit, calleeMethod, invoke, isPredicted, isVerySimple, complexCaseSupported);
+         }
+         else
+         {
+-            inlined = kInliningNoBackendExtendedOpSupport;
++            inlined = complexCaseSupported;
+         }
+     }
+-#endif
+ 
+     //We may have inserted basic blocks so update cUnit's value right now
+     cUnit->numBlocks = dvmGrowableListSize (&cUnit->blockList);
+-- 
+1.7.4.1
+

@@ -1,0 +1,197 @@
+From 4421113c2cc2e5bd577ca9e8a07a80795821672a Mon Sep 17 00:00:00 2001
+From: aleksey.v.ignatenko <avignate@lab-dyn-116-248.ins.intel.com>
+Date: Wed, 30 Oct 2013 17:55:27 +0700
+Subject: Dalvik: rPC calculation with dvmCompilerGetDalvikPC can lead to a crash
+
+BZ: 148654
+
+rPC is calculated with dvmCompilerGetDalvikPC method. This method relies on
+mir->nesting.sourceMethod info which can be 0 for some extended MIRs. That
+will lead to a crash if exception is generated. The patch validates sourceMethod
+!= 0 for inlined mirs and returns cUnit->method for non-inlined.
+
+Change-Id: I0d27ba25d3119a2f88318952170ffb04ad966040
+Category: device enablement
+Domain: AOSP.Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, need rework
+Signed-off-by: avignate <aleksey.v.ignatenko@intel.com>
+---
+ vm/compiler/CompilerIR.h                        |    5 +++--
+ vm/compiler/IntermediateRep.cpp                 |   18 ++++++++++++++++--
+ vm/compiler/SSATransformation.cpp               |    2 +-
+ vm/compiler/codegen/x86/CompilationErrorX86.cpp |    1 +
+ vm/compiler/codegen/x86/CompilationErrorX86.h   |    2 ++
+ vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp  |    2 +-
+ vm/compiler/codegen/x86/lightcg/NcgAot.cpp      |    8 ++++++++
+ vm/compiler/codegen/x86/pcg/CodeGeneration.cpp  |    2 +-
+ vm/compiler/codegen/x86/pcg/LowerMemory.cpp     |    9 +++++++++
+ 9 files changed, 42 insertions(+), 7 deletions(-)
+
+diff --git a/vm/compiler/CompilerIR.h b/vm/compiler/CompilerIR.h
+index 3769094..69a222d 100644
+--- a/vm/compiler/CompilerIR.h
++++ b/vm/compiler/CompilerIR.h
+@@ -790,10 +790,11 @@ MIR *dvmCompilerCopyMIR (MIR *orig);
+ 
+ /**
+  * @brief Get the dalvik PC for a MIR
++ * @param cUnit The CompilationUnit
+  * @param mir The bytecode whose PC to determine
+- * @return Returns the dalvik PC if the bytecode originates from dex file. Otherwise returns 0.
++ * @return Returns the dalvik PC.
+  */
+-u2 * dvmCompilerGetDalvikPC (const MIR *mir);
++u2 * dvmCompilerGetDalvikPC (CompilationUnit *cUnit, const MIR *mir);
+ 
+ /**
+  * @brief Determines if ssa reg define is live out of current basic block.
+diff --git a/vm/compiler/IntermediateRep.cpp b/vm/compiler/IntermediateRep.cpp
+index 8de44f7..0fbea94 100644
+--- a/vm/compiler/IntermediateRep.cpp
++++ b/vm/compiler/IntermediateRep.cpp
+@@ -943,7 +943,7 @@ MIR *dvmCompilerCopyMIR (MIR *orig)
+     return copy;
+ }
+ 
+-u2 * dvmCompilerGetDalvikPC (const MIR *mir)
++u2 * dvmCompilerGetDalvikPC (CompilationUnit* cUnit, const MIR *mir)
+ {
+     //If we are not provided a MIR, then we cannot figure out a PC
+     if (mir == 0)
+@@ -957,7 +957,21 @@ u2 * dvmCompilerGetDalvikPC (const MIR *mir)
+     //If the MIR had no source method, then we cannot figure out a valid PC for it
+     if (sourceMethod == 0)
+     {
+-        return 0;
++        /* We should guarantee mir has valid
++         * sourceMethod if mir is inlined
++         */
++        int flags = mir->OptimizationFlags;
++        if ((flags & MIR_INLINED_PRED) != 0 || (flags & MIR_INLINED) != 0)
++        {
++            ALOGD("JIT_INFO: No sourceMethod for an inlined mir");
++            assert(false);
++            return 0;
++        }
++        /* Consider sourceMethod = cUnit->method for non inlined mirs
++         * untill we support exceptions for non-simple inlining
++         * TODO: fix this as soon as inlining scope gets expanded
++         */
++        sourceMethod = cUnit->method;
+     }
+ 
+     //The dalvik PC is the pointer to instructions of method plus the offset
+diff --git a/vm/compiler/SSATransformation.cpp b/vm/compiler/SSATransformation.cpp
+index 459a29c..58827d3 100644
+--- a/vm/compiler/SSATransformation.cpp
++++ b/vm/compiler/SSATransformation.cpp
+@@ -572,7 +572,7 @@ static void insertPhiNodes(CompilationUnit *cUnit)
+                 (BasicBlock *) dvmGrowableListGetElement(blockList, idx);
+             /* Variable will be clobbered before being used - no need for phi */
+             if (!dvmIsBitSet(phiBB->dataFlowInfo->liveInV, dalvikReg)) continue;
+-            MIR *phi = (MIR *) dvmCompilerNew(sizeof(MIR), true);
++            MIR *phi = dvmCompilerNewMIR ();
+             phi->dalvikInsn.opcode = (Opcode)kMirOpPhi;
+             phi->dalvikInsn.vA = dalvikReg;
+             phi->offset = phiBB->startOffset;
+diff --git a/vm/compiler/codegen/x86/CompilationErrorX86.cpp b/vm/compiler/codegen/x86/CompilationErrorX86.cpp
+index 36509e9..abb3d6a 100644
+--- a/vm/compiler/codegen/x86/CompilationErrorX86.cpp
++++ b/vm/compiler/codegen/x86/CompilationErrorX86.cpp
+@@ -26,6 +26,7 @@ START_ERRORS
+     NEW_ERROR (kJitErrorUnsupportedBytecode,  "Trace contains bytecode with no implementation.",              false, false),
+     NEW_ERROR (kJitErrorUnsupportedVectorization, "Requested vectorization is not supported.",                    false, false),
+     NEW_ERROR (kJitErrorUnsupportedInstruction,   "Architecture does not support desired x86 instruction.",       false, false),
++    NEW_ERROR (kJitErrorZeroPC,               "JIT is exporting a PC of 0.",                         false, false),
+ END_ERRORS
+ 
+ unsigned int CompilationErrorHandlerX86::getMaximumErrors (void) const
+diff --git a/vm/compiler/codegen/x86/CompilationErrorX86.h b/vm/compiler/codegen/x86/CompilationErrorX86.h
+index 50c3c30..2c9d215 100644
+--- a/vm/compiler/codegen/x86/CompilationErrorX86.h
++++ b/vm/compiler/codegen/x86/CompilationErrorX86.h
+@@ -35,6 +35,8 @@ enum JitX86CompilationErrors {
+     kJitErrorUnsupportedVectorization,
+     /** @brief Unsupported case for vectorization */
+     kJitErrorUnsupportedInstruction,
++    /** @brief The JIT is exporting a PC of 0 */
++    kJitErrorZeroPC,
+     /** @brief Guarding value
+      * THIS NEEDS TO BE THE LAST VALUE
+      */
+diff --git a/vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp b/vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp
+index 6da0fe4..5fc5da2 100644
+--- a/vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp
++++ b/vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp
+@@ -1490,7 +1490,7 @@ int codeGenBasicBlock(const Method* method, BasicBlock_O1* bb, CompilationUnit_O
+         offsetPC = mir->seqNum;
+ 
+         //Update rPC to contain the dalvik PC for this bytecode
+-        rPC = dvmCompilerGetDalvikPC (mir);
++        rPC = dvmCompilerGetDalvikPC (cUnit, mir);
+ 
+         //Skip mirs tagged as being no-ops
+         if ((mir->OptimizationFlags & MIR_INLINED) != 0)
+diff --git a/vm/compiler/codegen/x86/lightcg/NcgAot.cpp b/vm/compiler/codegen/x86/lightcg/NcgAot.cpp
+index 9588f62..7f5bf02 100644
+--- a/vm/compiler/codegen/x86/lightcg/NcgAot.cpp
++++ b/vm/compiler/codegen/x86/lightcg/NcgAot.cpp
+@@ -51,6 +51,14 @@ static void export_pc (int dalvikPC, int framePtrRegister, bool isFramePtrRegPhy
+  */
+ void export_pc (void)
+ {
++    // check rPC !=0 as it can lead to failure during exception thrown
++    if (rPC == 0) {
++        ALOGD ("JIT_INFO: The JIT is exporting a PC of 0. This is likely \
++                        incorrect thus we reject trace to prevent semantic problem");
++        assert(false);
++        SET_JIT_ERROR (kJitErrorZeroPC);
++        return;
++    }
+     //Determine PC and register that contains frame pointer
+     int dalvikPC = reinterpret_cast<int> (rPC);
+     int framePtrRegister = PhysicalReg_FP;
+diff --git a/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp b/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
+index 0a25ef4..38fb23d 100644
+--- a/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
++++ b/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
+@@ -51,7 +51,7 @@ static bool dvmCompilerPcgTranslateInsn (CompilationUnitPCG *cUnit, MIR *mir)
+     Opcode dalvikOpCode = mir->dalvikInsn.opcode;
+ 
+     //Update rPC to contain the dalvik PC for this bytecode
+-    rPC = dvmCompilerGetDalvikPC (mir);
++    rPC = dvmCompilerGetDalvikPC (cUnit, mir);
+ 
+     //Get the SSARepresentation
+     SSARepresentation *ssaRep = mir->ssaRep;
+diff --git a/vm/compiler/codegen/x86/pcg/LowerMemory.cpp b/vm/compiler/codegen/x86/pcg/LowerMemory.cpp
+index da0f8a8..8b435f7 100644
+--- a/vm/compiler/codegen/x86/pcg/LowerMemory.cpp
++++ b/vm/compiler/codegen/x86/pcg/LowerMemory.cpp
+@@ -19,6 +19,7 @@
+ #include "Lower.h"
+ #include "LowerJump.h"
+ #include "UtilityPCG.h"
++#include "CompilationErrorPCG.h"
+ 
+ //TODO see how to remove this
+ // Self PTR from ebp (cUnit->getFramePtr ())
+@@ -65,6 +66,14 @@ CGInst dvmCompilerPcgGetSelfPointer (const CompilationUnitPCG *cUnit)
+ 
+ void dvmCompilerPcgExportPC (CompilationUnitPCG *cUnit)
+ {
++    // check rPC !=0 as it can lead to failure during exception thrown
++    if (rPC == 0) {
++        ALOGD ("JIT_INFO: The JIT is exporting a PC of 0. This is likely \
++                        incorrect thus we reject trace to prevent semantic problem");
++        assert(false);
++        cUnit->errorHandler->setError (kJitErrorZeroPC);
++        return;
++    }
+     // exportPc
+     CGAddr pcAddr = CGCreateAddr (cUnit->getVMPtr (), CGInstInvalid, 0, CGSymbolInvalid,
+            (OFFSETOF_MEMBER (StackSaveArea,xtra) - sizeof (StackSaveArea)));
+-- 
+1.7.4.1
+

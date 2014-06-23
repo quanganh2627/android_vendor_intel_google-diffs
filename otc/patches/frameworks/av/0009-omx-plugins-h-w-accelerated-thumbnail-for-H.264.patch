@@ -1,0 +1,149 @@
+From a646e72539dcc36e5e9212995428d1c1af4c4a8d Mon Sep 17 00:00:00 2001
+From: Robin Mathew <robbin.mathew@intel.com>
+Date: Fri, 10 Aug 2012 15:22:15 -0700
+Subject: omx-plugins: h/w accelerated thumbnail for H.264
+
+Added h/w accelerated support for H.264 thumbnails.
+This required adding "OMX.Intel.index.ThumbnailMode"
+extension in stagefright.
+
+Add stagefright logic to re-order components to use h/w
+accelerated for thumbnails.  Currently playback is performed
+by s/w OMX codec.
+
+To be able to use the h/w accelerated plug-in the rest of the
+stack has to be enabled.  If not enable the code added won't
+show regression in functionality.
+
+This patch must be filtered out when submitting this branch
+upstream
+
+Change-Id: Id9f0e15fcbcd3c19ebb590fde45983d96e9717ef
+Signed-off-by: Daniel Charles <daniel.charles@intel.com>
+Signed-off-by: Daniel Leung <daniel.leung@intel.com>
+---
+ include/media/stagefright/OMXCodec.h               |    4 ++
+ media/libstagefright/OMXCodec.cpp                  |   48 ++++++++++++++++++-
+ .../StagefrightMetadataRetriever.cpp               |    2 +-
+ 3 files changed, 50 insertions(+), 4 deletions(-)
+
+diff --git a/include/media/stagefright/OMXCodec.h b/include/media/stagefright/OMXCodec.h
+index 583c3b3..124b916 100644
+--- a/include/media/stagefright/OMXCodec.h
++++ b/include/media/stagefright/OMXCodec.h
+@@ -60,6 +60,10 @@ struct OMXCodec : public MediaSource,
+ 
+         // Secure decoding mode
+         kUseSecureInputBuffers = 256,
++
++        // Hardware codecs list first
++        kPreferHardwareCodecs = 512,
++
+     };
+     static sp<MediaSource> Create(
+             const sp<IOMX> &omx,
+diff --git a/media/libstagefright/OMXCodec.cpp b/media/libstagefright/OMXCodec.cpp
+index 4f38ffd..fad1d2c 100644
+--- a/media/libstagefright/OMXCodec.cpp
++++ b/media/libstagefright/OMXCodec.cpp
+@@ -178,6 +178,29 @@ static int CompareSoftwareCodecsFirst(
+     return 0;
+ }
+ 
++// A sort order in which OMX hardware codecs are first, followed
++// by other OMX software codecs and non-OMX sofware codecs
++// followed by everything else (if exists)
++static int CompareHardwareCodecsFirst(
++        const OMXCodec::CodecNameAndQuirks *elem1,
++        const OMXCodec::CodecNameAndQuirks *elem2) {
++
++    bool isSoftwareCodec1 = IsSoftwareCodec(elem1->mName.string());
++    bool isSoftwareCodec2 = IsSoftwareCodec(elem2->mName.string());
++
++    if (!isSoftwareCodec1) {
++        return -1;
++    }
++
++    if (!isSoftwareCodec2) {
++        return 1;
++    }
++
++    return 0;
++}
++
++
++
+ // static
+ void OMXCodec::findMatchingCodecs(
+         const char *mime,
+@@ -227,7 +250,9 @@ void OMXCodec::findMatchingCodecs(
+         }
+     }
+ 
+-    if (flags & kPreferSoftwareCodecs) {
++    if (flags & kPreferHardwareCodecs) {
++        matchingCodecs->sort(CompareHardwareCodecsFirst);
++    } else if (flags & kPreferSoftwareCodecs) {
+         matchingCodecs->sort(CompareSoftwareCodecsFirst);
+     }
+ }
+@@ -576,9 +601,16 @@ status_t OMXCodec::configureCodec(const sp<MetaData> &meta) {
+     }
+ 
+     initOutputFormat(meta);
++    const char* extString;
++    if(!strncmp(mComponentName, "OMX.SEC.", 8)) {
++        extString = "OMX.SEC.index.ThumbnailMode";
++    } else if ((!strncmp(mComponentName, "OMX.Intel.",10))) {
++        extString = "OMX.Intel.index.ThumbnailMode";
++    }
+ 
+     if ((mFlags & kClientNeedsFramebuffer)
+-            && !strncmp(mComponentName, "OMX.SEC.", 8)) {
++            && ((!strncmp(mComponentName, "OMX.SEC.", 8))
++              || (!strncmp(mComponentName, "OMX.Intel.", 10)))) {
+         // This appears to no longer be needed???
+ 
+         OMX_INDEXTYPE index;
+@@ -586,7 +618,7 @@ status_t OMXCodec::configureCodec(const sp<MetaData> &meta) {
+         status_t err =
+             mOMX->getExtensionIndex(
+                     mNode,
+-                    "OMX.SEC.index.ThumbnailMode",
++                    extString,
+                     &index);
+ 
+         if (err != OK) {
+@@ -1547,6 +1579,16 @@ status_t OMXCodec::allocateBuffersOnPort(OMX_U32 portIndex) {
+     CODEC_LOGV("allocating %lu buffers of size %lu on %s port",
+             def.nBufferCountActual, def.nBufferSize,
+             portIndex == kPortIndexInput ? "input" : "output");
++    if ((mFlags & kClientNeedsFramebuffer) &&
++                    (!strncmp(mComponentName, "OMX.Intel.", 8))) {
++            def.nBufferSize = (def.format.video.nFrameWidth *
++                            def.format.video.nFrameHeight * 3) / 2;
++            ALOGV("%s, after modifying size, def.nBufferSize %d, width %d, height %d",
++                            __FUNCTION__, def.nBufferSize,
++                            def.format.video.nFrameWidth,
++                            def.format.video.nFrameHeight);
++    }
++
+ 
+     size_t totalSize = def.nBufferCountActual * def.nBufferSize;
+     mDealer[portIndex] = new MemoryDealer(totalSize, "OMXCodec");
+diff --git a/media/libstagefright/StagefrightMetadataRetriever.cpp b/media/libstagefright/StagefrightMetadataRetriever.cpp
+index 19af4fb..81d9802 100644
+--- a/media/libstagefright/StagefrightMetadataRetriever.cpp
++++ b/media/libstagefright/StagefrightMetadataRetriever.cpp
+@@ -382,7 +382,7 @@ VideoFrame *StagefrightMetadataRetriever::getFrameAtTime(
+ 
+     VideoFrame *frame =
+         extractVideoFrameWithCodecFlags(
+-                &mClient, trackMeta, source, OMXCodec::kPreferSoftwareCodecs,
++                &mClient, trackMeta, source, OMXCodec::kPreferHardwareCodecs,
+                 timeUs, option);
+ 
+     if (frame == NULL) {
+-- 
+1.7.4.1
+

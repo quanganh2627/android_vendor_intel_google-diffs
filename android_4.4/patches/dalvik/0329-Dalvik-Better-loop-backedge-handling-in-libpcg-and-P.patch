@@ -1,0 +1,174 @@
+From a1659c0c58353f88fb966ea1171b10d3cdcb0916 Mon Sep 17 00:00:00 2001
+From: Tim Hartley <timothy.d.hartley@intel.com>
+Date: Mon, 19 Aug 2013 12:04:54 -0700
+Subject: Dalvik: Better loop backedge handling in libpcg and PCG GL
+
+BZ: 131834
+
+This patch slightly changes the PCG API calls to create loops.
+It avoids doing writebacks to non-phi dirty VRS in the prebackward
+block. It does this by intersecting the dirtyIns of the loop
+header with the phi nodes. If there is an empty set, there
+are no writebacks for this path.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Ib152111c80aea167c8a5bd493481f1434a1dc3cc
+Orig-MCG-Change-Id: Icf9c4f6fffe08bc578f617f57b4f7b4593c94fd1
+Signed-off-by: Tim Hartley <timothy.d.hartley@intel.com>
+Reviewed-on: http://android.intel.com:8080/126901
+Reviewed-by: Beyler, Jean Christophe <jean.christophe.beyler@intel.com>
+Reviewed-by: Kreitzer, David L <david.l.kreitzer@intel.com>
+Reviewed-by: Dittert, Eric <eric.dittert@intel.com>
+Reviewed-by: Lupusoru, Razvan A <razvan.a.lupusoru@intel.com>
+Reviewed-by: Popov, Ivan G <ivan.g.popov@intel.com>
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: Banerji, Udayan <udayan.banerji@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/codegen/x86/pcg/CodeGeneration.cpp |    6 ++--
+ vm/compiler/codegen/x86/pcg/LowerJump.cpp      |    9 +++++--
+ vm/compiler/codegen/x86/pcg/LowerJump.h        |    5 +--
+ vm/compiler/codegen/x86/pcg/UtilityPCG.cpp     |   27 ++++++++++++++++++++++++
+ vm/compiler/codegen/x86/pcg/UtilityPCG.h       |    9 ++++++++
+ 5 files changed, 47 insertions(+), 9 deletions(-)
+
+diff --git a/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp b/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
+index 87a7934..f94695e 100644
+--- a/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
++++ b/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
+@@ -961,10 +961,10 @@ static void handlePreBackwardBlock (CompilationUnitPCG *cUnit, BasicBlockPCG *bb
+     // in a conditional jump to this block.  The possible branch targets
+     // are the pre backward block label (before the jump is patched) and
+     // the loop head (after the jump is patched).
+-    CGInst jsr = CGCreateNewInst ("jsr", "n", cgSymbol);
+-    CGAddIndirectBranchTarget(jsr, cgLabel);
++    CGInst jmp = CGCreateNewInst ("jmp", "n", cgSymbol);
++    CGAddIndirectBranchTarget(jmp, cgLabel);
+     assert(loopHeadLabel != 0);
+-    CGAddIndirectBranchTarget(jsr, loopHeadLabel);
++    CGAddIndirectBranchTarget(jmp, loopHeadLabel);
+     CGBindLabel(cgLabel);
+ }
+ 
+diff --git a/vm/compiler/codegen/x86/pcg/LowerJump.cpp b/vm/compiler/codegen/x86/pcg/LowerJump.cpp
+index 359a0e2..f97cc15 100644
+--- a/vm/compiler/codegen/x86/pcg/LowerJump.cpp
++++ b/vm/compiler/codegen/x86/pcg/LowerJump.cpp
+@@ -239,18 +239,21 @@ void dvmCompilerPcgTranslateGoto (BasicBlockPCG *bb)
+ 
+ void dvmCompilerPcgDoWritebacksOnEdge (CompilationUnitPCG *cUnit, BasicBlockPCG *from, BasicBlockPCG *to)
+ {
++    BitVector *tempBV = cUnit->getTemporaryBitVector ();
++    dvmCopyBitVector (tempBV, from->dirtyOuts);
++
+     // We have to write back any register that is live out of "from" but not
+     // live into "to".  If "to" is a pre backward block, the edge is really to
+     // the loop header.
+-
+     if (to->blockType == kPreBackwardBlock)
+     {
+         LoopInformation *loopInfo = cUnit->loopInformation;
+         to = (BasicBlockPCG *) loopInfo->getEntryBlock ();
++
++        // We only need to write back phi nodes inside the loop
++        dvmCompilerPcgRemoveNonPhiNodes (cUnit, tempBV, to);
+     }
+ 
+-    BitVector *tempBV = cUnit->getTemporaryBitVector ();
+-    dvmCopyBitVector (tempBV, from->dirtyOuts);
+     dvmSubtractBitVectors (tempBV, tempBV, to->dirtyIns);
+     dvmCompilerPcgGenerateWritebacks (cUnit, tempBV);
+     cUnit->freeTemporaryBitVector (tempBV);
+diff --git a/vm/compiler/codegen/x86/pcg/LowerJump.h b/vm/compiler/codegen/x86/pcg/LowerJump.h
+index d64973f..a6d3bca 100644
+--- a/vm/compiler/codegen/x86/pcg/LowerJump.h
++++ b/vm/compiler/codegen/x86/pcg/LowerJump.h
+@@ -82,9 +82,7 @@ void dvmCompilerPcgTranslateGoto (BasicBlockPCG *bb);
+  * @brief Generate the write backs
+  * @param cUnit the CompilationUnitPCG
+  * @param bv the BitVector representing what to write back
+- * Generate code for writing back all members of the set, bv, to their home
+- * virtual registers. This routine modifies tempBV.  Callers may use tempBV
+- * to pass the input set but must be aware that its contents will change.
++ * @details Generate code for writing back all members of the set, bv, to their home virtual registers. This routine modifies tempBV.  Callers may use tempBV to pass the input set but must be aware that its contents will change.
+  */
+ void dvmCompilerPcgGenerateWritebacks (CompilationUnitPCG *cUnit, BitVector *bv);
+ 
+@@ -93,6 +91,7 @@ void dvmCompilerPcgGenerateWritebacks (CompilationUnitPCG *cUnit, BitVector *bv)
+  * @param cUnit the CompilationUnitPCG
+  * @param from the BasicBlockPCG from which we are coming
+  * @param to the BasicBlockPCG from which we are going to
++ * @details This function specially handles "to" blocks that are kPreBackwardBlocks. It calls dvmCompilerPcgRemoveNonPhiNodes, such that only phi nodes are written back to their home VRs inside the loop.
+  */
+ void dvmCompilerPcgDoWritebacksOnEdge (CompilationUnitPCG *cUnit, BasicBlockPCG *from, BasicBlockPCG *to);
+ 
+diff --git a/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp b/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp
+index 486f3e3..b25d3e3 100644
+--- a/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp
++++ b/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp
+@@ -26,6 +26,7 @@
+ #include "PersistentInfo.h"
+ #include "Singleton.h"
+ #include "UtilityPCG.h"
++#include "BitVector.h"
+ 
+ /**
+  * @brief Get a call and register from a type
+@@ -812,3 +813,29 @@ CGInst dvmCompilerPcgResolveClass(CompilationUnitPCG *cUnit, u4 classIdx)
+     CGInst res = CGGetTempUseInst (classPtrTemp);
+     return res;
+ }
++
++void dvmCompilerPcgRemoveNonPhiNodes (CompilationUnitPCG *cUnit, BitVector *tempBV, BasicBlockPCG *loopEntry)
++{
++    BitVector *phiNodes = dvmCompilerAllocBitVector (1, true);
++
++    dvmClearAllBits (phiNodes);
++
++    // Go through the MIR instructions in the BB looking for Phi nodes
++    for (MIR *mir = loopEntry->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        // Get opcode
++        Opcode opcode = mir->dalvikInsn.opcode;
++        if (static_cast<ExtendedMIROpcode> (opcode) == kMirOpPhi)
++        {
++            int ssaReg = mir->ssaRep->defs[0];
++            ssaReg = static_cast<int> (cUnit->getCGTempForSSANum (ssaReg));
++            dvmSetBit (phiNodes, ssaReg);
++        }
++        else
++        {
++            // if the opcode isn't a phi, we can exit, all the phis are first in the block
++            break;
++        }
++    }
++    dvmIntersectBitVectors (tempBV, tempBV, phiNodes);
++}
+diff --git a/vm/compiler/codegen/x86/pcg/UtilityPCG.h b/vm/compiler/codegen/x86/pcg/UtilityPCG.h
+index 9a4933e..ff987e7 100644
+--- a/vm/compiler/codegen/x86/pcg/UtilityPCG.h
++++ b/vm/compiler/codegen/x86/pcg/UtilityPCG.h
+@@ -176,4 +176,13 @@ void dvmCompilerPcgHandleInitialLoad (CompilationUnitPCG *cUnit, BasicBlock *bb,
+  * @return the instruction containing the class information
+  */
+ CGInst dvmCompilerPcgResolveClass(CompilationUnitPCG *cUnit, u4 classIdx);
++
++/**
++ * @brief Remove the phi nodes in the loop from the bitvector
++ * @param cUnit the CompilationUnitPCG
++ * @param bv The bit vector to remove phi nodes from
++ * @param loopEntry The basic block which is the beginning of the loop (containing the phi nodes)
++ * @details This function removes all of the SSA numbers of the arguments (uses) to the phi nodes from the bv. The phi nodes are found in the loopEntry BB.
++ */
++void dvmCompilerPcgRemoveNonPhiNodes (CompilationUnitPCG *cUnit, BitVector *bv, BasicBlockPCG *loopEntry);
+ #endif
+-- 
+1.7.4.1
+

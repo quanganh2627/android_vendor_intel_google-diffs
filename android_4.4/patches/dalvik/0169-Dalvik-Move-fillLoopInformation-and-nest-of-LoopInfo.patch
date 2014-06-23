@@ -1,0 +1,248 @@
+From eda2a4ad5c20b9a797508ec41d956a1c1d1ea3b3 Mon Sep 17 00:00:00 2001
+From: Serguei Katkov <serguei.i.katkov@intel.com>
+Date: Mon, 22 Apr 2013 15:20:10 +0700
+Subject: Dalvik: Move fillLoopInformation and nest of LoopInformation after loop formation
+
+BZ: 101308
+
+Loop formation phase generates LoopInformation structures. As a part of it
+it invokes the function fillLoopInformation which puts the details to
+LoopInformation structure. This method requires the correct information about
+dominators. During its work loop formation phase modifies the CFG resulting
+domination information becomes incomplete and invalid.
+The patch moves filling LoopInformation and formation of
+nesting of LoopInformation from loop formation phase after
+loop formation phase when domination information is updated.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I569222af9db741ae923cf0ad81e03e3238253be4
+Orig-MCG-Change-Id: Ie795954fee27f65e039c0db685654b0451765a59
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/BBOptimization.cpp  |   12 +-------
+ vm/compiler/LoopInformation.cpp |   58 ++++++++++++++++++++++++++++++++++++++-
+ vm/compiler/LoopInformation.h   |   20 +++++++++++++-
+ vm/compiler/LoopOpt.cpp         |   19 +++++++++++-
+ vm/compiler/Pass.h              |    1 +
+ 5 files changed, 96 insertions(+), 14 deletions(-)
+
+diff --git a/vm/compiler/BBOptimization.cpp b/vm/compiler/BBOptimization.cpp
+index c7d90f6..29e0935 100644
+--- a/vm/compiler/BBOptimization.cpp
++++ b/vm/compiler/BBOptimization.cpp
+@@ -998,9 +998,6 @@ bool dvmCompilerFormLoop (CompilationUnit *cUnit, BasicBlock *bb)
+                 break;
+             }
+ 
+-            //Fill in the last information about the loop
+-            info->fillLoopInformation ();
+-
+             //We now have a new loop information
+             if (cUnit->loopInformation == 0)
+             {
+@@ -1008,13 +1005,8 @@ bool dvmCompilerFormLoop (CompilationUnit *cUnit, BasicBlock *bb)
+             }
+             else
+             {
+-                //Nest it with the current loop information
+-                LoopInformation *nested = cUnit->loopInformation->nest (info);
+-                if (nested == 0) {
+-                    cUnit->quitLoopMode = true;
+-                    return false;
+-                }
+-                cUnit->loopInformation = nested;
++                //Add the current loop information
++                cUnit->loopInformation->add (info);
+             }
+         }
+     }
+diff --git a/vm/compiler/LoopInformation.cpp b/vm/compiler/LoopInformation.cpp
+index 55d3847..e02df58 100644
+--- a/vm/compiler/LoopInformation.cpp
++++ b/vm/compiler/LoopInformation.cpp
+@@ -63,6 +63,51 @@ void LoopInformation::init (void)
+ }
+ 
+ /**
++ * Add takes a new LoopInformation and add to nested list independent on nested correctness.
++ * The correction of nest information will be done later with a special invocation of nestUpdate()
++ * No need to worry about duplicates, nestUpdate will handle it.
++ */
++void LoopInformation::add (LoopInformation *info)
++{
++    if (info != this)
++    {
++        dvmInsertGrowableList (&nested, (intptr_t) info);
++    }
++}
++
++/**
++ * nestUpdate makes the nest information up to date
++ */
++LoopInformation *LoopInformation::nestUpdate (void)
++{
++    GrowableList allInfo;
++    dvmInitGrowableList (&allInfo, 1);
++    collectAllNested (&allInfo);
++
++    LoopInformation *top = this;
++    dvmClearGrowableList (&(top->nested));
++
++    GrowableListIterator iterator;
++    dvmGrowableListIteratorInit (&allInfo, &iterator);
++    while (true)
++    {
++        LoopInformation *info = (LoopInformation*) dvmGrowableListIteratorNext (&iterator);
++        if (info == 0)
++        {
++            return top;
++        }
++        dvmClearGrowableList (&(info->nested));
++        LoopInformation *res = top->nest (info);
++        if (res == 0)
++        {
++            return 0;
++        }
++        top = res;
++    }
++}
++
++
++/**
+  * Nest takes a new LoopInformation and determines if info is nested with this instance or not.
+  * If it is nested in this instance, we fill our nested information with it
+  * Otherwise, we are nested in it and we request it to nest us
+@@ -469,7 +514,7 @@ void LoopInformation::addBackwardBlock (BasicBlock *bb)
+ LoopInformation *LoopInformation::getNested (unsigned int i) const
+ {
+     //Error checking
+-    if (i >= nested.numUsed)
++    if (i >= dvmGrowableListSize(&nested))
+     {
+         return 0;
+     }
+@@ -477,6 +522,17 @@ LoopInformation *LoopInformation::getNested (unsigned int i) const
+     return (LoopInformation *) dvmGrowableListGetElement (&nested, i);
+ }
+ 
++void LoopInformation::collectAllNested (GrowableList *container)
++{
++    unsigned int count = getNestedNbr ();
++    for (unsigned int i = 0; i < count; i++)
++    {
++        LoopInformation *info = getNested (i);
++        dvmInsertGrowableList (container, (intptr_t)info);
++        info->collectAllNested (container);
++    }
++}
++
+ bool LoopInformation::executedPerIteration (CompilationUnit *cUnit, const MIR *mir) const
+ {
+     //Paranoid
+diff --git a/vm/compiler/LoopInformation.h b/vm/compiler/LoopInformation.h
+index 63f086f..bd3c1c1 100644
+--- a/vm/compiler/LoopInformation.h
++++ b/vm/compiler/LoopInformation.h
+@@ -154,6 +154,18 @@ class LoopInformation
+         LoopInformation *nest (LoopInformation *info);
+ 
+         /**
++         * @brief Update nest of loop information
++         * @return the overall LoopInformation
++         */
++        LoopInformation *nestUpdate (void);
++
++        /**
++         * @brief Add a loop information without nest correctness
++         * @param info another LoopInformation to next
++         */
++        void add (LoopInformation *info);
++
++        /**
+          * @brief Get a LoopInformation, search in the nested and use entry as the ID
+          * @param entry the entry BasicBlock
+          * @return the found LoopInformation, 0 otherwise
+@@ -189,6 +201,12 @@ class LoopInformation
+         void dumpInformationDotFormat (FILE *file);
+ 
+         /**
++         * @brief Get all nested LoopInformation including children
++         * @param container to put data
++         */
++        void collectAllNested (GrowableList *container);
++
++        /**
+          * @brief Get a nested LoopInformation
+          * @param i the index
+          * @return the nested LoopInformation at index i
+@@ -199,7 +217,7 @@ class LoopInformation
+          * @brief Get the number of nested loops
+          * @return the number of nested loops
+          */
+-        unsigned int getNestedNbr (void) const {return nested.numUsed;}
++        unsigned int getNestedNbr (void) const {return dvmGrowableListSize(&nested);}
+ 
+         /**
+          * @brief Get the exit loop BasicBlocks BitVector
+diff --git a/vm/compiler/LoopOpt.cpp b/vm/compiler/LoopOpt.cpp
+index 75af557..71d8934 100644
+--- a/vm/compiler/LoopOpt.cpp
++++ b/vm/compiler/LoopOpt.cpp
+@@ -50,7 +50,7 @@ static void clearPHIInformation (CompilationUnit *cUnit);
+ START_PASSES
+     //This loop formation is used when the new loop filtering is active
+     NEW_PASS ("Form_Loop", kAllNodesAndNew, 0, dvmCompilerTraceIsLoopNewSystem,
+-                0, dvmCompilerTestLoop, dvmCompilerFormLoop, 0, kOptimizationBasicBlockChange),
++                0, dvmCompilerTestLoop, dvmCompilerFormLoop, 0, kOptimizationBasicBlockChange | kLoopStructureChange),
+     //Check if the formed loops are like we want right now (nested or not, branches or not)
+     NEW_PASS ("Reject_Loops", kAllNodes, 0, dvmCompilerCheckLoops,
+                             0, 0, 0, 0, 0),
+@@ -163,11 +163,26 @@ bool dvmCompilerCalculateBasicBlockInformation (CompilationUnit *cUnit, bool fil
+   */
+ void handlePassFlag (CompilationUnit *cUnit, Pass *pass)
+ {
+-    //For the moment we only check for BasicBlock change requests
+     if (pass->getFlag (kOptimizationBasicBlockChange) == true)
+     {
+         dvmCompilerCalculateBasicBlockInformation (cUnit, false);
+     }
++    if (pass->getFlag (kLoopStructureChange) == true)
++    {
++        if (cUnit->loopInformation != 0)
++        {
++            LoopInformation *top = cUnit->loopInformation->nestUpdate ();
++            if (top == 0)
++            {
++                cUnit->quitLoopMode = true;
++            }
++            else
++            {
++                cUnit->loopInformation = top;
++            }
++        }
++    }
++
+ }
+ 
+  /**
+diff --git a/vm/compiler/Pass.h b/vm/compiler/Pass.h
+index dc54616..2a36f37 100644
+--- a/vm/compiler/Pass.h
++++ b/vm/compiler/Pass.h
+@@ -32,6 +32,7 @@ typedef bool (*fctWorkPtr) (CompilationUnit *, BasicBlock *);
+ enum OptimizationFlag
+ {
+     kOptimizationBasicBlockChange = 1,   /**< @brief Recalculate BasicBlock information */
++    kLoopStructureChange = 2,            /**< @brief Recalculate LoopInformation nest information */
+ };
+ 
+ /**
+-- 
+1.7.4.1
+

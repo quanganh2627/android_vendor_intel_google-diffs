@@ -1,0 +1,393 @@
+From 4c6e07424c9579121cb44cfcbf850d694e3ddc43 Mon Sep 17 00:00:00 2001
+From: Tim Hartley <timothy.d.hartley@intel.com>
+Date: Mon, 7 Oct 2013 16:25:30 -0700
+Subject: Dalvik: Enable loops with inlined methods with PCG GL
+
+BZ: 143351
+
+The PCG GL schedules the dirty VR writebacks after storing the
+arguments for a method invocation. Hence, in a trace with both
+an inlined method and a regular method invoke, the dirty VR writebacks
+for the inlined callee method would  clobber the stored arguments
+for the regular invoke.
+
+This patch avoids writeback dirty VRs for inlined methods, because
+after the inlined method is complete, those VRs are dead. Additionally,
+this patch stores the invoke arguments after the VR writebacks, to
+ensure the fix is robust.
+
+Hence, loops with inlined methods are allowed.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Ia01203d6d319c79178075216ef4de43233f07d30
+Orig-MCG-Change-Id: I037b8403d5b4b33ef04c4a17f309cc6c76a2208a
+Signed-off-by: Tim Hartley <timothy.d.hartley@intel.com>
+Reviewed-on: http://android.intel.com:8080/136680
+Reviewed-by: Dittert, Eric <eric.dittert@intel.com>
+Reviewed-by: lab_aqa <lab_aqa@intel.com>
+Reviewed-by: Banerji, Udayan <udayan.banerji@intel.com>
+Reviewed-by: Popov, Ivan G <ivan.g.popov@intel.com>
+Reviewed-by: Kreitzer, David L <david.l.kreitzer@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/codegen/x86/pcg/Analysis.cpp     |   78 +++++++++++++++++++++++++-
+ vm/compiler/codegen/x86/pcg/LowerCall.cpp    |   50 ++++++++++++-----
+ vm/compiler/codegen/x86/pcg/LowerCall.h      |    6 +-
+ vm/compiler/codegen/x86/pcg/PcgInterface.cpp |    3 -
+ vm/compiler/codegen/x86/pcg/UtilityPCG.cpp   |   27 +---------
+ vm/compiler/codegen/x86/pcg/UtilityPCG.h     |    9 ---
+ 6 files changed, 117 insertions(+), 56 deletions(-)
+
+diff --git a/vm/compiler/codegen/x86/pcg/Analysis.cpp b/vm/compiler/codegen/x86/pcg/Analysis.cpp
+index 52aca23..673c60e 100644
+--- a/vm/compiler/codegen/x86/pcg/Analysis.cpp
++++ b/vm/compiler/codegen/x86/pcg/Analysis.cpp
+@@ -421,8 +421,41 @@ static void pcgAnalyzeFilledNewArray (CompilationUnitPCG *cUnit, MIR *mir)
+ }
+ 
+ /**
++ * @brief Kill VRs from inlined methods after the method is done being executed
++ * @param cUnit the CompilationUnitPCG
++ * @param bb the BasicBlockPCG in which to kill VRs, to stop them from being dirty out
++ */
++static void killInlinedVRs (CompilationUnitPCG * cUnit, BasicBlockPCG * bb)
++{
++    // We need to kill the VRs defined in the inlined method
++    BitVector *inlinedVRs = cUnit->getTemporaryBitVector ();
++    dvmClearAllBits (inlinedVRs);
++
++    for (int j = 0; j < cUnit->registerWindowShift; j++)
++    {
++        //Get bitvector associated to it
++        BitVector *vrDefsBv = cUnit->getSSANumSet (j);
++
++        if (vrDefsBv != 0)
++        {
++            // Add all the defs of the inlined VR to the inlinedVRs set
++            dvmUnifyBitVectors (inlinedVRs, inlinedVRs, vrDefsBv);
++        }
++    }
++
++    // Add all defs all inlined VRs to the kills set.
++    // Remove all defs of all inlined VRs from the gens set.
++    dvmUnifyBitVectors (bb->kills, bb->kills, inlinedVRs);
++    dvmSubtractBitVectors (bb->dirtyGens, bb->dirtyGens, inlinedVRs);
++
++    //Free temporary bitvector
++    cUnit->freeTemporaryBitVector (inlinedVRs);
++}
++
++/**
+  * @brief Init Generation and Kills
+  * @param cUnit the CompilationUnitPCG
++ * @details We have added some complexity here, to track inlined MIRs, and to kill VRs from inlined MIRs after the inlined method is finished.
+  */
+ static void initGensAndKills (CompilationUnitPCG *cUnit)
+ {
+@@ -431,12 +464,21 @@ static void initGensAndKills (CompilationUnitPCG *cUnit)
+     //Get the block list
+     GrowableList *blockList = &cUnit->blockList;
+ 
++    // We're going to track the inlined method (if any)
++    // because VRs associated with inlined methods are dead
++    // after the inlined method is finished
++    const Method * currentInlinedMethod = 0;
++
++    // We define this here, because we want to check the last BB
++    // for an inlined MIR -> non inlined MIR transition, too
++    BasicBlockPCG * bb = 0;
++
+     //Go through the blocks
+     for (unsigned int i = 0; i < blockList->numUsed; i++)
+     {
+         //Get the current block
+         //TODO: change loop to use iterator instead
+-        BasicBlockPCG *bb = (BasicBlockPCG *) blockList->elemList[i];
++        bb = (BasicBlockPCG *) blockList->elemList[i];
+ 
+         //Paranoid
+         assert (bb != 0);
+@@ -571,8 +613,42 @@ static void initGensAndKills (CompilationUnitPCG *cUnit)
+                     }
+                 }
+             }
++
++            // There are three cases for inlined VRs we track here:
++            // 1) we move from non-inlined MIRs to inlined MIRs
++            // 2) we move from inlined MIRs to non-inlined MIRs
++            // 3) we move from inlined MIRs to inlined MIRs from different methods
++            if (mir->nesting.parent != 0 && currentInlinedMethod == 0)
++            {
++                // 1) just set the currently tracked method
++                currentInlinedMethod = mir->nesting.sourceMethod;
++            }
++            else if (mir->nesting.parent == 0 && currentInlinedMethod != 0)
++            {
++                killInlinedVRs (cUnit, bb);
++
++                // Future MIRs aren't from an inlined method any more
++                currentInlinedMethod = 0;
++            }
++            else if (mir->nesting.parent != 0 &&
++                     currentInlinedMethod != mir->nesting.sourceMethod)
++            {
++                killInlinedVRs (cUnit, bb);
++
++                // Future MIRs are from a different inlined method
++                currentInlinedMethod = mir->nesting.sourceMethod;
++            }
++
+         }
+     }
++
++    // We need to check the end of the cUnit, too, because
++    // we may have dirty out VRs from the inlined method
++    // which doesn't make sense
++    if (currentInlinedMethod != 0)
++    {
++        killInlinedVRs (cUnit, bb);
++    }
+ }
+ 
+ /**
+diff --git a/vm/compiler/codegen/x86/pcg/LowerCall.cpp b/vm/compiler/codegen/x86/pcg/LowerCall.cpp
+index d46dbe1..13509b0 100644
+--- a/vm/compiler/codegen/x86/pcg/LowerCall.cpp
++++ b/vm/compiler/codegen/x86/pcg/LowerCall.cpp
+@@ -73,8 +73,6 @@ static void generatePredictedChain (CompilationUnitPCG *cUnit, BasicBlockPCG *bb
+     //Paranoid
+     assert (traceTakenId != 0);
+ 
+-    dvmCompilerPcgStoreInvokeArgs (cUnit, mir);
+-
+     BasicBlockPCG *target = cUnit->getBasicBlockPCG (traceTakenId);
+ 
+     //Paranoid check
+@@ -213,7 +211,7 @@ static void generatePredictedChain (CompilationUnitPCG *cUnit, BasicBlockPCG *bb
+         CGBindLabel (skipPredictionLabel);
+ 
+         // now create the trampoline to get to the singleton chaining cell
+-        dvmCompilerPcgCommonInvokeMethodJmp (cUnit, bb, ArgsDone_Full, CGGetTempUseInst (methodTemp), fallthroughTargetSymbInst);
++        dvmCompilerPcgCommonInvokeMethodJmp (cUnit, mir, ArgsDone_Full, CGGetTempUseInst (methodTemp), fallthroughTargetSymbInst);
+     }
+     else
+     {
+@@ -278,14 +276,14 @@ static void generatePredictedChain (CompilationUnitPCG *cUnit, BasicBlockPCG *bb
+         CGBindLabel (skipPredictionLabel);
+ 
+         // now create the trampoline to get to the singleton chaining cell
+-        dvmCompilerPcgCommonInvokeMethodJmp (cUnit, bb, ArgsDone_Full, CGGetTempUseInst (methodTemp), fallthroughTargetSymbInst);
++        dvmCompilerPcgCommonInvokeMethodJmp (cUnit, mir, ArgsDone_Full, CGGetTempUseInst (methodTemp), fallthroughTargetSymbInst);
+     }
+ 
+     CGBindLabel (invokeChainLabel);
+ 
+     takenTarget = CGCreateNewInst ("movltc", "n", dvmCompilerPcgGetInvokeTarget (cUnit, target));
+ 
+-    dvmCompilerPcgCommonInvokeMethodJmp (cUnit, bb, ArgsDone_Normal, predictedMethod, fallthroughTargetSymbInst);
++    dvmCompilerPcgCommonInvokeMethodJmp (cUnit, mir, ArgsDone_Normal, predictedMethod, fallthroughTargetSymbInst);
+ }
+ 
+ void dvmCompilerPcgTranslateInvokeVirtual (CompilationUnitPCG *cUnit, MIR *mir)
+@@ -413,12 +411,10 @@ void dvmCompilerPcgTranslateInvokeStaticSuper (CompilationUnitPCG *cUnit, MIR *m
+ 
+     ArgsDoneType methodType = dvmCompilerPcgTranslateConvertCalleeToType (calleeMethod);
+ 
+-    dvmCompilerPcgStoreInvokeArgs (cUnit, mir);
+-
+     // get the fallthrough target instruction
+     CGInst fallthroughTargetSymbInst = dvmCompilerPcgGetFallthroughTargetSymbolInst (cUnit, bb);
+ 
+-    dvmCompilerPcgCommonInvokeMethodJmp (cUnit, bb, methodType, methodIl, fallthroughTargetSymbInst);
++    dvmCompilerPcgCommonInvokeMethodJmp (cUnit, mir, methodType, methodIl, fallthroughTargetSymbInst);
+ }
+ 
+ void dvmCompilerPcgTranslateInvokeInterface (CompilationUnitPCG *cUnit, MIR *mir)
+@@ -478,12 +474,10 @@ void dvmCompilerPcgTranslateInvokeDirect (CompilationUnitPCG *cUnit, MIR *mir)
+     CGInst methodIl = CGCreateNewInst ("mov", "i", calleeMethod);
+     ArgsDoneType methodType = dvmCompilerPcgTranslateConvertCalleeToType (calleeMethod);
+ 
+-    dvmCompilerPcgStoreInvokeArgs (cUnit, mir);
+-
+     // get the fallthrough target instruction
+     CGInst fallthroughTargetSymbInst = dvmCompilerPcgGetFallthroughTargetSymbolInst (cUnit, bb);
+ 
+-    dvmCompilerPcgCommonInvokeMethodJmp (cUnit, bb, methodType, methodIl, fallthroughTargetSymbInst);
++    dvmCompilerPcgCommonInvokeMethodJmp (cUnit, mir, methodType, methodIl, fallthroughTargetSymbInst);
+ }
+ 
+ void dvmCompilerPcgTranslateReturn (CompilationUnitPCG *cUnit, MIR *mir, bool isVoid)
+@@ -980,8 +974,9 @@ CGInst dvmCompilerPcgGetFallthroughTargetSymbolInst (CompilationUnitPCG *cUnit,
+     return inst;
+ }
+ 
+-void dvmCompilerPcgCommonInvokeMethodJmp (CompilationUnitPCG *cUnit, BasicBlockPCG *bb, ArgsDoneType form, CGInst methodToCall, CGInst fallThroughTargetSymInst)
++void dvmCompilerPcgCommonInvokeMethodJmp (CompilationUnitPCG *cUnit, const MIR *mir, ArgsDoneType form, CGInst methodToCall, CGInst fallThroughTargetSymInst)
+ {
++    const BasicBlockPCG * bb = static_cast <const BasicBlockPCG *> (mir->bb);
+     //  arguments needed in ArgsDone:
+     //      start of HotChainingCell for next bytecode: -4 (%esp)
+     //      start of InvokeSingletonChainingCell for callee: -8 (%esp)
+@@ -998,8 +993,35 @@ void dvmCompilerPcgCommonInvokeMethodJmp (CompilationUnitPCG *cUnit, BasicBlockP
+     // The taken edge must always be a supporting chaining cell for invoke or it must not exist
+     assert (takenNeedsCfgEdge == false);
+ 
++    // We will remove VRs associated with any inlined method
++    // because they're dead, now that we're calling a different method
++    BitVector *inlinedVRs = cUnit->getTemporaryBitVector ();
++    dvmClearAllBits (inlinedVRs);
++
++    for (int j = 0; j < cUnit->registerWindowShift; j++)
++    {
++        //Get bitvector associated to it
++        BitVector *vrDefsBv = cUnit->getSSANumSet (j);
++
++        if (vrDefsBv != 0)
++        {
++            // Add all the defs of the inlined VR to the inlinedVRs set
++            dvmUnifyBitVectors (inlinedVRs, inlinedVRs, vrDefsBv);
++        }
++    }
++
++    // Remove all defs of all inlined VRs from the currently tracked VRs
++    BitVector *currentlyTrackedVRs = cUnit->getCurrMod ();
++    dvmSubtractBitVectors (currentlyTrackedVRs, currentlyTrackedVRs, inlinedVRs);
++
++    //Free temporary bitvector
++    cUnit->freeTemporaryBitVector (inlinedVRs);
++
+     // Now generate the necessary writebacks because we are leaving trace
+-    dvmCompilerPcgGenerateWritebacks (cUnit, cUnit->getCurrMod ());
++    dvmCompilerPcgGenerateWritebacks (cUnit, currentlyTrackedVRs);
++
++    // Now set up the arguments for the invoke
++    dvmCompilerPcgStoreInvokeArgs (cUnit, mir);
+ 
+     // sets up parameters in eax, ebx, ecx, and edx
+     CGInst fallthroughTarget = CGCreateNewInst ("mov", "r", fallThroughTargetSymInst);
+@@ -1047,7 +1069,7 @@ void dvmCompilerPcgCommonInvokeMethodJmp (CompilationUnitPCG *cUnit, BasicBlockP
+     dvmCompilerPcgCreateJsr (target, parms);
+ }
+ 
+-void dvmCompilerPcgStoreInvokeArgs (CompilationUnitPCG *cUnit, MIR *mir)
++void dvmCompilerPcgStoreInvokeArgs (CompilationUnitPCG *cUnit, const MIR *mir)
+ {
+     int offset = - sizeof (StackSaveArea) - (4 * mir->ssaRep->numUses);
+ 
+diff --git a/vm/compiler/codegen/x86/pcg/LowerCall.h b/vm/compiler/codegen/x86/pcg/LowerCall.h
+index 02c6910..28d17e5 100644
+--- a/vm/compiler/codegen/x86/pcg/LowerCall.h
++++ b/vm/compiler/codegen/x86/pcg/LowerCall.h
+@@ -100,19 +100,19 @@ CGInst dvmCompilerPcgGetFallthroughTargetSymbolInst (CompilationUnitPCG *cUnit,
+ /**
+  * @brief Invoke a method
+  * @param cUnit the CompilationUnitPCG
+- * @param bb the BasicBlockPCG
++ * @param mir the invoke MIR
+  * @param form the form type of the argument
+  * @param methodToCall what method are we calling
+  * @param fallThroughTargetSymInst a CGInst containing a load of the fall through target symbol
+  */
+-void dvmCompilerPcgCommonInvokeMethodJmp (CompilationUnitPCG *cUnit, BasicBlockPCG *bb, ArgsDoneType form, CGInst methodToCall, CGInst fallThroughTargetSymInst);
++void dvmCompilerPcgCommonInvokeMethodJmp (CompilationUnitPCG *cUnit, const MIR *mir, ArgsDoneType form, CGInst methodToCall, CGInst fallThroughTargetSymInst);
+ 
+ /**
+  * @brief Handle the storing of invoke arguments
+  * @param cUnit the CompilationUnitPCG
+  * @param mir the MIR instruction
+  */
+-void dvmCompilerPcgStoreInvokeArgs (CompilationUnitPCG *cUnit, MIR *mir);
++void dvmCompilerPcgStoreInvokeArgs (CompilationUnitPCG *cUnit, const MIR *mir);
+ 
+ /**
+  * @brief Get an invoke target
+diff --git a/vm/compiler/codegen/x86/pcg/PcgInterface.cpp b/vm/compiler/codegen/x86/pcg/PcgInterface.cpp
+index d47a025..57be569 100644
+--- a/vm/compiler/codegen/x86/pcg/PcgInterface.cpp
++++ b/vm/compiler/codegen/x86/pcg/PcgInterface.cpp
+@@ -262,9 +262,6 @@ extern "C" bool dalvikPluginInit (void)
+ 
+     setupPcgJit();
+ 
+-    //Loops with invokes exposes a bug with PCG. Therefore we check after inlining if we have
+-    //any remaining invokes that we have not inlined when in loop mode
+-    dvmCompilerReplaceEnd ("Method_Inlining", dvmCompilerPcgRejectLoopsWithInvokes);
+ 
+     return true;
+ }
+diff --git a/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp b/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp
+index 6d155b0..271c4b8 100644
+--- a/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp
++++ b/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp
+@@ -459,6 +459,7 @@ bool dvmCompilerPcgSupportsExtendedOp (int extendedOpcode)
+         case kMirOpPackedAddition:
+         case kMirOpPackedMultiply:
+         case kMirOpPackedAddReduce:
++        case kMirOpCheckStackOverflow:
+             return true;
+         default:
+             break;
+@@ -875,32 +876,6 @@ void dvmCompilerPcgRemoveNonPhiNodes (CompilationUnitPCG *cUnit, BitVector *temp
+     dvmIntersectBitVectors (tempBV, tempBV, phiNodes);
+ }
+ 
+-void dvmCompilerPcgRejectLoopsWithInvokes (CompilationUnit *cUnit, Pass *curPass)
+-{
+-    //If we are in loop mode, then we need to check if any invokes have been accepted
+-    if (dvmCompilerTraceIsLoopNewSystem (cUnit, curPass) == true)
+-    {
+-        //Create and initialize iterator to navigate the block
+-        GrowableListIterator blockIter;
+-        dvmGrowableListIteratorInit (&cUnit->blockList, &blockIter);
+-
+-        for (BasicBlock *bb = reinterpret_cast<BasicBlock *>(dvmGrowableListIteratorNext (&blockIter));
+-                bb != NULL;
+-                bb = reinterpret_cast<BasicBlock *>(dvmGrowableListIteratorNext (&blockIter)))
+-        {
+-            //Now walk through the MIRs looking for an invoke
+-            for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
+-            {
+-                if ((dvmCompilerGetOpcodeFlags (mir->dalvikInsn.opcode) & kInstrInvoke) != 0)
+-                {
+-                    //We found an invoke but we want to reject all such loops
+-                    cUnit->quitLoopMode = true;
+-                }
+-            }
+-        }
+-    }
+-}
+-
+ int dvmCompilerPcgGetVROffsetRelativeToVMPtr (CompilationUnitPCG *cUnit, int vR)
+ {
+     int sizeOfVR = sizeof (u4);
+diff --git a/vm/compiler/codegen/x86/pcg/UtilityPCG.h b/vm/compiler/codegen/x86/pcg/UtilityPCG.h
+index 6584fd9..023dc89 100644
+--- a/vm/compiler/codegen/x86/pcg/UtilityPCG.h
++++ b/vm/compiler/codegen/x86/pcg/UtilityPCG.h
+@@ -217,15 +217,6 @@ CGInst dvmCompilerPcgResolveClass(CompilationUnitPCG *cUnit, u4 classIdx);
+ void dvmCompilerPcgRemoveNonPhiNodes (CompilationUnitPCG *cUnit, BitVector *bv, BasicBlockPCG *loopEntry);
+ 
+ /**
+- * @brief Used to reject loops with invokes
+- * @details This is used as a temporary solution to allow inlining to do its job
+- * but in case there are any invokes left in a loop, to reject so we can go to trace mode.
+- * @param cUnit The compilation unit
+- * @param curPass The current pass pointer
+- */
+-void dvmCompilerPcgRejectLoopsWithInvokes (CompilationUnit *cUnit, Pass *curPass);
+-
+-/**
+  * @brief Used to obtain the offset relative to VM frame pointer for a given VR
+  * @param cUnit The compilation unit
+  * @param vR The virtual register number for which to calculate offset
+-- 
+1.7.4.1
+

@@ -1,0 +1,739 @@
+From 863f7e59d76e7639999da2c9355796ec5a8bb24b Mon Sep 17 00:00:00 2001
+From: Bijoy Jose <bijoy.a.jose@intel.com>
+Date: Sat, 16 Mar 2013 14:06:59 -0700
+Subject: Dalvik: Storing 64 bit constants in code cache memory
+
+BZ: 89567
+
+Previously we moved 64 bit data using two 32 bit moves into Virtual
+Registers and then to XMM registers for eventual computation. Here we
+provide an infrastructure to store constants in code cache memory at
+the end of each trace. Also, for double computations we enable loading
+of constants directly from this constant data section instead of the
+above mentioned steps.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I6e615bc8e40d56c896ad17fa213b564b0b0ae576
+Orig-MCG-Change-Id: Ia6c6eb4b6a95ac6f42d71fc8cd27e1e6e22d4097
+Signed-off-by: Bijoy Jose <bijoy.a.jose@intel.com>:55
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/CompilerIR.h                     |    1 +
+ vm/compiler/codegen/Optimizer.h              |    3 +-
+ vm/compiler/codegen/x86/AnalysisO1.h         |   16 ++
+ vm/compiler/codegen/x86/CodegenErrors.cpp    |   11 ++-
+ vm/compiler/codegen/x86/CodegenErrors.h      |    2 +
+ vm/compiler/codegen/x86/CodegenInterface.cpp |  199 +++++++++++++++++++++++++-
+ vm/compiler/codegen/x86/Lower.h              |    9 ++
+ vm/compiler/codegen/x86/LowerHelper.cpp      |  124 ++++++++++++----
+ vm/compiler/codegen/x86/Schedule.cpp         |    8 +
+ 9 files changed, 334 insertions(+), 39 deletions(-)
+
+diff --git a/vm/compiler/CompilerIR.h b/vm/compiler/CompilerIR.h
+index d185f6e..f938d51 100644
+--- a/vm/compiler/CompilerIR.h
++++ b/vm/compiler/CompilerIR.h
+@@ -257,6 +257,7 @@ typedef struct CompilationUnit {
+ #ifdef ARCH_IA32
+     int exceptionBlockId;               /**< @brief The block corresponding to exception handling */
+     bool singletonInlined;              /**< @brief TRUE if singleton call inlined */
++    struct ConstInfo *constListHead;    /**< @brief pointer to head of the list of 64 bit constants */
+ #endif
+     unsigned int maximumRegisterization;    /**< @brief Maximum registerization to be accepted */
+     void *passData;                         /**< @brief Pass data is used to transfer data throughout a Pass */
+diff --git a/vm/compiler/codegen/Optimizer.h b/vm/compiler/codegen/Optimizer.h
+index f02f71c..0485149 100644
+--- a/vm/compiler/codegen/Optimizer.h
++++ b/vm/compiler/codegen/Optimizer.h
+@@ -30,7 +30,8 @@ enum optControlVector {
+     kSuppressLoads,
+     kMethodInlining,
+     kMethodJit,
+-    kShortJumpOffset
++    kShortJumpOffset,
++    kElimConstInitOpt
+ };
+ 
+ /* Forward declarations */
+diff --git a/vm/compiler/codegen/x86/AnalysisO1.h b/vm/compiler/codegen/x86/AnalysisO1.h
+index 634e336..3fea79e 100644
+--- a/vm/compiler/codegen/x86/AnalysisO1.h
++++ b/vm/compiler/codegen/x86/AnalysisO1.h
+@@ -194,6 +194,22 @@ typedef struct ConstVRInfo {
+   int value;
+   bool isConst;
+ } ConstVRInfo;
++
++/**
++ * @class constInfo
++ * @brief information on 64 bit constants and their locations in a trace
++*/
++typedef struct ConstInfo {
++    int valueL;             /**< @brief The lower 32 bits of the constant */
++    int valueH;             /**< @brief The higher 32 bits of the constant */
++    int regNum;             /**< @brief The register number of the constant */
++    int offsetAddr;         /**< @brief The offset from start of instruction */
++    char* streamAddr;       /**< @brief The address of instruction in stream before scheduling */
++    char* schedAddr;        /**< @brief The address of memory location to patch after scheduling */
++    char* constAddr;        /**< @brief The address of the constant at the end of trace */
++    struct ConstInfo *next; /**< @brief The pointer to the next 64 bit constant */
++} ConstInfo;
++
+ #define NUM_ACCESS_IN_LIVERANGE 10
+ //!specifies one live range
+ typedef struct LiveRange {
+diff --git a/vm/compiler/codegen/x86/CodegenErrors.cpp b/vm/compiler/codegen/x86/CodegenErrors.cpp
+index f9a8567..e21ab2b 100644
+--- a/vm/compiler/codegen/x86/CodegenErrors.cpp
++++ b/vm/compiler/codegen/x86/CodegenErrors.cpp
+@@ -37,10 +37,11 @@ static const char* jitErrorMessages[kJitErrorMaxDefined] = {
+     "Problem while performing null or bound check",
+     "Problem while merging live ranges (mergeLiveRange)",
+     "Global data not defined",
+-    "Problem while scheduling instructions"
++    "Problem while scheduling instructions",
+     "Issue registerizing the trace in the backend",
+     "The trace provoked a spill",
+     "The backend decided it cannot safely handle the Basic Block",
++    "Patching of Double/Long constants failed"
+     //Add error messages here when adding error codes
+ };
+ 
+@@ -166,6 +167,14 @@ bool dvmCanFixErrorsAndRetry(CompilationUnit *cUnit){
+         }
+     }
+ 
++    //Handle constant initialization failure
++    if (IS_JIT_ERROR_SET(kJitErrorConstInitFail) == true) {
++        gDvmJit.disableOpt |= (1 << kElimConstInitOpt);
++        ALOGI("Resolved error due to constant initialization failure");
++        //Clear the error:
++        CLEAR_JIT_ERROR(kJitErrorConstInitFail);
++    }
++
+     /* If at this point, we again have no errors set
+      * we have successfully resolved the errors. We can
+      * retry the trace now.
+diff --git a/vm/compiler/codegen/x86/CodegenErrors.h b/vm/compiler/codegen/x86/CodegenErrors.h
+index a5fa55f..e4f23d0 100644
+--- a/vm/compiler/codegen/x86/CodegenErrors.h
++++ b/vm/compiler/codegen/x86/CodegenErrors.h
+@@ -79,6 +79,8 @@ enum JitCompilationErrors {
+     kJitErrorSpill,
+     /** @brief Set when a basic block is reject by backend */
+     kJitErrorBBCannotBeHandled,
++    /** @brief Errors while performing double/long constant initialization */
++    kJitErrorConstInitFail,
+ 
+     /* ----- Add more errors above ---------------------------*/
+     /* ----- Don't add new errors beyond this point ----------*/
+diff --git a/vm/compiler/codegen/x86/CodegenInterface.cpp b/vm/compiler/codegen/x86/CodegenInterface.cpp
+index 96737c3..984b8b2 100644
+--- a/vm/compiler/codegen/x86/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/CodegenInterface.cpp
+@@ -1298,6 +1298,126 @@ static void handleIfTaken (CompilationUnit *cUnit, BasicBlock *bb)
+ }
+ 
+ /**
++ * @brief Create a new record of 64bit constant in use
++ * @details Allocates memory to store a 64bit constant and its details. All address fields
++ *          are initialized to NULL.
++ * @param listPtr address of the constList
++ * @param constL the lower 32bits
++ * @param constH the higher 32bits
++ * @param reg Virtual Register number
++ */
++void addNewToConstList(struct ConstInfo** listPtr, int constL, int constH, int reg) {
++    struct ConstInfo* tmpPtr =static_cast<ConstInfo *>(dvmCompilerNew(sizeof(ConstInfo), false));
++    tmpPtr->valueL = constL;
++    tmpPtr->valueH = constH;
++    tmpPtr->regNum = reg;
++    tmpPtr->offsetAddr = 0;
++    tmpPtr->streamAddr = NULL;
++    tmpPtr->constAddr = NULL;
++    tmpPtr->schedAddr = NULL;
++    tmpPtr->next = *listPtr;
++    *listPtr = tmpPtr;
++    assert(*listPtr != NULL);
++}
++
++/**
++ * @brief Save address of memory access into constList
++ * @details Populates stream information
++ * @param listPtr address of the constList
++ * @param constL the lower 32bits
++ * @param constH the higher 32bits
++ * @param reg Virtual Register number
++ * @param patchAddr The address of memory location to be patched currently
++ * @return true when it succeeds, false when it fails
++ */
++bool saveAddrToConstList(struct ConstInfo** listPtr, int constL, int constH, int reg, char* patchAddr, int offset) {
++    struct ConstInfo* tmpPtr = *listPtr;
++    while (tmpPtr != NULL) {    // check all elements of the structure
++        if (tmpPtr->valueL == constL && tmpPtr->valueH == constH && tmpPtr->regNum == reg && tmpPtr->streamAddr==NULL) {
++            tmpPtr->streamAddr = patchAddr; // save address of instruction in jit stream
++            tmpPtr->offsetAddr = offset; // save offset to memory location to patch for the instruction
++#ifdef DEBUG_CONST
++            ALOGD("**Save constants for VR# %d containing constant (%x):(%x) streamAddr is (%d)%x, offset %d",
++                             tmpPtr->regNum, tmpPtr->valueL, tmpPtr->valueH,
++                             tmpPtr->streamAddr, tmpPtr->streamAddr, tmpPtr->offsetAddr);
++#endif
++            return true;
++        }
++        tmpPtr = tmpPtr->next; // check next element
++    }
++    return false;
++}
++
++/**
++ * @brief insert 64bit constants in a Constant Data Section at end of a trace
++ * @details Populates stream information
++ * @param constListTemp pointer to list of 64 bit constants
++ * @param intaddr pointer to jit stream
++ */
++void insertConstDataSection(struct ConstInfo *constListTemp, unsigned int *intaddr) {
++    while(constListTemp != NULL){
++        constListTemp->constAddr = reinterpret_cast<char *>(intaddr);
++        *intaddr = constListTemp->valueL;// store lower 32 bit of a constant
++#ifdef DEBUG_CONST
++        ALOGI("**Lower constants at  %p: %d(%x), VR# %d containing constant (%x):(%x) constAddr is (%d)%x",
++                             intaddr, *intaddr, *intaddr, constListTemp->regNum, constListTemp->valueL, constListTemp->valueH,
++                             *intaddr, constListTemp->constAddr, constListTemp->constAddr);
++#endif
++        intaddr++;
++        *intaddr = constListTemp->valueH;// store higher 32 bits of a constant
++        intaddr++;
++        constListTemp = constListTemp->next; // move to next constant
++    }
++}
++
++/**
++ * @brief patch stream with address of constants in Constant Data Section
++ * @details lowers address of constant if placeholder data is found
++ * @param constListTemp pointer to list of 64 bit constants
++ * @param cUnit the compilation unit
++ * @return returns -1 if error, else reports number of patches
++ */
++int patchConstToStream(struct ConstInfo *constListTemp, CompilationUnit *cUnit) {
++    unsigned int *writeval;
++    char *iaddr;
++    int pResult = 0;
++
++    while (constListTemp != NULL){
++        /* iterate through the generated code to patch constants */
++        if (gDvmJit.scheduling== true)
++            iaddr = static_cast<char*>(constListTemp->schedAddr);
++        else
++            iaddr = static_cast<char*>(constListTemp->streamAddr+constListTemp->offsetAddr);
++
++        writeval = reinterpret_cast<unsigned int*>(iaddr);
++        unsigned int dispAddr =  getGlobalDataAddr("64bits");
++
++        if (*writeval == dispAddr){ /* verify that place holder data inserted is present */
++            *writeval = reinterpret_cast<unsigned int>(constListTemp->constAddr);
++#ifdef DEBUG_CONST
++            ALOGI("Patched location of VR# %d with constant (%x):(%x)",
++                            constListTemp->regNum, constListTemp->valueL, constListTemp->valueH);
++            ALOGI("Address is streamAddr %p, schedAddr %p, offset %d with constAddr %p",
++                       constListTemp->streamAddr,constListTemp->schedAddr, constListTemp->offsetAddr, constListTemp->constAddr);
++#endif
++            pResult++;              /* keep count of successful patches in stream */
++        } else {
++            ALOGI("JIT_INFO: Error Wrong value found at streamAddr");
++#ifdef DEBUG_CONST
++            ALOGI("Tried patching VR# %d with constant (%x):(%x)",
++                            constListTemp->regNum, constListTemp->valueL, constListTemp->valueH);
++            ALOGI("Address is streamAddr %p, schedAddr %p, offset %d with constAddr %p",
++                    constListTemp->streamAddr,constListTemp->schedAddr, constListTemp->offsetAddr, constListTemp->constAddr);
++#endif
++            ALOGI("JIT_INFO: Constant init opt could not patch all required locations");
++            return -1;              /* incorrect data found at patch location, reject trace */
++        }
++        constListTemp = constListTemp->next;
++    }
++    return pResult;
++}
++
++/**
+  * @brief Generate the code for the BasicBlock
+  * @param cUnit the CompilationUnit
+  * @param bb the BasicBlock
+@@ -1429,7 +1549,6 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+ {
+     //Used to determine whether we need a fallthrough jump
+     BasicBlock *nextFallThrough = 0;
+-
+     dump_x86_inst = cUnit->printMe;
+ 
+     GrowableList chainingListByType[kChainingCellLast];
+@@ -1476,6 +1595,8 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+     }
+     startOfTrace(cUnit->method, cUnit->exceptionBlockId, cUnit);
+ 
++    cUnit->constListHead = NULL; // Initialize constant list
++
+     if(gDvm.executionMode == kExecutionModeNcgO1) {
+ 
+         dvmGrowableListIteratorInit(&cUnit->blockList, &iterator);
+@@ -1792,21 +1913,85 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+ 
+     PROTECT_CODE_CACHE(stream, unprotected_code_cache_bytes);
+ 
++    /* Align trace to 16-bytes before Constant Data Section */
++    stream = reinterpret_cast<char*>((reinterpret_cast<unsigned int>(stream) + 0xF) & ~0xF);
+     gDvmJit.codeCacheByteUsed += (stream - streamStart);
+-    if (cUnit->printMe) {
+-        unsigned char* codeBaseAddr = (unsigned char *) cUnit->baseAddr;
+-        unsigned char* codeBaseAddrNext = ((unsigned char *) gDvmJit.codeCache) + gDvmJit.codeCacheByteUsed;
++
++    int patchCount = 0;       // Store number of constants initialized in a trace
++    ConstInfo *constListTemp; // Temp ptr for constant initialization
++    unsigned int *intaddr = reinterpret_cast<unsigned int *>(stream);
++
++    if(((gDvmJit.disableOpt & (1 << kElimConstInitOpt)) == false) && cUnit->constListHead != NULL ) {
++
++        int constSize = 0; // size of constant data section in bytes
++        constListTemp = cUnit->constListHead;
++        while(constListTemp != NULL){
++            constSize = constSize + 8; // 4 bytes each for higher and lower 32 bits
++            constListTemp = constListTemp->next;
++        }
++
++        //  Sum of bytes used in code cache, constant data section and padding should be lower than code cache size
++        if(gDvmJit.codeCacheByteUsed + constSize + CODE_CACHE_PADDING > gDvmJit.codeCacheSize) {
++            ALOGE("JIT_ERROR: Code cache full after ChainingCellCounts and constant data section");
++            SET_JIT_ERROR(kJitErrorCodeCacheFull);
++            gDvmJit.codeCacheFull = true;
++            cUnit->baseAddr = NULL;
++            PROTECT_CODE_CACHE(stream, unprotected_code_cache_bytes);
++            return;
++        }
++
++        /* Insert constant data section at the end of a trace */
++        insertConstDataSection(cUnit->constListHead, intaddr);
++
++        /* Patch address of constants into stream */
++        constListTemp = cUnit->constListHead;
++        patchCount = patchConstToStream(constListTemp, cUnit);
++
++        if (patchCount < 0) {// if patchCount is less than 0, trigger error recovery
++            ALOGI("JIT_INFO: Constant init opt could not patch all required locations");
++            SET_JIT_ERROR(kJitErrorConstInitFail);
++            cUnit->baseAddr = NULL;
++            cUnit->constListHead = NULL;
++            return;
++        }
++    }
++
++    if (cUnit->printMe == true) {
++        unsigned char* codeBaseAddr = static_cast<unsigned char *>(cUnit->baseAddr);
++        unsigned char* codeBaseAddrNext = static_cast<unsigned char *>(gDvmJit.codeCache) + gDvmJit.codeCacheByteUsed;
+         ALOGD("-------- Built trace for %s%s, JIT code [%p, %p) cache start %p",
+               cUnit->method->clazz->descriptor, cUnit->method->name,
+               codeBaseAddr, codeBaseAddrNext, gDvmJit.codeCache);
+         ALOGD("** %s%s@0x%x:", cUnit->method->clazz->descriptor,
+               cUnit->method->name, cUnit->traceDesc->trace[0].info.frag.startOffset);
+         printEmittedCodeBlock(codeBaseAddr, codeBaseAddrNext);
++        ALOGD("JIT CODE after trace %p to %p size %x START %p", cUnit->baseAddr,
++          (char *) gDvmJit.codeCache + gDvmJit.codeCacheByteUsed, cUnit->totalSize, gDvmJit.codeCache);
+     }
+-    ALOGV("JIT CODE after trace %p to %p size %x START %p", cUnit->baseAddr,
+-          (char *) gDvmJit.codeCache + gDvmJit.codeCacheByteUsed,
+-          cUnit->totalSize, gDvmJit.codeCache);
+ 
++    if((gDvmJit.disableOpt & (1 << kElimConstInitOpt)) == false) {
++        if ((cUnit->printMe && (patchCount > 0) ) == true) {
++            ALOGD("-------- Constant Data Section ------");
++            intaddr = reinterpret_cast<unsigned int*>(static_cast<unsigned char *>(gDvmJit.codeCache) + gDvmJit.codeCacheByteUsed);
++            constListTemp = cUnit->constListHead;
++            while(constListTemp != NULL){
++                ALOGD("**  %p: %d (%x)", intaddr, *intaddr, *intaddr); // print lower 32 bits of constant
++                intaddr++;
++                ALOGD("**  %p: %d (%x)", intaddr, *intaddr, *intaddr); // print higher 32 bits of constant
++                intaddr++;
++                constListTemp = constListTemp->next;
++            }
++        }
++        gDvmJit.codeCacheByteUsed += (patchCount*8); // adjust cache byte used to include constants 4bytesL, 4bytesH
++        stream = stream + (patchCount*8);            // move stream pointer to end of constant section of trace
++        cUnit->totalSize = (stream - streamStart);   // adjust cUnit->totalSize to include constants
++        cUnit->constListHead = NULL;
++
++        if (cUnit->printMe && (patchCount > 0) == true) {
++            ALOGD("JIT CODE after Constant Data Section in trace %p to %p size %x START %p", cUnit->baseAddr,
++                  (char *) gDvmJit.codeCache + gDvmJit.codeCacheByteUsed, cUnit->totalSize, gDvmJit.codeCache);
++        }
++    }
+     gDvmJit.numCompilations++;
+ 
+     info->codeAddress = (char*)cUnit->baseAddr;// + cUnit->headerSize;
+diff --git a/vm/compiler/codegen/x86/Lower.h b/vm/compiler/codegen/x86/Lower.h
+index 2a83e76..e30a8cc 100644
+--- a/vm/compiler/codegen/x86/Lower.h
++++ b/vm/compiler/codegen/x86/Lower.h
+@@ -549,6 +549,8 @@ struct LowOpMemReg : LowOp {
+     LowOpndMem memSrc;
+     //! \brief Register as destination.
+     LowOpndReg regDest;
++   //! \brief ptr to data structure containing 64 bit constants
++    ConstInfo *constLink;
+ };
+ 
+ //! \brief Specialized LowOp for immediate to memory.
+@@ -868,6 +870,13 @@ void alu_sd_binary_reg_reg(ALU_Opcode opc, int reg, bool isPhysical,
+ void push_mem_to_stack(OpndSize size, int disp, int base_reg, bool isBasePhysical);
+ void push_reg_to_stack(OpndSize size, int reg, bool isPhysical);
+ 
++// create a new record for a 64 bit constant
++void addNewToConstList(struct ConstInfo** listPtr, int constL, int constH, int reg);
++// save address of memory location to be patched
++bool saveAddrToConstList(struct ConstInfo** listPtr, int constL, int constH, int reg, char* patchAddr, int offset);
++// access address of global constants
++int getGlobalDataAddr(const char* dataName);
++
+ //returns the pointer to end of the native code
+ void move_reg_to_mem(OpndSize size,
+                       int reg, bool isPhysical,
+diff --git a/vm/compiler/codegen/x86/LowerHelper.cpp b/vm/compiler/codegen/x86/LowerHelper.cpp
+index 83b7062..cdb20e9 100644
+--- a/vm/compiler/codegen/x86/LowerHelper.cpp
++++ b/vm/compiler/codegen/x86/LowerHelper.cpp
+@@ -551,7 +551,7 @@ LowOpRegReg* dump_reg_reg(Mnemonic m, AtomOpCode m2, OpndSize size, int reg,
+ 
+ LowOpMemReg* lower_mem_to_reg(Mnemonic m, AtomOpCode m2, OpndSize size, int disp,
+         int base_reg, bool isBasePhysical, MemoryAccessType mType, int mIndex,
+-        int reg, bool isPhysical, LowOpndRegType type) {
++        int reg, bool isPhysical, LowOpndRegType type, struct ConstInfo** listPtr) {
+     bool isMovzs = (m == Mnemonic_MOVZX || m == Mnemonic_MOVSX);
+     OpndSize overridden_size = isMovzs ? OpndSize_32 : size;
+     LowOpndRegType overridden_type = isMovzs ? LowOpndRegType_gp : type;
+@@ -566,7 +566,13 @@ LowOpMemReg* lower_mem_to_reg(Mnemonic m, AtomOpCode m2, OpndSize size, int disp
+         SET_JIT_ERROR(kJitErrorInsScheduling);
+         return NULL;
+     }
++
+     LowOpMemReg* op = singletonPtr<Scheduler>()->allocateNewEmptyLIR<LowOpMemReg>();
++    if (listPtr != NULL) {
++        op->constLink = *listPtr;
++    } else {
++        op->constLink = NULL;
++    }
+ 
+     op->opCode = m;
+     op->opCode2 = m2;
+@@ -591,7 +597,7 @@ LowOpMemReg* dump_mem_reg_noalloc(Mnemonic m, OpndSize size, int disp,
+         int reg, bool isPhysical, LowOpndRegType type) {
+     return lower_mem_to_reg(m, ATOM_NORMAL, size, disp, base_reg,
+             true /*isBasePhysical*/, mType, mIndex, reg, true /*isPhysical*/,
+-            type);
++            type, NULL);
+ }
+ 
+ //!update fields of LowOp and generate a x86 instruction that takes one reg operand and one mem operand
+@@ -604,10 +610,10 @@ LowOpMemReg* dump_mem_reg_noalloc_mem(Mnemonic m, AtomOpCode m2, OpndSize size,
+         int regAll = registerAlloc(type, reg, isPhysical, true, true);
+         return lower_mem_to_reg(m, m2, size, disp, base_reg,
+                 true /*isBasePhysical*/, mType, mIndex, regAll,
+-                true /*isPhysical*/, type);
++                true /*isPhysical*/, type, NULL);
+     } else {
+         return lower_mem_to_reg(m, m2, size, disp, base_reg, isBasePhysical, mType,
+-                mIndex, reg, isPhysical, type);
++                mIndex, reg, isPhysical, type, NULL);
+     }
+     return NULL;
+ }
+@@ -617,7 +623,7 @@ LowOpMemReg* dump_mem_reg_noalloc_mem(Mnemonic m, AtomOpCode m2, OpndSize size,
+ //!
+ LowOpMemReg* dump_mem_reg(Mnemonic m, AtomOpCode m2, OpndSize size, int disp,
+         int base_reg, bool isBasePhysical, MemoryAccessType mType, int mIndex,
+-        int reg, bool isPhysical, LowOpndRegType type) {
++        int reg, bool isPhysical, LowOpndRegType type, struct ConstInfo** listPtr) {
+     if (gDvm.executionMode == kExecutionModeNcgO1) {
+         startNativeCode(-1, -1);
+         freeReg(false);
+@@ -633,10 +639,10 @@ LowOpMemReg* dump_mem_reg(Mnemonic m, AtomOpCode m2, OpndSize size, int disp,
+         endNativeCode();
+         return lower_mem_to_reg(m, m2, size, disp, baseAll,
+                 true /*isBasePhysical*/, mType, mIndex, regAll,
+-                true /*isPhysical*/, type);
++                true /*isPhysical*/, type, listPtr);
+     } else {
+         return lower_mem_to_reg(m, m2, size, disp, base_reg, isBasePhysical, mType,
+-                mIndex, reg, isPhysical, type);
++                mIndex, reg, isPhysical, type, NULL);
+     }
+     return NULL;
+ }
+@@ -681,11 +687,11 @@ LowOpMemReg* dump_movez_mem_reg(Mnemonic m, OpndSize size, int disp,
+         endNativeCode();
+         return lower_mem_to_reg(m, ATOM_NORMAL, size, disp, baseAll,
+                 true /*isBasePhysical*/, MemoryAccess_Unknown, -1, regAll,
+-                true /*isPhysical*/, LowOpndRegType_gp);
++                true /*isPhysical*/, LowOpndRegType_gp, NULL);
+     } else {
+         return lower_mem_to_reg(m, ATOM_NORMAL, size, disp, base_reg,
+                 isBasePhysical, MemoryAccess_Unknown, -1, reg, isPhysical,
+-                LowOpndRegType_gp);
++                LowOpndRegType_gp, NULL);
+     }
+     return NULL;
+ }
+@@ -1189,7 +1195,7 @@ void load_effective_addr(int disp, int base_reg, bool isBasePhysical,
+                           int reg, bool isPhysical) {
+     Mnemonic m = Mnemonic_LEA;
+     dump_mem_reg(m, ATOM_NORMAL, OpndSize_32, disp, base_reg, isBasePhysical,
+-        MemoryAccess_Unknown, -1, reg, isPhysical, LowOpndRegType_gp);
++        MemoryAccess_Unknown, -1, reg, isPhysical, LowOpndRegType_gp, NULL);
+ }
+ //! generate a native instruction lea
+ 
+@@ -1300,7 +1306,7 @@ void compare_mem_reg(OpndSize size,
+               int disp, int base_reg, bool isBasePhysical,
+               int reg, bool isPhysical) {
+     Mnemonic m = Mnemonic_CMP;
+-    dump_mem_reg(m, ATOM_NORMAL, size, disp, base_reg, isBasePhysical, MemoryAccess_Unknown, -1, reg, isPhysical, getTypeFromIntSize(size));
++    dump_mem_reg(m, ATOM_NORMAL, size, disp, base_reg, isBasePhysical, MemoryAccess_Unknown, -1, reg, isPhysical, getTypeFromIntSize(size), NULL);
+ }
+ //! compare a VR with a temporary variable
+ 
+@@ -1325,7 +1331,7 @@ void compare_VR_reg_all(OpndSize size,
+ #endif
+                 writeBackConstVR(vA, tmpValue[0]);
+                 //dumpImmToMem(vA+1, OpndSize_32, 0); //CHECK necessary? will overwrite vA+1!!!
+-                dump_mem_reg(m, ATOM_NORMAL, size, 4*vA, PhysicalReg_FP, true, MemoryAccess_VR, vA, reg, isPhysical, pType);
++                dump_mem_reg(m, ATOM_NORMAL, size, 4*vA, PhysicalReg_FP, true, MemoryAccess_VR, vA, reg, isPhysical, pType, NULL);
+                 return;
+             }
+             else if(size != OpndSize_64) {
+@@ -1341,8 +1347,38 @@ void compare_VR_reg_all(OpndSize size,
+ #endif
+                 writeBackConstVR(vA, tmpValue[0]);
+                 writeBackConstVR(vA+1, tmpValue[1]);
+-                dump_mem_reg(m, ATOM_NORMAL, size, 4*vA, PhysicalReg_FP, true,
+-                    MemoryAccess_VR, vA, reg, isPhysical, pType);
++
++                bool storedAddr = false;
++                if((gDvmJit.disableOpt & (1 << kElimConstInitOpt)) == false){
++
++                    // create a new record of a constant
++                    addNewToConstList(&(gCompilationUnit->constListHead), tmpValue[0], tmpValue[1], vA);
++                    const int offset = 4; // offset is 4 for COMISD
++                    // save mem access location in constList
++                    storedAddr = saveAddrToConstList(&(gCompilationUnit->constListHead), tmpValue[0], tmpValue[1], vA, stream, offset);
++
++                    ConstInfo* tmpPtr = gCompilationUnit->constListHead;
++                    if (storedAddr == true){
++#ifdef DEBUG_CONST
++                        ALOGD("constVRList regnum %d, valueL %d(%x) valueH %d(%x)",
++                                tmpPtr->regNum, tmpPtr->valueL, tmpPtr->valueL,
++                                tmpPtr->valueH, tmpPtr->valueH);
++#endif
++                    } else {
++                        ALOGI("JIT_INFO: Error creating constant failed for VR %d, regnum %d, valueL %d(%x) valueH %d(%x)",
++                                tmpPtr->regNum, tmpPtr->valueL, tmpPtr->valueL,
++                                tmpPtr->valueH, tmpPtr->valueH);
++                    }
++                }
++                // Lower mem_reg instruction with constant to be accessed from constant data section
++                if (storedAddr == true) {
++                    int dispAddr =  getGlobalDataAddr("64bits");
++                    dump_mem_reg(m, ATOM_NORMAL_ALU, OpndSize_64, dispAddr, PhysicalReg_Null, true,
++                                     MemoryAccess_VR, vA, reg, isPhysical, LowOpndRegType_xmm, &(gCompilationUnit->constListHead));
++                } else {
++                    dump_mem_reg(m, ATOM_NORMAL, size, 4*vA, PhysicalReg_FP, true,
++                                    MemoryAccess_VR, vA, reg, isPhysical, pType, NULL);
++                }
+                 return;
+             }
+         }
+@@ -1365,7 +1401,7 @@ void compare_VR_reg_all(OpndSize size,
+         return;
+     } else {
+         dump_mem_reg(m, ATOM_NORMAL, size, 4*vA, PhysicalReg_FP, true,
+-            MemoryAccess_VR, vA, reg, isPhysical, pType);
++            MemoryAccess_VR, vA, reg, isPhysical, pType, NULL);
+         return;
+     }
+ }
+@@ -1570,7 +1606,7 @@ void compare_ss_mem_reg(LowOp* op, int disp, int base_reg, bool isBasePhysical,
+              int reg, bool isPhysical) {
+     Mnemonic m = Mnemonic_COMISS;
+     dump_mem_reg(m, ATOM_NORMAL, OpndSize_32, disp, base_reg, isBasePhysical,
+-        MemoryAccess_Unknown, -1, reg, isPhysical, LowOpndRegType_xmm);
++        MemoryAccess_Unknown, -1, reg, isPhysical, LowOpndRegType_xmm, NULL);
+ }
+ //! comiss reg reg
+ 
+@@ -1587,7 +1623,7 @@ void compare_sd_mem_with_reg(LowOp* op, int disp, int base_reg, bool isBasePhysi
+                   int reg, bool isPhysical) {
+     Mnemonic m = Mnemonic_COMISD;
+     dump_mem_reg(m, ATOM_NORMAL, OpndSize_64, disp, base_reg, isBasePhysical,
+-        MemoryAccess_Unknown, -1, reg, isPhysical, LowOpndRegType_xmm);
++        MemoryAccess_Unknown, -1, reg, isPhysical, LowOpndRegType_xmm, NULL);
+ }
+ //! comisd reg reg
+ 
+@@ -1694,7 +1730,7 @@ void alu_binary_mem_reg(OpndSize size, ALU_Opcode opc,
+         m = map_of_64_opcode_2_mnemonic[opc];
+     else
+         m = map_of_alu_opcode_2_mnemonic[opc];
+-    dump_mem_reg(m, ATOM_NORMAL_ALU, size, disp, base_reg, isBasePhysical, MemoryAccess_Unknown, -1, reg, isPhysical, getTypeFromIntSize(size));
++    dump_mem_reg(m, ATOM_NORMAL_ALU, size, disp, base_reg, isBasePhysical, MemoryAccess_Unknown, -1, reg, isPhysical, getTypeFromIntSize(size), NULL);
+ }
+ 
+ void alu_sd_binary_VR_reg(ALU_Opcode opc, int vA, int reg, bool isPhysical, bool isSD) {
+@@ -1712,14 +1748,42 @@ void alu_sd_binary_VR_reg(ALU_Opcode opc, int vA, int reg, bool isPhysical, bool
+             writeBackConstVR(vA, tmpValue[0]);
+             dump_mem_reg(m, ATOM_NORMAL_ALU, OpndSize_32, 4*vA, PhysicalReg_FP, true,
+                        MemoryAccess_VR, vA, reg, isPhysical,
+-                       LowOpndRegType_xmm);
++                       LowOpndRegType_xmm, NULL);
+             return;
+         }
+         if(isConst == 3 && isSD) {
+             writeBackConstVR(vA, tmpValue[0]);
+             writeBackConstVR(vA+1, tmpValue[1]);
+-            dump_mem_reg(m, ATOM_NORMAL_ALU, OpndSize_64, 4*vA, PhysicalReg_FP, true,
+-                       MemoryAccess_VR, vA, reg, isPhysical, LowOpndRegType_xmm);
++
++            bool storedAddr = false;
++            if((gDvmJit.disableOpt & (1 << kElimConstInitOpt)) == false){
++
++                // create a new record of a constant
++                addNewToConstList(&(gCompilationUnit->constListHead), tmpValue[0], tmpValue[1], vA);
++                const int offset = 4; // offset is 4 for OPC_(ADD,SUB,MUL,DIV) double operations
++                // save mem access location in constList
++                storedAddr = saveAddrToConstList(&(gCompilationUnit->constListHead), tmpValue[0], tmpValue[1], vA, stream, offset);
++
++                ConstInfo* tmpPtr = gCompilationUnit->constListHead;
++                if (storedAddr == true){ // creating constant record and saving address to constant list was successfull
++#ifdef DEBUG_CONST
++                    ALOGD("constVRList regnum %d, valueL %d(%x) valueH %d(%x)",
++                            tmpPtr->regNum, tmpPtr->valueL, tmpPtr->valueL, tmpPtr->valueH, tmpPtr->valueH);
++#endif
++                } else {
++                    ALOGI("JIT_INFO: Error creating constant failed for VR %d, regnum %d, valueL %d(%x) valueH %d(%x)",
++                            tmpPtr->regNum, tmpPtr->valueL, tmpPtr->valueL, tmpPtr->valueH, tmpPtr->valueH);
++                }
++            }
++            // Lower mem_reg instruction with constant to be accessed from constant data section
++            if (storedAddr == true){
++                int dispAddr =  getGlobalDataAddr("64bits");
++                dump_mem_reg(m, ATOM_NORMAL_ALU, OpndSize_64, dispAddr, PhysicalReg_Null, true,
++                       MemoryAccess_VR, vA, reg, isPhysical, LowOpndRegType_xmm, &(gCompilationUnit->constListHead));
++            } else {
++                dump_mem_reg(m, ATOM_NORMAL_ALU, OpndSize_64, 4*vA, PhysicalReg_FP, true,
++                       MemoryAccess_VR, vA, reg, isPhysical, LowOpndRegType_xmm, NULL);
++            }
+             return;
+         }
+         if(isConst == 1) writeBackConstVR(vA, tmpValue[0]);
+@@ -1743,7 +1807,7 @@ void alu_sd_binary_VR_reg(ALU_Opcode opc, int vA, int reg, bool isPhysical, bool
+     }
+     else {
+         dump_mem_reg(m, ATOM_NORMAL_ALU, size, 4*vA, PhysicalReg_FP, true,
+-                    MemoryAccess_VR, vA, reg, isPhysical, LowOpndRegType_xmm);
++                    MemoryAccess_VR, vA, reg, isPhysical, LowOpndRegType_xmm, NULL);
+     }
+ }
+ 
+@@ -1770,7 +1834,7 @@ void alu_binary_VR_reg(OpndSize size, ALU_Opcode opc, int vA, int reg, bool isPh
+             writeBackConstVR(vA, tmpValue[0]);
+             writeBackConstVR(vA+1, tmpValue[1]);
+             dump_mem_reg(m, ATOM_NORMAL_ALU, size, 4*vA, PhysicalReg_FP, true,
+-                MemoryAccess_VR, vA, reg, isPhysical, getTypeFromIntSize(size));
++                MemoryAccess_VR, vA, reg, isPhysical, getTypeFromIntSize(size), NULL);
+             return;
+         }
+         if(isConst == 1) writeBackConstVR(vA, tmpValue[0]);
+@@ -1793,7 +1857,7 @@ void alu_binary_VR_reg(OpndSize size, ALU_Opcode opc, int vA, int reg, bool isPh
+     }
+     else {
+         dump_mem_reg(m, ATOM_NORMAL_ALU, size, 4*vA, PhysicalReg_FP, true,
+-            MemoryAccess_VR, vA, reg, isPhysical, getTypeFromIntSize(size));
++            MemoryAccess_VR, vA, reg, isPhysical, getTypeFromIntSize(size), NULL);
+     }
+ }
+ //!alu binary op with two reg operands
+@@ -1883,7 +1947,7 @@ LowOpMemReg* move_mem_to_reg(OpndSize size,
+                       int disp, int base_reg, bool isBasePhysical,
+                       int reg, bool isPhysical) {
+     Mnemonic m = (size == OpndSize_64) ? Mnemonic_MOVQ : Mnemonic_MOV;
+-    return dump_mem_reg(m, ATOM_NORMAL, size, disp, base_reg, isBasePhysical, MemoryAccess_Unknown, -1, reg, isPhysical, getTypeFromIntSize(size));
++    return dump_mem_reg(m, ATOM_NORMAL, size, disp, base_reg, isBasePhysical, MemoryAccess_Unknown, -1, reg, isPhysical, getTypeFromIntSize(size), NULL);
+ }
+ //!move from memory to reg
+ 
+@@ -2132,7 +2196,7 @@ void conditional_move_reg_to_reg(OpndSize size, ConditionCode cc, int reg1, bool
+ void move_ss_mem_to_reg(LowOp* op, int disp, int base_reg, bool isBasePhysical,
+                          int reg, bool isPhysical) {
+     dump_mem_reg(Mnemonic_MOVSS, ATOM_NORMAL, OpndSize_32, disp, base_reg, isBasePhysical,
+-        MemoryAccess_Unknown, -1, reg, isPhysical, LowOpndRegType_xmm);
++        MemoryAccess_Unknown, -1, reg, isPhysical, LowOpndRegType_xmm, NULL);
+ }
+ //!movss from reg to memory
+ 
+@@ -2146,7 +2210,7 @@ void move_ss_reg_to_mem(LowOp* op, int reg, bool isPhysical,
+ //!
+ void move_sd_mem_to_reg(int disp, int base_reg, bool isBasePhysical,
+                          int reg, bool isPhysical) {
+-    dump_mem_reg(Mnemonic_MOVSD, ATOM_NORMAL, OpndSize_64, disp, base_reg, isBasePhysical, MemoryAccess_Unknown, -1, reg, isPhysical, LowOpndRegType_xmm);
++    dump_mem_reg(Mnemonic_MOVSD, ATOM_NORMAL, OpndSize_64, disp, base_reg, isBasePhysical, MemoryAccess_Unknown, -1, reg, isPhysical, LowOpndRegType_xmm, NULL);
+ }
+ //!movsd from reg to memory
+ 
+@@ -2182,7 +2246,7 @@ void get_virtual_reg_all(u2 vR, OpndSize size, int reg, bool isPhysical, Mnemoni
+                 writeBackConstVR(vR, tmpValue[0]);
+                 //temporary reg has "pType" (which is xmm)
+                 dump_mem_reg(m, ATOM_NORMAL, size, 4*vR, PhysicalReg_FP, true,
+-                    MemoryAccess_VR, vR, reg, isPhysical, pType);
++                    MemoryAccess_VR, vR, reg, isPhysical, pType, NULL);
+                 return;
+             }
+             else if(m == Mnemonic_MOVSD || size == OpndSize_64) {
+@@ -2190,7 +2254,7 @@ void get_virtual_reg_all(u2 vR, OpndSize size, int reg, bool isPhysical, Mnemoni
+                 writeBackConstVR(vR, tmpValue[0]);
+                 writeBackConstVR(vR+1, tmpValue[1]);
+                 dump_mem_reg(m, ATOM_NORMAL, size, 4*vR, PhysicalReg_FP, true,
+-                    MemoryAccess_VR, vR, reg, isPhysical, pType);
++                    MemoryAccess_VR, vR, reg, isPhysical, pType, NULL);
+                 return;
+             }
+             else if(size != OpndSize_64) {
+@@ -2257,7 +2321,7 @@ void get_virtual_reg_all(u2 vR, OpndSize size, int reg, bool isPhysical, Mnemoni
+     }
+     else {
+         dump_mem_reg(m, ATOM_NORMAL, size, 4*vR, PhysicalReg_FP, true,
+-            MemoryAccess_VR, vR, reg, isPhysical, pType);
++            MemoryAccess_VR, vR, reg, isPhysical, pType, NULL);
+     }
+ }
+ void get_virtual_reg(u2 vB, OpndSize size, int reg, bool isPhysical) {
+diff --git a/vm/compiler/codegen/x86/Schedule.cpp b/vm/compiler/codegen/x86/Schedule.cpp
+index 44dd377..cbc5227 100644
+--- a/vm/compiler/codegen/x86/Schedule.cpp
++++ b/vm/compiler/codegen/x86/Schedule.cpp
+@@ -1432,6 +1432,14 @@ void Scheduler::generateAssembly(LowOp * op) {
+         // Corresponds to lower_mem_reg, lower_mem_fp, or lower_mem_scale_reg
+         LowOpMemReg * regmem_op = (LowOpMemReg*) op;
+ 
++        // Constant initialization for 64 bit data requires saving stream address location
++        struct ConstInfo* tmpPtr;
++        tmpPtr = regmem_op->constLink;
++        if (tmpPtr != NULL && tmpPtr->constAddr == NULL && tmpPtr->schedAddr == NULL){
++            // save final address as (start of instruction + offset to memory access)
++            tmpPtr->schedAddr = stream + tmpPtr->offsetAddr;
++        }
++
+         if (regmem_op->regDest.regType == LowOpndRegType_fs)
+             stream = encoder_mem_fp(regmem_op->opCode, regmem_op->opndSrc.size,
+                     regmem_op->memSrc.m_disp.value,
+-- 
+1.7.4.1
+

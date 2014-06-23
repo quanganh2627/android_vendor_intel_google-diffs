@@ -1,0 +1,169 @@
+From 962a5d8cda81daf23ef5eaaad58b1c4677dda39a Mon Sep 17 00:00:00 2001
+From: Dan Liang <dan.liang@intel.com>
+Date: Sun, 28 Apr 2013 16:47:57 +0800
+Subject: [PORT FROM MAIN] libstagefright: enable video hw rotation
+
+BZ: 69069
+
+original patch:
+57996:libstagefright: Pass rotation info to hal
+58939:libstagefright: Pass native window handle to hal.
+73396:libstagefright: connect api after new surface texture client because
+need to get the client info initialized from surface texture back end.
+
+Change-Id: I78e14a1a2b17dc296c7d9317a714c365c48546d6
+Orig-Change-Id: I28c7cf9210a70d59a4226b282018332746f58722
+Signed-off-by: Jason Hu <jason.hu@intel.com>
+Signed-off-by: Dan Liang <dan.liang@intel.com>
+---
+ media/libmediaplayerservice/nuplayer/NuPlayer.cpp |   22 +++++++++++-
+ media/libstagefright/ACodec.cpp                   |   16 +++++++++
+ media/libstagefright/AwesomePlayer.cpp            |   21 +++++++++++-
+ media/libstagefright/OMXCodec.cpp                 |   36 +++++++++++++++++++++
+ 4 files changed, 92 insertions(+), 3 deletions(-)
+
+diff --git a/media/libmediaplayerservice/nuplayer/NuPlayer.cpp b/media/libmediaplayerservice/nuplayer/NuPlayer.cpp
+index 46d0a5a..5459ec2 100644
+--- a/media/libmediaplayerservice/nuplayer/NuPlayer.cpp
++++ b/media/libmediaplayerservice/nuplayer/NuPlayer.cpp
+@@ -222,10 +222,28 @@ void NuPlayer::setVideoSurfaceTextureAsync(
+     if (bufferProducer == NULL) {
+         msg->setObject("native-window", NULL);
+     } else {
++        sp<Surface> surface = new Surface(bufferProducer);
++        sp<ANativeWindow> anw = surface;
++        //NOTES: we must re-connect api here because we need to get right
++        //infomation from surface texture's back end. Otherwise, we only get
++        //uninitlized mTransformHint, mDefaultWidth, mDefaultHeight, etc.
++        status_t err = native_window_api_disconnect(anw.get(),
++                NATIVE_WINDOW_API_MEDIA);
++        if (err != OK) {
++            ALOGE("setVideoSurfaceTextureAsync: api disconnect failed: %d", err);
++            return;
++        }
++
++        err = native_window_api_connect(anw.get(),
++                NATIVE_WINDOW_API_MEDIA);
++        if (err != OK) {
++            ALOGE("setVideoSurfaceTextureAsync: api connect failed: %d", err);
++            return;
++        }
++
+         msg->setObject(
+                 "native-window",
+-                new NativeWindowWrapper(
+-                    new Surface(bufferProducer)));
++                new NativeWindowWrapper(surface));
+     }
+ 
+     msg->post();
+diff --git a/media/libstagefright/ACodec.cpp b/media/libstagefright/ACodec.cpp
+index ff72b71..4f17dec 100644
+--- a/media/libstagefright/ACodec.cpp
++++ b/media/libstagefright/ACodec.cpp
+@@ -2089,6 +2089,22 @@ status_t ACodec::setVideoFormatOnPort(
+ 
+ status_t ACodec::initNativeWindow() {
+     if (mNativeWindow != NULL) {
++        if (mOMX->livesLocally(mNode,getpid())){
++            OMX_PARAM_PORTDEFINITIONTYPE def;
++            OMX_VIDEO_PORTDEFINITIONTYPE *video_def = &def.format.video;
++
++            InitOMXParams(&def);
++            def.nPortIndex = kPortIndexInput;
++
++            status_t err = mOMX->getParameter(
++                    mNode, OMX_IndexParamPortDefinition, &def, sizeof(def));
++            CHECK_EQ(err, (status_t)OK);
++
++            ALOGD("set NativeWindow = %p",mNativeWindow.get());
++            video_def->pNativeWindow = mNativeWindow.get();
++            err = mOMX->setParameter(
++                    mNode, OMX_IndexParamPortDefinition, &def, sizeof(def));
++        }
+         return mOMX->enableGraphicBuffers(mNode, kPortIndexOutput, OMX_TRUE);
+     }
+ 
+diff --git a/media/libstagefright/AwesomePlayer.cpp b/media/libstagefright/AwesomePlayer.cpp
+index 5bbd305..1650a32 100644
+--- a/media/libstagefright/AwesomePlayer.cpp
++++ b/media/libstagefright/AwesomePlayer.cpp
+@@ -1189,8 +1189,27 @@ status_t AwesomePlayer::setSurfaceTexture(const sp<IGraphicBufferProducer> &buff
+     Mutex::Autolock autoLock(mLock);
+ 
+     status_t err;
++
+     if (bufferProducer != NULL) {
+-        err = setNativeWindow_l(new Surface(bufferProducer));
++        sp<ANativeWindow> anw = new Surface(bufferProducer);
++        //NOTES: we must re-connect api here because we need to get right
++        //infomation from surface texture's back end. Otherwise, we only get
++        //uninitlized mTransformHint, mDefaultWidth, mDefaultHeight, etc.
++        status_t err = native_window_api_disconnect(anw.get(),
++                NATIVE_WINDOW_API_MEDIA);
++        if (err != OK) {
++            ALOGE("setSurfaceTexture: api disconnect failed: %d", err);
++            return err;
++        }
++
++        err = native_window_api_connect(anw.get(),
++                NATIVE_WINDOW_API_MEDIA);
++        if (err != OK) {
++            ALOGE("setSurfaceTexture: api connect failed: %d", err);
++            return err;
++        }
++
++        err = setNativeWindow_l(anw);
+     } else {
+         err = setNativeWindow_l(NULL);
+     }
+diff --git a/media/libstagefright/OMXCodec.cpp b/media/libstagefright/OMXCodec.cpp
+index a70f84f..b9ae503 100644
+--- a/media/libstagefright/OMXCodec.cpp
++++ b/media/libstagefright/OMXCodec.cpp
+@@ -1360,6 +1360,42 @@ status_t OMXCodec::setVideoOutputFormat(
+     err = mOMX->setParameter(
+             mNode, OMX_IndexParamPortDefinition, &def, sizeof(def));
+ 
++    if (!strncmp(mComponentName, "OMX.Intel.VideoDecoder", 22)) {
++        sp<MetaData> meta = mSource->getFormat();
++
++        int32_t rotationDegrees;
++        if (!meta->findInt32(kKeyRotation, &rotationDegrees)) {
++            rotationDegrees = 0;
++        }
++        // set rotation for decoder
++        OMX_INDEXTYPE index;
++
++        status_t error =
++            mOMX->getExtensionIndex(
++                mNode,
++                "OMX.Intel.index.rotation",
++                &index);
++        if (error == OK) {
++            error = mOMX->setParameter(mNode, index, (void*)&rotationDegrees, sizeof(int32_t));
++        } else {
++            // ingore this error
++            ALOGW("Set decode rotation failed");
++        }
++
++        if (mNativeWindow != NULL && mOMX->livesLocally(mNode,getpid())){
++            InitOMXParams(&def);
++            def.nPortIndex = kPortIndexInput;
++
++            err = mOMX->getParameter(
++                    mNode, OMX_IndexParamPortDefinition, &def, sizeof(def));
++            CHECK_EQ(err, (status_t)OK);
++
++            ALOGD("set NativeWindow = %p",mNativeWindow.get());
++            video_def->pNativeWindow = mNativeWindow.get();
++            err = mOMX->setParameter(
++                    mNode, OMX_IndexParamPortDefinition, &def, sizeof(def));
++        }
++    }
+     return err;
+ }
+ 
+-- 
+1.7.4.1
+

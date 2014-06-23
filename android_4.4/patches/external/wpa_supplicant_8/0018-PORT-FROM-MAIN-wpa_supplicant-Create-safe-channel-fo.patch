@@ -1,0 +1,352 @@
+From fe72ddac8c8d06fcf8963b18913261890c01fe7e Mon Sep 17 00:00:00 2001
+From: Paul Naoumenko <paulx.naoumenko@intel.com>
+Date: Mon, 14 Oct 2013 10:54:15 +0200
+Subject: [PORT FROM MAIN] wpa_supplicant: Create safe channel fonctionality for LTE/WIFI/BT coexistence.
+
+BZ: 118952 138079
+
+With modem enabled LTE, some bands (FDD 7 and TDD 40/41) will cause interferences
+on some WIFI and BT channels. When using those problematics bands it is possible to request
+the modem to produce a list of RX/TX frequencies for WIFI and BT depending of its environment.
+Those frequencies can then be mapped to a safe channel list, and then mapped in a 2 bytes value.
+The wpa_supplicant is using today the best channel capability based on some computations.
+This patch will add to the supplicant the capability to handle a list of safe/unsafe channel
+(bitmap based, each bit corresponding to a channel, 1 for unsafe, 0 for safe).
+Upon reception of the channel list bitmap, the wpa_supplicant will exclude from the best
+channel computation the unsafe channels, thus unsafe channels will not be used.
+In order to achieve this, the new command SETSAFECHANNELS has been added to the control
+interface process handler.
+Accordingly, while this list will be provided by wifi application framework services,
+the wpa_cli tool is also updated in order to be able to also send this channel list
+from command line.
+
+Change-Id: I5928a939d12883242ae7ef10a813367f8aebf3fe
+Orig-Change-Id: I623a969c459b25c8c8e27c725b38535448517636
+Category: device enablement
+Domain: CWS.WIFI-Common
+Origin: upstream
+Upstream-Candidate: no,proprietary
+Orig-Change-Id: Ie6dc2331b2c75c97b39d55d6c3f5e96652ab9042
+Signed-off-by: Marc Blassin <marcx.blassin@intel.com>
+Signed-off-by: Jean Trivelly <jean.trivelly@intel.com>
+---
+ wpa_supplicant/bestchannel.c      |  114 ++++++++++++++++++++++++++++++++++++-
+ wpa_supplicant/bestchannel.h      |    4 +-
+ wpa_supplicant/ctrl_iface.c       |   30 ++++++++++
+ wpa_supplicant/wpa_cli.c          |   29 +++++++++
+ wpa_supplicant/wpa_supplicant_i.h |    4 +-
+ 5 files changed, 176 insertions(+), 5 deletions(-)
+
+diff --git a/wpa_supplicant/bestchannel.c b/wpa_supplicant/bestchannel.c
+index 094c8eb..68ff7c0 100644
+--- a/wpa_supplicant/bestchannel.c
++++ b/wpa_supplicant/bestchannel.c
+@@ -63,6 +63,29 @@ int index2channel(int index)
+ 	return channel;
+ }
+ 
++/*
++ * best_safe_channel_list_set
++ *	set the safe channel list bitmap
++ *	@global: Pointer to global data from wpa_supplicant_init()
++ *	@channel_list: Bitmap of the safe channel (each bit set to 1,
++ *		       for unsafe, 0 for safe)
++ *
++ * Returns: 0 on success,
++ *          -1 on error
++ */
++int best_safe_channel_list_set(struct wpa_global *global,
++	unsigned int channel_list)
++{
++
++	wpa_printf(MSG_DEBUG, ">%s channel_list bitmap (0x%X)",
++			__func__, channel_list);
++	if (global && (global->best_safe_channel_list != channel_list)) {
++		global->best_safe_channel_init = 1;
++		global->best_safe_channel_list = channel_list;
++		return 0;
++	}
++	return -1;
++}
+ 
+ /**
+  * bestOper_init - Alloc and Init the algo structure
+@@ -71,6 +94,13 @@ int best_channel_init(struct wpa_global *global)
+ {
+ 	int i;
+ 
++	if (global && global->best_safe_channel_init != 1) {
++		/*
++		 * default enable all
++		*/
++		global->best_safe_channel_list = 0;
++	}
++
+ 	global->best_channel_channels = (struct best_op_channel*) malloc(sizeof (struct best_op_channel) *
+ 									 (NUM_CHANNELS_2_4_GHZ +
+ 									  NUM_CHANNELS_5_1_GHZ +
+@@ -97,8 +127,12 @@ int best_channel_init(struct wpa_global *global)
+  */
+ void best_channel_uninit(struct wpa_global *global)
+ {
+-	if(global->best_channel_channels)
++	wpa_printf(MSG_DEBUG, ">%s", __func__);
++	if (global->best_channel_channels) {
++		global->best_safe_channel_init = 0;
++		global->best_safe_channel_list = 0;
+ 		free(global->best_channel_channels);
++	}
+ }
+ 
+ /**
+@@ -148,8 +182,65 @@ int best_channel_add_ap(struct wpa_supplicant *wpa_s,
+ 	return 0;
+ }
+ 
++
++/**
++ * best_channel_deny_channels
++ *	Prevent channel in the safe channel list to be authorized
++ *	best_safe_channel_list can be initialised using
++ *	best_channel_safe_channel_list_set
++ *	( by default all channels are authorized)
++ *
++ * Returns: 0 on success,
++ *          -1 on error
++ */
++static int best_channel_deny_channels(struct wpa_supplicant *wpa_s)
++{
++
++	unsigned int i = 1;
++	int index = -1;
++	unsigned int best_safe_channel_list = 0;
++
++	if (!wpa_s)
++		return -1;
++
++	if (wpa_s->global->best_channel_channels == NULL)
++		return -1;
++
++
++	if (wpa_s->global->best_safe_channel_list == 0) {
++		/*
++		 * All channel safe, do nothing
++		 */
++		return 0;
++	}
++
++	best_safe_channel_list = wpa_s->global->best_safe_channel_list;
++
++	/*
++	 * channel_list contain a bitmap of unsafe channels flagged by value 1.
++	 * Only 2.4Ghz are subject to interferences
++	 */
++	for (i = 1; i <= 13; i++) {
++		/*
++		 * only do something for flagged as unsafe channels
++		 */
++		if (best_safe_channel_list & (1 << (i-1))) {
++			index = channel2index(i);
++			if (index != -1) {
++				wpa_printf(MSG_DEBUG, "Denying channel %d", i);
++				wpa_s->global->best_channel_channels[index].enabled = 0;
++			} else {
++				wpa_printf(MSG_DEBUG, "Failure to deny channel %d", i);
++				return -1;
++			}
++		}
++	}
++	return 0;
++}
++
+ /**
+  * best_channel_auth_channel - Consider the specified channel as Authorized
++ *	if this channel is not excluded from the safe channel list.
+  *      @channel: Channel to authorize
+  *
+  * Returns: 0 on success,
+@@ -158,6 +249,10 @@ int best_channel_add_ap(struct wpa_supplicant *wpa_s,
+ static int best_channel_auth_channel(struct wpa_supplicant *wpa_s,
+ 		unsigned int channel)
+ {
++
++	if (!wpa_s)
++		return -1;
++
+ 	int index = channel2index(channel);
+ 
+ 	if (index == -1)
+@@ -166,8 +261,16 @@ static int best_channel_auth_channel(struct wpa_supplicant *wpa_s,
+ 	if (wpa_s->global->best_channel_channels == NULL)
+ 		return -1;
+ 
+-	wpa_printf(MSG_DEBUG, "Authorize channel %d", channel);
+-	wpa_s->global->best_channel_channels[index].enabled = 1;
++	/*
++	 * if channel is on safe channel list, we can authorize it.
++	 */
++	if ((wpa_s->global->best_safe_channel_list & (1 << (channel-1))) == 0) {
++		wpa_printf(MSG_DEBUG, "Authorize channel %d", channel);
++		wpa_s->global->best_channel_channels[index].enabled = 1;
++	} else {
++		wpa_printf(MSG_DEBUG, "Not authorizing channel %d", channel);
++		wpa_s->global->best_channel_channels[index].enabled = 0;
++	}
+ 
+ 	return 0;
+ }
+@@ -187,6 +290,11 @@ int best_channel_get_freq_list(struct wpa_supplicant *wpa_s)
+ 	if (modes == NULL)
+ 		return -1;
+ 
++	/*
++	 * Build channel deny list if set
++	 */
++	best_channel_deny_channels(wpa_s);
++
+ 	for (i = 0; i < wpa_s->hw.num_modes; i++) {
+ 		for (j = 0; j < modes[i].num_channels; j++) {
+ 			if (modes[i].channels[j].flag &  (HOSTAPD_CHAN_DISABLED |
+diff --git a/wpa_supplicant/bestchannel.h b/wpa_supplicant/bestchannel.h
+index 8380990..3e6b759 100644
+--- a/wpa_supplicant/bestchannel.h
++++ b/wpa_supplicant/bestchannel.h
+@@ -42,6 +42,8 @@ struct wpa_global;
+ 
+ #ifdef CONFIG_BESTCHANNEL
+ 
++int best_safe_channel_list_set(struct wpa_global *global,
++				unsigned int channel_list);
+ int best_channel_init(struct wpa_global *global);
+ void best_channel_uninit(struct wpa_global *global);
+ void best_channel_reset_ap(struct wpa_supplicant *wpa_s);
+@@ -66,7 +68,7 @@ static inline void best_channel_reset_ap(struct wpa_supplicant *wpa_s)
+ }
+ 
+ static inline int best_channel_add_ap(struct wpa_supplicant *wpa_s,
+-										unsigned int channel)
++					unsigned int channel)
+ {
+ 	return 0;
+ }
+diff --git a/wpa_supplicant/ctrl_iface.c b/wpa_supplicant/ctrl_iface.c
+index 349a6b1..bb70e7c 100644
+--- a/wpa_supplicant/ctrl_iface.c
++++ b/wpa_supplicant/ctrl_iface.c
+@@ -39,6 +39,7 @@
+ #include "blacklist.h"
+ #include "autoscan.h"
+ #include "wnm_sta.h"
++#include "bestchannel.h"
+ 
+ extern struct wpa_driver_ops *wpa_drivers[];
+ 
+@@ -5264,6 +5265,21 @@ static void wpa_supplicant_ctrl_iface_flush(struct wpa_supplicant *wpa_s)
+ 	wpa_supplicant_ctrl_iface_remove_cred(wpa_s, "all");
+ }
+ 
++int wpa_supplicant_set_safe_channels(struct wpa_supplicant *wpa_s, char *buf)
++{
++
++	if (!buf || !wpa_s)
++		return -1;
++
++	/*
++	 * Extract the safe channel list, (buf is 0 terminated).
++	 */
++	unsigned int safe_value = (unsigned int) atol(buf) & 0x1fff;
++	best_safe_channel_list_set(wpa_s->global, safe_value);
++
++	return safe_value;
++}
++
+ 
+ char * wpa_supplicant_ctrl_iface_process(struct wpa_supplicant *wpa_s,
+ 					 char *buf, size_t *resp_len)
+@@ -5803,6 +5819,20 @@ char * wpa_supplicant_ctrl_iface_process(struct wpa_supplicant *wpa_s,
+ #endif /* CONFIG_WNM */
+ 	} else if (os_strcmp(buf, "FLUSH") == 0) {
+ 		wpa_supplicant_ctrl_iface_flush(wpa_s);
++	} else if (os_strncmp(buf, "SET_SAFE_CHANNELS ", 18) == 0) {
++		/*
++		 * LTE coexistence send us the safe channel list, we
++		 * need to update our authorized list.
++		 */
++		int val = wpa_supplicant_set_safe_channels(wpa_s, buf + 18);
++		wpa_printf(MSG_DEBUG, "SET_SAFE_CHANNELS %d", val);
++		if (val == -1) {
++			os_memcpy(reply, "FAIL\n", 5);
++			reply_len = 5;
++		} else {
++			os_memcpy(reply, "OK\n", 3);
++			reply_len = 3;
++		}
+ 	} else {
+ 		os_memcpy(reply, "UNKNOWN COMMAND\n", 16);
+ 		reply_len = 16;
+diff --git a/wpa_supplicant/wpa_cli.c b/wpa_supplicant/wpa_cli.c
+index 89996d7..6b10475 100644
+--- a/wpa_supplicant/wpa_cli.c
++++ b/wpa_supplicant/wpa_cli.c
+@@ -490,6 +490,32 @@ static int wpa_cli_cmd_ifname(struct wpa_ctrl *ctrl, int argc, char *argv[])
+ }
+ 
+ 
++static int wpa_cli_cmd_set_safe_channels(struct wpa_ctrl *ctrl, int argc,
++					char *argv[])
++{
++	char cmd[256];
++	int i,len;
++	int safe_value = 0;
++
++	if (argc != 1) {
++		printf("Invalid SET_SAFE_CHANNELS command: needs one argument (channel_list bitmap))\n");
++		return -1;
++	}
++
++	safe_value = atol(argv[0]);
++
++	printf("Channel(s) marked unsafe -> ");
++	for (i = 1; i <= 13; i++) {
++		if (safe_value & (1 << (i-1)))
++			printf("%d ", i);
++	}
++	printf("%s\n", safe_value == 0 ? "none" : "");
++
++	len = os_snprintf(cmd, sizeof(cmd), "SET_SAFE_CHANNELS %s", argv[0]);
++	printf("%s: %s\n", __func__, cmd);
++	return wpa_ctrl_command(ctrl, cmd);
++}
++
+ static int wpa_cli_cmd_status(struct wpa_ctrl *ctrl, int argc, char *argv[])
+ {
+ 	if (argc > 0 && os_strcmp(argv[0], "verbose") == 0)
+@@ -2777,6 +2803,9 @@ static struct wpa_cli_cmd wpa_cli_commands[] = {
+ 	{ "p2p_remove_client", wpa_cli_cmd_p2p_remove_client,
+ 	  wpa_cli_complete_p2p_peer, cli_cmd_flag_none,
+ 	  "<address|iface=address> = remove a peer from all groups" },
++	{ "p2p_set_safe_channels", wpa_cli_cmd_set_safe_channels, NULL,
++	  cli_cmd_flag_none,
++	  "<channel_list bitmap> = set safe channels for LTE/WIFI/BT Coex" },
+ #endif /* CONFIG_P2P */
+ #ifdef CONFIG_WIFI_DISPLAY
+ 	{ "wfd_subelem_set", wpa_cli_cmd_wfd_subelem_set, NULL,
+diff --git a/wpa_supplicant/wpa_supplicant_i.h b/wpa_supplicant/wpa_supplicant_i.h
+index 2da0a29..460d213 100644
+--- a/wpa_supplicant/wpa_supplicant_i.h
++++ b/wpa_supplicant/wpa_supplicant_i.h
+@@ -276,8 +276,10 @@ struct wpa_global {
+ 	struct psk_list_entry *add_psk; /* From group formation */
+ #ifdef CONFIG_BESTCHANNEL
+ 	int best_freq;
+-	struct best_op_channel *best_channel_channels;
++	int best_safe_channel_init;
+ 	unsigned int best_chan_disable;
++	unsigned int best_safe_channel_list;
++	struct best_op_channel *best_channel_channels;
+ #endif
+ };
+ 
+-- 
+1.7.4.1
+

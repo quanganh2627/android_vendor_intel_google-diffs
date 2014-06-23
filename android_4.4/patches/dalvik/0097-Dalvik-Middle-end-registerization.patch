@@ -1,0 +1,2106 @@
+From 2d4dbc1cd257bc714536f72e873bb4f78b410935 Mon Sep 17 00:00:00 2001
+From: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Date: Wed, 16 Jan 2013 12:58:22 -0800
+Subject: Dalvik: Middle-end registerization
+
+BZ: 79647
+
+Middle-end Registerization
+
+New pass to prepare the CFG for backend registerization.
+There is an option to modify the maximum amount of registerization requests:
+  - Xjitregisterization: the option itself does not change the Midde-end's
+     behavior
+      - Instead, it will expect the Backend to respect it
+
+BitVector.cpp/BitVector.h:
+  - Made dvmSetInitialBits safe
+  - dvmCopyBitVector now can handle different vector styles and sizes
+  - Fixed size calculation issue in dvmUnifyBitVectors
+
+Globals.h, Init.cpp:
+  - Added the maximum registerization requests in the trace in CompilationUnit
+    - Handle via the option -Xjitregisterization
+
+BBOptimizations.cpp:
+  - When merging a BasicBlock, now remember the write back requests
+
+CompilerIR.h:
+  - Added three new register types
+  - Added a new kMirOpRegisterCheck opcode for registerization
+  - Added topologicalOrder for MIR and BasicBlock
+  - Added requestWriteBack vector for BasicBlocks to track write back requests
+  - Added walkData, globalChainList to CompilationUnit to help the dispatcher
+      and the use-def chains
+
+Dataflow.cpp:
+  - New SUsedChain to handle use-def chains between MIRs
+  - Added use-def chains to the SSARepresentation
+  - Added liveOut vector in BasicBlockDataFlow structure
+  - Handle the kMirOpRegisterize case for dumping
+  - Added live-out information for the BasicBlock
+  - Added the def-use chains for MIRs to be able to walk the chains
+  - Fixed the live-in/live-out algorithm for complex CFGs
+
+Frontend.cpp:
+  - Fixed dumping to handle additional information
+  - Handle the option for maximum registerization requests
+
+LoopOpt.cpp:
+  - Added two new passes:
+    - Writeback registers: requests write backs to all BasicBlocks
+    - Registerization: can request not to write back certain registers and can
+       request registerization from the Back-end
+
+RegisterizationME.cpp, RegisterizationME.h:
+  - The new compiler pass to handle registerization
+  - Contains all the logic to only registerize for the moment the inner loop
+
+SSATransformation.cpp:
+  - Fixed an initization issue with the number of BasicBlocks
+  - Fixed the live-in/live-out algorithm for complex CFGs and registerization
+     issues
+  - Build the use-def chains for MIRs
+
+SSAWalkData.cpp, SSAWalkData.h:
+  - New files to be helper functions for the use-def creation
+
+CompilerCodegen.h:
+  - Added a new dvmCompilerFindClass the ME can call to discover the class of a
+     given VR
+
+Analysis01.cpp:
+  - Fixed updateCurrentBBWithConstraints to ignore the call if the global
+      variable currentBB is nil
+
+CodegenInterface.cpp:
+  - Handle the x86 version of dvmCompilerFindClass
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I6d9a0262fe28c5eb1fb8ecd3665f0f2ca9731206
+Orig-MCG-Change-Id: I26e39b86c64d8a8b0fbdd772b7478f3e17455a38
+Signed-off-by: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/BitVector.cpp                             |   80 ++++-
+ vm/BitVector.h                               |    4 +-
+ vm/Dvm.mk                                    |    4 +-
+ vm/Globals.h                                 |    3 +
+ vm/Init.cpp                                  |   17 +
+ vm/compiler/BBOptimization.cpp               |    3 +
+ vm/compiler/CompilerIR.h                     |   17 +-
+ vm/compiler/Dataflow.cpp                     |  113 +++++--
+ vm/compiler/Dataflow.h                       |   31 ++
+ vm/compiler/Frontend.cpp                     |   68 +++-
+ vm/compiler/IntermediateRep.cpp              |    1 +
+ vm/compiler/Loop.cpp                         |    1 +
+ vm/compiler/LoopInformation.h                |    6 +-
+ vm/compiler/LoopOpt.cpp                      |   30 +-
+ vm/compiler/RegisterizationME.cpp            |  503 ++++++++++++++++++++++++++
+ vm/compiler/RegisterizationME.h              |   40 ++
+ vm/compiler/SSATransformation.cpp            |  250 ++++++++++++-
+ vm/compiler/SSAWalkData.cpp                  |   73 ++++
+ vm/compiler/SSAWalkData.h                    |   86 +++++
+ vm/compiler/codegen/CodegenFactory.cpp       |   11 +
+ vm/compiler/codegen/CompilerCodegen.h        |    3 +
+ vm/compiler/codegen/x86/AnalysisO1.cpp       |   13 +-
+ vm/compiler/codegen/x86/CodegenInterface.cpp |   50 +++-
+ 23 files changed, 1314 insertions(+), 93 deletions(-)
+ create mode 100644 vm/compiler/RegisterizationME.cpp
+ create mode 100644 vm/compiler/RegisterizationME.h
+ create mode 100644 vm/compiler/SSAWalkData.cpp
+ create mode 100644 vm/compiler/SSAWalkData.h
+
+diff --git a/vm/BitVector.cpp b/vm/BitVector.cpp
+index edb84ce..635b97d 100644
+--- a/vm/BitVector.cpp
++++ b/vm/BitVector.cpp
+@@ -222,10 +222,16 @@ void dvmClearAllBits(BitVector* pBits)
+  * since there might be unused bits - setting those to one will confuse the
+  * iterator.
+  */
+-void dvmSetInitialBits(BitVector* pBits, unsigned int numBits)
++bool dvmSetInitialBits(BitVector* pBits, unsigned int numBits)
+ {
++    //First step is to see if we can set those bits
++    if (dvmSetBit (pBits, numBits, false) == false)
++    {
++        //Then don't do it
++        return false;
++    }
++
+     unsigned int idx;
+-    assert(((numBits + 31) >> 5) <= pBits->storageSize);
+     for (idx = 0; idx < (numBits >> 5); idx++) {
+         pBits->storage[idx] = -1;
+     }
+@@ -233,6 +239,9 @@ void dvmSetInitialBits(BitVector* pBits, unsigned int numBits)
+     if (remNumBits) {
+         pBits->storage[idx] = (1 << remNumBits) - 1;
+     }
++
++    //Report success
++    return true;
+ }
+ 
+ /*
+@@ -294,12 +303,59 @@ static void checkSizes(const BitVector* bv1, const BitVector* bv2)
+  * Copy a whole vector to the other. Only do that when the both vectors have
+  * the same size.
+  */
+-void dvmCopyBitVector(BitVector *dest, const BitVector *src)
++bool dvmCopyBitVector(BitVector *dest, const BitVector *src)
+ {
+-    /* if dest is expandable and < src, we could expand dest to match */
+-    checkSizes(dest, src);
++    //Paranoid
++    if (dest == 0 || src == 0)
++    {
++        return false;
++    }
++
++    //Paranoid
++    if (dest == src)
++    {
++        return true;
++    }
++
++    int destSize = dest->storageSize;
++    int srcSize = src->storageSize;
++
++    if (destSize < srcSize)
++    {
++        //We have more work to do
++        //Calculate the highest possible bit position
++        unsigned int nbrBitsPerBlock = sizeof ( * (src->storage)) * 8;
++        int highestBit = srcSize * nbrBitsPerBlock - 1;
++
++        //Set it and capture the answer: can dest hold the highest bit
++        bool res = dvmSetBit (dest, highestBit, false);
++
++        //If dvmSetBit returned false, then we cannot do anything here
++        // - It means that dest is non expandable and src are too big
++        if (res == false)
++        {
++            return false;
++        }
++    }
+ 
+-    memcpy(dest->storage, src->storage, sizeof(u4) * dest->storageSize);
++    //Otherwise we know dest is at least as big as src because
++    //  - Either it was big enough to begin with
++    //  - Or it wasn't and we got here by correctly getting it big enough via the dvmSetBit
++    int i;
++    for (i = 0; i < srcSize; i++)
++    {
++        dest->storage[i] = src->storage[i];
++    }
++
++    //For anything remaining, set to 0
++    while (i < destSize)
++    {
++        dest->storage[i] = 0;
++        i++;
++    }
++
++    //Report success
++    return true;
+ }
+ 
+ /*
+@@ -468,8 +524,11 @@ bool dvmUnifyBitVectors(BitVector *dest, const BitVector *src1,
+             max = src2->storageSize;
+         }
+ 
++        //Get the max of destination
++        unsigned int maxDest = dest->storageSize;
++
+         //Copy until max, we know both accept it
+-        while (idx < max)
++        while (idx < max && idx < maxDest)
+         {
+             dest->storage[idx] = src1->storage[idx] | src2->storage[idx];
+             idx++;
+@@ -477,21 +536,20 @@ bool dvmUnifyBitVectors(BitVector *dest, const BitVector *src1,
+ 
+         //Now it depends on the sizes, we can just do both sibling loops
+         max = src1->storageSize;
+-        while (idx < max)
++        while (idx < max && idx < maxDest)
+         {
+             dest->storage[idx] = src1->storage[idx];
+             idx++;
+         }
+         max = src2->storageSize;
+-        while (idx < max)
++        while (idx < max && idx < maxDest)
+         {
+             dest->storage[idx] = src2->storage[idx];
+             idx++;
+         }
+ 
+         //Finally reset anything remaining in dest
+-        max = dest->storageSize;
+-        while (idx < max)
++        while (idx < maxDest)
+         {
+             dest->storage[idx] = 0;
+             idx++;
+diff --git a/vm/BitVector.h b/vm/BitVector.h
+index f98a930..eba9de2 100644
+--- a/vm/BitVector.h
++++ b/vm/BitVector.h
+@@ -64,14 +64,14 @@ int dvmAllocBit(BitVector* pBits);
+ bool dvmSetBit(BitVector* pBits, unsigned int num, bool abortOnFail = true);
+ void dvmClearBit(BitVector* pBits, unsigned int num);
+ void dvmClearAllBits(BitVector* pBits);
+-void dvmSetInitialBits(BitVector* pBits, unsigned int numBits);
++bool dvmSetInitialBits(BitVector* pBits, unsigned int numBits);
+ bool dvmIsBitSet(const BitVector* pBits, unsigned int num);
+ 
+ /* count the number of bits that have been set */
+ int dvmCountSetBits(const BitVector* pBits);
+ 
+ /* copy one vector to another of equal size */
+-void dvmCopyBitVector(BitVector *dest, const BitVector *src);
++bool dvmCopyBitVector(BitVector *dest, const BitVector *src);
+ 
+ /*
+  * Intersect two bit vectors and store the result to the dest vector.
+diff --git a/vm/Dvm.mk b/vm/Dvm.mk
+index ea18ee0..f7000bf 100644
+--- a/vm/Dvm.mk
++++ b/vm/Dvm.mk
+@@ -357,7 +357,9 @@ ifeq ($(dvm_arch),x86)
+               compiler/Checks.cpp \
+               compiler/Pass.cpp \
+               compiler/BBOptimization.cpp \
+-              compiler/LoopInformation.cpp
++              compiler/LoopInformation.cpp \
++              compiler/SSAWalkData.cpp \
++              compiler/RegisterizationME.cpp
+        # need apache harmony x86 encoder/decoder
+        LOCAL_C_INCLUDES += \
+ 	      dalvik/vm/compiler/codegen/x86/libenc
+diff --git a/vm/Globals.h b/vm/Globals.h
+index 4923f6f..db56d70 100644
+--- a/vm/Globals.h
++++ b/vm/Globals.h
+@@ -942,6 +942,9 @@ struct DvmJitGlobals {
+     /* Flag to control loops with branches in JIT mode or not */
+     bool branchLoops;
+ 
++    /* Flag to control backend registerization */
++    unsigned int maximumRegisterization;
++
+     /* Flag to control which loop detection system is being used */
+     bool oldLoopDetection;
+ 
+diff --git a/vm/Init.cpp b/vm/Init.cpp
+index fe35fb4..c13eb38 100644
+--- a/vm/Init.cpp
++++ b/vm/Init.cpp
+@@ -163,6 +163,7 @@ static void usage(const char* progName)
+     dvmFprintf(stderr, "  -Xjitoldloops (Only accept the old loop detection system)\n");
+     dvmFprintf(stderr, "  -Xjitignorepasses:<value> (Ignore certain loop passes, the full name of the pass must be included, see -Xjitlooppasses to get a list)\n");
+     dvmFprintf(stderr, "  -Xjitlooppasses (Prints the loop passes available)\n");
++    dvmFprintf(stderr, "  -Xjitregisterization:<value> Request a maximum of registerization requests\n");
+ #if defined(VTUNE_DALVIK)
+     dvmFprintf(stderr, "  -Xjitsepdalvik\n");
+     dvmFprintf(stderr, "  -Xjitvtuneinfo:{none,jit,dex,src}\n");
+@@ -1174,6 +1175,21 @@ static int processOptions(int argc, const char* const argv[],
+             gDvmJit.nestedLoops = true;
+         } else if (strncmp(argv[i], "-Xjitbranchloops", 16) == 0) {
+             gDvmJit.branchLoops = true;
++        } else if (strncmp(argv[i], "-Xjitregisterization:", 21) == 0) {
++            char *endptr = NULL;
++            //Get requested style
++            long res = strtol (argv[i] + 21, &endptr, 0);
++
++            //Error checking: basic ones first
++            if (endptr != NULL && *endptr == '\0' && res != LONG_MIN && res != LONG_MAX && res > 0)
++            {
++                dvmFprintf (stderr, "Setting Registerization value to: %ld\n", res);
++                gDvmJit.maximumRegisterization = res;
++            }
++            else
++            {
++                dvmFprintf (stderr, "Refusing option for %s, it is not a valid number: must be only a strictly positive number\n", argv[i]);
++            }
+         } else if (strncmp(argv[i], "-Xjitoldloops", 13) == 0) {
+             gDvmJit.oldLoopDetection = true;
+         } else if (strncmp(argv[i], "-Xjitignorepasses:", 18) == 0) {
+@@ -1404,6 +1420,7 @@ static void setCommandLineDefaults()
+     gDvm.executionMode = kExecutionModeJit;
+     gDvmJit.nestedLoops = false;
+     gDvmJit.branchLoops = false;
++    gDvmJit.maximumRegisterization = UINT_MAX;
+     gDvmJit.oldLoopDetection = false;
+     gDvmJit.ignorePasses = 0;
+ #if defined(ARCH_IA32)
+diff --git a/vm/compiler/BBOptimization.cpp b/vm/compiler/BBOptimization.cpp
+index 013e3e9..1930eca 100644
+--- a/vm/compiler/BBOptimization.cpp
++++ b/vm/compiler/BBOptimization.cpp
+@@ -125,6 +125,9 @@ bool dvmCompilerMergeBasicBlocks (CompilationUnit *cUnit, BasicBlock *bb)
+     child->taken = 0;
+     child->fallThrough = 0;
+ 
++    //Finally merge any spill request between what the father has and the child
++    dvmUnifyBitVectors (bb->requestWriteBack, bb->requestWriteBack, child->requestWriteBack);
++
+     //We have changed the basic block
+     return true;
+ }
+diff --git a/vm/compiler/CompilerIR.h b/vm/compiler/CompilerIR.h
+index 555ca09..d185f6e 100644
+--- a/vm/compiler/CompilerIR.h
++++ b/vm/compiler/CompilerIR.h
+@@ -18,6 +18,8 @@
+ #define DALVIK_VM_COMPILER_IR_H_
+ 
+ #include "codegen/Optimizer.h"
++#include "CompilerIR.h"
++
+ #ifdef ARCH_IA32
+ #include "CompilerUtility.h"
+ #include "LoopInformation.h"
+@@ -26,6 +28,9 @@
+ typedef enum RegisterClass {
+     kCoreReg,
+     kFPReg,
++    kX87Reg,    /**< @brief X87 style register */
++    kSFPReg,    /**< @brief Single precision floating-point */
++    kDFPReg,    /**< @brief Double precision floating-point */
+     kAnyReg,
+ } RegisterClass;
+ 
+@@ -120,6 +125,10 @@ enum ExtendedMIROpcode {
+       arg[1]: indexREG or constant
+      */
+     kMirOpBoundCheck,
++    /** @brief MIR for hint to registerize a VR:
++      vA: the VR number, vB: the type using the RegisterClass enum
++    */
++    kMirOpRegisterize,
+     /** @brief Last enumeration: not used except for array bounds */
+     kMirOpLast,
+ };
+@@ -157,6 +166,7 @@ typedef struct MIR {
+     DecodedInstruction dalvikInsn;
+     unsigned int width;
+     unsigned int offset;
++    unsigned int topologicalOrder;      //Topological order of the MIR in the entire CFG
+     struct MIR *prev;
+     struct MIR *next;
+     struct SSARepresentation *ssaRep;
+@@ -185,6 +195,7 @@ typedef struct BasicBlock {
+     bool visited;
+     bool topLoop;                       //Is this a loop head and is it a top loop?
+     bool bottomLoop;                    //Is this a loop head and is it a bottom loop?
++    BitVector *requestWriteBack;        //Request a write back from the BE
+     bool hidden;
+     unsigned int startOffset;
+     const Method *containingMethod;     // For blocks from the callee
+@@ -205,6 +216,7 @@ typedef struct BasicBlock {
+         BlockListType blockListType;    // switch and exception handling
+         GrowableList blocks;
+     } successorBlockList;
++    unsigned int topologicalOrder;      //Topological order of the BB's first instruction in the whole CFG
+ } BasicBlock;
+ 
+ /*
+@@ -245,8 +257,11 @@ typedef struct CompilationUnit {
+ #ifdef ARCH_IA32
+     int exceptionBlockId;               /**< @brief The block corresponding to exception handling */
+     bool singletonInlined;              /**< @brief TRUE if singleton call inlined */
+-    void *passData;                     /**< @brief Pass data */
+ #endif
++    unsigned int maximumRegisterization;    /**< @brief Maximum registerization to be accepted */
++    void *passData;                         /**< @brief Pass data is used to transfer data throughout a Pass */
++    void *walkData;                         /**< @brief Walk data when using the dispatcher */
++    struct sUsedChain* globalDefUseChain;   /**< @Brief The global def-use chain, this contains all def-use chains for reuse when recalculating */
+     const JitTraceDescription *traceDesc;
+     LIR *firstLIRInsn;
+     LIR *lastLIRInsn;
+diff --git a/vm/compiler/Dataflow.cpp b/vm/compiler/Dataflow.cpp
+index da23fb6..2f63f95 100644
+--- a/vm/compiler/Dataflow.cpp
++++ b/vm/compiler/Dataflow.cpp
+@@ -1085,6 +1085,42 @@ void dvmCompilerExtendedDisassembler (const CompilationUnit *cUnit,
+                         mir != NULL ? mir->meta.callsiteInfo->classDescriptor : "Unknown");
+             }
+             break;
++        case kMirOpRegisterize: {
++            /* The kMirOpRegisterize uses vB as the type of register:
++             *    - kCoreReg -> is a general purpose register
++             *    - kFPReg -> general floating point register
++             *    - kSFPReg -> single floating point (uses movss for x86 for example)
++             *    - kDFReg -> double floating point (uses movq for x86 for example)
++             *    - kX87Reg -> x87 register
++             *    - kAnyReg -> is put here for completeness of regClass but registerization should not use that
++             */
++            const char * regClass;
++            switch (insn->vB) {
++                case kCoreReg:
++                    regClass = "core";
++                    break;
++                case kFPReg:
++                    regClass = "FP";
++                    break;
++                case kSFPReg:
++                    regClass = "Single FP";
++                    break;
++                case kDFPReg:
++                    regClass = "Double FP";
++                    break;
++                case kAnyReg:
++                    regClass = "any";
++                    break;
++                case kX87Reg:
++                    regClass = "X87";
++                    break;
++                default:
++                    regClass = "invalid";
++                    break;
++            }
++            snprintf (buffer, len, "kMirOpRegisterize: v%d %s", insn->vA, regClass);
++            break;
++        }
+         default:
+             snprintf (buffer, len, "Unknown Extended Opcode");
+             break;
+@@ -1263,13 +1299,12 @@ char *dvmCompilerGetSSAString(CompilationUnit *cUnit, SSARepresentation *ssaRep)
+     return ret;
+ }
+ 
+-/* Any register that is used before being defined is considered live-in */
+-static inline void handleLiveInUse(BitVector *useV, BitVector *defV,
+-                                   BitVector *liveInV, int dalvikRegId)
++/* Set any register that is used before being defined */
++static inline void handleUse(BitVector *useV, BitVector *defV, int dalvikRegId)
+ {
+-    dvmCompilerSetBit(useV, dalvikRegId);
+-    if (!dvmIsBitSet(defV, dalvikRegId)) {
+-        dvmCompilerSetBit(liveInV, dalvikRegId);
++    //If it has been defined before, don't set it, it is dead
++    if (dvmIsBitSet(defV, dalvikRegId) == 0) {
++        dvmCompilerSetBit(useV, dalvikRegId);
+     }
+ }
+ 
+@@ -1286,7 +1321,7 @@ static inline void handleDef(BitVector *defV, int dalvikRegId)
+ bool dvmCompilerFindLocalLiveIn(CompilationUnit *cUnit, BasicBlock *bb)
+ {
+     MIR *mir;
+-    BitVector *useV, *defV, *liveInV;
++    BitVector *useV, *defV;
+ 
+     if (bb->dataFlowInfo == NULL) return false;
+ 
+@@ -1296,6 +1331,11 @@ bool dvmCompilerFindLocalLiveIn(CompilationUnit *cUnit, BasicBlock *bb)
+         bb->dataFlowInfo->useV =
+             dvmCompilerAllocBitVector(cUnit->numDalvikRegisters, false);
+     }
++    else
++    {
++        dvmClearAllBits (bb->dataFlowInfo->useV);
++    }
++
+     //Get local version
+     useV = bb->dataFlowInfo->useV;
+ 
+@@ -1305,6 +1345,11 @@ bool dvmCompilerFindLocalLiveIn(CompilationUnit *cUnit, BasicBlock *bb)
+         bb->dataFlowInfo->defV =
+             dvmCompilerAllocBitVector(cUnit->numDalvikRegisters, false);
+     }
++    else
++    {
++        dvmClearAllBits (bb->dataFlowInfo->defV);
++    }
++
+     //Get local version
+     defV = bb->dataFlowInfo->defV;
+ 
+@@ -1314,8 +1359,21 @@ bool dvmCompilerFindLocalLiveIn(CompilationUnit *cUnit, BasicBlock *bb)
+         bb->dataFlowInfo->liveInV =
+             dvmCompilerAllocBitVector(cUnit->numDalvikRegisters, false);
+     }
+-    //Get local version
+-    liveInV = bb->dataFlowInfo->liveInV;
++    else
++    {
++        dvmClearAllBits (bb->dataFlowInfo->liveInV);
++    }
++
++    //If not allocated yet
++    if (bb->dataFlowInfo->liveOutV == 0)
++    {
++        bb->dataFlowInfo->liveOutV =
++            dvmCompilerAllocBitVector(cUnit->numDalvikRegisters, false);
++    }
++    else
++    {
++        dvmClearAllBits (bb->dataFlowInfo->liveOutV);
++    }
+ 
+     for (mir = bb->firstMIRInsn; mir; mir = mir->next) {
+         int dfAttributes =
+@@ -1324,28 +1382,28 @@ bool dvmCompilerFindLocalLiveIn(CompilationUnit *cUnit, BasicBlock *bb)
+ 
+         if (dfAttributes & DF_HAS_USES) {
+             if (dfAttributes & DF_UA) {
+-                handleLiveInUse(useV, defV, liveInV, dInsn->vA);
++                handleUse(useV, defV, dInsn->vA);
+             } else if (dfAttributes & DF_UA_WIDE) {
+-                handleLiveInUse(useV, defV, liveInV, dInsn->vA);
+-                handleLiveInUse(useV, defV, liveInV, dInsn->vA+1);
++                handleUse(useV, defV, dInsn->vA);
++                handleUse(useV, defV, dInsn->vA + 1);
+             }
+             if (dfAttributes & DF_UB) {
+-                handleLiveInUse(useV, defV, liveInV, dInsn->vB);
++                handleUse(useV, defV, dInsn->vB);
+             } else if (dfAttributes & DF_UB_WIDE) {
+-                handleLiveInUse(useV, defV, liveInV, dInsn->vB);
+-                handleLiveInUse(useV, defV, liveInV, dInsn->vB+1);
++                handleUse(useV, defV, dInsn->vB);
++                handleUse(useV, defV, dInsn->vB + 1);
+             }
+             if (dfAttributes & DF_UC) {
+-                handleLiveInUse(useV, defV, liveInV, dInsn->vC);
++                handleUse(useV, defV, dInsn->vC);
+             } else if (dfAttributes & DF_UC_WIDE) {
+-                handleLiveInUse(useV, defV, liveInV, dInsn->vC);
+-                handleLiveInUse(useV, defV, liveInV, dInsn->vC+1);
++                handleUse(useV, defV, dInsn->vC);
++                handleUse(useV, defV, dInsn->vC + 1);
+             }
+         }
+         if (dfAttributes & DF_HAS_DEFS) {
+             handleDef(defV, dInsn->vA);
+             if (dfAttributes & DF_DA_WIDE) {
+-                handleDef(defV, dInsn->vA+1);
++                handleDef(defV, dInsn->vA + 1);
+             }
+         }
+     }
+@@ -1407,6 +1465,7 @@ static void dataFlowSSAFormat35C(CompilationUnit *cUnit, MIR *mir)
+     {
+         mir->ssaRep->numUses = numUses;
+         mir->ssaRep->uses = static_cast <int *> (dvmCompilerNew (sizeof (* (mir->ssaRep->uses)) * numUses, false));
++        mir->ssaRep->defWhere = static_cast<MIR **> (dvmCompilerNew (sizeof (* (mir->ssaRep->defWhere)) * numUses, true));
+     }
+ 
+     for (i = 0; i < numUses; i++) {
+@@ -1426,6 +1485,7 @@ static void dataFlowSSAFormat3RC(CompilationUnit *cUnit, MIR *mir)
+     {
+         mir->ssaRep->numUses = numUses;
+         mir->ssaRep->uses = static_cast <int *> (dvmCompilerNew (sizeof (* (mir->ssaRep->uses)) * numUses, false));
++        mir->ssaRep->defWhere = static_cast<MIR **> (dvmCompilerNew (sizeof (* (mir->ssaRep->defWhere)) * numUses, true));
+     }
+ 
+     for (i = 0; i < numUses; i++) {
+@@ -1501,6 +1561,7 @@ bool dvmCompilerDoSSAConversion(CompilationUnit *cUnit, BasicBlock *bb)
+             mir->ssaRep->numUses = numUses;
+             mir->ssaRep->uses = static_cast<int *> (dvmCompilerNew (sizeof (* (mir->ssaRep->uses)) * numUses, false));
+             mir->ssaRep->fpUse = static_cast<bool *> (dvmCompilerNew (sizeof (* (mir->ssaRep->fpUse)) * numUses, false));
++            mir->ssaRep->defWhere = static_cast<MIR **> (dvmCompilerNew (sizeof (* (mir->ssaRep->defWhere)) * numUses, true));
+         }
+ 
+         int numDefs = 0;
+@@ -1516,6 +1577,7 @@ bool dvmCompilerDoSSAConversion(CompilationUnit *cUnit, BasicBlock *bb)
+             mir->ssaRep->numDefs = numDefs;
+             mir->ssaRep->defs = static_cast<int *> (dvmCompilerNew (sizeof (* (mir->ssaRep->defs)) * numDefs, false));
+             mir->ssaRep->fpDef = static_cast<bool *> (dvmCompilerNew (sizeof (* (mir->ssaRep->fpDef)) * numDefs, false));
++            mir->ssaRep->usedNext = static_cast<SUsedChain **> (dvmCompilerNew (sizeof (* (mir->ssaRep->usedNext)) * numDefs, true));
+         }
+ 
+         DecodedInstruction *dInsn = &mir->dalvikInsn;
+@@ -1529,7 +1591,7 @@ bool dvmCompilerDoSSAConversion(CompilationUnit *cUnit, BasicBlock *bb)
+                 mir->ssaRep->fpUse[numUses] = dfAttributes & DF_FP_A;
+                 handleSSAUse(cUnit, mir->ssaRep->uses, dInsn->vA, numUses++);
+                 mir->ssaRep->fpUse[numUses] = dfAttributes & DF_FP_A;
+-                handleSSAUse(cUnit, mir->ssaRep->uses, dInsn->vA+1, numUses++);
++                handleSSAUse(cUnit, mir->ssaRep->uses, dInsn->vA + 1, numUses++);
+             }
+             if (dfAttributes & DF_UB) {
+                 mir->ssaRep->fpUse[numUses] = dfAttributes & DF_FP_B;
+@@ -1538,7 +1600,7 @@ bool dvmCompilerDoSSAConversion(CompilationUnit *cUnit, BasicBlock *bb)
+                 mir->ssaRep->fpUse[numUses] = dfAttributes & DF_FP_B;
+                 handleSSAUse(cUnit, mir->ssaRep->uses, dInsn->vB, numUses++);
+                 mir->ssaRep->fpUse[numUses] = dfAttributes & DF_FP_B;
+-                handleSSAUse(cUnit, mir->ssaRep->uses, dInsn->vB+1, numUses++);
++                handleSSAUse(cUnit, mir->ssaRep->uses, dInsn->vB + 1, numUses++);
+             }
+             if (dfAttributes & DF_UC) {
+                 mir->ssaRep->fpUse[numUses] = dfAttributes & DF_FP_C;
+@@ -1547,7 +1609,7 @@ bool dvmCompilerDoSSAConversion(CompilationUnit *cUnit, BasicBlock *bb)
+                 mir->ssaRep->fpUse[numUses] = dfAttributes & DF_FP_C;
+                 handleSSAUse(cUnit, mir->ssaRep->uses, dInsn->vC, numUses++);
+                 mir->ssaRep->fpUse[numUses] = dfAttributes & DF_FP_C;
+-                handleSSAUse(cUnit, mir->ssaRep->uses, dInsn->vC+1, numUses++);
++                handleSSAUse(cUnit, mir->ssaRep->uses, dInsn->vC + 1, numUses++);
+             }
+         }
+         if (dfAttributes & DF_HAS_DEFS) {
+@@ -1555,7 +1617,7 @@ bool dvmCompilerDoSSAConversion(CompilationUnit *cUnit, BasicBlock *bb)
+             handleSSADef(cUnit, mir->ssaRep->defs, dInsn->vA, 0);
+             if (dfAttributes & DF_DA_WIDE) {
+                 mir->ssaRep->fpDef[1] = dfAttributes & DF_FP_A;
+-                handleSSADef(cUnit, mir->ssaRep->defs, dInsn->vA+1, 1);
++                handleSSADef(cUnit, mir->ssaRep->defs, dInsn->vA + 1, 1);
+             }
+         }
+     }
+@@ -2088,4 +2150,9 @@ void dvmCompilerNonLoopAnalysis(CompilationUnit *cUnit)
+     dvmCompilerDataFlowAnalysisDispatcher(cUnit, dvmCompilerDoSSAConversion,
+                                           kAllNodes,
+                                           false /* isIterative */);
++
++    //We do this calculation to provide the backend with what is being used and defined in each BasicBlock
++    dvmCompilerDataFlowAnalysisDispatcher(cUnit, dvmCompilerFindLocalLiveIn,
++                                          kAllNodes,
++                                          false /* isIterative */);
+ }
+diff --git a/vm/compiler/Dataflow.h b/vm/compiler/Dataflow.h
+index 0ef803d..daa097b 100644
+--- a/vm/compiler/Dataflow.h
++++ b/vm/compiler/Dataflow.h
+@@ -103,10 +103,29 @@ typedef struct BasicBlockDataFlow {
+     BitVector *useV;
+     BitVector *defV;
+     BitVector *liveInV;
++    BitVector *liveOutV;
+     BitVector *phiV;
+     int *dalvikToSSAMap;
+ } BasicBlockDataFlow;
+ 
++/**
++ * @class SUsedChain
++ * @brief Used chain for each virtual register to link the MIRs together
++ */
++typedef struct sUsedChain
++{
++    MIR *prevUse;       /**< @brief MIR containing the previous use */
++    MIR *mir;           /**< @brief MIR containing the current use */
++    MIR *nextUse;       /**< @brief MIR containing the next use */
++    BasicBlock *bb;     /**< @brief BasicBlock containing the current use (mir field) */
++
++    struct sUsedChain *nextChain;   /**< @brief Used internally by the chain builder */
++}SUsedChain;
++
++/**
++ * @class SSARepresentation
++ * @brief The SSA Representation for a MIR
++ */
+ typedef struct SSARepresentation {
+     int numUses;
+     int *uses;
+@@ -114,6 +133,18 @@ typedef struct SSARepresentation {
+     int numDefs;
+     int *defs;
+     bool *fpDef;
++
++    /** @brief For each definition in defs, we have an entry in the usedNext array
++     *     If there is a WIDE, it gets two defs in the defs array and gets two entries in the def-use chain
++     *     Depending on uses, it might be important/necessary to follow both chains
++     */
++    SUsedChain **usedNext;
++
++    /** @brief Where the uses are defined:
++     *      For each usage is uses, there is an entry in defWhere to provide the MIR containing the definition
++     */
++    MIR **defWhere;
++
+ } SSARepresentation;
+ 
+ /*
+diff --git a/vm/compiler/Frontend.cpp b/vm/compiler/Frontend.cpp
+index e3d4cbf..4a9d626 100644
+--- a/vm/compiler/Frontend.cpp
++++ b/vm/compiler/Frontend.cpp
+@@ -23,6 +23,7 @@
+ #include "Loop.h"
+ #include "LoopOpt.h"
+ #include "LoopInformation.h"
++#include "RegisterizationME.h"
+ 
+ #define BYTECODE_FILTER
+ 
+@@ -744,6 +745,21 @@ static FILE *dvmCompilerDumpGetFile (CompilationUnit *cUnit, const char *dirPref
+ }
+ 
+ /**
++ * @brief Dump an MIR
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock to dump
++ * @param file the File in which to dump the BasicBlock
++ */
++static void dumpMIRInstructions (CompilationUnit *cUnit, const BasicBlock *bb, FILE *file)
++{
++    for (const MIR *mir = bb->firstMIRInsn; mir; mir = mir->next) {
++        char buffer[256];
++        dvmCompilerExtendedDisassembler (cUnit, mir, & (mir->dalvikInsn), buffer, sizeof (buffer));
++        fprintf(file, "    {%04x %s\\l} | \\\n", mir->offset, buffer);
++    }
++}
++
++/**
+   * @brief Dump a BasicBlock
+   * @param cUnit the CompilationUnit
+   * @param bb the BasicBlock
+@@ -764,28 +780,26 @@ void dvmDumpBasicBlock (CompilationUnit *cUnit, BasicBlock *bb, FILE *file, bool
+             fprintf(file, "  entry [shape=Mdiamond];\n");
+         } else if (bb->blockType == kExitBlock) {
+             fprintf(file, "  exit [shape=Mdiamond];\n");
+-        } else if (bb->blockType == kDalvikByteCode) {
++        } else {
+             fprintf(file, "  %s [shape=record,label = \"{ \\\n",
+                     bbName);
+-            const MIR *mir;
+-            fprintf(file, "    {block id %d\\l}%s\\\n", bb->id,
+-                    bb->firstMIRInsn ? " | " : " ");
+-            for (mir = bb->firstMIRInsn; mir; mir = mir->next) {
+-                char buffer[256];
+-                dvmCompilerExtendedDisassembler (cUnit, mir, & (mir->dalvikInsn), buffer, sizeof (buffer));
+-                fprintf(file, "    {%04x %s\\l}%s\\\n", mir->offset, buffer, mir->next ? " | " : " ");
+-            }
+ 
+-            //Add information about fallThrough branches
+-            if (bb->needFallThroughBranch == true && bb->fallThrough != NULL)
+-            {
+-                dvmGetBlockName (bb->fallThrough, blockName);
+-                fprintf (file, "| FallThrough jmp %s", blockName);
++            //First print out the block id for dalvik code or the name for others
++            if (bb->blockType == kDalvikByteCode) {
++                // For BBs that have MIRs, print them
++                fprintf(file, "    {block id %d\\l} |\\\n", bb->id);
++            } else {
++                // For other kinds of BBs, simply print its name
++                fprintf(file, "    {%s\\l}|\\\n", bbName);
+             }
++
++            //Then dump the instructions if any
++            dumpMIRInstructions (cUnit, bb, file);
++
++            //Finally, dump spill requests
++            dvmDumpBitVectorDotFormat (file, "Write Backs: ", bb->requestWriteBack, true, true);
++
+             fprintf(file, "  }\"];\n\n");
+-        } else if (bb->blockType == kExceptionHandling) {
+-            dvmGetBlockName(bb, blockName);
+-            fprintf(file, "  %s [shape=invhouse];\n", blockName);
+         }
+ 
+         if (bb->taken) {
+@@ -793,6 +807,7 @@ void dvmDumpBasicBlock (CompilationUnit *cUnit, BasicBlock *bb, FILE *file, bool
+             fprintf(file, "  %s:s -> %s:n [style=dotted]\n",
+                     bbName, blockName);
+         }
++
+         if (bb->fallThrough) {
+             dvmGetBlockName(bb->fallThrough, blockName);
+             fprintf(file, "  %s:s -> %s:n\n", bbName, blockName);
+@@ -1895,6 +1910,25 @@ static bool compileLoop(CompilationUnit *cUnit, unsigned int startOffset,
+         dvmCompilerDumpCompilationUnit (cUnit);
+     }
+ 
++    //Get global registerization information
++    {
++        int gRegisterization = gDvmJit.maximumRegisterization;
++
++        //If the global information gave us something
++        if (gRegisterization >= 0)
++        {
++            //Get the minimum between what we have and the global registerization
++            int min = cUnit->maximumRegisterization;
++
++            if (min > gRegisterization)
++            {
++                min = gRegisterization;
++            }
++
++            cUnit->maximumRegisterization = min;
++        }
++    }
++
+     /* Convert MIR to LIR, etc. */
+     dvmCompilerMIR2LIR(cUnit, info);
+ #else
+diff --git a/vm/compiler/IntermediateRep.cpp b/vm/compiler/IntermediateRep.cpp
+index 609433c..1e136aa 100644
+--- a/vm/compiler/IntermediateRep.cpp
++++ b/vm/compiler/IntermediateRep.cpp
+@@ -25,6 +25,7 @@ BasicBlock *dvmCompilerNewBB(BBType blockType, int blockId)
+     bb->id = blockId;
+     bb->predecessors = dvmCompilerAllocBitVector(blockId > 32 ? blockId : 32,
+                                                  true /* expandable */);
++    bb->requestWriteBack = dvmCompilerAllocBitVector(1, true);
+     return bb;
+ }
+ 
+diff --git a/vm/compiler/Loop.cpp b/vm/compiler/Loop.cpp
+index 7869f82..2a9cc01 100644
+--- a/vm/compiler/Loop.cpp
++++ b/vm/compiler/Loop.cpp
+@@ -1436,6 +1436,7 @@ static bool markOffNonHeadersHelper (CompilationUnit *cUnit, BasicBlock *bb)
+         return false;
+     }
+ 
++    //Did we find a BasicBlock being a backward branch
+     while (true) {
+         //Get the next iterator
+         int blockIdx = dvmBitVectorIteratorNext(&bvIterator);
+diff --git a/vm/compiler/LoopInformation.h b/vm/compiler/LoopInformation.h
+index cce839a..612387d 100644
+--- a/vm/compiler/LoopInformation.h
++++ b/vm/compiler/LoopInformation.h
+@@ -189,10 +189,10 @@ class LoopInformation
+         unsigned int getNestedNbr (void) const {return nested.numUsed;}
+ 
+         /**
+-         * @brief Get the exit loop BitVector
+-         * @return the exit loop BitVector
++         * @brief Get the exit loop BasicBlocks BitVector
++         * @return the exit loop BasicBlocks BitVector
+          */
+-        const BitVector *getExitLoop (void) const {return exitLoop;}
++        const BitVector *getExitLoops (void) const {return exitLoop;}
+ 
+         /**
+          * @brief Get the BasicBlocks of the loop
+diff --git a/vm/compiler/LoopOpt.cpp b/vm/compiler/LoopOpt.cpp
+index 6004e94..2b1cde4 100644
+--- a/vm/compiler/LoopOpt.cpp
++++ b/vm/compiler/LoopOpt.cpp
+@@ -21,6 +21,7 @@
+ #include "Loop.h"
+ #include "LoopOpt.h"
+ #include "Pass.h"
++#include "RegisterizationME.h"
+ 
+ /**
+  * @brief Static functions defined below
+@@ -53,20 +54,27 @@ START_PASSES
+                 dvmCompilerFormOldLoop, 0, 0, 0, kOptimizationBasicBlockChange),
+     NEW_PASS ("Check Removal", kAllNodes, 0, 0,
+                 dvmCompilerStartCheckRemoval, dvmCompilerEndCheckRemoval, dvmCompilerCheckRemoval, 0, 0),
++    //This should be after the last optimization that changes instruction sequence or BB logic
++    //Note: merge block and reorder are safe and should be after
++    //We do registerization for all traces to provide spill information to the BE
++    NEW_PASS ("Write Back Registers", kAllNodes, 0, 0, 0, 0, dvmCompilerWriteBackAll, 0, 0),
++    NEW_PASS ("Registerization ME", kAllNodes, 0, dvmCompilerTraceIsLoopNewSystem,
++                0, dvmCompilerRegisterize, 0, 0, 0),
+     NEW_PASS ("Merge Blocks", kAllNodes, 0, 0,
+-                0, NULL, dvmCompilerMergeBasicBlocks, 0, kOptimizationBasicBlockChange),
++                0, 0, dvmCompilerMergeBasicBlocks, 0, kOptimizationBasicBlockChange),
+     NEW_PASS ("Reorder Blocks", kBreadthFirstTraversal, 0, dvmCompilerTraceIsLoop,
+                 dvmCompilerReorder, 0, 0, 0, kOptimizationBasicBlockChange),
+-    /* Last element must have and be the only one to have a "" as name, it's our ending check */
+-    NEW_PASS ("",        /** Pass name */
+-         kAllNodes,      /** Type of traversal */
+-         0,              /** Data */
+-         0,              /** Gate function */
+-         0,              /** Start function */
+-         0,              /** End function */
+-         0,              /** Work function */
+-         0,              /** Free function */
+-         0               /** Flags */
++
++    /* Last element must have and be the only one to have a NULL name, it's our ending check */
++    NEW_PASS ("",       /** Pass name */
++         kAllNodes,     /** Type of traversal */
++         0,             /** Data */
++         0,             /** Gate function */
++         0,             /** Start function */
++         0,             /** End function */
++         0,             /** Work function */
++         0,             /** Free function */
++         0              /** Flags */
+          ),
+ END_PASSES
+ 
+diff --git a/vm/compiler/RegisterizationME.cpp b/vm/compiler/RegisterizationME.cpp
+new file mode 100644
+index 0000000..4318ddb
+--- /dev/null
++++ b/vm/compiler/RegisterizationME.cpp
+@@ -0,0 +1,503 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "Dalvik.h"
++#include "Dataflow.h"
++#include "CompilerIR.h"
++#include "LoopInformation.h"
++#include "RegisterizationME.h"
++
++#include <algorithm>
++
++/**
++ * @brief Get the register class for a given define from a PHI node
++ * @param mir the PHI node MIR
++ * @param vR the virtual register number
++ * @param regClass the RegisterClass (updated by the function)
++ * @return whether the function found the register class
++ */
++static bool getType (const MIR *mir, int vR, RegisterClass &regClass)
++{
++    //Paranoid
++    if (mir == 0)
++    {
++        return false;
++    }
++
++    //Get SSA representation
++    SSARepresentation *ssaRep = mir->ssaRep;
++
++    //Paranoid
++    if (ssaRep == 0 || ssaRep->defs == 0)
++    {
++        return false;
++    }
++
++    SUsedChain **chains = ssaRep->usedNext;
++
++    //If chain is emtpy, we cannot do anything
++    if (chains == 0)
++    {
++        return false;
++    }
++
++    //For a PHI node, it will be in chains[0]
++    SUsedChain *chain = chains[0];
++
++    //Paranoid
++    if (chain == 0)
++    {
++        return false;
++    }
++
++    MIR *firstUse = chain->mir;
++
++    //Paranoid
++    if (firstUse == 0)
++    {
++        return false;
++    }
++
++    //If the first use is extended, reject it
++    if (firstUse->dalvikInsn.opcode >= static_cast<Opcode> (kMirOpFirst))
++    {
++        return false;
++    }
++
++    //Ok now find out about this one
++    bool res = dvmCompilerFindRegClass (firstUse, vR, regClass);
++
++    if (res == false)
++    {
++        return false;
++    }
++
++    //Currently we ignore kX87Reg registers
++    if (regClass == kX87Reg)
++    {
++        return false;
++    }
++
++    //Success
++    return true;
++}
++
++/**
++ * @brief Select the registers we want to registerize: currently only the entry PHI nodes
++ * @param info the LoopInformation
++ * @param registers the final vector of registers
++ */
++static void selectRegisters (CompilationUnit *cUnit, const LoopInformation *info, std::vector<std::pair<int, RegisterClass> > &registers)
++{
++    //Clear the vector just in case
++    registers.clear ();
++
++    //As a first iteration of the algorithm, we are only going to registerize interloop dependent variables
++    //These variables are automatically PHI nodes in the entry block
++    BasicBlock *entry = info->getEntryBlock ();
++
++    for (MIR *mir = entry->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        //Get dalvik instruction
++        DecodedInstruction &dalvikInsn = mir->dalvikInsn;
++
++        //Check opcode: is it a Phi node?
++        if (dalvikInsn.opcode == static_cast<Opcode> (kMirOpPhi))
++        {
++            //Paranoid
++            assert (mir->ssaRep != 0);
++            assert (mir->ssaRep->numDefs > 0);
++
++            //It is, ok let's get the left side for it: it is in defs[0]
++            int ssaName = mir->ssaRep->defs[0];
++
++            //Get the first type used for this register
++            RegisterClass type = kAnyReg;
++
++            int reg = dvmConvertSSARegToDalvik (cUnit, ssaName);
++            reg = DECODE_REG (reg);
++            bool res = getType (mir, reg, type);
++
++            //If success, we can add it
++            if (res == true)
++            {
++                registers.push_back (std::make_pair<int, RegisterClass> (ssaName, type));
++            }
++        }
++    }
++}
++
++/**
++ * @brief Fill the write back requests using the destination's phi nodes
++ * @param bb the BasicBlock that will be walked to get the PHI nodes
++ * @param bv the BitVector to fill
++ */
++static void fillWriteBackRequests (BasicBlock *bb, BitVector *bv)
++{
++    //If null, we have nothing to do
++    if (bb == 0)
++    {
++        return;
++    }
++
++    //Go through each instruction
++    for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        //Get the instruction
++        DecodedInstruction &insn = mir->dalvikInsn;
++
++        //Get the opcode
++        Opcode opcode = insn.opcode;
++
++        //Check for a PHI node
++        if (opcode == static_cast<Opcode> (kMirOpPhi))
++        {
++            //Get the va, it contains the register in question
++            int dalvikReg = insn.vA;
++
++            //Now add it
++            dvmSetBit (bv, dalvikReg);
++        }
++    }
++}
++
++/**
++ * @brief Fill the write back requests of the post loop basic blocks using their live outs
++ * @param cUnit the CompilationUnit
++ * @param info the LoopInformation
++ */
++static void handleWriteBackRequestsPostLoop (const CompilationUnit *cUnit, const LoopInformation *info)
++{
++    const BitVector *postBasicBlocks = info->getExitLoops ();
++
++    //Now take care of write back requests
++    BitVectorIterator bvIterator;
++
++    //Const cast because of incompatibility here
++    BitVector *tmp = const_cast<BitVector *> (postBasicBlocks);
++    dvmBitVectorIteratorInit (tmp, &bvIterator);
++
++    while (true)
++    {
++        //Get the block index
++        int blockIdx = dvmBitVectorIteratorNext (&bvIterator);
++
++        //If we are done
++        if (blockIdx == -1)
++        {
++            break;
++        }
++
++        BasicBlock *bb = (BasicBlock *) dvmGrowableListGetElement(&cUnit->blockList, blockIdx);
++
++        //Paranoid
++        if (bb == 0)
++        {
++            continue;
++        }
++
++        //For the moment, we are being simple, exiting the loop, we request write backs of
++        //every register in the method
++        unsigned int size = cUnit->method->registersSize;
++        dvmSetInitialBits (bb->requestWriteBack, size);
++    }
++}
++
++/**
++ * @brief Handle write backs requests for a given BitVector representing blocks
++ * @param cUnit the CompilationUnit
++ * @param blocks a BitVector representing which BasicBlocks to handle
++ */
++static void handleWriteBackRequests (const CompilationUnit *cUnit, const BitVector *blocks)
++{
++    //Paranoid
++    if (blocks == 0)
++    {
++        return;
++    }
++
++    //Now take care of write backs requests
++    BitVectorIterator bvIterator;
++
++    //Const cast due to incompatibility here
++    BitVector *tmp = const_cast<BitVector *> (blocks);
++    dvmBitVectorIteratorInit (tmp, &bvIterator);
++    while (true)
++    {
++        //Get the block index
++        int blockIdx = dvmBitVectorIteratorNext (&bvIterator);
++
++        //If we are done
++        if (blockIdx == -1)
++        {
++            break;
++        }
++
++        BasicBlock *bb = (BasicBlock *) dvmGrowableListGetElement(&cUnit->blockList, blockIdx);
++
++        //Paranoid
++        if (bb == 0)
++        {
++            continue;
++        }
++
++        //Get any merge issues until the BE can handle them by itself
++        //Get the write backs BitVector
++        BitVector *writeBack = bb->requestWriteBack;
++
++        //First clear the vector
++        dvmClearAllBits (writeBack);
++
++        //Now get a union of any Phi nodes we need to handle here
++        fillWriteBackRequests (bb->taken, writeBack);
++        fillWriteBackRequests (bb->fallThrough, writeBack);
++    }
++}
++
++/**
++ * @brief Count the register usage for each SSA register in the BasicBlock
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock
++ * @return false, the function does not change the BasicBlock
++ */
++static bool countRegistersHelper (CompilationUnit *cUnit, BasicBlock *bb)
++{
++    //Get the register count data
++    std::map<int, int> *registerCounts = static_cast<std::map<int, int> *> (cUnit->walkData);
++
++    //If there is no data, bail
++    if (registerCounts == 0)
++    {
++        return false;
++    }
++
++    //Now go through the BasicBlock
++    for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        //If there is the SSA information
++        SSARepresentation *ssa = mir->ssaRep;
++
++        if (ssa != 0)
++        {
++            //Go through the uses and count
++            for (int i = 0; i < ssa->numUses; i++)
++            {
++                int use = ssa->uses[i];
++
++                (*registerCounts)[use]++;
++            }
++        }
++    }
++
++    return false;
++}
++
++/**
++ * @brief Count the register usage
++ * @param cUnit the CompilationUnit
++ * @param registerCounts the map to count register usage
++ */
++static void countRegisters (CompilationUnit *cUnit, std::map<int, int> &registerCounts)
++{
++    //Set walking data
++    cUnit->walkData = static_cast<void *> (&registerCounts);
++
++    //Dispatch the counting
++    dvmCompilerDataFlowAnalysisDispatcher(cUnit, countRegistersHelper, kAllNodes, false);
++
++    //Reset walking data
++    cUnit->walkData = 0;
++}
++
++/**
++ * @class RegisterSorter
++ * @brief Used to sort the registerize order
++ */
++class RegisterSorter
++{
++    public:
++        /** @brief Register counts to determine the order to registerize */
++        std::map<int, int> registerCounts;
++
++        /**
++         * @brief Operator used for the sorting of first < second, it uses the information in registerCount to sort in reverse order
++         * @param first the first register to compare
++         * @param second the second register to compare
++         * @return whether first has a higher register count than second
++         */
++        bool operator() (const std::pair<int, RegisterClass> &first, const std::pair<int, RegisterClass> &second)
++        {
++            int firstCount = registerCounts[first.first];
++            int secondCount = registerCounts[second.second];
++
++            //We only care about the first
++            return (firstCount > secondCount);
++        }
++
++        /**
++         * @brief Get the register count map
++         * @return the registerCount map
++         */
++        std::map<int, int> &getRegisterCounts (void)
++        {
++            return registerCounts;
++        }
++
++        /**
++         * @brief Destructor to clear the register count map
++         */
++        ~RegisterSorter (void)
++        {
++            registerCounts.clear ();
++        }
++};
++
++/**
++ * @brief Regiseterize a given loop
++ * @param cUnit the CompilationUnit
++ * @param info the LoopInformation
++ */
++static void registerizeLoop (CompilationUnit *cUnit, const LoopInformation *info)
++{
++    RegisterSorter sorter;
++    std::vector<std::pair<int, RegisterClass> > registers;
++    std::map<int, int> &registerCounts = sorter.getRegisterCounts ();
++
++    BasicBlock *preHeader = info->getPreHeader ();
++
++    //Select which registers should get registerized
++    selectRegisters (cUnit, info, registers);
++
++    //Set maximum registerization
++    cUnit->maximumRegisterization = registers.size ();
++
++    //Now count the uses of each register, do it for all, it's simpler than trying to do it only for the ones we care
++    countRegisters (cUnit, registerCounts);
++
++    //Finally, filter out and sort the registers in priority order
++    std::sort (registers.begin (), registers.end (), sorter);
++
++    //Now go through these registers and add the instructions
++    for (std::vector<std::pair<int, RegisterClass> >::const_iterator it = registers.begin (); it != registers.end (); it++)
++    {
++        //Get the values
++        const std::pair<int, RegisterClass> &p = *it;
++
++        int reg = p.first;
++        // Get the Dalvik number
++        reg = dvmConvertSSARegToDalvik(cUnit, reg);
++
++        RegisterClass regClass = p.second;
++
++        //Create a registerize request in the preheader
++        //Actually generate the hoisting code
++        MIR *registerizeInsn = static_cast<MIR *> (dvmCompilerNew (sizeof (*registerizeInsn), true));
++        registerizeInsn->dalvikInsn.opcode = static_cast<Opcode> (kMirOpRegisterize);
++        //We only care about the register number
++        registerizeInsn->dalvikInsn.vA = DECODE_REG (reg);
++        registerizeInsn->dalvikInsn.vB = regClass;
++        registerizeInsn->dalvikInsn.vC = 0;
++
++        dvmCompilerAppendMIR(preHeader, registerizeInsn);
++    }
++
++    //Handle the BasicBlocks of the loop
++    const BitVector *basicBlocks = info->getBasicBlocks ();
++
++    //Paranoid
++    assert (basicBlocks != 0);
++
++    //Call the helper function to set the writebacks for each BasicBlock
++    handleWriteBackRequests (cUnit, basicBlocks);
++
++    //Handle the backward chaining cells of the loop
++    const BitVector *backwards = info->getBackwardBranches ();
++
++    //Paranoid
++    assert (backwards != 0);
++
++    //Call the helper function to set the writebacks for the backward chaining cells
++    handleWriteBackRequests (cUnit, backwards);
++
++    //Last handle the write backs of all live outs for the post loops
++    handleWriteBackRequestsPostLoop (cUnit, info);
++}
++
++/**
++ * @brief Wrapper around registerizing the loop, it handles loop nests as well
++ * @param cUnit the CompilationUnit
++ * @param info the LoopInformation
++ */
++static void registerize (CompilationUnit *cUnit, const LoopInformation *info)
++{
++    //If info is 0, there is nothing to do
++    if (info == 0)
++    {
++        return;
++    }
++
++    //Search in the children if anybody includes them
++    unsigned int nbr = info->getNestedNbr ();
++
++    //Is it the inner loop ?
++    if (nbr == 0)
++    {
++        //Actually registerize the loop
++        registerizeLoop (cUnit, info);
++    }
++    else
++    {
++        for (unsigned int i = 0; i < nbr; i++)
++        {
++            LoopInformation *inner = info->getNested (i);
++
++            //Paranoid
++            assert (inner != 0);
++
++            registerize (cUnit, inner);
++        }
++    }
++}
++
++bool dvmCompilerWriteBackAll (CompilationUnit *cUnit, BasicBlock *bb)
++{
++    //First job is going through the BasicBlocks and requesting to write back any defs
++    dvmClearAllBits (bb->requestWriteBack);
++
++    if (bb->dataFlowInfo != 0 && bb->dataFlowInfo->defV != 0 && bb->dataFlowInfo->useV != 0)
++    {
++        dvmUnifyBitVectors (bb->requestWriteBack, bb->requestWriteBack, bb->dataFlowInfo->defV);
++        // We also add the uses because it is possible to enter loop preheader with
++        // physical register association but when going through interpreter, we may
++        // clobber those register associations.
++        dvmUnifyBitVectors (bb->requestWriteBack, bb->requestWriteBack, bb->dataFlowInfo->useV);
++    }
++
++    //We don't want to iterate, do this once
++    return false;
++}
++
++void dvmCompilerRegisterize (CompilationUnit *cUnit, Pass *currentPass)
++{
++    //Now let's go through the loop information
++    LoopInformation *info = cUnit->loopInformation;
++
++    //Now registerize it
++    registerize (cUnit, info);
++
++    //Unused argument
++    (void) currentPass;
++}
+diff --git a/vm/compiler/RegisterizationME.h b/vm/compiler/RegisterizationME.h
+new file mode 100644
+index 0000000..4746512
+--- /dev/null
++++ b/vm/compiler/RegisterizationME.h
+@@ -0,0 +1,40 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef DALVIK_VM_REGISTERIZATIONME_H_
++#define DALVIK_VM_REGISTERIZATIONME_H_
++
++//Forward declarations
++struct BasicBlock;
++struct CompilationUnit;
++class Pass;
++
++/**
++ * @brief Perform middle-end registerization on loops and pass registerization hints to backend
++ * @param cUnit the CompilationUnit
++ * @param pass the current Pass
++ */
++void dvmCompilerRegisterize (CompilationUnit *cUnit, Pass *pass);
++
++/**
++ * @brief Add the writeback hints for the backend, the pass sets all registers to be spilled
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock
++ * @return returns false because nothing in the BB changes per se
++ */
++bool dvmCompilerWriteBackAll (CompilationUnit *cUnit, BasicBlock *bb);
++
++#endif
+diff --git a/vm/compiler/SSATransformation.cpp b/vm/compiler/SSATransformation.cpp
+index f8301d3..091dc27 100644
+--- a/vm/compiler/SSATransformation.cpp
++++ b/vm/compiler/SSATransformation.cpp
+@@ -14,10 +14,14 @@
+  * limitations under the License.
+  */
+ 
++//Need it for UINT_MAX
++#include <limits.h>
++
+ #include "Dalvik.h"
+ #include "Dataflow.h"
+ #include "Loop.h"
+ #include "libdex/DexOpcodes.h"
++#include "SSAWalkData.h"
+ 
+ /* Enter the node to the dfsOrder list then visit its successors */
+ static void recordDFSPreOrder(CompilationUnit *cUnit, BasicBlock *block)
+@@ -100,9 +104,11 @@ static void computeDefBlockMatrix(CompilationUnit *cUnit)
+         cUnit->defBlockMatrix[i] = dvmCompilerAllocBitVector(cUnit->numBlocks,
+                                                              false);
+     }
++
+     dvmCompilerDataFlowAnalysisDispatcher(cUnit, dvmCompilerFindLocalLiveIn,
+                                           kAllNodes,
+                                           false /* isIterative */);
++
+     dvmCompilerDataFlowAnalysisDispatcher(cUnit, fillDefBlockMatrix,
+                                           kAllNodes,
+                                           false /* isIterative */);
+@@ -211,6 +217,12 @@ static bool initializeDominationInfo(CompilationUnit *cUnit, BasicBlock *bb)
+ {
+     int numTotalBlocks = cUnit->blockList.numUsed;
+ 
++    //In case numTotalBlocks is 0, put it to 1
++    if (numTotalBlocks == 0)
++    {
++        numTotalBlocks = 1;
++    }
++
+     if (bb->dominators == NULL ) {
+         bb->dominators = dvmCompilerAllocBitVector(numTotalBlocks,
+                                                    true /* expandable */);
+@@ -403,17 +415,44 @@ static void computeSuccLiveIn(BitVector *dest,
+  */
+ static bool computeBlockLiveIns(CompilationUnit *cUnit, BasicBlock *bb)
+ {
++    //Paranoid
++    if (bb->dataFlowInfo == NULL)
++    {
++        return false;
++    }
++
++    //Suppose no change
++    bool change = false;
++
++    //First handle LiveIns
+     BitVector *tempDalvikRegisterV = cUnit->tempDalvikRegisterV;
+ 
+-    if (bb->dataFlowInfo == NULL) return false;
+-    dvmCopyBitVector(tempDalvikRegisterV, bb->dataFlowInfo->liveInV);
+-    if (bb->taken && bb->taken->dataFlowInfo)
+-        computeSuccLiveIn(tempDalvikRegisterV, bb->taken->dataFlowInfo->liveInV,
+-                          bb->dataFlowInfo->defV);
+-    if (bb->fallThrough && bb->fallThrough->dataFlowInfo)
+-        computeSuccLiveIn(tempDalvikRegisterV,
+-                          bb->fallThrough->dataFlowInfo->liveInV,
+-                          bb->dataFlowInfo->defV);
++    //Copy the current one for reference
++    dvmCopyBitVector(tempDalvikRegisterV, bb->dataFlowInfo->useV);
++
++    //Now update it: in = use U (out - defs)
++    computeSuccLiveIn (tempDalvikRegisterV, bb->dataFlowInfo->liveOutV, bb->dataFlowInfo->defV);
++
++    //Now we have the new live in, compare it
++    if (dvmCompareBitVectors(tempDalvikRegisterV, bb->dataFlowInfo->liveInV) == true) {
++        //Copy it in
++        dvmCopyBitVector(bb->dataFlowInfo->liveInV, tempDalvikRegisterV);
++        //We have changed something
++        change = true;
++    }
++
++    //Now we can handle the outs: new out = U ins for each successor of bb
++    //Clear the temp
++    dvmClearAllBits (tempDalvikRegisterV);
++
++    if (bb->taken != 0 && bb->taken->dataFlowInfo != 0) {
++        dvmUnifyBitVectors (tempDalvikRegisterV, tempDalvikRegisterV, bb->taken->dataFlowInfo->liveInV);
++    }
++
++    if (bb->fallThrough != 0 && bb->fallThrough->dataFlowInfo != 0) {
++        dvmUnifyBitVectors (tempDalvikRegisterV, tempDalvikRegisterV, bb->fallThrough->dataFlowInfo->liveInV);
++    }
++
+     if (bb->successorBlockList.blockListType != kNotUsed) {
+         GrowableListIterator iterator;
+         dvmGrowableListIteratorInit(&bb->successorBlockList.blocks,
+@@ -424,17 +463,20 @@ static bool computeBlockLiveIns(CompilationUnit *cUnit, BasicBlock *bb)
+             if (successorBlockInfo == NULL) break;
+             BasicBlock *succBB = successorBlockInfo->block;
+             if (succBB->dataFlowInfo) {
+-                computeSuccLiveIn(tempDalvikRegisterV,
+-                                  succBB->dataFlowInfo->liveInV,
+-                                  bb->dataFlowInfo->defV);
++                dvmUnifyBitVectors (tempDalvikRegisterV, tempDalvikRegisterV, succBB->dataFlowInfo->liveInV);
+             }
+         }
+     }
+-    if (dvmCompareBitVectors(tempDalvikRegisterV, bb->dataFlowInfo->liveInV)) {
+-        dvmCopyBitVector(bb->dataFlowInfo->liveInV, tempDalvikRegisterV);
+-        return true;
++
++    //Check for a difference
++    if (dvmCompareBitVectors(tempDalvikRegisterV, bb->dataFlowInfo->liveOutV) == true) {
++        //Copy it in
++        dvmCopyBitVector(bb->dataFlowInfo->liveOutV, tempDalvikRegisterV);
++        //We have changed something
++        change = true;
+     }
+-    return false;
++
++    return change;
+ }
+ 
+ /* Insert phi nodes to for each variable to the dominance frontiers */
+@@ -585,6 +627,11 @@ static bool insertPhiNodeOperands(CompilationUnit *cUnit, BasicBlock *bb)
+         mir->ssaRep->fpUse =
+             (bool *) dvmCompilerNew(sizeof(bool) * numUses, true);
+ 
++        /** %todo ok we are allocating it here but this must change with the http://android.intel.com:8080/#/c/82524/ patch but I don't want to make them depend on each other yet to
++            simplify the BE's usage of this patch
++         */
++        mir->ssaRep->defWhere = static_cast<MIR **> (dvmCompilerNew (sizeof (* (mir->ssaRep->defWhere)) * numUses, true));
++
+         BitVectorIterator phiIterator;
+ 
+         dvmBitVectorIteratorInit(ssaRegV, &phiIterator);
+@@ -652,11 +699,170 @@ void dvmCompilerBuildDomination (CompilationUnit *cUnit)
+     computeDominators (cUnit);
+ }
+ 
++/**
++ * @brief Build the def use chains
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock
++ * @return returns whether it changed the BasicBlock bb
++ */
++static bool buildDefUseChain (CompilationUnit *cUnit, BasicBlock *bb)
++{
++    //Suppose we did not change anything
++    bool res = false;
++
++    //Get walker data
++    SSAWalkData *data = static_cast<SSAWalkData *> (cUnit->walkData);
++
++    //By default the order is the max accepted
++    unsigned int currentOrder = UINT_MAX;
++
++    //Get minimum topological order from predecessors
++    BitVectorIterator bvIterator;
++
++    dvmBitVectorIteratorInit(bb->predecessors, &bvIterator);
++    while (true) {
++        int blockIdx = dvmBitVectorIteratorNext(&bvIterator);
++        if (blockIdx == -1) break;
++        BasicBlock *predBB = (BasicBlock *)
++            dvmGrowableListGetElement(&cUnit->blockList, blockIdx);
++
++        //Paranoid
++        if (predBB == 0)
++            continue;
++
++        //Get order from the entrance of the BB
++        unsigned int order = predBB->topologicalOrder;
++
++        //Get the last instruction's order
++        MIR *lastInsn = predBB->lastMIRInsn;
++
++        //If no instruction, just use the BB order, so skip this
++        if (lastInsn != 0)
++        {
++            //Get order
++            order = lastInsn->topologicalOrder;
++        }
++
++        //Compare to actual minimum
++        if (currentOrder > order)
++        {
++            currentOrder = order;
++        }
++    }
++
++    //Check if we had at least one hit for the order
++    if (currentOrder == UINT_MAX)
++    {
++        //If not, we reset the counter
++        currentOrder = 0;
++    }
++
++    if (bb->topologicalOrder != currentOrder)
++    {
++        //Set the basic block's order now
++        bb->topologicalOrder = currentOrder;
++        //A change occured
++        res = true;
++    }
++
++    //We now have the minimum topological order: go through the instructions
++    for (MIR *insn = bb->firstMIRInsn; insn != 0; insn = insn->next)
++    {
++        //Set and then augment the current topological order
++        insn->topologicalOrder = currentOrder;
++        currentOrder++;
++
++        //Now handle use and def chains
++        SSARepresentation *ssaRep = insn->ssaRep;
++
++        //If we don't have a ssaRep, there is nothing we can do here
++        if (ssaRep != 0)
++        {
++            //First add to the use chains
++            int nbr = ssaRep->numUses;
++            for (int i = 0; i < nbr; i++)
++            {
++                //Get use value
++                int value = ssaRep->uses[i];
++
++                //We have a need of a new chain element, do we have one still available?
++                SUsedChain *elem = data->getUsedChain ();
++
++                //Set its mir and bb
++                elem->mir = insn;
++                elem->bb = bb;
++
++                //Get the last use for this element
++                SUsedChain *last = data->getLastChain (value);
++
++                //Set defWhere for this instruction
++                MIR *defined = data->getDefinition (value);
++                ssaRep->defWhere[i] = defined;
++
++                //If we have one
++                if (last != 0)
++                {
++                    //Link it
++                    last->nextUse = insn;
++                    elem->prevUse = last->mir;
++                }
++                else
++                {
++                    //We might not have a define
++                    if (defined != 0)
++                    {
++                        //It's the first, tell defined about it
++                        SSARepresentation *defSSA = defined->ssaRep;
++
++                        //Paranoid
++                        assert (defSSA != 0);
++
++                        //Go through the defines and find value
++                        int max = defSSA->numDefs;
++                        int j;
++                        for (j = 0; j < max; j++)
++                        {
++                            if (defSSA->defs[j] == value)
++                            {
++                                defSSA->usedNext[j] = elem;
++                                //We are done here
++                                break;
++                            }
++                        }
++
++                        //We should have found it
++                        assert (j != max);
++                    }
++                }
++
++                //Last, set it as the new last
++                data->setLastChain (elem, value);
++            }
++
++            //Now handle defs
++            nbr = ssaRep->numDefs;
++            for (int i = 0; i < nbr; i++)
++            {
++                //Get def value
++                int value = ssaRep->defs[i];
++
++                //Register definition
++                data->setDefinition (insn, value);
++            }
++        }
++
++        //Something changed if we got here: at least one instruction was touched
++        res = true;
++    }
++
++    return res;
++}
++
+ /*
+  * @brief Build a loop. Return true if a loop structure is successfully identified.
+  * @param cUnit the CompilationUnit
+  * @param filter do we filter the loop or not (default: true)
+- * @return wheterh or not the loop should be accepted
++ * @return whether or not the loop should be accepted
+  */
+ bool dvmCompilerBuildLoop(CompilationUnit *cUnit, bool filter)
+ {
+@@ -707,5 +913,15 @@ bool dvmCompilerBuildLoop(CompilationUnit *cUnit, bool filter)
+                                           kReachableNodes,
+                                           false /* isIterative */);
+ 
++    //Set walk data: create the data on the stack, will get destroyed automatically at the end of the function
++    SSAWalkData data (cUnit);
++    cUnit->walkData = static_cast<void *> (&data);
++
++    //Once this is done, we fill in the def/use chain and topological order for the MIRs
++    //We suppose here that SSA has been done already
++    dvmCompilerDataFlowAnalysisDispatcher (cUnit, buildDefUseChain, kBreadthFirstTraversal, false);
++
++    //Just for safety, reset walkData
++    cUnit->walkData = 0;
+     return true;
+ }
+diff --git a/vm/compiler/SSAWalkData.cpp b/vm/compiler/SSAWalkData.cpp
+new file mode 100644
+index 0000000..629c006
+--- /dev/null
++++ b/vm/compiler/SSAWalkData.cpp
+@@ -0,0 +1,73 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "SSAWalkData.h"
++
++SSAWalkData::SSAWalkData (CompilationUnit *cUnit)
++{
++    //Set up the free chain list
++    freeChainsList = & (cUnit->globalDefUseChain);
++    freeChains = cUnit->globalDefUseChain;
++}
++
++SSAWalkData::~SSAWalkData (void)
++{
++    //Clear maps
++    lastChain.clear ();
++    definitions.clear ();
++}
++
++SUsedChain *SSAWalkData::getUsedChain (void)
++{
++    SUsedChain *res = freeChains;
++
++    //If we don't have one
++    if (res == 0)
++    {
++        res = static_cast<SUsedChain *> (dvmCompilerNew (sizeof (*res), true));
++
++        //Attach it to global free chains
++        res->nextChain = *freeChainsList;
++        *freeChainsList = res;
++    }
++    else
++    {
++        //We can move forward in the freeChains list
++        freeChains = freeChains->nextChain;
++    }
++
++    return res;
++}
++
++SUsedChain *SSAWalkData::getLastChain (int value)
++{
++    return lastChain[value];
++}
++
++void SSAWalkData::setLastChain (SUsedChain *chain, int value)
++{
++    lastChain[value] = chain;
++}
++
++void SSAWalkData::setDefinition (MIR *insn, int value)
++{
++    definitions[value] = insn;
++}
++
++MIR *SSAWalkData::getDefinition (int value)
++{
++    return definitions[value];
++}
+diff --git a/vm/compiler/SSAWalkData.h b/vm/compiler/SSAWalkData.h
+new file mode 100644
+index 0000000..45e7b14
+--- /dev/null
++++ b/vm/compiler/SSAWalkData.h
+@@ -0,0 +1,86 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef DALVIK_VM_SSAWALKDATA_H_
++#define DALVIK_VM_SSAWALKDATA_H_
++
++#include <map>
++
++#include "Dataflow.h"
++
++/**
++ * @class SSAWalkData
++ * @brief SSAWalkData contains any data required inter BasicBlock
++ */
++class SSAWalkData
++{
++    public:
++        /**
++         * @brief Constructor
++         * @param cUnit the CompilationUnit
++         */
++        SSAWalkData (CompilationUnit *cUnit);
++        ~SSAWalkData (void);    /**< @brief Destructor */
++
++        /**
++         * @brief Get a SUsedChain
++         * @return a SUsedChain node
++         */
++        SUsedChain *getUsedChain (void);
++
++        /**
++         * @brief Get last chain node for a particular SSA register
++         * @param value the SSA register
++         * @return the last chain node for the value SSA register or 0 if none are found
++         */
++         SUsedChain *getLastChain (int value);
++
++         /**
++          * @brief Set the last chain for a given SSA register
++          * @param chain the last chain node for the SSA register
++          * @param value the SSA register
++          */
++          void setLastChain (SUsedChain *chain, int value);
++
++         /**
++          * @brief Associate a defined register and the instruction
++          * @param insn the instruction where the register is defined
++          * @param value the SSA register getting defined
++          */
++          void setDefinition (MIR *insn, int value);
++
++          /**
++           * @brief Get the instruction containing the definition
++           * @param value the SSA register
++           * @return the MIR containing the definition
++           */
++          MIR *getDefinition (int value);
++
++    protected:
++          /** @brief Association SSA register <-> where it is defined */
++          std::map<int, MIR *> definitions;
++
++          /** @brief Association SSA register <-> the last use chain node */
++          std::map<int, SUsedChain *> lastChain;
++
++          /** @brief Free chain node list */
++          SUsedChain **freeChainsList;
++
++          /** @brief Current free chain node */
++          SUsedChain *freeChains;
++};
++
++#endif
+diff --git a/vm/compiler/codegen/CodegenFactory.cpp b/vm/compiler/codegen/CodegenFactory.cpp
+index f42ae74..790b258 100644
+--- a/vm/compiler/codegen/CodegenFactory.cpp
++++ b/vm/compiler/codegen/CodegenFactory.cpp
+@@ -266,3 +266,14 @@ static void storeValueWide(CompilationUnit *cUnit, RegLocation rlDest,
+         }
+     }
+ }
++
++#ifndef ARCH_IA32
++//For non x86, to let it compile
++bool dvmCompilerFindRegClass (MIR *mir, int vR, RegisterClass &regClass)
++{
++    (void) mir;
++    (void) vR;
++    (void) regClass;
++    return false;
++}
++#endif
+diff --git a/vm/compiler/codegen/CompilerCodegen.h b/vm/compiler/codegen/CompilerCodegen.h
+index 869171c..8161316 100644
+--- a/vm/compiler/codegen/CompilerCodegen.h
++++ b/vm/compiler/codegen/CompilerCodegen.h
+@@ -51,6 +51,9 @@ bool dvmJitPatchInlineCache(void *cellPtr, void *contentPtr);
+ /* Implemented in the codegen/<target>/ArchUtility.c */
+ void dvmCompilerCodegenDump(CompilationUnit *cUnit);
+ 
++/* Implemented in the codegen/<target>/CodegenInterface.c */
++bool dvmCompilerFindRegClass(MIR *mir, int vr, RegisterClass &regClass);
++
+ /* Implemented in the codegen/<target>/Assembler.c */
+ void dvmCompilerPatchInlineCache(void);
+ 
+diff --git a/vm/compiler/codegen/x86/AnalysisO1.cpp b/vm/compiler/codegen/x86/AnalysisO1.cpp
+index 555fce4..11328e6 100644
+--- a/vm/compiler/codegen/x86/AnalysisO1.cpp
++++ b/vm/compiler/codegen/x86/AnalysisO1.cpp
+@@ -3003,12 +3003,15 @@ int spillForHardReg(int regNum, int type) {
+ 
+ //! allocConstraints specify how many times a hardcoded register is used in this basic block
+ void updateCurrentBBWithConstraints(PhysicalReg reg) {
+-    if(reg > PhysicalReg_EBP) {
+-        ALOGI("JIT_INFO: Register %d out of range in updateCurrentBBWithConstraints\n", reg);
+-        SET_JIT_ERROR(kJitErrorRegAllocFailed);
+-        return;
++    if (currentBB != 0)
++    {
++        if(reg > PhysicalReg_EBP) {
++            ALOGI("JIT_INFO: Register %d out of range in updateCurrentBBWithConstraints\n", reg);
++            SET_JIT_ERROR(kJitErrorRegAllocFailed);
++            return;
++        }
++        currentBB->allocConstraints[reg].count++;
+     }
+-    currentBB->allocConstraints[reg].count++;
+ }
+ //! sort allocConstraints and save the result in allocConstraintsSorted
+ 
+diff --git a/vm/compiler/codegen/x86/CodegenInterface.cpp b/vm/compiler/codegen/x86/CodegenInterface.cpp
+index 0fbc1a9..f22e8a3 100644
+--- a/vm/compiler/codegen/x86/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/CodegenInterface.cpp
+@@ -1414,7 +1414,7 @@ static BasicBlock * getLoopHeaderFromBBChaining(CompilationUnit *cUnit, BasicBlo
+     BasicBlock * bb;
+     GrowableList *blockList = &cUnit->blockList;
+ 
+-    for (int i = 0; i < blockList->numUsed; i++) {
++    for (unsigned int i = 0; i < blockList->numUsed; i++) {
+         bb = (BasicBlock *) blockList->elemList[i];
+         if(bb->blockType == kDalvikByteCode && bb->startOffset == chainingBB->startOffset)
+             return bb;
+@@ -1921,4 +1921,50 @@ void dvmCompilerCacheFlush(long start, long end, long flags) {
+   /* cacheflush is needed for ARM, but not for IA32 (coherent icache) */
+ }
+ 
+-//#endif
++bool dvmCompilerFindRegClass (MIR *mir, int vR, RegisterClass &regClass)
++{
++    int res = getVirtualRegInfo (infoByteCode, mir);
++
++    //If that failed, we failed
++    if (res == 0)
++    {
++        return false;
++    }
++
++    int entry;
++    for (entry = 0; entry < num_regs_per_bytecode; entry++) {
++        if (infoByteCode[entry].regNum == vR) {
++            break;
++        }
++    }
++
++    // If we cannot find this VR, we failed
++    if (entry == num_regs_per_bytecode)
++    {
++        return false;
++    }
++
++    switch (infoByteCode[entry].physicalType)
++    {
++        case LowOpndRegType_gp:
++            regClass = kCoreReg;
++            break;
++        case LowOpndRegType_fs_s:
++        case LowOpndRegType_fs:
++            regClass = kX87Reg;
++            break;
++        case LowOpndRegType_ss:
++            regClass = kSFPReg;
++            break;
++        case LowOpndRegType_xmm:
++            regClass = kDFPReg;
++            break;
++        default:
++            ALOGD ("JIT_INFO: dvmCompilerFindClass: Type not found %d\n",
++                    infoByteCode[entry].physicalType);
++            return false;
++    }
++
++    //Success, signal it
++    return true;
++}
+-- 
+1.7.4.1
+

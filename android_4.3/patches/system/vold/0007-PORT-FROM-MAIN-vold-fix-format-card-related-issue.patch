@@ -1,0 +1,149 @@
+From 6d94fc7adb3e75767a76a27555b7294a16b981b8 Mon Sep 17 00:00:00 2001
+From: Chuanxiao Dong <chuanxiao.dong@intel.com>
+Date: Tue, 27 Nov 2012 16:14:24 +0800
+Subject: [PORT FROM MAIN]vold: fix format card related issue
+
+BZ: 47043
+
+Original BZ: 15634
+Below is the commit from GB:
+
+	Vold: fix erase card issue
+
+	BZ: 11718
+
+	To make SD card erase function works more smoothly, this patch will do
+	follow things for "Vold" service:
+	1. recover mPartIdx for Volume when handling disk remove event.
+	2. only erase the partition which is inuse if there are multiple partitions.
+	3. erase the whole card if android cannot recognize all the partitions after
+	inserting a SD card.
+
+	[PORT FROM R1] Vold: fix external storage format failed issue
+
+	BZ:  9317
+
+	Vold will format wrong device since SD card and MMC card are using
+	the same MAJOR.
+
+	This patch will let vold only choose the device which defines in vold.fstab.
+	And if there is no partition on device, vold can format the enteri device
+	and mount the enteri device. If there are multiple partitions in the device,
+	vold will only format the first partition.
+
+Change-Id: Ie05e2d9f28a34f99bb0e78c7fee382c661037044
+Orig-Change-Id: I1daa82329bfd28505be719ec1b8b4c6876b2f18b
+Signed-off-by: Chuanxiao Dong <chuanxiao.dong@intel.com>
+---
+ DirectVolume.cpp |   24 +++++++++++++++++++++++-
+ Volume.cpp       |   24 +++++++++++++++++-------
+ 2 files changed, 40 insertions(+), 8 deletions(-)
+
+diff --git a/DirectVolume.cpp b/DirectVolume.cpp
+index 1e41087..6b4d04f 100644
+--- a/DirectVolume.cpp
++++ b/DirectVolume.cpp
+@@ -323,6 +323,28 @@ void DirectVolume::handleDiskRemoved(const char *devpath, NetlinkEvent *evt) {
+     }
+ 
+     SLOGD("Volume %s %s disk %d:%d removed\n", getLabel(), getMountpoint(), major, minor);
++    /*
++     * The disk itself is mounted. We need to unmount it first before remove
++     * disk
++     */
++    if (getState() == Volume::State_Mounted &&
++        (dev_t) MKDEV(major, minor) == mCurrentlyMountedKdev) {
++        snprintf(msg, sizeof(msg), "Volume %s %s bad removal (%d:%d)",
++            getLabel(), getMountpoint(), major, minor);
++        mVm->getBroadcaster()->sendBroadcast(ResponseCode::VolumeBadRemoval, msg, false);
++
++        if (mVm->cleanupAsec(this, true))
++            SLOGE("Failed to cleanup ASEC - unmount will probably fail!");
++
++        if (Volume::unmountVol(true, false)) {
++            SLOGE("Failed to unmount volume on bad removal (%s)", strerror(errno));
++            /* failed to unmount, maybe unexpected error would happen */
++        } else
++           SLOGD("Crisis averted");
++    }
++
++    mPartIdx = -1;
++
+     snprintf(msg, sizeof(msg), "Volume %s %s disk removed (%d:%d)",
+              getLabel(), getMountpoint(), major, minor);
+     mVm->getBroadcaster()->sendBroadcast(ResponseCode::VolumeDiskRemoved,
+@@ -395,7 +417,7 @@ int DirectVolume::getDeviceNodes(dev_t *devs, int max) {
+         // If the disk has no partitions, try the disk itself
+         if (!mDiskNumParts) {
+             devs[0] = MKDEV(mDiskMajor, mDiskMinor);
+-            return 1;
++            return 0;
+         }
+ 
+         int i;
+diff --git a/Volume.cpp b/Volume.cpp
+index 5cd8fb6..793d954 100644
+--- a/Volume.cpp
++++ b/Volume.cpp
+@@ -227,7 +227,7 @@ int Volume::formatVol() {
+     bool formatEntireDevice = (mPartIdx == -1);
+     char devicePath[255];
+     dev_t diskNode = getDiskDevice();
+-    dev_t partNode = MKDEV(MAJOR(diskNode), (formatEntireDevice ? 1 : MINOR(diskNode) + mPartIdx));
++    dev_t partNode = MKDEV(MAJOR(diskNode), (formatEntireDevice ? MINOR(diskNode) : MINOR(diskNode) + mPartIdx));
+ 
+     setState(Volume::State_Formatting);
+ 
+@@ -241,6 +241,15 @@ int Volume::formatVol() {
+             SLOGE("Failed to initialize MBR (%s)", strerror(errno));
+             goto err;
+         }
++        /*
++         * Partition lba will be changed, and vold will record the
++         * new minor/major. vold doesn't provide a sync mechanism
++         * and we also don't know what the major/minor should be.
++         * Waiting for 50ms is just an experience value.
++         */
++        usleep(1000*50);
++        getDeviceNodes((dev_t *)&diskNode, 1);
++        partNode = MKDEV(MAJOR(diskNode), MINOR(diskNode));
+     }
+ 
+     sprintf(devicePath, "/dev/block/vold/%d:%d",
+@@ -300,6 +309,7 @@ int Volume::mountVol() {
+     char crypto_state[PROPERTY_VALUE_MAX];
+     char encrypt_progress[PROPERTY_VALUE_MAX];
+     int flags;
++    int nParts = 0;
+ 
+     property_get("vold.decrypt", decrypt_state, "");
+     property_get("vold.encrypt_progress", encrypt_progress, "");
+@@ -332,11 +342,11 @@ int Volume::mountVol() {
+         return 0;
+     }
+ 
+-    n = getDeviceNodes((dev_t *) &deviceNodes, 4);
+-    if (!n) {
+-        SLOGE("Failed to get device nodes (%s)\n", strerror(errno));
+-        return -1;
+-    }
++    nParts = getDeviceNodes((dev_t *) &deviceNodes, 4);
++    if (!nParts)
++        n = 1;
++    else
++        n = nParts;
+ 
+     /* If we're running encrypted, and the volume is marked as encryptable and nonremovable,
+      * and vold is asking to mount the primaryStorage device, then we need to decrypt
+@@ -477,7 +487,7 @@ int Volume::mountVol() {
+          * And USB mass storage will export entire disk(all the partitions) to host PC.
+          * So update the mPartIdx to export only one proper FAT FS partition.
+          */
+-        if (mPartIdx == -1)
++        if (mPartIdx == -1 && nParts)
+             mPartIdx = i + 1;
+ 
+         return 0;
+-- 
+1.7.4.1
+

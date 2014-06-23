@@ -1,0 +1,3946 @@
+From d499c6f8bc2657af3afef365611da4b4355bd67b Mon Sep 17 00:00:00 2001
+From: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Date: Tue, 20 Aug 2013 10:16:07 -0700
+Subject: Dalvik: Extend vectorization support
+
+BZ: 132512
+
+In order to extend the vectorization support, new extended MIRs have
+been added in order to support following packed operations: sub, and,
+or, xor, shl, shr, and ushr.
+
+Along with these, backend support has been added for doing x86 instruction
+encoding for the new packed operations, scheduler support, and extended
+MIR implementation.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I1ce862bc55e7c6d0aa9fb1b45a9432c32a1a9f46
+Orig-MCG-Change-Id: I8e2e2662ff3df37e74c9f98de70d459c7c918b43
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Signed-off-by: Yixin Shou <yixin.shou@intel.com>
+Signed-off-by: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Signed-off-by: Udayan Banerji <udayan.banerji@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/AccumulationSinking.cpp                |   28 +-
+ vm/compiler/AccumulationSinking.h                  |   12 +
+ vm/compiler/BBOptimization.cpp                     |    2 +-
+ vm/compiler/Checks.cpp                             |    4 +-
+ vm/compiler/CompilerIR.h                           |   91 +++-
+ vm/compiler/Dataflow.cpp                           |  249 ++++++----
+ vm/compiler/Dataflow.h                             |   85 ++--
+ vm/compiler/Expression.cpp                         |  132 ++++--
+ vm/compiler/Expression.h                           |   27 +
+ vm/compiler/InlineTransformation.cpp               |    2 +-
+ vm/compiler/IntermediateRep.cpp                    |   46 ++-
+ vm/compiler/InvariantRemoval.cpp                   |   14 +-
+ vm/compiler/Loop.cpp                               |    2 +-
+ vm/compiler/LoopInformation.cpp                    |    2 +-
+ vm/compiler/LoopRegisterUsage.cpp                  |    6 +-
+ vm/compiler/RegisterizationME.cpp                  |    8 +
+ vm/compiler/SinkCastOpt.cpp                        |    4 +-
+ vm/compiler/Vectorization.cpp                      |  535 +++++++++++++++-----
+ vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp     |   30 +-
+ .../codegen/x86/lightcg/BytecodeVisitor.cpp        |   91 +++-
+ .../codegen/x86/lightcg/CodegenInterface.cpp       |  131 +++--
+ .../codegen/x86/lightcg/InstructionGeneration.cpp  |  102 +++-
+ .../codegen/x86/lightcg/InstructionGeneration.h    |   34 +-
+ vm/compiler/codegen/x86/lightcg/Lower.cpp          |    2 +-
+ vm/compiler/codegen/x86/lightcg/Lower.h            |  163 ++++++-
+ vm/compiler/codegen/x86/lightcg/LowerHelper.cpp    |  263 ++++++++++-
+ vm/compiler/codegen/x86/lightcg/Scheduler.cpp      |   13 +-
+ .../codegen/x86/lightcg/libenc/enc_defs_ext.h      |   54 ++-
+ .../codegen/x86/lightcg/libenc/enc_tabl.cpp        |   71 +++-
+ vm/compiler/codegen/x86/pcg/Analysis.cpp           |   11 +
+ vm/compiler/codegen/x86/pcg/CodeGeneration.cpp     |   13 +-
+ vm/compiler/codegen/x86/pcg/LowerExtended.cpp      |   97 +++--
+ vm/compiler/codegen/x86/pcg/LowerExtended.h        |   11 +-
+ vm/compiler/codegen/x86/pcg/UtilityPCG.cpp         |    4 +
+ 34 files changed, 1793 insertions(+), 546 deletions(-)
+
+diff --git a/vm/compiler/AccumulationSinking.cpp b/vm/compiler/AccumulationSinking.cpp
+index 61286a8..0b80a48 100644
+--- a/vm/compiler/AccumulationSinking.cpp
++++ b/vm/compiler/AccumulationSinking.cpp
+@@ -816,6 +816,18 @@ static void removeAccumulations(const std::vector<MIR *> & toRemove)
+     }
+ }
+ 
++void dvmCompilerGetLoopExpressions (CompilationUnit *cUnit, LoopInformation *info,
++                                std::vector<Expression *> &ivExpressions)
++{
++    //Filter out the virtual registers because we only want to keep PHI nodes that aren't IVs
++    //and are not used except for their own calculation.
++    std::vector<std::vector<MIR *> > accumulatorList;
++    filterVRs (cUnit, info, accumulatorList);
++
++    //Now build the expressions for all these MIRs
++    buildExpressions (cUnit, info, accumulatorList, ivExpressions);
++}
++
+ /**
+  * @brief Handle a loop for the sinking of an accumulation
+  * @param cUnit the CompilationUnit
+@@ -841,28 +853,24 @@ static bool sinkAccumulation (CompilationUnit *cUnit, LoopInformation *info, voi
+         return true;
+     }
+ 
+-    //Step 2: Filter out the virtual registers: we only want PHI nodes that aren't IVs and are not used except for their own calculation
+-    std::vector<std::vector<MIR *> > accumulatorList;
+-    filterVRs (cUnit, info, accumulatorList);
+-
+-    //Step 3: Build the expression tree for the chosen VRs
++    //Step 2: Get the PHI Nodes and build the expressions for them
+     std::vector<Expression *> ivExpressions;
+-    buildExpressions (cUnit, info, accumulatorList, ivExpressions);
++    dvmCompilerGetLoopExpressions (cUnit, info, ivExpressions);
+ 
+-    //Step 4: Find the dangling constants (any constant accumulation we can sink)
++    //Step 3: Find the dangling constants (any constant accumulation we can sink)
+     std::vector<MIR *> toRemove;
+     std::vector<MIR *> toSink;
+     std::vector<MIR *> toHoist;
+     findDanglingConstants (info, ivExpressions, chosenIV, increment, toRemove,
+             toSink, toHoist);
+ 
+-    //Step 5: Sink the accumulation
++    //Step 4: Sink the accumulation
+     info->addInstructionsToExits (cUnit, toSink);
+ 
+-    //Step 6: Hoist the initial value decrementation
++    //Step 5: Hoist the initial value decrementation
+     dvmCompilerAddInstructionsToBasicBlock (info->getPreHeader (), toHoist);
+ 
+-    //Step 7: Remove MIRs no longer needed
++    //Step 6: Remove MIRs no longer needed
+     removeAccumulations (toRemove);
+     return true;
+ }
+diff --git a/vm/compiler/AccumulationSinking.h b/vm/compiler/AccumulationSinking.h
+index ddb4c7b..5ace577 100644
+--- a/vm/compiler/AccumulationSinking.h
++++ b/vm/compiler/AccumulationSinking.h
+@@ -17,10 +17,14 @@
+ #ifndef DALVIK_VM_ACCUMULATIONSINKING_H_
+ #define DALVIK_VM_ACCUMULATIONSINKING_H_
+ 
++#include "CompilerUtility.h"
++
+ //Forward declarations
+ struct BasicBlock;
+ struct CompilationUnit;
+ class Pass;
++class LoopInformation;
++class Expression;
+ 
+ /**
+  * @brief Perform accumulation sinking optimization
+@@ -36,4 +40,12 @@ void dvmCompilerAccumulationSinking (CompilationUnit *cUnit, Pass *pass);
+  * @return whether the sink accumulation sinking
+  */
+ bool dvmCompilerSinkAccumulationsGate (const CompilationUnit *cUnit, Pass *curPass);
++
++/**
++ * @brief Get the Expression values for all the inter-iteration variables of the loop
++ * @param cUnit The CompilationUnit containing the loop
++ * @param info The LoopInformation corresponding to the loop
++ * @param[out] ivExpressions A vector of Expression to be filled up by this function
++ */
++void dvmCompilerGetLoopExpressions (CompilationUnit *cUnit, LoopInformation *info, std::vector<Expression *> &ivExpressions);
+ #endif
+diff --git a/vm/compiler/BBOptimization.cpp b/vm/compiler/BBOptimization.cpp
+index 1cf8a59..4f956e5 100644
+--- a/vm/compiler/BBOptimization.cpp
++++ b/vm/compiler/BBOptimization.cpp
+@@ -1358,7 +1358,7 @@ static void handleLocalValueNumbering (MIR *mir,
+             association.constant = 0;
+ 
+             //Get flags first
+-            int flags = dvmCompilerDataFlowAttributes[opcode];
++            long long flags = dvmCompilerDataFlowAttributes[opcode];
+ 
+             //If vB is being used, vC might be a constant
+             if ( (flags & (DF_UB | DF_UB_WIDE)) != 0)
+diff --git a/vm/compiler/Checks.cpp b/vm/compiler/Checks.cpp
+index 2a1c2bb..a6e8dfc 100644
+--- a/vm/compiler/Checks.cpp
++++ b/vm/compiler/Checks.cpp
+@@ -719,7 +719,7 @@ void walkBasicBlock (CompilationUnit *cUnit, SRemoveData *removeData, MIR *first
+     for (MIR *mir = first; mir != NULL; mir = mir->next)
+     {
+         DecodedInstruction *dInsn = &mir->dalvikInsn;
+-        int dfAttributes =
++        long long dfAttributes =
+             dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
+ 
+         CHECK_LOG ( "\nHandling %s\n",
+@@ -1203,7 +1203,7 @@ bool usesEqual (const MIR *mir, const MIR *other, std::map<int, std::vector <std
+     const DecodedInstruction &it = other->dalvikInsn;
+ 
+     //We need the attributes to check the right virtual register
+-    int dfAttributes =
++    long long dfAttributes =
+         dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
+ 
+     //We only care about the virtual register if it isn't a defined
+diff --git a/vm/compiler/CompilerIR.h b/vm/compiler/CompilerIR.h
+index 12becba..e85f753 100644
+--- a/vm/compiler/CompilerIR.h
++++ b/vm/compiler/CompilerIR.h
+@@ -100,67 +100,142 @@ typedef struct LIR {
+ enum ExtendedMIROpcode {
+ 
+     kMirOpFirst = kNumPackedOpcodes,
++
+     /** @brief PHI node
+       No arguments for the back-end */
+     kMirOpPhi = kMirOpFirst,
++
+     /** @brief Null and Range Up for Up Loop
+       va: arrayReg, vB: idx Reg, vC: end condition,
+       arg[0]: maxC, arg[1]: minC, arg[2]:branch opcode */
+     kMirOpNullNRangeUpCheck,
++
+     /** @brief Null and Range for Down Loop
+       va: arrayReg, vB: idx Reg, vC: end condition,
+       arg[0]: maxC, arg[1]: minC, arg[2]:branch opcode */
+     kMirOpNullNRangeDownCheck,
++
+     /** @brief Check lower bound if an index register
+       va: idxReg, vb:globalMinC */
+     kMirOpLowerBound,
++
+     /** @brief Punt
+       No arguments for the back end */
+     kMirOpPunt,
++
+     /** @brief Checks for validity of predicted inlining
+       vB: Class object pointer
+       vC: The register that holds "this" reference */
+     kMirOpCheckInlinePrediction,
++
+     /** @brief Null Check, va: objectReg */
+     kMirOpNullCheck,
++
+     /** @brief Bound Check using a constant value or invariant register:
+       vA: objectReg, arg[0]=MIR_BOUND_CHECK_REG/CST
+       arg[1]: indexREG or constant
+      */
+     kMirOpBoundCheck,
++
+     /** @brief MIR for hint to registerize a VR:
+       vA: the VR number, vB: the type using the RegisterClass enum
+      */
+     kMirOpRegisterize,
++
+     /** @brief MIR to move data to a 128-bit vectorized register
+        vA: destination
+        args[0]~args[3]: the 128-bit data to be stored in vA
+      */
+     kMirOpConst128b,
++
+     /** @brief MIR to move a 128-bit vectorized register to another
+        vA: destination
+        vB: source
+      */
+     kMirOpMove128b,
+-    /** @brief Packed multiply: two 128-bit vectorized registers: vA = vA * vB using opnd size to know the data size
++
++    /** @brief Packed multiply of units (using "." to represent unit) in two 128-bit vectorized registers: vA = vA .* vB using vC to know the packed unit size
+        vA: destination and source
+        vB: source
++       vC: operands' size (2 bytes, 4 bytes)
+      */
+     kMirOpPackedMultiply,
+-    /** @brief Packed addition: two 128-bit vectorized registers: vA = vA + vB using opnd size to know the data size
++
++    /** @brief Packed addition of units (using "." to represent unit) in two 128-bit vectorized registers: vA = vA .+ vB using vC to know the packed unit size
+        vA: destination and source
+        vB: source
+        vC: operands' size (2 bytes, 4 bytes)
+      */
+     kMirOpPackedAddition,
++
++    /** @brief Packed subtraction of units (using "." to represent unit) in two 128-bit vectorized registers: vA = vA .- vB using vC to know the packed unit size
++       vA: destination and source
++       vB: source
++       vC: operands' size (2 bytes, 4 bytes)
++     */
++    kMirOpPackedSubtract,
++
++    /** @brief Packed shift left of units (using "." to represent unit) in two 128-bit vectorized registers: vA = vA .<< vB using vC to know the packed unit size
++       vA: destination and source
++       vB: immediate
++       vC: operands' size (2 bytes, 4 bytes)
++     */
++    kMirOpPackedShiftLeft,
++
++    /** @brief Packed signed shift right of units (using "." to represent unit) in two 128-bit vectorized registers: vA = vA .>> vB using vC to know the packed unit size
++       vA: destination and source
++       vB: immediate
++       vC: operands' size (2 bytes, 4 bytes)
++     */
++    kMirOpPackedSignedShiftRight,
++
++    /** @brief Packed unsigned shift right of units (using "." to represent unit) in two 128-bit vectorized registers: vA = vA .>>> vB using vC to know the packed unit size
++       vA: destination and source
++       vB: immediate
++       vC: operands' size (2 bytes, 4 bytes)
++     */
++    kMirOpPackedUnsignedShiftRight,
++
++    /** @brief Packed bitwise and of units (using "." to represent unit) in two 128-bit vectorized registers: vA = vA .& vB
++       vA: destination and source
++       vB: source
++       vC: operands' size (2 bytes, 4 bytes)
++     */
++    kMirOpPackedAnd,
++
++    /** @brief Packed bitwise or of units (using "." to represent unit) in two 128-bit vectorized registers: vA = vA .| vB
++       vA: destination and source
++       vB: source
++       vC: operands' size (2 bytes, 4 bytes)
++     */
++    kMirOpPackedOr,
++
++    /** @brief Packed bitwise xor of units (using "." to represent unit) in two 128-bit vectorized registers: vA = vA .^ vB
++       vA: destination and source
++       vB: source
++       vC: operands' size (2 bytes, 4 bytes)
++     */
++    kMirOpPackedXor,
++
+     /**
+-       @brief Reduce a 128-bit packed element into a single VR
+-       @details Instruction does an addition of the different packed elements and sets the accumulation into a VR
+-       vA: destination VR
++       @brief Reduce a 128-bit packed element into a single VR by taking lower bits
++       @details Instruction does a horizontal addition of the different packed elements and then adds it to VR
++       vA: destination and source VR
+        vB: 128-bit source register
+        vC: operands' size (2 bytes, 4 bytes)
++       arg[0]: The index to use for extraction from vector register
+      */
+     kMirOpPackedAddReduce,
++
++    /**
++       @brief Reduce a 128-bit packed element into a single VR by taking lower bits
++       vA: destination VR
++       vB: 128-bit source register
++       vC: operands' size (2 bytes, 4 bytes)
++       arg[0]: The index to use for extraction from vector register
++     */
++    kMirOpPackedReduce,
++
+     /** @brief Create a 128 bit value, with all 16 bytes / vC values equal to vB
+        vA: destination 128-bit vector register
+        vB: source VR
+@@ -755,9 +830,10 @@ void dvmCompilerDumpCompilationUnit(CompilationUnit *cUnit);
+  * @param newVR the new VR we want to use
+  * @param shouldRewriteUses Since we are changing the def register, when this is set to true
+  * it will walk to the uses and change those to match the new register.
++ * @param remainInSameBB should the rewrite only remain in the same BasicBlock (default: false)
+  * @return Returns true if successfully rewrote with the given rewrite rules.
+  */
+-bool dvmCompilerRewriteMirDef (MIR *mir, int oldVR, int newVR, bool shouldRewriteUses = true);
++bool dvmCompilerRewriteMirDef (MIR *mir, int oldVR, int newVR, bool shouldRewriteUses = true, bool remainInSameBB = false);
+ 
+ /**
+  * @brief Rewrite the uses of def specified by a MIR.
+@@ -765,9 +841,10 @@ bool dvmCompilerRewriteMirDef (MIR *mir, int oldVR, int newVR, bool shouldRewrit
+  * @param mir The MIR to rewrite uses of its def
+  * @param oldVR the old VR that we want to rewrite
+  * @param newVR the new VR we want to use
++ * @param remainInSameBB should the rewrite only remain in the same BasicBlock (default: false)
+  * @return whether the rewrite was successful
+  */
+-bool dvmCompilerRewriteMirUses (MIR *mir, int oldVR, int newVR);
++bool dvmCompilerRewriteMirUses (MIR *mir, int oldVR, int newVR, bool remainInSameBB = false);
+ 
+ /**
+  * @brief Used to rewrite the virtual register numbers of a MIR
+diff --git a/vm/compiler/Dataflow.cpp b/vm/compiler/Dataflow.cpp
+index 8831489..84bb689 100644
+--- a/vm/compiler/Dataflow.cpp
++++ b/vm/compiler/Dataflow.cpp
+@@ -35,7 +35,7 @@
+  * TODO - many optimization flags are incomplete - they will only limit the
+  * scope of optimizations but will not cause mis-optimizations.
+  */
+-int dvmCompilerDataFlowAttributes[kMirOpLast] = {
++long long dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     // 00 OP_NOP
+     DF_NOP,
+ 
+@@ -425,49 +425,49 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_DA_WIDE | DF_UB_WIDE | DF_FP_A | DF_FP_B,
+ 
+     // 81 OP_INT_TO_LONG vA, vB
+-    DF_DA_WIDE | DF_UB,
++    DF_DA_WIDE | DF_UB | DF_CAST,
+ 
+     // 82 OP_INT_TO_FLOAT vA, vB
+-    DF_DA | DF_UB | DF_FP_A,
++    DF_DA | DF_UB | DF_FP_A | DF_CAST,
+ 
+     // 83 OP_INT_TO_DOUBLE vA, vB
+-    DF_DA_WIDE | DF_UB | DF_FP_A,
++    DF_DA_WIDE | DF_UB | DF_FP_A | DF_CAST,
+ 
+     // 84 OP_LONG_TO_INT vA, vB
+-    DF_DA | DF_UB_WIDE,
++    DF_DA | DF_UB_WIDE | DF_CAST,
+ 
+     // 85 OP_LONG_TO_FLOAT vA, vB
+-    DF_DA | DF_UB_WIDE | DF_FP_A,
++    DF_DA | DF_UB_WIDE | DF_FP_A | DF_CAST,
+ 
+     // 86 OP_LONG_TO_DOUBLE vA, vB
+-    DF_DA_WIDE | DF_UB_WIDE | DF_FP_A,
++    DF_DA_WIDE | DF_UB_WIDE | DF_FP_A | DF_CAST,
+ 
+     // 87 OP_FLOAT_TO_INT vA, vB
+-    DF_DA | DF_UB | DF_FP_B,
++    DF_DA | DF_UB | DF_FP_B | DF_CAST,
+ 
+     // 88 OP_FLOAT_TO_LONG vA, vB
+-    DF_DA_WIDE | DF_UB | DF_FP_B,
++    DF_DA_WIDE | DF_UB | DF_FP_B | DF_CAST,
+ 
+     // 89 OP_FLOAT_TO_DOUBLE vA, vB
+-    DF_DA_WIDE | DF_UB | DF_FP_A | DF_FP_B,
++    DF_DA_WIDE | DF_UB | DF_FP_A | DF_FP_B | DF_CAST,
+ 
+     // 8A OP_DOUBLE_TO_INT vA, vB
+-    DF_DA | DF_UB_WIDE | DF_FP_B,
++    DF_DA | DF_UB_WIDE | DF_FP_B | DF_CAST,
+ 
+     // 8B OP_DOUBLE_TO_LONG vA, vB
+-    DF_DA_WIDE | DF_UB_WIDE | DF_FP_B,
++    DF_DA_WIDE | DF_UB_WIDE | DF_FP_B | DF_CAST,
+ 
+     // 8C OP_DOUBLE_TO_FLOAT vA, vB
+-    DF_DA | DF_UB_WIDE | DF_FP_A | DF_FP_B,
++    DF_DA | DF_UB_WIDE | DF_FP_A | DF_FP_B | DF_CAST,
+ 
+     // 8D OP_INT_TO_BYTE vA, vB
+-    DF_DA | DF_UB,
++    DF_DA | DF_UB | DF_CAST,
+ 
+     // 8E OP_INT_TO_CHAR vA, vB
+-    DF_DA | DF_UB,
++    DF_DA | DF_UB | DF_CAST,
+ 
+     // 8F OP_INT_TO_SHORT vA, vB
+-    DF_DA | DF_UB,
++    DF_DA | DF_UB | DF_CAST,
+ 
+     // 90 OP_ADD_INT vAA, vBB, vCC
+     DF_DA | DF_UB | DF_UC | DF_IS_LINEAR | DF_ADD_EXPRESSION,
+@@ -479,28 +479,28 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_DA | DF_UB | DF_UC | DF_MULTIPLY_EXPRESSION,
+ 
+     // 93 OP_DIV_INT vAA, vBB, vCC
+-    DF_DA | DF_UB | DF_UC,
++    DF_DA | DF_UB | DF_UC | DF_DIVIDE_EXPRESSION,
+ 
+     // 94 OP_REM_INT vAA, vBB, vCC
+-    DF_DA | DF_UB | DF_UC,
++    DF_DA | DF_UB | DF_UC | DF_REMAINDER_EXPRESSION,
+ 
+     // 95 OP_AND_INT vAA, vBB, vCC
+-    DF_DA | DF_UB | DF_UC,
++    DF_DA | DF_UB | DF_UC | DF_AND_EXPRESSION,
+ 
+     // 96 OP_OR_INT vAA, vBB, vCC
+-    DF_DA | DF_UB | DF_UC,
++    DF_DA | DF_UB | DF_UC | DF_OR_EXPRESSION,
+ 
+     // 97 OP_XOR_INT vAA, vBB, vCC
+-    DF_DA | DF_UB | DF_UC,
++    DF_DA | DF_UB | DF_UC | DF_XOR_EXPRESSION,
+ 
+     // 98 OP_SHL_INT vAA, vBB, vCC
+-    DF_DA | DF_UB | DF_UC,
++    DF_DA | DF_UB | DF_UC | DF_SHL_EXPRESSION,
+ 
+     // 99 OP_SHR_INT vAA, vBB, vCC
+-    DF_DA | DF_UB | DF_UC,
++    DF_DA | DF_UB | DF_UC | DF_SHR_EXPRESSION,
+ 
+     // 9A OP_USHR_INT vAA, vBB, vCC
+-    DF_DA | DF_UB | DF_UC,
++    DF_DA | DF_UB | DF_UC | DF_USHR_EXPRESSION,
+ 
+     // 9B OP_ADD_LONG vAA, vBB, vCC
+     DF_DA_WIDE | DF_UB_WIDE | DF_UC_WIDE | DF_ADD_EXPRESSION,
+@@ -512,28 +512,28 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_DA_WIDE | DF_UB_WIDE | DF_UC_WIDE | DF_MULTIPLY_EXPRESSION,
+ 
+     // 9E OP_DIV_LONG vAA, vBB, vCC
+-    DF_DA_WIDE | DF_UB_WIDE | DF_UC_WIDE,
++    DF_DA_WIDE | DF_UB_WIDE | DF_UC_WIDE | DF_DIVIDE_EXPRESSION,
+ 
+     // 9F OP_REM_LONG vAA, vBB, vCC
+-    DF_DA_WIDE | DF_UB_WIDE | DF_UC_WIDE,
++    DF_DA_WIDE | DF_UB_WIDE | DF_UC_WIDE | DF_REMAINDER_EXPRESSION,
+ 
+     // A0 OP_AND_LONG vAA, vBB, vCC
+-    DF_DA_WIDE | DF_UB_WIDE | DF_UC_WIDE,
++    DF_DA_WIDE | DF_UB_WIDE | DF_UC_WIDE | DF_AND_EXPRESSION,
+ 
+     // A1 OP_OR_LONG vAA, vBB, vCC
+-    DF_DA_WIDE | DF_UB_WIDE | DF_UC_WIDE,
++    DF_DA_WIDE | DF_UB_WIDE | DF_UC_WIDE | DF_OR_EXPRESSION,
+ 
+     // A2 OP_XOR_LONG vAA, vBB, vCC
+-    DF_DA_WIDE | DF_UB_WIDE | DF_UC_WIDE,
++    DF_DA_WIDE | DF_UB_WIDE | DF_UC_WIDE | DF_XOR_EXPRESSION,
+ 
+     // A3 OP_SHL_LONG vAA, vBB, vCC
+-    DF_DA_WIDE | DF_UB_WIDE | DF_UC,
++    DF_DA_WIDE | DF_UB_WIDE | DF_UC | DF_SHL_EXPRESSION,
+ 
+     // A4 OP_SHR_LONG vAA, vBB, vCC
+-    DF_DA_WIDE | DF_UB_WIDE | DF_UC,
++    DF_DA_WIDE | DF_UB_WIDE | DF_UC | DF_SHR_EXPRESSION,
+ 
+     // A5 OP_USHR_LONG vAA, vBB, vCC
+-    DF_DA_WIDE | DF_UB_WIDE | DF_UC,
++    DF_DA_WIDE | DF_UB_WIDE | DF_UC | DF_USHR_EXPRESSION,
+ 
+     // A6 OP_ADD_FLOAT vAA, vBB, vCC
+     DF_DA | DF_UB | DF_UC | DF_FP_A | DF_FP_B | DF_FP_C | DF_ADD_EXPRESSION,
+@@ -545,10 +545,10 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_DA | DF_UB | DF_UC | DF_FP_A | DF_FP_B | DF_FP_C | DF_MULTIPLY_EXPRESSION,
+ 
+     // A9 OP_DIV_FLOAT vAA, vBB, vCC
+-    DF_DA | DF_UB | DF_UC | DF_FP_A | DF_FP_B | DF_FP_C,
++    DF_DA | DF_UB | DF_UC | DF_FP_A | DF_FP_B | DF_FP_C | DF_DIVIDE_EXPRESSION,
+ 
+     // AA OP_REM_FLOAT vAA, vBB, vCC
+-    DF_DA | DF_UB | DF_UC | DF_FP_A | DF_FP_B | DF_FP_C,
++    DF_DA | DF_UB | DF_UC | DF_FP_A | DF_FP_B | DF_FP_C | DF_REMAINDER_EXPRESSION,
+ 
+     // AB OP_ADD_DOUBLE vAA, vBB, vCC
+     DF_DA_WIDE | DF_UB_WIDE | DF_UC_WIDE | DF_FP_A | DF_FP_B | DF_FP_C | DF_ADD_EXPRESSION,
+@@ -560,10 +560,10 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_DA_WIDE | DF_UB_WIDE | DF_UC_WIDE | DF_FP_A | DF_FP_B | DF_FP_C | DF_MULTIPLY_EXPRESSION,
+ 
+     // AE OP_DIV_DOUBLE vAA, vBB, vCC
+-    DF_DA_WIDE | DF_UB_WIDE | DF_UC_WIDE | DF_FP_A | DF_FP_B | DF_FP_C,
++    DF_DA_WIDE | DF_UB_WIDE | DF_UC_WIDE | DF_FP_A | DF_FP_B | DF_FP_C | DF_DIVIDE_EXPRESSION,
+ 
+     // AF OP_REM_DOUBLE vAA, vBB, vCC
+-    DF_DA_WIDE | DF_UB_WIDE | DF_UC_WIDE | DF_FP_A | DF_FP_B | DF_FP_C,
++    DF_DA_WIDE | DF_UB_WIDE | DF_UC_WIDE | DF_FP_A | DF_FP_B | DF_FP_C | DF_REMAINDER_EXPRESSION,
+ 
+     // B0 OP_ADD_INT_2ADDR vA, vB
+     DF_DA | DF_UA | DF_UB | DF_ADD_EXPRESSION,
+@@ -575,28 +575,28 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_DA | DF_UA | DF_UB | DF_MULTIPLY_EXPRESSION,
+ 
+     // B3 OP_DIV_INT_2ADDR vA, vB
+-    DF_DA | DF_UA | DF_UB,
++    DF_DA | DF_UA | DF_UB | DF_DIVIDE_EXPRESSION,
+ 
+     // B4 OP_REM_INT_2ADDR vA, vB
+-    DF_DA | DF_UA | DF_UB,
++    DF_DA | DF_UA | DF_UB | DF_REMAINDER_EXPRESSION,
+ 
+     // B5 OP_AND_INT_2ADDR vA, vB
+-    DF_DA | DF_UA | DF_UB,
++    DF_DA | DF_UA | DF_UB | DF_AND_EXPRESSION,
+ 
+     // B6 OP_OR_INT_2ADDR vA, vB
+-    DF_DA | DF_UA | DF_UB,
++    DF_DA | DF_UA | DF_UB | DF_OR_EXPRESSION,
+ 
+     // B7 OP_XOR_INT_2ADDR vA, vB
+-    DF_DA | DF_UA | DF_UB,
++    DF_DA | DF_UA | DF_UB | DF_XOR_EXPRESSION,
+ 
+     // B8 OP_SHL_INT_2ADDR vA, vB
+-    DF_DA | DF_UA | DF_UB,
++    DF_DA | DF_UA | DF_UB | DF_SHL_EXPRESSION,
+ 
+     // B9 OP_SHR_INT_2ADDR vA, vB
+-    DF_DA | DF_UA | DF_UB,
++    DF_DA | DF_UA | DF_UB | DF_SHR_EXPRESSION,
+ 
+     // BA OP_USHR_INT_2ADDR vA, vB
+-    DF_DA | DF_UA | DF_UB,
++    DF_DA | DF_UA | DF_UB | DF_USHR_EXPRESSION,
+ 
+     // BB OP_ADD_LONG_2ADDR vA, vB
+     DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE | DF_ADD_EXPRESSION,
+@@ -608,28 +608,28 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE | DF_MULTIPLY_EXPRESSION,
+ 
+     // BE OP_DIV_LONG_2ADDR vA, vB
+-    DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE,
++    DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE | DF_DIVIDE_EXPRESSION,
+ 
+     // BF OP_REM_LONG_2ADDR vA, vB
+-    DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE,
++    DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE | DF_REMAINDER_EXPRESSION,
+ 
+     // C0 OP_AND_LONG_2ADDR vA, vB
+-    DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE,
++    DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE | DF_AND_EXPRESSION,
+ 
+     // C1 OP_OR_LONG_2ADDR vA, vB
+-    DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE,
++    DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE | DF_OR_EXPRESSION,
+ 
+     // C2 OP_XOR_LONG_2ADDR vA, vB
+-    DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE,
++    DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE | DF_XOR_EXPRESSION,
+ 
+     // C3 OP_SHL_LONG_2ADDR vA, vB
+-    DF_DA_WIDE | DF_UA_WIDE | DF_UB,
++    DF_DA_WIDE | DF_UA_WIDE | DF_UB | DF_SHL_EXPRESSION,
+ 
+     // C4 OP_SHR_LONG_2ADDR vA, vB
+-    DF_DA_WIDE | DF_UA_WIDE | DF_UB,
++    DF_DA_WIDE | DF_UA_WIDE | DF_UB | DF_SHR_EXPRESSION,
+ 
+     // C5 OP_USHR_LONG_2ADDR vA, vB
+-    DF_DA_WIDE | DF_UA_WIDE | DF_UB,
++    DF_DA_WIDE | DF_UA_WIDE | DF_UB | DF_USHR_EXPRESSION,
+ 
+     // C6 OP_ADD_FLOAT_2ADDR vA, vB
+     DF_DA | DF_UA | DF_UB | DF_FP_A | DF_FP_B | DF_ADD_EXPRESSION,
+@@ -641,10 +641,10 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_DA | DF_UA | DF_UB | DF_FP_A | DF_FP_B | DF_MULTIPLY_EXPRESSION,
+ 
+     // C9 OP_DIV_FLOAT_2ADDR vA, vB
+-    DF_DA | DF_UA | DF_UB | DF_FP_A | DF_FP_B,
++    DF_DA | DF_UA | DF_UB | DF_FP_A | DF_FP_B | DF_DIVIDE_EXPRESSION,
+ 
+     // CA OP_REM_FLOAT_2ADDR vA, vB
+-    DF_DA | DF_UA | DF_UB | DF_FP_A | DF_FP_B,
++    DF_DA | DF_UA | DF_UB | DF_FP_A | DF_FP_B | DF_REMAINDER_EXPRESSION,
+ 
+     // CB OP_ADD_DOUBLE_2ADDR vA, vB
+     DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE | DF_FP_A | DF_FP_B | DF_ADD_EXPRESSION,
+@@ -656,10 +656,10 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE | DF_FP_A | DF_FP_B | DF_MULTIPLY_EXPRESSION,
+ 
+     // CE OP_DIV_DOUBLE_2ADDR vA, vB
+-    DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE | DF_FP_A | DF_FP_B,
++    DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE | DF_FP_A | DF_FP_B | DF_DIVIDE_EXPRESSION,
+ 
+     // CF OP_REM_DOUBLE_2ADDR vA, vB
+-    DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE | DF_FP_A | DF_FP_B,
++    DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE | DF_FP_A | DF_FP_B | DF_REMAINDER_EXPRESSION,
+ 
+     // D0 OP_ADD_INT_LIT16 vA, vB, #+CCCC
+     DF_DA | DF_UB | DF_ADD_EXPRESSION,
+@@ -671,19 +671,19 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_DA | DF_UB | DF_MULTIPLY_EXPRESSION,
+ 
+     // D3 OP_DIV_INT_LIT16 vA, vB, #+CCCC
+-    DF_DA | DF_UB,
++    DF_DA | DF_UB | DF_DIVIDE_EXPRESSION,
+ 
+     // D4 OP_REM_INT_LIT16 vA, vB, #+CCCC
+-    DF_DA | DF_UB,
++    DF_DA | DF_UB | DF_REMAINDER_EXPRESSION,
+ 
+     // D5 OP_AND_INT_LIT16 vA, vB, #+CCCC
+-    DF_DA | DF_UB,
++    DF_DA | DF_UB | DF_AND_EXPRESSION,
+ 
+     // D6 OP_OR_INT_LIT16 vA, vB, #+CCCC
+-    DF_DA | DF_UB,
++    DF_DA | DF_UB | DF_OR_EXPRESSION,
+ 
+     // D7 OP_XOR_INT_LIT16 vA, vB, #+CCCC
+-    DF_DA | DF_UB,
++    DF_DA | DF_UB | DF_XOR_EXPRESSION,
+ 
+     // D8 OP_ADD_INT_LIT8 vAA, vBB, #+CC
+     DF_DA | DF_UB | DF_IS_LINEAR | DF_ADD_EXPRESSION,
+@@ -695,28 +695,28 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_DA | DF_UB | DF_MULTIPLY_EXPRESSION,
+ 
+     // DB OP_DIV_INT_LIT8 vAA, vBB, #+CC
+-    DF_DA | DF_UB,
++    DF_DA | DF_UB | DF_DIVIDE_EXPRESSION,
+ 
+     // DC OP_REM_INT_LIT8 vAA, vBB, #+CC
+-    DF_DA | DF_UB,
++    DF_DA | DF_UB | DF_REMAINDER_EXPRESSION,
+ 
+     // DD OP_AND_INT_LIT8 vAA, vBB, #+CC
+-    DF_DA | DF_UB,
++    DF_DA | DF_UB | DF_AND_EXPRESSION,
+ 
+     // DE OP_OR_INT_LIT8 vAA, vBB, #+CC
+-    DF_DA | DF_UB,
++    DF_DA | DF_UB | DF_OR_EXPRESSION,
+ 
+     // DF OP_XOR_INT_LIT8 vAA, vBB, #+CC
+-    DF_DA | DF_UB,
++    DF_DA | DF_UB | DF_XOR_EXPRESSION,
+ 
+     // E0 OP_SHL_INT_LIT8 vAA, vBB, #+CC
+-    DF_DA | DF_UB,
++    DF_DA | DF_UB | DF_SHL_EXPRESSION,
+ 
+     // E1 OP_SHR_INT_LIT8 vAA, vBB, #+CC
+-    DF_DA | DF_UB,
++    DF_DA | DF_UB | DF_SHR_EXPRESSION,
+ 
+     // E2 OP_USHR_INT_LIT8 vAA, vBB, #+CC
+-    DF_DA | DF_UB,
++    DF_DA | DF_UB | DF_USHR_EXPRESSION,
+ 
+     // E3 OP_IGET_VOLATILE
+     DF_DA | DF_UB,
+@@ -835,7 +835,7 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     //kMirOpRegisterize
+     DF_FORMAT_EXT_OP,
+ 
+-    //kMirOpMoveData128b
++    //kMirOpConst128b
+     DF_NOP,
+ 
+     //kMirOpMove128b,
+@@ -847,9 +847,33 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     //kMirOpPackedAddition,
+     DF_NOP,
+ 
+-    //kMirOpPackedReduce,
++    //kMirOpPackedSubtract,
++    DF_NOP,
++
++    //kMirOpPackedShiftLeft,
++    DF_NOP,
++
++    //kMirOpPackedSignedShiftRight,
++    DF_NOP,
++
++    //kMirOpPackedUnsignedShiftRight,
++    DF_NOP,
++
++    //kMirOpPackedAnd,
++    DF_NOP,
++
++    //kMirOpPackedOr,
++    DF_NOP,
++
++    //kMirOpPackedXor,
++    DF_NOP,
++
++    //kMirOpPackedAddReduce,
+     DF_DA | DF_UA,
+ 
++    //kMirOpPackedReduce,
++    DF_DA,
++
+     //kMirOpPackedSet,
+     DF_UB,
+ 
+@@ -903,7 +927,7 @@ char *dvmCompilerGetDalvikDisassembly(const DecodedInstruction *insn,
+ {
+     char buffer[256];
+     Opcode opcode = insn->opcode;
+-    int dfAttributes = dvmCompilerDataFlowAttributes[opcode];
++    long long dfAttributes = dvmCompilerDataFlowAttributes[opcode];
+     int flags;
+     char *ret;
+ 
+@@ -1282,20 +1306,71 @@ void dvmCompilerExtendedDisassembler (const CompilationUnit *cUnit,
+             }
+             break;
+         case kMirOpConst128b:
+-            snprintf (buffer, len, "kMirOpConst128DW xmm%d = %x, %x, %x, %x", insn->vA, insn->arg[0], insn->arg[1], insn->arg[2], insn->arg[3]);
++            snprintf (buffer, len, "kMirOpConst128DW xmm%d = %x, %x, %x, %x", insn->vA, insn->arg[0], insn->arg[1],
++                    insn->arg[2], insn->arg[3]);
+             break;
+         case kMirOpPackedAddition:
+-            snprintf (buffer, len, "kMirOpPackedAddition xmm%d = xmm%d + xmm%d, size %d", insn->vA, insn->vA, insn->vB, insn->vC);
++            snprintf (buffer, len, "kMirOpPackedAddition xmm%d = xmm%d + xmm%d, size %d", insn->vA, insn->vA, insn->vB,
++                    insn->vC);
+             break;
+         case kMirOpPackedMultiply:
+-            snprintf (buffer, len, "kMirOpPackedMultiply xmm%d = xmm%d * xmm%d, size %d", insn->vA, insn->vA, insn->vB, insn->vC);
++            snprintf (buffer, len, "kMirOpPackedMultiply xmm%d = xmm%d * xmm%d, size %d", insn->vA, insn->vA, insn->vB,
++                    insn->vC);
++            break;
++        case kMirOpPackedSubtract:
++            snprintf (buffer, len, "kMirOpPackedSubtract xmm%d = xmm%d - xmm%d, size %d", insn->vA, insn->vA, insn->vB,
++                    insn->vC);
++            break;
++        case kMirOpPackedAnd:
++            snprintf (buffer, len, "kMirOpPackedAnd xmm%d = xmm%d & xmm%d, size %d", insn->vA, insn->vA, insn->vB,
++                    insn->vC);
++            break;
++        case kMirOpPackedOr:
++            snprintf (buffer, len, "kMirOpPackedOr xmm%d = xmm%d | xmm%d, size %d", insn->vA, insn->vA, insn->vB,
++                    insn->vC);
++            break;
++        case kMirOpPackedXor:
++            snprintf (buffer, len, "kMirOpPackedXor xmm%d = xmm%d ^ xmm%d, size %d", insn->vA, insn->vA, insn->vB,
++                    insn->vC);
++            break;
++        case kMirOpPackedShiftLeft:
++            snprintf (buffer, len, "kMirOpPackedShiftLeft xmm%d = xmm%d << xmm%d, size %d", insn->vA, insn->vA,
++                    insn->vB, insn->vC);
++            break;
++        case kMirOpPackedUnsignedShiftRight:
++            snprintf (buffer, len, "kMirOpPackedUnsignedShiftRight xmm%d = xmm%d >>> xmm%d, size %d", insn->vA,
++                    insn->vA, insn->vB, insn->vC);
++            break;
++        case kMirOpPackedSignedShiftRight:
++            snprintf (buffer, len, "kMirOpPackedSignedShiftRight xmm%d = xmm%d >> xmm%d, size %d", insn->vA, insn->vA, insn->vB,
++                    insn->vC);
+             break;
+         case kMirOpPackedAddReduce:
+-            snprintf (buffer, len, "kMirOpPackedAddReduce %s = xmm%d + %s, size %d",
+-                      getSSAName (cUnit, mir->ssaRep->defs[0], operand0),
+-                      insn->vB,
+-                      getSSAName (cUnit, mir->ssaRep->uses[0], operand1),
+-                      insn->vC);
++            if (cUnit != NULL && mir != NULL && mir->ssaRep != NULL)
++            {
++                snprintf (buffer, len, "kMirOpPackedAddReduce %s = xmm%d + %s, size %d",
++                          getSSAName (cUnit, mir->ssaRep->defs[0], operand0),
++                          insn->vB,
++                          getSSAName (cUnit, mir->ssaRep->uses[0], operand1),
++                          insn->vC);
++            }
++            else
++            {
++                snprintf (buffer, len, "kMirOpPackedAddReduce v%d = xmm%d + v%d, size %d", insn->vA, insn->vB, insn->vA,
++                        insn->vC);
++            }
++            break;
++        case kMirOpPackedReduce:
++            if (cUnit != NULL && mir != NULL && mir->ssaRep != NULL)
++            {
++                snprintf (buffer, len, "kMirOpPackedReduce %s = xmm%d, size %d",
++                        getSSAName (cUnit, mir->ssaRep->defs[0], operand0),
++                        insn->vB, insn->vC);
++            }
++            else
++            {
++                snprintf (buffer, len, "kMirOpPackedReduce v%d = xmm%d, size %d", insn->vA, insn->vB, insn->vC);
++            }
+             break;
+         case kMirOpNullCheck:
+             if (mir != 0)
+@@ -1326,7 +1401,7 @@ char *dvmCompilerFullDisassembler(const CompilationUnit *cUnit,
+     char operand0[256], operand1[256];
+     const DecodedInstruction *insn = &mir->dalvikInsn;
+     int opcode = insn->opcode;
+-    int dfAttributes = dvmCompilerDataFlowAttributes[opcode];
++    long long dfAttributes = dvmCompilerDataFlowAttributes[opcode];
+     char *ret;
+     int length;
+     int offset, left;
+@@ -1638,9 +1713,9 @@ bool dvmCompilerFindLocalLiveIn(CompilationUnit *cUnit, BasicBlock *bb)
+     BitVector *defV = bb->dataFlowInfo->defV;
+     BitVector *useV = bb->dataFlowInfo->useV;
+ 
+-    for (MIR *mir = bb->firstMIRInsn; mir; mir = mir->next) {
+-        int dfAttributes =
+-            dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
++    for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        long long dfAttributes = dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
+         DecodedInstruction *dInsn = &mir->dalvikInsn;
+ 
+         //If backend can bail out, ensure that all reaching definitions are uses
+@@ -2085,7 +2160,7 @@ bool dvmCompilerDoSSAConversion(CompilationUnit *cUnit, BasicBlock *bb)
+             mir->ssaRep = static_cast<struct SSARepresentation *> (dvmCompilerNew (sizeof (* (mir->ssaRep)), true));
+         }
+ 
+-        int dfAttributes =
++        long long dfAttributes =
+             dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
+ 
+         if (dfAttributes & DF_FORMAT_35C) {
+@@ -2230,7 +2305,7 @@ bool dvmCompilerDoConstantPropagation(CompilationUnit *cUnit, BasicBlock *bb)
+     BitVector *isConstantV = cUnit->isConstantV;
+ 
+     for (mir = bb->firstMIRInsn; mir; mir = mir->next) {
+-        int dfAttributes =
++        long long dfAttributes =
+             dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
+ 
+         if (!(dfAttributes & DF_HAS_DEFS)) continue;
+@@ -2895,7 +2970,7 @@ bool dvmCompilerFindInductionVariablesHelper(CompilationUnit *cUnit,
+     {
+         for (MIR* mir = bb->firstMIRInsn; mir; mir = mir->next)
+         {
+-            int dfAttributes =
++            long long dfAttributes =
+                 dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
+ 
+             if ((dfAttributes & DF_IS_LINEAR) == 0) {
+diff --git a/vm/compiler/Dataflow.h b/vm/compiler/Dataflow.h
+index 37efedf..59af26b 100644
+--- a/vm/compiler/Dataflow.h
++++ b/vm/compiler/Dataflow.h
+@@ -52,43 +52,58 @@ typedef enum DataFlowAttributePos {
+     kAddExpression,
+     kSubtractExpression,
+     kMultiplyExpression,
++    kDivideExpression,
++    kRemainerExpression,
++    kShiftLeftExpression,
++    kSignedShiftRightExpression,
++    kUnsignedShiftRightExpression,
++    kAndExpression,
++    kOrExpression,
++    kXorExpression,
++    kCastExpression,
+ } DataFlowAttributes;
+ 
+ #define DF_NOP                  0
+-#define DF_UA                   (1 << kUA)
+-#define DF_UB                   (1 << kUB)
+-#define DF_UC                   (1 << kUC)
+-#define DF_UA_WIDE              (1 << kUAWide)
+-#define DF_UB_WIDE              (1 << kUBWide)
+-#define DF_UC_WIDE              (1 << kUCWide)
+-#define DF_DA                   (1 << kDA)
+-#define DF_DA_WIDE              (1 << kDAWide)
+-#define DF_IS_MOVE              (1 << kIsMove)
+-#define DF_IS_LINEAR            (1 << kIsLinear)
+-#define DF_SETS_CONST           (1 << kSetsConst)
+-#define DF_FORMAT_35C           (1 << kFormat35c)
+-#define DF_FORMAT_3RC           (1 << kFormat3rc)
+-#define DF_FORMAT_EXT_OP        (1 << kFormatExtendedOp)
+-#define DF_PHI                  (1 << kPhi)
+-#define DF_NULL_N_RANGE_CHECK_0 (1 << kNullNRangeCheck0)
+-#define DF_NULL_N_RANGE_CHECK_1 (1 << kNullNRangeCheck1)
+-#define DF_NULL_N_RANGE_CHECK_2 (1 << kNullNRangeCheck2)
+-#define DF_NULL_OBJECT_CHECK_0  (1 << kNullObjectCheck0)
+-#define DF_NULL_OBJECT_CHECK_1  (1 << kNullObjectCheck1)
+-#define DF_NULL_OBJECT_CHECK_2  (1 << kNullObjectCheck2)
+-#define DF_FP_A                 (1 << kFPA)
+-#define DF_FP_B                 (1 << kFPB)
+-#define DF_FP_C                 (1 << kFPC)
+-#define DF_IS_GETTER            (1 << kGetter)
+-#define DF_IS_SETTER            (1 << kSetter)
+-#define DF_IS_CALL              (1 << kCall)
+-#define DF_CLOBBERS_MEMORY      (1 << kClobbersMemory)
+-#define DF_ADD_EXPRESSION       (1 << kAddExpression)
+-#define DF_SUBTRACT_EXPRESSION  (1 << kSubtractExpression)
+-#define DF_MULTIPLY_EXPRESSION  (1 << kMultiplyExpression)
+-//Note that we are getting close to overflowing the DF properties
+-//since we use an int as representation. If you are adding something
+-//new here, you should be careful.
++#define DF_UA                   (1LL << kUA)
++#define DF_UB                   (1LL << kUB)
++#define DF_UC                   (1LL << kUC)
++#define DF_UA_WIDE              (1LL << kUAWide)
++#define DF_UB_WIDE              (1LL << kUBWide)
++#define DF_UC_WIDE              (1LL << kUCWide)
++#define DF_DA                   (1LL << kDA)
++#define DF_DA_WIDE              (1LL << kDAWide)
++#define DF_IS_MOVE              (1LL << kIsMove)
++#define DF_IS_LINEAR            (1LL << kIsLinear)
++#define DF_SETS_CONST           (1LL << kSetsConst)
++#define DF_FORMAT_35C           (1LL << kFormat35c)
++#define DF_FORMAT_3RC           (1LL << kFormat3rc)
++#define DF_FORMAT_EXT_OP        (1LL << kFormatExtendedOp)
++#define DF_PHI                  (1LL << kPhi)
++#define DF_NULL_N_RANGE_CHECK_0 (1LL << kNullNRangeCheck0)
++#define DF_NULL_N_RANGE_CHECK_1 (1LL << kNullNRangeCheck1)
++#define DF_NULL_N_RANGE_CHECK_2 (1LL << kNullNRangeCheck2)
++#define DF_NULL_OBJECT_CHECK_0  (1LL << kNullObjectCheck0)
++#define DF_NULL_OBJECT_CHECK_1  (1LL << kNullObjectCheck1)
++#define DF_NULL_OBJECT_CHECK_2  (1LL << kNullObjectCheck2)
++#define DF_FP_A                 (1LL << kFPA)
++#define DF_FP_B                 (1LL << kFPB)
++#define DF_FP_C                 (1LL << kFPC)
++#define DF_IS_GETTER            (1LL << kGetter)
++#define DF_IS_SETTER            (1LL << kSetter)
++#define DF_IS_CALL              (1LL << kCall)
++#define DF_CLOBBERS_MEMORY      (1LL << kClobbersMemory)
++#define DF_ADD_EXPRESSION       (1LL << kAddExpression)
++#define DF_SUBTRACT_EXPRESSION  (1LL << kSubtractExpression)
++#define DF_MULTIPLY_EXPRESSION  (1LL << kMultiplyExpression)
++#define DF_DIVIDE_EXPRESSION    (1LL << kDivideExpression)
++#define DF_REMAINDER_EXPRESSION (1LL << kRemainerExpression)
++#define DF_SHL_EXPRESSION       (1LL << kShiftLeftExpression)
++#define DF_SHR_EXPRESSION       (1LL << kSignedShiftRightExpression)
++#define DF_USHR_EXPRESSION      (1LL << kUnsignedShiftRightExpression)
++#define DF_AND_EXPRESSION       (1LL << kAndExpression)
++#define DF_OR_EXPRESSION        (1LL << kOrExpression)
++#define DF_XOR_EXPRESSION       (1LL << kXorExpression)
++#define DF_CAST                 (1LL << kCastExpression)
+ 
+ #define DF_HAS_USES             (DF_UA | DF_UB | DF_UC | DF_UA_WIDE | \
+                                  DF_UB_WIDE | DF_UC_WIDE)
+@@ -110,7 +125,7 @@ typedef enum DataFlowAttributePos {
+ #define DF_C_IS_REG             (DF_UC | DF_UC_WIDE)
+ #define DF_IS_GETTER_OR_SETTER  (DF_IS_GETTER | DF_IS_SETTER)
+ 
+-extern int dvmCompilerDataFlowAttributes[kMirOpLast];
++extern long long dvmCompilerDataFlowAttributes[kMirOpLast];
+ 
+ typedef struct BasicBlockDataFlow {
+     BitVector *useV;
+diff --git a/vm/compiler/Expression.cpp b/vm/compiler/Expression.cpp
+index 3c3ff75..a3e61d0 100644
+--- a/vm/compiler/Expression.cpp
++++ b/vm/compiler/Expression.cpp
+@@ -62,29 +62,50 @@ std::string BinaryExpression::toString (const CompilationUnit * cUnit)
+     expressionString.append (lhs->toString (cUnit));
+ 
+     //Now we print the operation
+-    if (expKind == ExpKind_Add)
+-    {
+-        expressionString.append (" + ");
+-    }
+-    else if (expKind == ExpKind_Sub)
+-    {
+-        expressionString.append (" - ");
+-    }
+-    else if (expKind == ExpKind_Mul)
+-    {
+-        expressionString.append (" * ");
+-    }
+-    else if (expKind == ExpKind_Phi)
+-    {
+-        expressionString.append (", ");
+-    }
+-    else
++    switch (expKind)
+     {
+-        expressionString.append (" ?? ");
+-
+-        //In the assert world, we want to know if we added a new
+-        //expression kind without updating the toString
+-        assert(false);
++        case ExpKind_ConstSet:
++            break;
++        case ExpKind_Add:
++            expressionString.append (" + ");
++            break;
++        case ExpKind_Sub:
++            expressionString.append (" - ");
++            break;
++        case ExpKind_Mul:
++            expressionString.append (" * ");
++            break;
++        case ExpKind_Phi:
++            expressionString.append (", ");
++            break;
++        case ExpKind_Div:
++            expressionString.append (" / ");
++            break;
++        case ExpKind_Rem:
++            expressionString.append (" % ");
++            break;
++        case ExpKind_And:
++            expressionString.append (" & ");
++            break;
++        case ExpKind_Or:
++            expressionString.append (" | ");
++            break;
++        case ExpKind_Xor:
++            expressionString.append (" ^ ");
++            break;
++        case ExpKind_Shl:
++            expressionString.append (" << ");
++            break;
++        case ExpKind_Shr:
++            expressionString.append (" >> ");
++            break;
++        case ExpKind_Ushr:
++            expressionString.append (" >>> ");
++            break;
++        case ExpKind_Invalid:
++        default:
++            expressionString.append (" ?? ");
++            break;
+     }
+ 
+     //Now we can print rhs operand
+@@ -101,6 +122,16 @@ std::string UnaryExpression::toString (const CompilationUnit * cUnit)
+     expressionString.append ("(");
+     expressionString.append (assignmentTo->toString (cUnit));
+     expressionString.append (" = ");
++
++    if (expKind == ExpKind_Cast)
++    {
++        expressionString.append (" (cast)");
++    }
++    else if (expKind == ExpKind_Invalid)
++    {
++        expressionString.append (" ?? ");
++    }
++
+     expressionString.append (operand->toString (cUnit));
+     expressionString.append (")");
+ 
+@@ -161,30 +192,59 @@ Expression * Expression::mirToExpression (MIR * mir,
+     //implementation is complete.
+     if (dvmCompilerDataFlowAttributes[dalvikOpcode] & DF_ADD_EXPRESSION)
+     {
+-        result = BinaryExpression::mirToExpression (mir, vrToExpression,
+-                ExpKind_Add);
++        result = BinaryExpression::mirToExpression (mir, vrToExpression, ExpKind_Add);
++    }
++    else if (dvmCompilerDataFlowAttributes[dalvikOpcode] & DF_SUBTRACT_EXPRESSION)
++    {
++        result = BinaryExpression::mirToExpression (mir, vrToExpression, ExpKind_Sub);
++    }
++    else if (dvmCompilerDataFlowAttributes[dalvikOpcode] & DF_MULTIPLY_EXPRESSION)
++    {
++        result = BinaryExpression::mirToExpression (mir, vrToExpression, ExpKind_Mul);
++    }
++    else if (dvmCompilerDataFlowAttributes[dalvikOpcode] & DF_DIVIDE_EXPRESSION)
++    {
++        result = BinaryExpression::mirToExpression (mir, vrToExpression, ExpKind_Div);
++    }
++    else if (dvmCompilerDataFlowAttributes[dalvikOpcode] & DF_REMAINDER_EXPRESSION)
++    {
++        result = BinaryExpression::mirToExpression (mir, vrToExpression, ExpKind_Rem);
++    }
++    else if (dvmCompilerDataFlowAttributes[dalvikOpcode] & DF_AND_EXPRESSION)
++    {
++        result = BinaryExpression::mirToExpression (mir, vrToExpression, ExpKind_And);
++    }
++    else if (dvmCompilerDataFlowAttributes[dalvikOpcode] & DF_OR_EXPRESSION)
++    {
++        result = BinaryExpression::mirToExpression (mir, vrToExpression, ExpKind_Or);
++    }
++    else if (dvmCompilerDataFlowAttributes[dalvikOpcode] & DF_XOR_EXPRESSION)
++    {
++        result = BinaryExpression::mirToExpression (mir, vrToExpression, ExpKind_Xor);
++    }
++    else if (dvmCompilerDataFlowAttributes[dalvikOpcode] & DF_SHR_EXPRESSION)
++    {
++        result = BinaryExpression::mirToExpression (mir, vrToExpression, ExpKind_Shr);
++    }
++    else if (dvmCompilerDataFlowAttributes[dalvikOpcode] & DF_SHL_EXPRESSION)
++    {
++        result = BinaryExpression::mirToExpression (mir, vrToExpression, ExpKind_Shl);
+     }
+-    else if (dvmCompilerDataFlowAttributes[dalvikOpcode]
+-            & DF_SUBTRACT_EXPRESSION)
++    else if (dvmCompilerDataFlowAttributes[dalvikOpcode] & DF_USHR_EXPRESSION)
+     {
+-        result = BinaryExpression::mirToExpression (mir, vrToExpression,
+-                ExpKind_Sub);
++        result = BinaryExpression::mirToExpression (mir, vrToExpression, ExpKind_Ushr);
+     }
+-    else if (dvmCompilerDataFlowAttributes[dalvikOpcode]
+-            & DF_MULTIPLY_EXPRESSION)
++    else if (dvmCompilerDataFlowAttributes[dalvikOpcode] & DF_CAST)
+     {
+-        result = BinaryExpression::mirToExpression (mir, vrToExpression,
+-                ExpKind_Mul);
++        result = UnaryExpression::mirToExpression (mir, vrToExpression, ExpKind_Cast);
+     }
+     else if (dvmCompilerDataFlowAttributes[dalvikOpcode] & DF_SETS_CONST)
+     {
+-        result = UnaryExpression::mirToExpression (mir, vrToExpression,
+-                ExpKind_ConstSet);
++        result = UnaryExpression::mirToExpression (mir, vrToExpression, ExpKind_ConstSet);
+     }
+     else if (dalvikOpcode == kMirOpPhi)
+     {
+-        result = BinaryExpression::mirToExpression (mir, vrToExpression,
+-                ExpKind_Phi);
++        result = BinaryExpression::mirToExpression (mir, vrToExpression, ExpKind_Phi);
+     }
+ 
+     return result;
+diff --git a/vm/compiler/Expression.h b/vm/compiler/Expression.h
+index bed5fd8..a133e38 100644
+--- a/vm/compiler/Expression.h
++++ b/vm/compiler/Expression.h
+@@ -51,6 +51,15 @@ enum ExpressionKind
+     ExpKind_Sub,          //!< Subtraction (binop)
+     ExpKind_Mul,          //!< Multiplication (binop)
+     ExpKind_Phi,          //!< Phi node (binop)
++    ExpKind_Cast,         //!< Cast (unop)
++    ExpKind_Div,          //!< Division (binop)
++    ExpKind_Rem,          //!< Remainder (binop)
++    ExpKind_And,          //!< And (binop)
++    ExpKind_Or,           //!< Or (binop)
++    ExpKind_Xor,          //!< Xor (binop)
++    ExpKind_Shl,          //!< Shift left (binop)
++    ExpKind_Shr,          //!< Signed shift right (binop)
++    ExpKind_Ushr,         //!< Unsigned shift right (binop)
+ };
+ 
+ /**
+@@ -214,6 +223,24 @@ public:
+     }
+ 
+     /**
++     * @brief Get the lowSsaReg of the VR corresponding to the class
++     * @return The lowSSA value
++     */
++    int getLowSSAReg (void) const
++    {
++        return lowSsaReg;
++    }
++
++    /**
++     * @brief Get the highSSA value, if this is a wide VR
++     * @return highSSA value if wide, else -1
++     */
++    int getHighSSAReg (void) const
++    {
++        return (wide == true) ? highSsaReg : -1;
++    }
++
++    /**
+      * @brief Converts one of the ssa registers (or two for wide case) to
+      * representation of virtual register.
+      * @details Once a virtual register is created, we then look through the
+diff --git a/vm/compiler/InlineTransformation.cpp b/vm/compiler/InlineTransformation.cpp
+index 72a6cbc..5dc3cc3 100755
+--- a/vm/compiler/InlineTransformation.cpp
++++ b/vm/compiler/InlineTransformation.cpp
+@@ -1164,7 +1164,7 @@ static InliningFailure rewriteSingleInlinedMIR (MIR *newMir, const MIR *moveResu
+     if (moveResult != 0)
+     {
+         //Get dataflow flags
+-        int newMirFlags = dvmCompilerDataFlowAttributes[newInsn.opcode];
++        long long newMirFlags = dvmCompilerDataFlowAttributes[newInsn.opcode];
+ 
+         //Make sure that return has a use in vA and move-result has define in vA
+         assert ((dvmCompilerDataFlowAttributes[returnMir->dalvikInsn.opcode] & DF_A_IS_USED_REG) != 0);
+diff --git a/vm/compiler/IntermediateRep.cpp b/vm/compiler/IntermediateRep.cpp
+index 6a5a8b1..793df9a 100644
+--- a/vm/compiler/IntermediateRep.cpp
++++ b/vm/compiler/IntermediateRep.cpp
+@@ -1263,7 +1263,7 @@ bool dvmCompilerRewriteMirVRs (DecodedInstruction &dalvikInsn, const std::map<in
+     }
+ 
+     //Get dataflow flags
+-    int dfAttributes = dvmCompilerDataFlowAttributes[dalvikInsn.opcode];
++    long long dfAttributes = dvmCompilerDataFlowAttributes[dalvikInsn.opcode];
+ 
+     //If we have an extended MIR then reject because rewriting support has not been added
+     if ((dfAttributes & DF_FORMAT_EXT_OP) != 0)
+@@ -1363,12 +1363,11 @@ static bool rewriteUses (DecodedInstruction &dalvikInsn, int oldVR, int newVR)
+  * @param oldVR the old VR that we want to rewrite
+  * @param newVR the new VR we want to use
+  * @param chain The first link in chain of uses.
+- * @param newDecodedInst Updated by function to contain the rewritten
+- * instruction for each mir.
++ * @param newDecodedInst Updated by function to contain the rewritten * instruction for each mir.
++ * @param constrainToThisBB do we constrain the algorithm to a given BasicBlock
+  * @return Returns true if all uses were rewritten correctly.
+  */
+-static bool rewriteUses (int oldVR, int newVR, SUsedChain *chain,
+-        std::map<MIR *, DecodedInstruction> &newDecodedInst)
++static bool rewriteUses (int oldVR, int newVR, SUsedChain *chain, std::map<MIR *, DecodedInstruction> &newDecodedInst, BasicBlock *constrainToThisBB)
+ {
+     //Walk the chain
+     for (; chain != 0; chain = chain->nextUse)
+@@ -1382,6 +1381,12 @@ static bool rewriteUses (int oldVR, int newVR, SUsedChain *chain,
+             continue;
+         }
+ 
++        //If we are only doing rewrites of MIRs in same BB, then we need to skip other MIRs now
++        if (constrainToThisBB != 0 && mir->bb != constrainToThisBB)
++        {
++            continue;
++        }
++
+         //Make a copy of the dalvik instruction that can be updated
+         DecodedInstruction dalvikInsn = mir->dalvikInsn;
+ 
+@@ -1403,7 +1408,7 @@ static bool rewriteUses (int oldVR, int newVR, SUsedChain *chain,
+ }
+ 
+ //Rewrite uses of the def specified by mir
+-bool dvmCompilerRewriteMirUses (MIR *mir, int oldVR, int newVR)
++bool dvmCompilerRewriteMirUses (MIR *mir, int oldVR, int newVR, bool shouldRemainInSameBB)
+ {
+     //Used to keep track of the rewritten instruction before we commit it
+     std::map<MIR *, DecodedInstruction> newDecodedInst;
+@@ -1422,12 +1427,15 @@ bool dvmCompilerRewriteMirUses (MIR *mir, int oldVR, int newVR)
+         return false;
+     }
+ 
++    //Determine if we need to contain the rewrites to the same BB
++    BasicBlock *constrainToThisBB = (shouldRemainInSameBB == true) ? mir->bb : 0;
++
+     //Follow the uses of the first def. When we get here we know we have
+     //at least one def.
+     SUsedChain *chain = ssaRep->usedNext[0];
+ 
+     //Now fix the uses of this updated define
+-    bool success = rewriteUses (oldVR, newVR, chain, newDecodedInst);
++    bool success = rewriteUses (oldVR, newVR, chain, newDecodedInst, constrainToThisBB);
+ 
+     //No use to keep going if we failed
+     if (success == false)
+@@ -1450,7 +1458,7 @@ bool dvmCompilerRewriteMirUses (MIR *mir, int oldVR, int newVR)
+ 
+         //Now try to rewrite the uses of the wide part.
+         //Don't affect success whether or not we fail here.
+-        rewriteUses (oldVRWide, newVRWide, chain, newDecodedInst);
++        rewriteUses (oldVRWide, newVRWide, chain, newDecodedInst, constrainToThisBB);
+     }
+ 
+     //We can commit our rewrites if we succeed all of them. We only make it
+@@ -1471,7 +1479,7 @@ bool dvmCompilerRewriteMirUses (MIR *mir, int oldVR, int newVR)
+ }
+ 
+ //Rewrite Mir for one instruction
+-bool dvmCompilerRewriteMirDef (MIR *mir, int oldVR, int newVR, bool shouldRewriteUses)
++bool dvmCompilerRewriteMirDef (MIR *mir, int oldVR, int newVR, bool shouldRewriteUses, bool shouldRemainInSameBB)
+ {
+     //Paranoid
+     assert (mir != 0);
+@@ -1480,7 +1488,7 @@ bool dvmCompilerRewriteMirDef (MIR *mir, int oldVR, int newVR, bool shouldRewrit
+     DecodedInstruction dalvikInsn = mir->dalvikInsn;
+ 
+     //Get dataflow flags
+-    int dfAttributes = dvmCompilerDataFlowAttributes[dalvikInsn.opcode];
++    long long dfAttributes = dvmCompilerDataFlowAttributes[dalvikInsn.opcode];
+ 
+     //Check to see if we have defs for this MIR
+     if ((dfAttributes & DF_HAS_DEFS) == 0)
+@@ -1508,7 +1516,7 @@ bool dvmCompilerRewriteMirDef (MIR *mir, int oldVR, int newVR, bool shouldRewrit
+     //Check if we need to rewrite the uses now that use the new def
+     if (shouldRewriteUses == true)
+     {
+-        if (dvmCompilerRewriteMirUses (mir, oldVR, newVR) == false)
++        if (dvmCompilerRewriteMirUses (mir, oldVR, newVR, shouldRemainInSameBB) == false)
+         {
+             return false;
+         }
+@@ -1611,6 +1619,22 @@ const char* dvmCompilerGetOpcodeName (int opcode)
+                 return "kMirOpPackedSet";
+             case kMirOpCheckStackOverflow:
+                 return "kMirOpCheckStackOverflow";
++            case kMirOpPackedSubtract:
++                return "kMirOpPackedSubtract";
++            case kMirOpPackedShiftLeft:
++                return "kMirOpPackedShiftLeft";
++            case kMirOpPackedSignedShiftRight:
++                return "kMirOpPackedSignedShiftRight";
++            case kMirOpPackedUnsignedShiftRight:
++                return "kMirOpPackedUnsignedShiftRight";
++            case kMirOpPackedAnd:
++                return "kMirOpPackedAnd";
++            case kMirOpPackedOr:
++                return "kMirOpPackedOr";
++            case kMirOpPackedXor:
++                return "kMirOpPackedXor";
++            case kMirOpPackedReduce:
++                return "kMirOpPackedReduce";
+             default:
+                 return "KMirUnknown";
+         }
+diff --git a/vm/compiler/InvariantRemoval.cpp b/vm/compiler/InvariantRemoval.cpp
+index dc4a3e2..1fce6ad 100644
+--- a/vm/compiler/InvariantRemoval.cpp
++++ b/vm/compiler/InvariantRemoval.cpp
+@@ -124,7 +124,7 @@ static bool findInvariantsInPeelHelper (CompilationUnit *cUnit, BasicBlock *bb)
+         //    However, if that one can't be hoisted later on and we did hoist the constant, we should put the constant back in... so a bit of work to get this all set-up
+ 
+         //Get the flags
+-        int dfFlags = dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
++        long long dfFlags = dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
+ 
+         if ((dfFlags & DF_SETS_CONST) != 0)
+         {
+@@ -573,7 +573,7 @@ static void findIgetIputCandidatesHelper (CompilationUnit *cUnit, const LoopInfo
+     for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
+     {
+         //Get the flags
+-        int flags = dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
++        long long flags = dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
+ 
+         //Is it a Iget ? and not wide
+         if ( ( (flags & DF_IS_GETTER) != 0))
+@@ -594,7 +594,7 @@ static void findIgetIputCandidatesHelper (CompilationUnit *cUnit, const LoopInfo
+                     if (potentialPut->color.next == 0)
+                     {
+                         //Ok, now is it a put?
+-                        int flags = dvmCompilerDataFlowAttributes[potentialPut->dalvikInsn.opcode];
++                        long long flags = dvmCompilerDataFlowAttributes[potentialPut->dalvikInsn.opcode];
+ 
+                         //Is it a Iput ?
+                         if ( (flags & DF_IS_SETTER) != 0)
+@@ -1005,7 +1005,7 @@ static bool findGettersSetters (CompilationUnit *cUnit, BasicBlock *bb, void *da
+ 
+     for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
+     {
+-        int dfFlags = dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
++        long long dfFlags = dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
+ 
+         if (((dfFlags & DF_IS_SETTER) != 0) || ((dfFlags & DF_IS_GETTER) != 0) || dvmCompilerIsOpcodeVolatile (mir->dalvikInsn.opcode) == true)
+         {
+@@ -1099,7 +1099,7 @@ static bool checkIfNoClobberMemory (CompilationUnit *cUnit, BasicBlock *bb, void
+ 
+     for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
+     {
+-        int dfFlags = dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
++        long long dfFlags = dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
+ 
+         if ((dfFlags & DF_CLOBBERS_MEMORY) != 0)
+         {
+@@ -1207,7 +1207,7 @@ static std::set<MIR *> selectInvariants (CompilationUnit *cUnit, LoopInformation
+             MIR *mir = *iter;
+ 
+             //Get the dataflow flags
+-            int dfFlags = dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
++            long long dfFlags = dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
+ 
+             if ((dfFlags & DF_IS_SETTER) == 0)
+             {
+@@ -1333,7 +1333,7 @@ static void handleNullCheckHoisting (CompilationUnit *cUnit, LoopInformation *in
+         MIR *mir = *iter;
+ 
+         //Get the dataflow flags
+-        int dfFlags = dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
++        long long dfFlags = dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
+ 
+         //Check if we need to have object use but null check has not been done
+         if ((dfFlags & DF_HAS_OBJECT_CHECKS) != 0 && (mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK) == 0)
+diff --git a/vm/compiler/Loop.cpp b/vm/compiler/Loop.cpp
+index 7f5bbd1..1c50112 100644
+--- a/vm/compiler/Loop.cpp
++++ b/vm/compiler/Loop.cpp
+@@ -795,7 +795,7 @@ void dvmCompilerBodyCodeMotion (CompilationUnit *cUnit, Pass *currentPass)
+ 
+         for (mir = loopBody->firstMIRInsn; mir; mir = mir->next) {
+             DecodedInstruction *dInsn = &mir->dalvikInsn;
+-            int dfAttributes =
++            long long dfAttributes =
+                 dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
+ 
+             /* Skip extended MIR instructions */
+diff --git a/vm/compiler/LoopInformation.cpp b/vm/compiler/LoopInformation.cpp
+index f0303b3..64fe4b5 100644
+--- a/vm/compiler/LoopInformation.cpp
++++ b/vm/compiler/LoopInformation.cpp
+@@ -1298,7 +1298,7 @@ bool LoopInformation::guaranteedToThrowFirstIteration (const CompilationUnit *cU
+             }
+ 
+             //Get Dataflow flags
+-            int dfFlags = dvmCompilerDataFlowAttributes[insn.opcode];
++            long long dfFlags = dvmCompilerDataFlowAttributes[insn.opcode];
+ 
+             //If the bytecode contains null and range checks
+             if ( (dfFlags & DF_HAS_NR_CHECKS) != 0)
+diff --git a/vm/compiler/LoopRegisterUsage.cpp b/vm/compiler/LoopRegisterUsage.cpp
+index a2b93ec..554f543 100644
+--- a/vm/compiler/LoopRegisterUsage.cpp
++++ b/vm/compiler/LoopRegisterUsage.cpp
+@@ -75,7 +75,7 @@ static void handleVariants (LoopInformation *info, MIR *highest, BitVector *vari
+         int opcode = current->dalvikInsn.opcode;
+ 
+         //Get flags for it
+-        int dfAttributes = dvmCompilerDataFlowAttributes[opcode];
++        long long dfAttributes = dvmCompilerDataFlowAttributes[opcode];
+ 
+         //Check if getter/setter
+         if ( (dfAttributes & DF_IS_SETTER) != 0)
+@@ -154,8 +154,8 @@ static void handleVariants (LoopInformation *info, MIR *highest, BitVector *vari
+ static bool compareConstants (const DecodedInstruction &first, const DecodedInstruction &second)
+ {
+     //Get the associated flags
+-    int fflags = dvmCompilerDataFlowAttributes[first.opcode];
+-    int sflags = dvmCompilerDataFlowAttributes[second.opcode];
++    long long fflags = dvmCompilerDataFlowAttributes[first.opcode];
++    long long sflags = dvmCompilerDataFlowAttributes[second.opcode];
+ 
+     //We have a special case for getter and setters and all the others
+     //First test is that the fact that first and second are either a setter/getter is the same
+diff --git a/vm/compiler/RegisterizationME.cpp b/vm/compiler/RegisterizationME.cpp
+index f705ecc..698e490 100644
+--- a/vm/compiler/RegisterizationME.cpp
++++ b/vm/compiler/RegisterizationME.cpp
+@@ -612,7 +612,15 @@ static bool parseBlock (BasicBlock *bb, bool verbose)
+             case kMirOpPackedMultiply:
+             case kMirOpPackedAddition:
+             case kMirOpPackedAddReduce:
++            case kMirOpPackedReduce:
+             case kMirOpPackedSet:
++            case kMirOpPackedSubtract:
++            case kMirOpPackedXor:
++            case kMirOpPackedOr:
++            case kMirOpPackedAnd:
++            case kMirOpPackedShiftLeft:
++            case kMirOpPackedSignedShiftRight:
++            case kMirOpPackedUnsignedShiftRight:
+ 
+                 break;
+ 
+diff --git a/vm/compiler/SinkCastOpt.cpp b/vm/compiler/SinkCastOpt.cpp
+index d6b0cb8..937aa0a 100644
+--- a/vm/compiler/SinkCastOpt.cpp
++++ b/vm/compiler/SinkCastOpt.cpp
+@@ -222,7 +222,7 @@ static bool isCastSinkable(MIR *mir)
+     DecodedInstruction &insn = mir->dalvikInsn;
+ 
+     //Get dataflow flags
+-    int flags = dvmCompilerDataFlowAttributes[insn.opcode];
++    long long flags = dvmCompilerDataFlowAttributes[insn.opcode];
+ 
+     //First off, we only sink casts that aren't wide associated
+     if ( (flags & DF_DA_WIDE) != 0 || ( (flags & DF_UB_WIDE) != 0))
+@@ -318,7 +318,7 @@ static bool isInstructionSafeForCastSinking (const CompilationUnit *cUnit, const
+     Opcode opcode = mir->dalvikInsn.opcode;
+ 
+     //Get dataflow flags
+-    int flags = dvmCompilerDataFlowAttributes[opcode];
++    long long flags = dvmCompilerDataFlowAttributes[opcode];
+ 
+     //First off, we only sink casts that aren't wide associated
+     if ( (flags & DF_DA_WIDE) != 0 || ( (flags & DF_UB_WIDE) != 0))
+diff --git a/vm/compiler/Vectorization.cpp b/vm/compiler/Vectorization.cpp
+index ed8ed88..1358ac5 100644
+--- a/vm/compiler/Vectorization.cpp
++++ b/vm/compiler/Vectorization.cpp
+@@ -26,6 +26,8 @@
+ #include "PassDriver.h"
+ #include "Vectorization.h"
+ #include "Utility.h"
++#include "AccumulationSinking.h"
++#include "Expression.h"
+ 
+ #define VECTORIZATION_LOG(cUnit,data,function) \
+     do { \
+@@ -108,7 +110,7 @@ struct VectorizationInfo
+  * @param cUnit The CompilationUnit for the loop
+  * @param message The message to report as a reason for failure
+  */
+-static void reportFailure (const CompilationUnit *cUnit, const char *message)
++static void reportFailure (const CompilationUnit * const cUnit, const char *message)
+ {
+     ALOGI("JIT_INFO: Vectorization gate failed at %s%s@0x%02x: %s", cUnit->method->clazz->descriptor,
+             cUnit->method->name, cUnit->entryBlock->startOffset, message);
+@@ -119,7 +121,7 @@ static void reportFailure (const CompilationUnit *cUnit, const char *message)
+  * @param cUnit The CompilationUnit of the loop
+  * @param info The VectorizationInfo containing the information
+  */
+-static void dumpVectorRegisterUsage (const CompilationUnit *cUnit, VectorizationInfo *info)
++static void dumpVectorRegisterUsage (const CompilationUnit * const cUnit, VectorizationInfo *info)
+ {
+     ALOGI("\nVectorized loop info for %s%s@0x%02x:", cUnit->method->clazz->descriptor,
+             cUnit->method->name, cUnit->entryBlock->startOffset);
+@@ -155,6 +157,55 @@ static void dumpVectorRegisterUsage (const CompilationUnit *cUnit, Vectorization
+ }
+ 
+ /**
++* @brief a helper function to return association vectorized version for an opcode
++* @param scalarOpcode the scalar version of opcode
++* @return vectorized version of opcode or 0 if no match
++*/
++static ExtendedMIROpcode getVectorizedOpcode (Opcode scalarOpcode)
++{
++   ExtendedMIROpcode vectorizedOpcode = (ExtendedMIROpcode) 0;
++
++   switch (scalarOpcode)
++   {
++       case OP_ADD_INT:
++       case OP_ADD_INT_LIT8:
++       case OP_ADD_INT_LIT16:
++           vectorizedOpcode = kMirOpPackedAddition;
++           break;
++       case OP_MUL_INT:
++       case OP_MUL_INT_LIT8:
++       case OP_MUL_INT_LIT16:
++           vectorizedOpcode = kMirOpPackedMultiply;
++           break;
++       case OP_SUB_INT:
++       case OP_RSUB_INT:
++       case OP_RSUB_INT_LIT8:
++           vectorizedOpcode = kMirOpPackedSubtract;
++           break;
++       case OP_AND_INT:
++       case OP_AND_INT_LIT8:
++       case OP_AND_INT_LIT16:
++           vectorizedOpcode = kMirOpPackedAnd;
++           break;
++       case OP_OR_INT:
++       case OP_OR_INT_LIT8:
++       case OP_OR_INT_LIT16:
++           vectorizedOpcode = kMirOpPackedOr;
++           break;
++       case OP_XOR_INT:
++       case OP_XOR_INT_LIT8:
++       case OP_XOR_INT_LIT16:
++           vectorizedOpcode = kMirOpPackedXor;
++           break;
++       default:
++           // not supported yet
++           break;
++   }
++
++   return vectorizedOpcode;
++}
++
++/**
+  * @brief Check whether this MIR can remain in vectorized loop
+  * @details The acception process is a whitelist and only allows a few select bytecodes.
+  * No memory operations are accepted.
+@@ -163,14 +214,10 @@ static void dumpVectorRegisterUsage (const CompilationUnit *cUnit, Vectorization
+  */
+ static bool isVectorizable (MIR *mir)
+ {
+-    switch (mir->dalvikInsn.opcode)
++    //First check if we can create a vectorized instruction for this opcode
++    if (getVectorizedOpcode (mir->dalvikInsn.opcode) != 0)
+     {
+-        case OP_ADD_INT:
+-        case OP_ADD_INT_LIT8:
+-        case OP_MUL_INT:
+-            return true;
+-        default:
+-            break;
++        return true;
+     }
+ 
+     //We also allow conditionals in vectorized loops
+@@ -180,7 +227,7 @@ static bool isVectorizable (MIR *mir)
+     }
+ 
+     //We also allow constants in the loop but not wide
+-    int flags = dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
++    long long flags = dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
+     if ((flags & DF_DA_WIDE) != 0)
+     {
+         return false;
+@@ -206,6 +253,17 @@ static bool isVectorizableInstructionUseConstant (MIR *mir)
+     switch (opcode)
+     {
+         case OP_ADD_INT_LIT8:
++        case OP_ADD_INT_LIT16:
++        case OP_RSUB_INT_LIT8:
++        case OP_RSUB_INT:
++        case OP_MUL_INT_LIT8:
++        case OP_MUL_INT_LIT16:
++        case OP_AND_INT_LIT8:
++        case OP_AND_INT_LIT16:
++        case OP_OR_INT_LIT8:
++        case OP_OR_INT_LIT16:
++        case OP_XOR_INT_LIT8:
++        case OP_XOR_INT_LIT16:
+             return true;
+         default:
+             break;
+@@ -365,7 +423,7 @@ static void setOutputRegister (VectorizationInfo *info, int vr, bool value)
+  * @param loopInfo the LoopInformation
+  * @return the type for the vectorization
+  */
+-static VectorizedType findType (const CompilationUnit *cUnit, LoopInformation *loopInfo)
++static VectorizedType findType (const CompilationUnit * const cUnit, LoopInformation *loopInfo)
+ {
+     BasicBlock *loopBB = loopInfo->getEntryBlock ();
+ 
+@@ -491,7 +549,7 @@ unsigned int convertTypeToSize (VectorizedType type)
+  * @param bb the unique BasicBlock of the loop
+  * @param info the VectorizationInfo associated to the pass
+  */
+-static bool fillVectorizationInformation (const CompilationUnit *cUnit, LoopInformation *loopInformation, BasicBlock *bb, VectorizationInfo *info)
++static bool fillVectorizationInformation (const CompilationUnit * const cUnit, LoopInformation *loopInformation, BasicBlock *bb, VectorizationInfo *info)
+ {
+     //Paranoid
+     if (bb == 0 || info == 0)
+@@ -522,7 +580,7 @@ static bool fillVectorizationInformation (const CompilationUnit *cUnit, LoopInfo
+     increment *= convertTypeToHowManyPerIteration (info->type);
+ 
+     //Add it as a constant
+-    //Add 0, the proper XMM value will be filled up later
++    //Add 0, the proper vectorized value will be filled up later
+     info->constants[increment] = 0;
+ 
+     //Go through the MIRs of the BB and fill up information
+@@ -549,12 +607,37 @@ static bool fillVectorizationInformation (const CompilationUnit *cUnit, LoopInfo
+         //We count on isVectorizable not allowing any memory operations.
+         if (isVectorizable (mir) == false)
+         {
++            VECTORIZATION_LOG (cUnit, "MIR is not vectorizable", reportFailure);
+             return false;
+         }
+ 
+-        //If this the IV bytecode, ignore it (we handle it later)
++        //If this the IV bytecode, ensure that this is the last use of the MIR (and do nothing else)
+         if (mir->dalvikInsn.vA == vrIV && dvmCompilerIsOpcodeConditionalBranch (mir->dalvikInsn.opcode) == false)
+         {
++            //We should have non-wide defines
++            assert (ssaRep->numDefs == 1);
++
++            //We want to detect use of IV in the loop after its increment.
++            //So we walk through the uses now.
++            for (SUsedChain *uses = ssaRep->usedNext[0]; uses != 0; uses = uses->nextUse)
++            {
++                //We only care of uses in same loop as our IV increment.
++                //The gate ensures that the loop has one basic block so this check is adequate.
++                if (mir->bb == uses->mir->bb)
++                {
++                    //If we have a use that is not a phi node nor an if, then it becomes a bit more complicated
++                    //in terms of vectorization since we increment IV with its new packed step but we actually
++                    //need to use its single iteration addition form. Thus for now we reject this case.
++                    if (dvmCompilerIsOpcodeConditionalBranch (uses->mir->dalvikInsn.opcode) == false
++                            && uses->mir->dalvikInsn.opcode != static_cast<Opcode> (kMirOpPhi))
++                    {
++                        VECTORIZATION_LOG(cUnit, "Invalid use of IV after increment", reportFailure);
++                        return false;
++                    }
++                }
++            }
++
++            //We don't need any other handling for the IV here.
+             continue;
+         }
+ 
+@@ -594,23 +677,22 @@ static bool fillVectorizationInformation (const CompilationUnit *cUnit, LoopInfo
+ 
+             MIR *used = next->mir;
+ 
+-            /* If the use is the last MIR of the loop basic block, or belongs to another basic block,
+-            * ignore it
+-            */
++            //If the use is the last MIR of the loop basic block, or belongs to another basic block, ignore it
+             if (used->next == 0 || used->bb != mir->bb)
+             {
+                 continue;
+             }
+ 
+-            //If the next used is not the if OR if there is another use, we bail as well
+-            if (dvmCompilerIsOpcodeConditionalBranch (used->dalvikInsn.opcode) == false || next->nextUse != 0)
++            //If the next used is the conditional, we continue
++            if (dvmCompilerIsOpcodeConditionalBranch (used->dalvikInsn.opcode) == true)
+             {
+-                return false;
++                continue;
+             }
+ 
++            //So, it is being used by an instruction in the same BB, add a request for it
+             info->constants[constValueLow] = 0;
+ 
+-            //Move to the next MIR
++            //Move to the next MIR, we don't handle the destination because we actually won't be using it here
+             continue;
+         }
+ 
+@@ -637,8 +719,8 @@ static bool fillVectorizationInformation (const CompilationUnit *cUnit, LoopInfo
+         int useIndex = ssaRep->numUses - 1;
+ 
+         //For each use, check the defines
+-        while (useIndex >= 0) {
+-
++        while (useIndex >= 0)
++        {
+             //Get the used ssa register
+             int ssaReg = ssaRep->uses[useIndex];
+ 
+@@ -669,7 +751,6 @@ static bool fillVectorizationInformation (const CompilationUnit *cUnit, LoopInfo
+             //Add it to the constant map
+             info->constants[mir->dalvikInsn.vC] = 0;
+         }
+-
+     }
+ 
+     //We have added the IV as an output due to the PHI node. Remove it now
+@@ -723,7 +804,7 @@ void handleInductionVariable (CompilationUnit *cUnit, LoopInformation *loopInfo,
+     //Theoretically, it would be better to not have to go through the list again
+     int increment = loopInfo->getInductionIncrement (cUnit, vr);
+ 
+-    //Create the XMM we need here
++    //Create the vectorized register we need here
+     MIR *cst = dvmCompilerNewMIR ();
+ 
+     //Paranoid
+@@ -956,7 +1037,7 @@ static void sinkWrapUp (VectorizationInfo *info, BasicBlock *bb)
+  * @param info the LoopInformation
+  * @return whether there is a loop interdependency
+  */
+-static bool checkLoopDependency (const CompilationUnit *cUnit, LoopInformation *info)
++static bool checkLoopDependency (const CompilationUnit * const cUnit, LoopInformation *info)
+ {
+     BasicBlock *bb = info->getEntryBlock ();
+ 
+@@ -1053,97 +1134,207 @@ static bool checkLoopDependency (const CompilationUnit *cUnit, LoopInformation *
+ }
+ 
+ /**
+- * @brief Does the loop have a safe accumulation or would it be unsafe to vectorize?
+- * @param cUnit the CompilationUnit
+- * @param loopInfo the LoopInformation
+- * @param outputVR the output virtual register
+- * @return whether or not the loop has a safe accumulation when considering a given outputVR
++ * @brief Helper function to verify a safe accumulation
++ * @details Go through all the branches of the expression tree and confirm
++ * 1. That the VR is only seen once
++ * 2. The path to the VR from top only has add expressions
++ * @param cUnit The compilation unit
++ * @param exp The expression to check
++ * @param[out] didFail Whether we saw a failure
++ * @param VR The VR we are looking for
++ * @return Whether we saw the VR in the expression tree
+  */
+-static bool haveSafeAccumulation (CompilationUnit *cUnit, LoopInformation *loopInfo, unsigned int outputVR)
++static bool haveSafeAccumulationHelper (CompilationUnit *cUnit, BytecodeExpression *exp, bool &didFail, int VR)
+ {
+-    //Get the phi associated with the output VR
+-    MIR *phi = loopInfo->getPhiInstruction (cUnit, outputVR);
+-
+-    if (phi == 0)
++    if (exp == 0)
+     {
+-        //The output VR must be a phi node
+         return false;
+     }
+ 
+-    //Check that our only use is accumulation
+-    SSARepresentation *ssaRep = phi->ssaRep;
++    bool sawVRLeft = false;
++    bool sawVRRight = false;
+ 
+-    if (ssaRep->numDefs != 1)
++    if (exp->getExpressionKind() == ExpKind_Invalid)
+     {
+-        //We do not have logic to handle wide defines
++        //This is not a failure
++        didFail = false;
++
++        //We did not see the VR
+         return false;
+     }
+ 
+-    SUsedChain *chain = ssaRep->usedNext[0];
++    if (exp->getExpressionKind() == ExpKind_ConstSet)
++    {
++        //Check if the constant being set is our VR
++        VirtualRegister *vrExpression = exp->getAssignmentTo();
+ 
+-    if (chain->nextUse != 0)
++        int vrConstLow = dvmExtractSSARegister (cUnit, vrExpression->getLowSSAReg());
++        int vrConstHigh = -1;
++
++        if (vrExpression->getHighSSAReg() != -1)
++        {
++            vrConstHigh = dvmExtractSSARegister (cUnit, vrExpression->getHighSSAReg());
++        }
++
++        if (vrConstLow == VR || vrConstHigh == VR)
++        {
++            //This should not happen. We are accumulating
++            didFail = true;
++
++            //We did see the VR (though we have failed so doesn't matter)
++            return true;
++        }
++    }
++
++    /*
++     * For the other expressions, we check the following:
++     * 1. If this expression is an ADD, we care only if we are defining VR, if we are
++     *    we should not see VR in the other branch. Otherwise, we should see VR is in at most
++     *    one child
++     *
++     * 2. If this expression is not an ADD, we should not see VR in either children, including the
++     *    fact that we should not be defining VR
++     */
++
++    //Get both the children
++    Expression *lhs = exp->getChildren()[0];
++    Expression *rhs = exp->getChildren()[1];
++
++    //Check the left side first
++    if (lhs != 0 && lhs->isBytecodeExpression() == true)
+     {
+-        //We cannot have more than one use
+-        VECTORIZATION_LOG (cUnit, "Multiple uses of the accumulation VR", reportFailure);
+-        return false;
++        //We now look for the VR in the lhs expression. We pass didFail to routine because it will update it.
++        sawVRLeft = haveSafeAccumulationHelper (cUnit, static_cast<BytecodeExpression *>(lhs), didFail, VR);
+     }
+ 
+-    assert (chain->mir != 0);
+-    assert (chain->mir->bb != 0);
++    //Bail if we failed already
++    if (didFail == true)
++    {
++        return (sawVRLeft == true || sawVRRight == true);
++    }
+ 
+-    Opcode opcode = chain->mir->dalvikInsn.opcode;
++    //Check the right side
++    if (rhs != 0 && rhs->isBytecodeExpression() == true)
++    {
++        //We now look for the VR in the rhs expression. We pass didFail to routine because it will update it.
++        sawVRRight = haveSafeAccumulationHelper (cUnit, static_cast<BytecodeExpression *>(rhs), didFail, VR);
++    }
+ 
+-    if ((dvmCompilerDataFlowAttributes[opcode] & DF_ADD_EXPRESSION) == 0)
++    //If we saw the VR on both sides, or we failed on one side
++    if (didFail == true || (sawVRLeft == true && sawVRRight == true))
+     {
+-        //We don't have accumulation, we cannot vectorize
+-        VECTORIZATION_LOG (cUnit, "We cannot vectorize if there is no accumulation", reportFailure);
+-        return false;
++        return true;
+     }
+ 
+-    if (loopInfo->contains (chain->mir->bb) == false)
++    //Now check if we set the VR
++    int lhsVR = -1;
++    int rhsVR = -1;
++
++    if (lhs->isVirtualRegister() == true)
+     {
+-        //This must be in the loop
+-        return false;
++        lhsVR = dvmExtractSSARegister (cUnit, static_cast<VirtualRegister *>(lhs)->getLowSSAReg());
+     }
+ 
+-    //Now check that we are redefining output VR
+-    ssaRep = chain->mir->ssaRep;
++    if (rhs->isVirtualRegister() == true)
++    {
++        rhsVR = dvmExtractSSARegister (cUnit, static_cast<VirtualRegister *>(rhs)->getLowSSAReg());
++    }
+ 
+-    if (ssaRep->numDefs != 1)
++    //If this is not an Add, neither this or any of the children should have our VR
++    if (exp->getExpressionKind() != ExpKind_Add)
+     {
+-        //We do not have logic to handle wide defines
++        if (lhsVR == VR || rhsVR == VR || sawVRLeft == true || sawVRRight == true)
++        {
++            didFail = true;
++        }
++    }
++    else
++    {
++        //Check the remaining cases in which we can see the VR twice
++        //Check both expressions here
++        if (lhsVR == VR && rhsVR == VR)
++        {
++            didFail = true;
++        }
++
++        //Check this VR and right child
++        if (lhsVR == VR && sawVRRight == true)
++        {
++            didFail = true;
++        }
++
++        //Check this VR and left child
++        if (rhsVR == VR && sawVRLeft == true)
++        {
++            didFail = true;
++        }
++    }
++
++    return (sawVRLeft == true || sawVRRight == true);
++}
++
++/**
++ * @brief Does the loop have a safe accumulation or would it be unsafe to vectorize?
++ * @details An unsafe accumulation is one whose result is used by another expression.
++ * For example: a = a + b; c = c + a; the second accumulation is "unsafe" because
++ * vectorization accumulates into broken up vectorized a and then reduces to the actual a.
++ * Thus we would need to ensure to keep c = c + a around at the exit after the a reduction
++ * but before the c reduction.
++ * @param cUnit the CompilationUnit
++ * @param loopInfo the LoopInformation
++ * @param outputVR the output virtual register
++ * @return whether or not the loop has a safe accumulation when considering a given outputVR
++ */
++static bool haveSafeAccumulation (CompilationUnit *cUnit, LoopInformation *loopInfo, unsigned int outputVR)
++{
++    //Get the phi associated with the output VR
++    MIR *phi = loopInfo->getPhiInstruction (cUnit, outputVR);
++
++    if (phi == 0)
++    {
++        //The output VR must be a phi node
+         return false;
+     }
+ 
+-    if (dvmExtractSSARegister (cUnit, ssaRep->defs[0]) != outputVR)
++    //Check that our only use is accumulation
++    SSARepresentation *ssaRep = phi->ssaRep;
++
++    if (ssaRep->numDefs != 1)
+     {
+-        //We must redefine ourselves
++        //We do not have logic to handle wide defines
+         return false;
+     }
+ 
+-    //Find the next use of this redefinition
+-    chain = ssaRep->usedNext[0];
++    //Get the expressions for the Phi nodes and see if they are accumulations
++    std::vector<Expression *> ivExpressions;
++    dvmCompilerGetLoopExpressions (cUnit, loopInfo, ivExpressions);
+ 
+-    while (chain != 0)
++    for (std::vector<Expression *>::iterator it = ivExpressions.begin(); it != ivExpressions.end(); it++)
+     {
+-        //The next use must be input into phi node we started with
+-        if (chain->mir->bb == phi->bb)
++        BytecodeExpression *bcExpression = static_cast<BytecodeExpression *>(*it);
++
++        if (bcExpression == 0)
+         {
+-            if (chain->mir != phi)
+-            {
+-                VECTORIZATION_LOG (cUnit, "Next use of accumulation is not a Phi", reportFailure);
+-                return false;
+-            }
++            continue;
+         }
+ 
+-        chain = chain->nextUse;
++        bool failure = false;
++
++        haveSafeAccumulationHelper (cUnit, bcExpression, failure, outputVR);
++
++        if (failure == true)
++        {
++            //Our expression tree does not have a safe accumulation
++            VECTORIZATION_LOG (cUnit, "Multiple uses of the accumulation VR", reportFailure);
++            return false;
++        }
+     }
+ 
+     //Everything is good
+     return true;
+ }
+ 
+-static bool vectorizationGate (const CompilationUnit *cUnit, LoopInformation *loopInfo, VectorizationInfo *info)
++static bool vectorizationGate (const CompilationUnit * const cUnit, LoopInformation *loopInfo, VectorizationInfo *info)
+ {
+     //Check if we are looking at simple loop
+     if (dvmCompilerVerySimpleLoopGateWithLoopInfo (cUnit, loopInfo) == false)
+@@ -1474,34 +1665,9 @@ static void linkBlocks (BasicBlock *vectorizedTest,
+     vectorizedExit->fallThrough = normalTest;
+ }
+ 
+- /**
+- * @brief a helper function to return association vectorized version for an opcode
+- * @param scalarOpcode the scalar version of opcode
+- * @return vectorized version of opcode or 0 if no match
+- */
+-ExtendedMIROpcode getVectorizedOpcode (Opcode scalarOpcode)
+-{
+-    ExtendedMIROpcode vectorizedOpcode = (ExtendedMIROpcode) 0;
+-
+-    switch (scalarOpcode)
+-    {
+-        case OP_ADD_INT:
+-        case OP_ADD_INT_LIT8:
+-            vectorizedOpcode = kMirOpPackedAddition;
+-            break;
+-        case OP_MUL_INT:
+-            vectorizedOpcode = kMirOpPackedMultiply;
+-            break;
+-        default:
+-            // not supported yet
+-            break;
+-    }
+-
+-    return vectorizedOpcode;
+-}
+-
+ /**
+- * @brief Handle the add literal vectorization
++ * @brief Handle the generation of vectorization instruction for alu operation with literal
++ * @details Generates a vectorized extended MIR equivalent to the int alu operation
+  * @param cUnit the CompilationUnit
+  * @param loopInformation the LoopInformation
+  * @param info the VectorizationInfo
+@@ -1509,26 +1675,26 @@ ExtendedMIROpcode getVectorizedOpcode (Opcode scalarOpcode)
+  * @param mir the MIR instruction
+  * @param size of the vectorization in bytes
+  */
+-static void handleAddLiteral (CompilationUnit *cUnit, LoopInformation *loopInformation, VectorizationInfo *info, BasicBlock *vectorizedBB, MIR *mir, unsigned int size)
++static void handleAluLiteral (CompilationUnit *cUnit, LoopInformation *loopInformation, VectorizationInfo *info,
++        BasicBlock *vectorizedBB, MIR *mir, unsigned int size)
+ {
+     //Get the opcode
+     Opcode opcode = mir->dalvikInsn.opcode;
+ 
+-    //Let's see if this is an IV
+-    if (loopInformation->isAnBasicInductionVariable(cUnit, mir->dalvikInsn.vA) == true)
++    //Let's see if this is a basic IV
++    if (loopInformation->isAnBasicInductionVariable (cUnit, mir->dalvikInsn.vA) == true)
+     {
+         MIR *vectorizedIV = dvmCompilerNewMIR ();
+ 
+-        /* We need to generate an IV increment adjusted to the vectorization
+-         * Basically look for the XMM containing the constant increment adjusted
+-         * to the number of iterations skipped due to vectorization
+-         */
++        //We need to generate an IV increment adjusted to the vectorization.
++        //Basically look for the vectorized register containing the constant increment adjusted
++        //to the number of iterations skipped due to vectorization.
+         int increment = mir->dalvikInsn.vC;
+-        increment *= convertTypeToHowManyPerIteration(info->type);
++        increment *= convertTypeToHowManyPerIteration (info->type);
+ 
+         std::map <int, int>::iterator itConst = info->constants.find (increment);
+ 
+-        //Convert the IV increment to a regular XMM addition
++        //Convert the IV increment to a regular vectorized addition
+         DecodedInstruction &insn = vectorizedIV->dalvikInsn;
+ 
+         insn.opcode = static_cast<Opcode> (getVectorizedOpcode (opcode));
+@@ -1550,7 +1716,7 @@ static void handleAddLiteral (CompilationUnit *cUnit, LoopInformation *loopInfor
+     }
+     else
+     {
+-        //This is not an IV. We need to transform it into one vector add using the constant vectorized register
++        //This is not an BIV. We need to transform it into one vector alu operation using the constant vectorized register
+         std::map <int, int>::iterator itConst = info->constants.find (mir->dalvikInsn.vC);
+ 
+         //Get instruction
+@@ -1572,9 +1738,16 @@ static void handleAddLiteral (CompilationUnit *cUnit, LoopInformation *loopInfor
+             newInsn.vA = associationA.vectorized;
+ 
+             // set the vB for new mir
+-            std::map <int, RegisterAssociation>::iterator itB = info->registers.find (insn.vB);
+-            RegisterAssociation &associationB = itB->second;
+-            newInsn.vB = associationB.vectorized;
++            if (opcode == OP_RSUB_INT || opcode == OP_RSUB_INT_LIT8)
++            {
++                newInsn.vB = itConst->second;
++            }
++            else
++            {
++                std::map<int, RegisterAssociation>::iterator itB = info->registers.find (insn.vB);
++                RegisterAssociation &associationB = itB->second;
++                newInsn.vB = associationB.vectorized;
++            }
+ 
+             // insert it before current mir
+             dvmCompilerInsertMIRBefore(vectorizedBB, mir, newMir);
+@@ -1582,21 +1755,30 @@ static void handleAddLiteral (CompilationUnit *cUnit, LoopInformation *loopInfor
+ 
+         //Now change this MIR
+         mir->dalvikInsn.vA = (info->registers.find (mir->dalvikInsn.vA)->second).vectorized;
+-        mir->dalvikInsn.vB = itConst->second;
++        if (opcode == OP_RSUB_INT || opcode == OP_RSUB_INT_LIT8)
++        {
++            mir->dalvikInsn.vB = (info->registers.find (mir->dalvikInsn.vB)->second).vectorized;
++        }
++        else
++        {
++            mir->dalvikInsn.vB = itConst->second;
++        }
+         mir->dalvikInsn.vC = convertTypeToSize(info->type);
+         mir->dalvikInsn.opcode = static_cast<Opcode>(getVectorizedOpcode (mir->dalvikInsn.opcode));
+     }
+ }
+ 
+ /**
+- * @brief Handle the vectorization of an addition or a multiplication
++ * @brief Handle the generation of vectorization instruction for alu operation
++ * @details Generates a vectorized extended MIR equivalent to the int alu operation
+  * @param cUnit the CompilationUnit
+  * @param info the VectorizationInfo
+  * @param vectorizedBB the BasicBlock which is getting vectorized
+  * @param mir the MIR instruction
+  * @param size of the vectorization in bytes
+  */
+-static void handleAddMultiply (CompilationUnit *cUnit, VectorizationInfo *info, BasicBlock *vectorizedBB, MIR *mir, unsigned int size)
++static void handleAlu (CompilationUnit *cUnit, VectorizationInfo *info, BasicBlock *vectorizedBB, MIR *mir,
++        unsigned int size)
+ {
+     //Get opcode
+     Opcode opcode = mir->dalvikInsn.opcode;
+@@ -1643,12 +1825,12 @@ static void handleAddMultiply (CompilationUnit *cUnit, VectorizationInfo *info,
+             dvmCompilerInsertMIRBefore(vectorizedBB, mir, newMir);
+         }
+ 
+-        // find destination XMM Reg
++        // find destination vectorized Reg
+         std::map <int, RegisterAssociation>::iterator itA = info->registers.find (insn.vA);
+         RegisterAssociation &associationA = itA->second;
+         insn.vA = associationA.vectorized;
+ 
+-        // find source XMM Reg
++        // find source vectorized Reg
+         std::map <int, RegisterAssociation>::iterator itC = info->registers.find (srcVr2);
+         RegisterAssociation &associationC = itC->second;
+         insn.vB = associationC.vectorized;
+@@ -1659,11 +1841,46 @@ static void handleAddMultiply (CompilationUnit *cUnit, VectorizationInfo *info,
+ }
+ 
+ /**
++ * @brief Find a temporary VR that is used for vectorization constant placeholder
++ * @param cUnit The compilation unit
++ * @param info The vectorization information
++ * @return the temporary VR that will never live by end of pass
++ */
++static unsigned int findTemporaryVRForConstant (const CompilationUnit * const cUnit, VectorizationInfo *info)
++{
++    //We are creating a temporary that will die in the vectorized loop.
++    //But we want a number that won't clash with any of the virtual registers numbers.
++    //So we begin the temporary search from the end of the cUnit VR numbers.
++    unsigned int temporary = cUnit->numDalvikRegisters + 1;
++
++    //Get an iterator
++    std::map<int, RegisterAssociation>::const_iterator found;
++
++    //Get the register map
++    std::map<int, RegisterAssociation> &registers = info->registers;
++
++    do
++    {
++        //Augment the counter
++        temporary++;
++
++        //Did we find it or not?
++        found = registers.find (temporary);
++
++        //Start again if we did
++    } while (found != registers.end ());
++
++    //Return the register we can use
++    return temporary;
++}
++
++/**
+  * @brief Handle the vectorization of a constant
+  * @param cUnit the CompilationUnit
+  * @param loopInformation the LoopInformation
+  * @param info the VectorizationInfo
+  * @param mir the MIR instruction
++ * @return did we remove the instruction?
+  */
+ static void handleConstant (CompilationUnit *cUnit, LoopInformation *loopInformation, VectorizationInfo *info, MIR *mir)
+ {
+@@ -1692,9 +1909,14 @@ static void handleConstant (CompilationUnit *cUnit, LoopInformation *loopInforma
+     //Find the MIR where this is used
+     if (ssaRep->usedNext != 0 && ssaRep->usedNext[0] != 0)
+     {
++        //Ok it is being used, let's find out where
+         MIR *useMIR = ssaRep->usedNext[0]->mir;
+ 
+-        if (useMIR->dalvikInsn.opcode >= OP_IF_EQ && useMIR->dalvikInsn.opcode <= OP_IF_LE)
++        //Paranoid
++        assert (useMIR != 0);
++
++        //Ok, is it being used by the if?
++        if (dvmCompilerIsOpcodeConditionalBranch (useMIR->dalvikInsn.opcode) == true)
+         {
+             if (useMIR->dalvikInsn.vA == vrIV || useMIR->dalvikInsn.vB == vrIV)
+             {
+@@ -1702,6 +1924,57 @@ static void handleConstant (CompilationUnit *cUnit, LoopInformation *loopInforma
+                 mir->dalvikInsn.vB -= convertTypeToHowManyPerIteration(info->type);
+             }
+         }
++        else
++        {
++            //We are dealing with a constant that is not used by the loop's if.
++            //However, it is used by instructions that will become vectorized so we need to ensure that at
++            //some point we fill a vector register with this constant. So what we do first is we rewrite
++            //all users of the constant to actually use a non-existent virtual register that we track. This
++            //register we track is the one associated with the vectorized register that holds the constant
++            //that vectorized operations needing the constant will themselves use.
++
++            //So first we get a temporary VR we can use that does not exist in cUnit
++            unsigned int tempVR = findTemporaryVRForConstant (cUnit, info);
++
++            //Then we remember the old VR that the const bytecode was writing to
++            unsigned int oldVR = mir->dalvikInsn.vA;
++
++            //Now we rewrite all of the MIRs in the loop's basic block to use this new VR that we are using
++            //solely for tracking the constant. All the instructions that we rewrite will be transformed
++            //into vectorized instructions.
++            bool result = dvmCompilerRewriteMirDef (mir, oldVR, tempVR, true, true);
++
++            //The const bytecode was writing to a virtual register that will still be live out
++            //So now we restore the const define solely because it is the only one that doesn't
++            //need a reduce, since we know the constant already.
++            mir->dalvikInsn.vA = oldVR;
++
++            //Paranoid
++            assert (result == true);
++
++            //Finally, assign to the register world the tempVR and assign to it the right constant vectorized register
++            bool isWide = false;
++            int constValueLow;
++            int constValueHigh;
++            bool setsConst = dexGetConstant (mir->dalvikInsn, constValueLow, constValueHigh, isWide);
++
++            //Paranoid: the gate should have said no to wide constants
++            assert (setsConst == true && isWide == false);
++
++            //Unused in non assert world
++            (void) setsConst;
++            (void) isWide;
++
++            //Since we preserved the const bytecode, we do not set the temporary VR as an output one.
++            setOutputRegister (info, tempVR, false);
++
++            //Now get the vectorized register and track it
++            int vectorizedRegister = info->constants[constValueLow];
++            info->registers[tempVR].vectorized = vectorizedRegister;
++
++            //Unused in non assert world
++            (void) result;
++        }
+     }
+ }
+ 
+@@ -1727,12 +2000,27 @@ static void transformMirVectorized (CompilationUnit *cUnit,
+ 
+     switch (opcode) {
+         case OP_ADD_INT_LIT8:
+-            handleAddLiteral (cUnit, loopInformation, info, vectorizedBB, mir, size);
++        case OP_ADD_INT_LIT16:
++        case OP_RSUB_INT:
++        case OP_RSUB_INT_LIT8:
++        case OP_MUL_INT_LIT8:
++        case OP_MUL_INT_LIT16:
++        case OP_AND_INT_LIT8:
++        case OP_AND_INT_LIT16:
++        case OP_OR_INT_LIT8:
++        case OP_OR_INT_LIT16:
++        case OP_XOR_INT_LIT8:
++        case OP_XOR_INT_LIT16:
++            handleAluLiteral (cUnit, loopInformation, info, vectorizedBB, mir, size);
+             break;
+ 
+         case OP_ADD_INT:
++        case OP_SUB_INT:
+         case OP_MUL_INT:
+-            handleAddMultiply (cUnit, info, vectorizedBB, mir, size);
++        case OP_AND_INT:
++        case OP_OR_INT:
++        case OP_XOR_INT:
++            handleAlu (cUnit, info, vectorizedBB, mir, size);
+             break;
+ 
+         case OP_CONST:
+@@ -1915,6 +2203,9 @@ static bool vectorizeHelper (CompilationUnit *cUnit, LoopInformation *loopInform
+     //We want to link things together
+     linkBlocks (vectorizedTest, copyExit, mainTest, postExit);
+ 
++    //At this point, recalculate SSA now: no filtering but do update the loop information
++    dvmCompilerCalculateBasicBlockInformation (cUnit, false, true);
++
+     //We have the CFG up now, what we want to do is now transform the vectorized loop into... a vectorized loop
+     transformVectorized (cUnit, loopInformation, &info, copyPreHeader, copyBasicBlock, copyExit, copyBWCC);
+ 
+diff --git a/vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp b/vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp
+index 1b54b85..6da0fe4 100644
+--- a/vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp
++++ b/vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp
+@@ -1252,28 +1252,24 @@ void endOfBasicBlock(BasicBlock* bb) {
+ 
+ /**
+  * @brief decide if skip the extended Op whose implementation uses NcgO0 mode
+- * @param opc opcode of the extended MIR
++ * @param opcode opcode of the extended MIR
+  * @return return false if the opcode doesn't use NcgO0, otherwise return true
+  */
+-bool skipExtendedMir(Opcode opc) {
+-    ExtendedMIROpcode extendedOpCode = static_cast<ExtendedMIROpcode> (opc);
+-
+-    switch (extendedOpCode)
++bool skipExtendedMir (int opcode)
++{
++    switch (opcode)
+     {
+-        case kMirOpCheckInlinePrediction:
+-        case kMirOpRegisterize:
+-        case kMirOpMove128b:
+-        case kMirOpConst128b:
+-        case kMirOpPackedMultiply:
+-        case kMirOpPackedAddition:
+-        case kMirOpPackedAddReduce:
+-        case kMirOpPackedSet:
+-        case kMirOpNullCheck:
+-        case kMirOpCheckStackOverflow:
+-            return false;
+-        default:
++        case kMirOpBoundCheck:
++        case kMirOpNullNRangeUpCheck:
++        case kMirOpNullNRangeDownCheck:
++        case kMirOpLowerBound:
+             return true;
++        default:
++            break;
+     }
++
++    //By default all implementations use NCGO1 mode
++    return false;
+ }
+ 
+ /** entry point to collect information about virtual registers used in a basic block
+diff --git a/vm/compiler/codegen/x86/lightcg/BytecodeVisitor.cpp b/vm/compiler/codegen/x86/lightcg/BytecodeVisitor.cpp
+index 85ef544..cc662ca 100644
+--- a/vm/compiler/codegen/x86/lightcg/BytecodeVisitor.cpp
++++ b/vm/compiler/codegen/x86/lightcg/BytecodeVisitor.cpp
+@@ -1506,6 +1506,9 @@ int getVirtualRegInfo (VirtualRegInfo* infoArray, const MIR * currentMIR, bool u
+         isExtended = true;
+ 
+         switch (static_cast<ExtendedMIROpcode>(currentMIR->dalvikInsn.opcode)) {
++            case kMirOpPhi:
++                num_regs_per_bytecode = 0;
++                break;
+             case kMirOpRegisterize:
+                 infoArray[0].regNum = currentMIR->dalvikInsn.vA;
+                 infoArray[0].refCount = 2;
+@@ -1546,6 +1549,13 @@ int getVirtualRegInfo (VirtualRegInfo* infoArray, const MIR * currentMIR, bool u
+             case kMirOpMove128b:
+             case kMirOpPackedMultiply:
+             case kMirOpPackedAddition:
++            case kMirOpPackedSubtract:
++            case kMirOpPackedXor:
++            case kMirOpPackedOr:
++            case kMirOpPackedAnd:
++            case kMirOpPackedShiftLeft:
++            case kMirOpPackedSignedShiftRight:
++            case kMirOpPackedUnsignedShiftRight:
+                 //No virtual registers are being used
+                 num_regs_per_bytecode = 0;
+                 break;
+@@ -1558,6 +1568,15 @@ int getVirtualRegInfo (VirtualRegInfo* infoArray, const MIR * currentMIR, bool u
+ 
+                 num_regs_per_bytecode = 1;
+                 break;
++            case kMirOpPackedReduce:
++                //One virtual register defined to store final reduction
++                infoArray[0].regNum = currentMIR->dalvikInsn.vA;
++                infoArray[0].refCount = 1;
++                infoArray[0].accessType = REGACCESS_D;
++                infoArray[0].physicalType = LowOpndRegType_gp;
++
++                num_regs_per_bytecode = 1;
++                break;
+             case kMirOpPackedSet:
+                 //One virtual register used to load into 128-bit register
+                 infoArray[0].regNum = currentMIR->dalvikInsn.vB;
+@@ -1588,9 +1607,12 @@ int getVirtualRegInfo (VirtualRegInfo* infoArray, const MIR * currentMIR, bool u
+                 num_regs_per_bytecode = 0;
+                 break;
+             default:
+-                ALOGI("JIT_INFO: Extended MIR not supported in getVirtualRegInfo");
++            {
++                char *decoded = dvmCompilerGetDalvikDisassembly(&currentMIR->dalvikInsn, NULL);
++                ALOGI("JIT_INFO: Extended MIR not supported in getVirtualRegInfo: %s", decoded);
+                 SET_JIT_ERROR(kJitErrorUnsupportedBytecode);
+                 return -1;
++            }
+         }
+     }
+ 
+@@ -3798,42 +3820,58 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR, const u2* dal
+                 return 1;
+             }
+             case kMirOpMove128b:
++            case kMirOpPackedMultiply:
++            case kMirOpPackedAddition:
++            case kMirOpPackedSubtract:
++            case kMirOpPackedXor:
++            case kMirOpPackedOr:
++            case kMirOpPackedAnd:
+             {
+                 const int sourceXmm = PhysicalReg_StartOfXmmMarker + currentMIR->dalvikInsn.vB;
+                 const int destXmm = PhysicalReg_StartOfXmmMarker + currentMIR->dalvikInsn.vA;
++                int numTemps = 0;
+ 
+-                infoArray[0].regNum = sourceXmm;
+-                infoArray[0].refCount = 1;
+-                infoArray[0].physicalType = LowOpndRegType_xmm | LowOpndRegType_hard;
++                if (sourceXmm == destXmm)
++                {
++                    infoArray[0].regNum = destXmm;
++                    infoArray[0].refCount = 2;
++                    infoArray[0].physicalType = LowOpndRegType_xmm | LowOpndRegType_hard;
+ 
+-                infoArray[1].regNum = destXmm;
+-                infoArray[1].refCount = 1;
+-                infoArray[1].physicalType = LowOpndRegType_xmm | LowOpndRegType_hard;
++                    numTemps = 1;
++                }
++                else
++                {
++                    infoArray[0].regNum = sourceXmm;
++                    infoArray[0].refCount = 1;
++                    infoArray[0].physicalType = LowOpndRegType_xmm | LowOpndRegType_hard;
+ 
+-                return 2;
++                    //The destination is used and then defined
++                    infoArray[1].regNum = destXmm;
++                    infoArray[1].refCount = 1;
++                    infoArray[1].physicalType = LowOpndRegType_xmm | LowOpndRegType_hard;
++
++                    numTemps = 2;
++                }
++
++                return numTemps;
+             }
+-            case kMirOpPackedMultiply:
+-            case kMirOpPackedAddition:
++            case kMirOpPackedShiftLeft:
++            case kMirOpPackedSignedShiftRight:
++            case kMirOpPackedUnsignedShiftRight:
+             {
+-                const int sourceXmm = PhysicalReg_StartOfXmmMarker + currentMIR->dalvikInsn.vB;
+                 const int destXmm = PhysicalReg_StartOfXmmMarker + currentMIR->dalvikInsn.vA;
+ 
+-                infoArray[0].regNum = sourceXmm;
++                infoArray[0].regNum = destXmm;
+                 infoArray[0].refCount = 1;
+                 infoArray[0].physicalType = LowOpndRegType_xmm | LowOpndRegType_hard;
+ 
+-                //The destination is used and then defined
+-                infoArray[1].regNum = destXmm;
+-                infoArray[1].refCount = 2;
+-                infoArray[1].physicalType = LowOpndRegType_xmm | LowOpndRegType_hard;
+-
+                 return 2;
+             }
+             case kMirOpPackedAddReduce:
+             {
+                 OpndSize vecUnitSize = static_cast<OpndSize> (currentMIR->dalvikInsn.vC);
+ 
+-                //Determine number of times we need to do horizontal add to fully saturate
++                //Determine number of times we need to do horizontal operation
+                 int times = 0;
+                 int width = 16 / vecUnitSize;
+                 while (width > 1)
+@@ -3868,6 +3906,23 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR, const u2* dal
+ 
+                 return 3;
+             }
++            case kMirOpPackedReduce:
++            {
++                //We will use one xmm for doing the reduction
++                const int reductionXmm = PhysicalReg_StartOfXmmMarker + currentMIR->dalvikInsn.vB;
++                infoArray[0].regNum = reductionXmm;
++                infoArray[0].physicalType = LowOpndRegType_xmm | LowOpndRegType_hard;
++                infoArray[0].refCount = 1;
++
++                //We need a temporary to use for virtual register
++                const int temp1 = 1;
++                infoArray[1].regNum = temp1;
++                infoArray[1].physicalType = LowOpndRegType_gp;
++                infoArray[1].refCount = 1;
++                infoArray[1].shareWithVR = true;
++
++                return 2;
++            }
+             case kMirOpPackedSet:
+             {
+                 const unsigned int operandSize = currentMIR->dalvikInsn.vC;
+diff --git a/vm/compiler/codegen/x86/lightcg/CodegenInterface.cpp b/vm/compiler/codegen/x86/lightcg/CodegenInterface.cpp
+index 6c7119a..c7ffb14 100644
+--- a/vm/compiler/codegen/x86/lightcg/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/lightcg/CodegenInterface.cpp
+@@ -419,12 +419,20 @@ bool dvmCompilerArchSupportsExtendedOp (int extendedOpcode)
+         case kMirOpLowerBound:
+         case kMirOpCheckInlinePrediction:
+         case kMirOpRegisterize:
++        case kMirOpPackedSet:
++        case kMirOpConst128b:
+         case kMirOpMove128b:
+         case kMirOpPackedAddition:
+         case kMirOpPackedMultiply:
++        case kMirOpPackedSubtract:
++        case kMirOpPackedShiftLeft:
++        case kMirOpPackedSignedShiftRight:
++        case kMirOpPackedUnsignedShiftRight:
++        case kMirOpPackedAnd:
++        case kMirOpPackedOr:
++        case kMirOpPackedXor:
+         case kMirOpPackedAddReduce:
+-        case kMirOpConst128b:
+-        case kMirOpPackedSet:
++        case kMirOpPackedReduce:
+         case kMirOpCheckStackOverflow:
+             return true;
+         default:
+@@ -1431,92 +1439,105 @@ bool handleExtendedMIR (CompilationUnit *cUnit, BasicBlock_O1 *bb, MIR *mir)
+     //Assume that we will be able to handle it
+     bool result = true;
+ 
+-    //Some of the extended MIRs only have implementations that use hardcoded registers.
+-    //For that reason we switch the "NCGO0" mode manually now. However, since that will
+-    //eventually be deprecated all new extended MIRs are implemented with "NCGO1" mode
+-    //and thus below we manually switch back the execution mode
+-    ExecutionMode origMode = gDvm.executionMode;
+-    gDvm.executionMode = kExecutionModeNcgO0;
+-
+-    switch ((ExtendedMIROpcode)mir->dalvikInsn.opcode) {
+-        case kMirOpPhi: {
++    switch ((ExtendedMIROpcode) mir->dalvikInsn.opcode)
++    {
++        case kMirOpPhi:
++            //Nothing to do
+             break;
+-        }
+-        case kMirOpNullCheck: {
+-            gDvm.executionMode = origMode;
++        case kMirOpNullCheck:
+             genHoistedNullCheck (cUnit, mir);
+             break;
+-        }
+-        case kMirOpBoundCheck: {
++        case kMirOpBoundCheck:
++        {
++            ExecutionMode origMode = gDvm.executionMode;
++            gDvm.executionMode = kExecutionModeNcgO0;
++
+             genHoistedBoundCheck (cUnit, mir);
++
++            gDvm.executionMode = origMode;
+             break;
+         }
+-        case kMirOpNullNRangeUpCheck: {
+-            genHoistedChecksForCountUpLoop(cUnit, mir);
+-            break;
+-        }
+-        case kMirOpNullNRangeDownCheck: {
+-            genHoistedChecksForCountDownLoop(cUnit, mir);
++        case kMirOpNullNRangeUpCheck:
++        {
++            ExecutionMode origMode = gDvm.executionMode;
++            gDvm.executionMode = kExecutionModeNcgO0;
++
++            genHoistedChecksForCountUpLoop (cUnit, mir);
++
++            gDvm.executionMode = origMode;
+             break;
+         }
+-        case kMirOpLowerBound: {
+-            genHoistedLowerBoundCheck(cUnit, mir);
++        case kMirOpNullNRangeDownCheck:
++        {
++            ExecutionMode origMode = gDvm.executionMode;
++            gDvm.executionMode = kExecutionModeNcgO0;
++
++            genHoistedChecksForCountDownLoop (cUnit, mir);
++
++            gDvm.executionMode = origMode;
+             break;
+         }
+-        case kMirOpPunt: {
++        case kMirOpLowerBound:
++        {
++            ExecutionMode origMode = gDvm.executionMode;
++            gDvm.executionMode = kExecutionModeNcgO0;
++
++            genHoistedLowerBoundCheck (cUnit, mir);
++
++            gDvm.executionMode = origMode;
+             break;
+         }
+-        case kMirOpRegisterize: {
+-            gDvm.executionMode = origMode;
++        case kMirOpRegisterize:
+             result = genRegisterize (cUnit, bb, mir);
+             break;
+-        }
+         case kMirOpCheckInlinePrediction:
+-        {
+-            gDvm.executionMode = origMode;
+             result = genValidationForPredictedInline (cUnit, mir);
+             break;
+-        }
+         case kMirOpMove128b:
+-        {
+-            gDvm.executionMode = origMode;
+             result = genMove128b (cUnit, mir);
+             break;
+-        }
+         case kMirOpPackedAddition:
+-        {
+-            gDvm.executionMode = origMode;
+-            result = genPackedAddition (cUnit, mir);
++            result = genPackedAlu (cUnit, mir, add_opc);
+             break;
+-        }
+         case kMirOpPackedMultiply:
+-        {
+-            gDvm.executionMode = origMode;
+-            result = genPackedMultiply (cUnit, mir);
++            result = genPackedAlu (cUnit, mir, mul_opc);
++            break;
++        case kMirOpPackedSubtract:
++            result = genPackedAlu (cUnit, mir, sub_opc);
++            break;
++        case kMirOpPackedXor:
++            result = genPackedAlu (cUnit, mir, xor_opc);
++            break;
++        case kMirOpPackedOr:
++            result = genPackedAlu (cUnit, mir, or_opc);
++            break;
++        case kMirOpPackedAnd:
++            result = genPackedAlu (cUnit, mir, and_opc);
++            break;
++        case kMirOpPackedShiftLeft:
++            result = genPackedAlu (cUnit, mir, shl_opc);
++            break;
++        case kMirOpPackedSignedShiftRight:
++            result = genPackedAlu (cUnit, mir, sar_opc);
++            break;
++        case kMirOpPackedUnsignedShiftRight:
++            result = genPackedAlu (cUnit, mir, shr_opc);
+             break;
+-        }
+         case kMirOpPackedAddReduce:
+-        {
+-            gDvm.executionMode = origMode;
++            result = genPackedHorizontalOperationWithReduce (cUnit, mir, add_opc);
++            break;
++        case kMirOpPackedReduce:
+             result = genPackedReduce (cUnit, mir);
+             break;
+-        }
+-        case kMirOpConst128b: {
+-            gDvm.executionMode = origMode;
++        case kMirOpConst128b:
+             result = genMoveData128b (cUnit, mir);
+             break;
+-        }
+-        case kMirOpPackedSet: {
+-            gDvm.executionMode = origMode;
++        case kMirOpPackedSet:
+             result = genPackedSet (cUnit, mir);
+             break;
+-        }
+         case kMirOpCheckStackOverflow:
+-        {
+-            gDvm.executionMode = origMode;
+             genCheckStackOverflow (cUnit, mir);
+             break;
+-        }
+         default:
+         {
+             char * decodedString = dvmCompilerGetDalvikDisassembly(&mir->dalvikInsn, NULL);
+@@ -1526,8 +1547,6 @@ bool handleExtendedMIR (CompilationUnit *cUnit, BasicBlock_O1 *bb, MIR *mir)
+         }
+     }
+ 
+-    gDvm.executionMode = origMode;
+-
+     return result;
+ }
+ 
+diff --git a/vm/compiler/codegen/x86/lightcg/InstructionGeneration.cpp b/vm/compiler/codegen/x86/lightcg/InstructionGeneration.cpp
+index 8c76d1c..e43d972 100644
+--- a/vm/compiler/codegen/x86/lightcg/InstructionGeneration.cpp
++++ b/vm/compiler/codegen/x86/lightcg/InstructionGeneration.cpp
+@@ -462,33 +462,62 @@ bool genMoveData128b (CompilationUnit *cUnit, MIR *mir)
+     return true;
+ }
+ 
+-bool genPackedAddition (CompilationUnit *cUnit, MIR *mir)
++bool genPackedAlu (CompilationUnit *cUnit, MIR *mir, ALU_Opcode aluOperation)
+ {
+     int dstXmm = mir->dalvikInsn.vA + PhysicalReg_StartOfXmmMarker;
+-    int srcXmm = mir->dalvikInsn.vB + PhysicalReg_StartOfXmmMarker;
+     OpndSize vecUnitSize = static_cast<OpndSize> (mir->dalvikInsn.vC);
+ 
+-    //Do the vector add now
+-    bool success = vec_add_reg_reg (srcXmm, true, dstXmm, true, vecUnitSize);
+-    return success;
+-}
+-
+-bool genPackedMultiply (CompilationUnit *cUnit, MIR *mir)
+-{
+-    int dstXmm = mir->dalvikInsn.vA + PhysicalReg_StartOfXmmMarker;
++    //For some of the packed extended MIRs, the field vB can mean different things.
++    //For shifts, the vB holds immediate. For others it holds the vector register.
++    //So right now we set both up and each invidual implementation picks one of these.
+     int srcXmm = mir->dalvikInsn.vB + PhysicalReg_StartOfXmmMarker;
+-    OpndSize vecUnitSize = static_cast<OpndSize> (mir->dalvikInsn.vC);
++    int immediate = mir->dalvikInsn.vB;
++
++    bool success = false;
++
++    switch (aluOperation)
++    {
++        case add_opc:
++            success = vec_add_reg_reg (srcXmm, true, dstXmm, true, vecUnitSize);
++            break;
++        case mul_opc:
++            success = vec_mul_reg_reg (srcXmm, true, dstXmm, true, vecUnitSize);
++            break;
++        case sub_opc:
++            success = vec_sub_reg_reg (srcXmm, true, dstXmm, true, vecUnitSize);
++            break;
++        case and_opc:
++            success = vec_and_reg_reg (srcXmm, true, dstXmm, true);
++            break;
++        case or_opc:
++            success = vec_or_reg_reg (srcXmm, true, dstXmm, true);
++            break;
++        case xor_opc:
++            success = vec_xor_reg_reg (srcXmm, true, dstXmm, true);
++            break;
++        case shl_opc:
++            success = vec_shift_left_imm_reg (immediate, dstXmm, true, vecUnitSize);
++            break;
++        case shr_opc:
++            success = vec_unsigned_shift_right_imm_reg (immediate, dstXmm, true, vecUnitSize);
++            break;
++        case sar_opc:
++            success = vec_signed_shift_right_imm_reg (immediate, dstXmm, true, vecUnitSize);
++            break;
++        default:
++            ALOGD ("JIT_INFO: Unsupported operation type for packed alu generation.");
++            break;
++    }
+ 
+-    //Do the vector multiply now
+-    bool success = vec_mul_reg_reg (srcXmm, true, dstXmm, true, vecUnitSize);
+     return success;
+ }
+ 
+-bool genPackedReduce (CompilationUnit *cUnit, MIR *mir)
++bool genPackedHorizontalOperationWithReduce (CompilationUnit *cUnit, MIR *mir, ALU_Opcode horizontalOperation)
+ {
+     int dstVr = mir->dalvikInsn.vA;
+     int srcXmm = mir->dalvikInsn.vB + PhysicalReg_StartOfXmmMarker;
+     OpndSize vecUnitSize = static_cast<OpndSize> (mir->dalvikInsn.vC);
++    int extractIndex = mir->dalvikInsn.arg[0];
+ 
+     if (vecUnitSize > OpndSize_32)
+     {
+@@ -496,14 +525,28 @@ bool genPackedReduce (CompilationUnit *cUnit, MIR *mir)
+         return false;
+     }
+ 
+-    //Now determine number of times we need to do the horizontal add to fully saturate
++    //Now determine number of times we need to do the horizontal operation
+     const unsigned int vectorBytes = 16;
+     int width = vectorBytes / vecUnitSize;
+ 
+     //Create the right number of horizontal adds
+     while (width > 1)
+     {
+-        bool success = vec_horizontal_add_reg_reg (srcXmm, true, srcXmm, true, vecUnitSize);
++        bool success = false;
++
++        if (horizontalOperation == add_opc)
++        {
++            success = vec_horizontal_add_reg_reg (srcXmm, true, srcXmm, true, vecUnitSize);
++        }
++        else if (horizontalOperation == sub_opc)
++        {
++            success = vec_horizontal_sub_reg_reg (srcXmm, true, srcXmm, true, vecUnitSize);
++        }
++        else
++        {
++            ALOGD ("JIT_INFO: Unsupported horizontal operation for packed reduce");
++            return false;
++        }
+ 
+         if (success == false)
+         {
+@@ -519,7 +562,7 @@ bool genPackedReduce (CompilationUnit *cUnit, MIR *mir)
+     const int temp2 = 2;
+ 
+     //Now do the actual extraction
+-    bool extracted = vec_extract_imm_reg_reg (0, srcXmm, true, temp2, false, vecUnitSize);
++    bool extracted = vec_extract_imm_reg_reg (extractIndex, srcXmm, true, temp2, false, vecUnitSize);
+ 
+     if (extracted == false)
+     {
+@@ -569,3 +612,28 @@ bool genCheckStackOverflow (CompilationUnit *cUnit, MIR *mir)
+     //If we get here everything went well
+     return true;
+ }
++
++bool genPackedReduce (CompilationUnit *cUnit, MIR *mir)
++{
++    int dstVr = mir->dalvikInsn.vA;
++    int srcXmm = mir->dalvikInsn.vB + PhysicalReg_StartOfXmmMarker;
++    int extractIndex = mir->dalvikInsn.arg[0];
++    OpndSize vecUnitSize = static_cast<OpndSize> (mir->dalvikInsn.vC);
++
++    //Use temp 1 for VR. We extract directly there
++    const int temp1 = 1;
++
++    //Now do the actual extraction
++    bool extracted = vec_extract_imm_reg_reg (extractIndex, srcXmm, true, temp1, false, vecUnitSize);
++
++    if (extracted == false)
++    {
++        //Just pass the error message
++        return false;
++    }
++
++    //Now alias the destination VR to the temp where we figured out result
++    set_virtual_reg (dstVr, OpndSize_32, temp1, false);
++
++    return true;
++}
+diff --git a/vm/compiler/codegen/x86/lightcg/InstructionGeneration.h b/vm/compiler/codegen/x86/lightcg/InstructionGeneration.h
+index 850282f..a3ec38d 100644
+--- a/vm/compiler/codegen/x86/lightcg/InstructionGeneration.h
++++ b/vm/compiler/codegen/x86/lightcg/InstructionGeneration.h
+@@ -18,6 +18,7 @@
+ #define H_DALVIK_INSTRUCTIONGENERATION
+ 
+ #include "Dalvik.h"
++#include "enc_wrapper.h"
+ 
+ //Forward declarations
+ class BasicBlock_O1;
+@@ -124,27 +125,30 @@ bool genPackedSet (CompilationUnit *cUnit, MIR *mir);
+ bool genMoveData128b (CompilationUnit *cUnit, MIR *mir);
+ 
+ /**
+- * @brief Generate a packed addition between two XMMs
+- * @param cUnit The CompilationUnit
+- * @param mir The MIR containing the dest and source XMM reg numbers
+- * @return whether the operation was successful
++ * @brief Used to generate a packed alu operation
++ * @details The vectorized registers are mapped 1:1 to XMM registers
++ * @param cUnit The compilation unit
++ * @param mir The vectorized MIR
++ * @param aluOperation The operation for which to generate vectorize operation for.
++ * Add, mul, sub, or, xor, and, shl, shr, and sar are supported.
++ * @return Returns whether the generation was successful
+  */
+-bool genPackedAddition (CompilationUnit *cUnit, MIR *mir);
++bool genPackedAlu (CompilationUnit *cUnit, MIR *mir, ALU_Opcode aluOperation);
+ 
+ /**
+- * @brief Generate a packed multiply between two XMMs
+- * @param cUnit The CompilationUnit
+- * @param mir The MIR containing the dest and source XMM reg numbers
+- * @return whether the operation was successful
++ * @brief Used to generate a horizontal operation whose result will be reduced to a VR
++ * @param cUnit The compilation unit
++ * @param mir The vectorized MIR
++ * @param horizontalOperation The horizontal operation to use for reduction. Add and sub are supported.
++ * @return Returns whether the generation was successful
+  */
+-bool genPackedMultiply (CompilationUnit *cUnit, MIR *mir);
++bool genPackedHorizontalOperationWithReduce (CompilationUnit *cUnit, MIR *mir, ALU_Opcode horizontalOperation);
+ 
+ /**
+- * @brief Generate a reduction of XMM to a VR
+- * @details Create a 128 bit value, with all 16 bytes / vC values equal to vB
+- * @param cUnit The CompilationUnit
+- * @param mir The MIR containing the dest VR and source XMM number
+- * @return whether the operation was successful
++ * @brief Used to generate a reduction from XMM to virtual register
++ * @param cUnit The compilation unit
++ * @param mir The vectorized MIR
++ * @return Returns whether the generation was successful
+  */
+ bool genPackedReduce (CompilationUnit *cUnit, MIR *mir);
+ 
+diff --git a/vm/compiler/codegen/x86/lightcg/Lower.cpp b/vm/compiler/codegen/x86/lightcg/Lower.cpp
+index 268c1fb..5cf2b23 100644
+--- a/vm/compiler/codegen/x86/lightcg/Lower.cpp
++++ b/vm/compiler/codegen/x86/lightcg/Lower.cpp
+@@ -544,7 +544,7 @@ int lowerByteCodeCanThrowCheck(const Method* method, const MIR * mir, const u2 *
+     // We do not activate delay if VRs state is not changed
+     if ((flags & kInstrCanThrow) != 0)
+     {
+-        int dfAttributes = dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
++        long long dfAttributes = dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
+ 
+         if ( (dfAttributes & DF_IS_CALL) == 0) { // Not applicable to calls
+             int mirOptFlags = mir->OptimizationFlags;
+diff --git a/vm/compiler/codegen/x86/lightcg/Lower.h b/vm/compiler/codegen/x86/lightcg/Lower.h
+index a4dc3ae..039b3a6 100644
+--- a/vm/compiler/codegen/x86/lightcg/Lower.h
++++ b/vm/compiler/codegen/x86/lightcg/Lower.h
+@@ -1326,8 +1326,10 @@ LowOpRegMem* dump_reg_mem_noalloc(Mnemonic m, OpndSize size,
+                            int reg, bool isPhysical,
+                            int disp, int base_reg, bool isBasePhysical,
+                            MemoryAccessType mType, int mIndex, LowOpndRegType type);
+-LowOpImmReg* dump_imm_reg(Mnemonic m, AtomOpCode m2, OpndSize size,
+-                   int imm, int reg, bool isPhysical, LowOpndRegType type, bool chaining, SwitchInfoScheduler * switchInfoScheduler);
++
++LowOpImmReg* dump_imm_reg (Mnemonic m, AtomOpCode m2, OpndSize size, int imm, int reg, bool isPhysical,
++        LowOpndRegType type, bool chaining = false, SwitchInfoScheduler * switchInfoScheduler = 0);
++
+ void dump_imm_reg_reg (Mnemonic op, AtomOpCode m2, int imm, OpndSize immediateSize, int sourceReg,
+         bool isSourcePhysical, LowOpndRegType sourcePhysicalType, OpndSize sourceRegSize, int destReg,
+         bool isDestPhysical, LowOpndRegType destPhysicalType, OpndSize destRegSize);
+@@ -1542,9 +1544,9 @@ void printEmittedCodeBlock(unsigned char *startAddr, unsigned char *endAddr);
+  * @param isSrcPhysical Whether srcReg is physical
+  * @param destReg The 128-bit register where the result is to be stored
+  * @param isDestPhysical whether destReg is physical
+- * @param vectorUnitSize The size of the shuffle (1-byte / 2-byte etc)
++ * @param vectorUnitSize The size of the packed elements in bytes
+  * @param mask Up to 16-bits of mask bits
+- * @return whether the operation was successful
++ * @return Returns true if generating instruction was successful
+  */
+ bool vec_shuffle_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical, OpndSize vectorUnitSize,
+         unsigned short mask);
+@@ -1555,8 +1557,8 @@ bool vec_shuffle_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bool isDe
+  * @param isSrcPhysical Whether srcReg is physical
+  * @param destReg The 128-bit register where the result is to be stored
+  * @param isDestPhysical whether destReg is physical
+- * @param vectorUnitSize The size of the add (1-byte / 2-byte etc)
+- * @return whether the operation was successful
++ * @param vectorUnitSize The size of the packed elements in bytes
++ * @return Returns true if generating instruction was successful
+  */
+ bool vec_add_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical, OpndSize vectorUnitSize);
+ 
+@@ -1566,37 +1568,170 @@ bool vec_add_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bool isDestPh
+  * @param isSrcPhysical Whether srcReg is physical
+  * @param destReg The 128-bit register where the result is to be stored
+  * @param isDestPhysical whether destReg is physical
+- * @param vectorUnitSize The size of the multiplication (1-byte / 2-byte etc)
+- * @return whether the operation was successful
++ * @param vectorUnitSize The size of the packed elements in bytes
++ * @return Returns true if generating instruction was successful
+  */
+ bool vec_mul_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical, OpndSize vectorUnitSize);
+ 
+ /**
++ * @brief Applies one of the PSUBx instructions depending on size.
++ * @details Operation applied is minuend - subtrahend = dest stored in minuend
++ * @param subtrahend The 128-bit register holding the packed values to subtract
++ * @param isSubtrahendPhysical Whether the register is physical
++ * @param minuend The 128-bit register holding the packed values to subtract from.
++ * Result of subtraction is stored in this register.
++ * @param isMinuendPhysical Whether the register is physical
++ * @param vectorUnitSize The size of the packed elements in bytes
++ * @return Returns true if generating instruction was successful
++ */
++bool vec_sub_reg_reg (int subtrahend, bool isSubtrahendPhysical, int minuend, bool isMinuendPhysical,
++        OpndSize vectorUnitSize);
++
++/**
+  * @brief Applies one of the PHADDx operations depending on size
+- * @param srcReg The 128-bit register containing the src value
++ * @param srcReg The 128-bit register containing the packed source values
+  * @param isSrcPhysical Whether srcReg is physical
+  * @param destReg The 128-bit register where the result is to be stored
+  * @param isDestPhysical whether destReg is physical
+- * @param vectorUnitSize The size of the add (1-byte / 2-byte etc)
+- * @return whether the operation was successful
++ * @param vectorUnitSize The size of the packed elements in bytes
++ * @return Returns true if generating instruction was successful
+  */
+ bool vec_horizontal_add_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical,
+         OpndSize vectorUnitSize);
+ 
+ /**
+- * @brief Extracts the "count" indexed portion of the XMM into a GPR
++ * @brief Applies one of the PHSUBx operations depending on size
++ * @param srcReg The 128-bit register containing the packed source values
++ * @param isSrcPhysical Whether srcReg is physical
++ * @param destReg The 128-bit register where the result is to be stored
++ * @param isDestPhysical whether destReg is physical
++ * @param vectorUnitSize The size of the packed elements in bytes
++ * @return Returns true if generating instruction was successful
++ */
++bool vec_horizontal_sub_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical,
++        OpndSize vectorUnitSize);
++
++/**
++ * @brief Extracts the indexed portion of the XMM into a GPR (PEXTR)
+  * @param index the offset to use to extract from the XMM
+  * @param srcReg The 128-bit register containing the src value
+  * @param isSrcPhysical Whether srcReg is physical
+  * @param destReg The 128-bit register where the result is to be stored
+  * @param isDestPhysical whether destReg is physical
+- * @param vectorUnitSize The size of the chunk to extract (1-byte / 2-byte etc)
+- * @return whether the operation was successful
++ * @param vectorUnitSize The size of the chunk to extract (1-byte / 2-byte / 4-byte)
++ * @return Returns true if generating instruction was successful
+  */
+ bool vec_extract_imm_reg_reg (int index, int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical,
+         OpndSize vectorUnitSize);
+ 
+ /**
++ * @brief Used to do a bitwise and of two XMM registers (PAND)
++ * @param srcReg The 128-bit register containing the src value
++ * @param isSrcPhysical Whether srcReg is physical
++ * @param destReg The 128-bit register where the result is to be stored
++ * @param isDestPhysical whether destReg is physical
++ * @return Returns true if generating instruction was successful
++ */
++bool vec_and_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical);
++
++/**
++ * @brief Used to do a bitwise or of two XMM registers (POR)
++ * @param srcReg The 128-bit register containing the src value
++ * @param isSrcPhysical Whether srcReg is physical
++ * @param destReg The 128-bit register where the result is to be stored
++ * @param isDestPhysical whether destReg is physical
++ * @return Returns true if generating instruction was successful
++ */
++bool vec_or_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical);
++
++/**
++ * @brief Used to do a bitwise xor of two XMM registers (PXOR)
++ * @param srcReg The 128-bit register containing the src value
++ * @param isSrcPhysical Whether srcReg is physical
++ * @param destReg The 128-bit register where the result is to be stored
++ * @param isDestPhysical whether destReg is physical
++ * @return Returns true if generating instruction was successful
++ */
++bool vec_xor_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical);
++
++/**
++ * @brief Used to generate a left shift of XMM using srcReg as the register holding shift amount in bits (PSLL)
++ * @param srcReg The 128-bit register containing the src value
++ * @param isSrcPhysical Whether srcReg is physical
++ * @param destReg The 128-bit register where the result is to be stored
++ * @param isDestPhysical whether destReg is physical
++ * @param vectorUnitSize The size of the chunk to extract (1-byte / 2-byte / 4-byte)
++ * @return Returns true if generating instruction was successful
++ */
++bool vec_shift_left_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical, OpndSize vectorUnitSize);
++
++/**
++ * @brief Used the generate a left shift of XMM using numBits as the immediate for shift amount (PSLL)
++ * @param numBits The number of bits for the shift
++ * @param destReg The 128-bit register where the result is to be stored
++ * @param isDestPhysical whether destReg is physical
++ * @param vectorUnitSize The size of the chunk to extract (1-byte / 2-byte / 4-byte)
++ * @return Returns true if generating instruction was successful
++ */
++bool vec_shift_left_imm_reg (int numBits, int destReg, bool isDestPhysical, OpndSize vectorUnitSize);
++
++/**
++ * @brief Used to generate a signed right shift of XMM using srcReg as the register holding shift amount in bits (PSRA)
++ * @param srcReg The 128-bit register containing the src value
++ * @param isSrcPhysical Whether srcReg is physical
++ * @param destReg The 128-bit register where the result is to be stored
++ * @param isDestPhysical whether destReg is physical
++ * @param vectorUnitSize The size of the chunk to extract (1-byte / 2-byte / 4-byte)
++ * @return Returns true if generating instruction was successful
++ */
++bool vec_signed_shift_right_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical,
++        OpndSize vectorUnitSize);
++
++/**
++ * @brief Used the generate a signed right shift of XMM using numBits as the immediate for shift amount (PSRA)
++ * @param numBits The number of bits for the shift
++ * @param destReg The 128-bit register where the result is to be stored
++ * @param isDestPhysical whether destReg is physical
++ * @param vectorUnitSize The size of the chunk to extract (1-byte / 2-byte / 4-byte)
++ * @return Returns true if generating instruction was successful
++ */
++bool vec_signed_shift_right_imm_reg (int numBits, int destReg, bool isDestPhysical, OpndSize vectorUnitSize);
++
++/**
++ * @brief Used to generate an unsigned right shift of XMM using srcReg as the register holding shift amount in bits (PSRL)
++ * @param srcReg The 128-bit register containing the src value
++ * @param isSrcPhysical Whether srcReg is physical
++ * @param destReg The 128-bit register where the result is to be stored
++ * @param isDestPhysical whether destReg is physical
++ * @param vectorUnitSize The size of the chunk to extract (1-byte / 2-byte / 4-byte)
++ * @return Returns true if generating instruction was successful
++ */
++bool vec_unsigned_shift_right_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical,
++        OpndSize vectorUnitSize);
++
++/**
++ * @brief Used the generate an unsigned right shift of XMM using numBits as the immediate for shift amount (PSRL)
++ * @param numBits The number of bits for the shift
++ * @param destReg The 128-bit register where the result is to be stored
++ * @param isDestPhysical whether destReg is physical
++ * @param vectorUnitSize The size of the chunk to extract (1-byte / 2-byte / 4-byte)
++ * @return Returns true if generating instruction was successful
++ */
++bool vec_unsigned_shift_right_imm_reg (int numBits, int destReg, bool isDestPhysical, OpndSize vectorUnitSize);
++
++/**
++ * @brief Does a horizontal subtract reduce on XMM registers (PHSUB)
++ * @param srcReg The 128-bit register containing the src value
++ * @param isSrcPhysical Whether srcReg is physical
++ * @param destReg The 128-bit register where the result is to be stored
++ * @param isDestPhysical whether destReg is physical
++ * @param vectorUnitSize The size of the chunk to extract (1-byte / 2-byte / 4-byte)
++ * @return Returns true if generating instruction was successful
++ */
++bool vec_horizontal_sub_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical,
++        OpndSize vectorUnitSize);
++
++/**
+  * @brief Entry point of the LCG backend
+  * @param cUnit the CompilationUnit
+  * @param info the JitTranslationInfo
+diff --git a/vm/compiler/codegen/x86/lightcg/LowerHelper.cpp b/vm/compiler/codegen/x86/lightcg/LowerHelper.cpp
+index 6ecb3f2..d8d2949 100644
+--- a/vm/compiler/codegen/x86/lightcg/LowerHelper.cpp
++++ b/vm/compiler/codegen/x86/lightcg/LowerHelper.cpp
+@@ -1002,7 +1002,7 @@ static bool isShiftMnemonic (Mnemonic m)
+ {
+     return (m == Mnemonic_SAL || m == Mnemonic_SHR || m == Mnemonic_SHL || m == Mnemonic_SAR || m == Mnemonic_ROR
+             || m == Mnemonic_PSLLD || m == Mnemonic_PSLLQ || m == Mnemonic_PSLLW || m == Mnemonic_PSRAD
+-            || m == Mnemonic_PSRAW || m == Mnemonic_PSRLQ);
++            || m == Mnemonic_PSRAW || m == Mnemonic_PSRLQ || m == Mnemonic_PSRLD || m == Mnemonic_PSRLW);
+ }
+ 
+ //!update fields of LowOp and generate a x86 instruction that takes one immediate and one reg operand
+@@ -4611,7 +4611,7 @@ bool vec_add_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bool isDestPh
+             op = Mnemonic_PADDQ;
+             break;
+         default:
+-            ALOGD ("JIT_INFO: Cannot support vectorized add for size %d", vectorUnitSize);
++            ALOGD ("JIT_INFO: Cannot support vectorized addition for size %d", vectorUnitSize);
+             SET_JIT_ERROR (kJitErrorUnsupportedVectorization);
+             return false;
+             break;
+@@ -4642,7 +4642,7 @@ bool vec_mul_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bool isDestPh
+             op = Mnemonic_PMULLD;
+             break;
+         default:
+-            ALOGD ("JIT_INFO: Cannot support vectorized mul for size %d", vectorUnitSize);
++            ALOGD ("JIT_INFO: Cannot support vectorized multiplication for size %d", vectorUnitSize);
+             SET_JIT_ERROR (kJitErrorUnsupportedVectorization);
+             return false;
+             break;
+@@ -4654,6 +4654,234 @@ bool vec_mul_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bool isDestPh
+     return true;
+ }
+ 
++bool vec_and_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical)
++{
++    Mnemonic op = Mnemonic_PAND;
++
++    dump_reg_reg (op, ATOM_NORMAL_ALU, OpndSize_128, srcReg, isSrcPhysical, destReg, isDestPhysical, LowOpndRegType_xmm);
++
++    //If we get here everything went well
++    return true;
++}
++
++bool vec_or_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical)
++{
++    Mnemonic op = Mnemonic_POR;
++
++    dump_reg_reg (op, ATOM_NORMAL_ALU, OpndSize_128, srcReg, isSrcPhysical, destReg, isDestPhysical, LowOpndRegType_xmm);
++
++    //If we get here everything went well
++    return true;
++}
++
++bool vec_xor_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical)
++{
++    Mnemonic op = Mnemonic_PXOR;
++
++    dump_reg_reg (op, ATOM_NORMAL_ALU, OpndSize_128, srcReg, isSrcPhysical, destReg, isDestPhysical, LowOpndRegType_xmm);
++
++    //If we get here everything went well
++    return true;
++}
++
++bool vec_sub_reg_reg (int subtrahend, bool isSubtrahendPhysical, int minuend, bool isMinuendPhysical, OpndSize vectorUnitSize)
++{
++    Mnemonic op;
++
++    switch (vectorUnitSize)
++    {
++        case OpndSize_8:
++            op = Mnemonic_PSUBB;
++            break;
++        case OpndSize_16:
++            op = Mnemonic_PSUBW;
++            break;
++        case OpndSize_32:
++            op = Mnemonic_PSUBD;
++            break;
++        case OpndSize_64:
++            op = Mnemonic_PSUBQ;
++            break;
++        default:
++            ALOGD ("JIT_INFO: Cannot support vectorized subtract for size %d", vectorUnitSize);
++            SET_JIT_ERROR (kJitErrorUnsupportedVectorization);
++            return false;
++            break;
++    }
++
++    // minuend - subtrahend = dest (result of difference is stored in dest)
++    const int src = subtrahend;
++    const int dest = minuend;
++
++    dump_reg_reg (op, ATOM_NORMAL_ALU, OpndSize_128, src, isSubtrahendPhysical, dest, isMinuendPhysical,
++            LowOpndRegType_xmm);
++
++    //If we get here everything went well
++    return true;
++}
++
++bool vec_shift_left_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical, OpndSize vectorUnitSize)
++{
++    Mnemonic op;
++
++    switch (vectorUnitSize)
++    {
++        case OpndSize_16:
++            op = Mnemonic_PSLLW;
++            break;
++        case OpndSize_32:
++            op = Mnemonic_PSLLD;
++            break;
++        case OpndSize_64:
++            op = Mnemonic_PSLLQ;
++            break;
++        default:
++            ALOGD ("JIT_INFO: Cannot support vectorized shift left for size %d", vectorUnitSize);
++            SET_JIT_ERROR (kJitErrorUnsupportedVectorization);
++            return false;
++            break;
++    }
++
++    dump_reg_reg (op, ATOM_NORMAL_ALU, OpndSize_128, srcReg, isSrcPhysical, destReg, isDestPhysical, LowOpndRegType_xmm);
++
++    //If we get here everything went well
++    return true;
++}
++
++bool vec_shift_left_imm_reg (int numBits, int destReg, bool isDestPhysical, OpndSize vectorUnitSize)
++{
++    Mnemonic op;
++
++    switch (vectorUnitSize)
++    {
++        case OpndSize_16:
++            op = Mnemonic_PSLLW;
++            break;
++        case OpndSize_32:
++            op = Mnemonic_PSLLD;
++            break;
++        case OpndSize_64:
++            op = Mnemonic_PSLLQ;
++            break;
++        default:
++            ALOGD ("JIT_INFO: Cannot support vectorized shift left for size %d", vectorUnitSize);
++            SET_JIT_ERROR (kJitErrorUnsupportedVectorization);
++            return false;
++            break;
++    }
++
++    dump_imm_reg (op, ATOM_NORMAL_ALU, OpndSize_128, numBits, destReg, isDestPhysical, LowOpndRegType_xmm);
++
++    //If we get here everything went well
++    return true;
++}
++
++bool vec_signed_shift_right_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical, OpndSize vectorUnitSize)
++{
++    Mnemonic op;
++
++    switch (vectorUnitSize)
++    {
++        case OpndSize_16:
++            op = Mnemonic_PSRAW;
++            break;
++        case OpndSize_32:
++            op = Mnemonic_PSRAD;
++            break;
++        default:
++            ALOGD ("JIT_INFO: Cannot support vectorized signed shift right for size %d", vectorUnitSize);
++            SET_JIT_ERROR (kJitErrorUnsupportedVectorization);
++            return false;
++            break;
++    }
++
++    dump_reg_reg (op, ATOM_NORMAL_ALU, OpndSize_128, srcReg, isSrcPhysical, destReg, isDestPhysical, LowOpndRegType_xmm);
++
++    //If we get here everything went well
++    return true;
++}
++
++bool vec_signed_shift_right_imm_reg (int numBits, int destReg, bool isDestPhysical, OpndSize vectorUnitSize)
++{
++    Mnemonic op;
++
++    switch (vectorUnitSize)
++    {
++        case OpndSize_16:
++            op = Mnemonic_PSRAW;
++            break;
++        case OpndSize_32:
++            op = Mnemonic_PSRAD;
++            break;
++        default:
++            ALOGD ("JIT_INFO: Cannot support vectorized signed shift right for size %d", vectorUnitSize);
++            SET_JIT_ERROR (kJitErrorUnsupportedVectorization);
++            return false;
++            break;
++    }
++
++    dump_imm_reg (op, ATOM_NORMAL_ALU, OpndSize_128, numBits, destReg, isDestPhysical, LowOpndRegType_xmm);
++
++    //If we get here everything went well
++    return true;
++}
++
++bool vec_unsigned_shift_right_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical, OpndSize vectorUnitSize)
++{
++    Mnemonic op;
++
++    switch (vectorUnitSize)
++    {
++        case OpndSize_16:
++            op = Mnemonic_PSRLW;
++            break;
++        case OpndSize_32:
++            op = Mnemonic_PSRLD;
++            break;
++        case OpndSize_64:
++            op = Mnemonic_PSRLQ;
++            break;
++        default:
++            ALOGD ("JIT_INFO: Cannot support vectorized unsigned shift right for size %d", vectorUnitSize);
++            SET_JIT_ERROR (kJitErrorUnsupportedVectorization);
++            return false;
++            break;
++    }
++
++    dump_reg_reg (op, ATOM_NORMAL_ALU, OpndSize_128, srcReg, isSrcPhysical, destReg, isDestPhysical, LowOpndRegType_xmm);
++
++    //If we get here everything went well
++    return true;
++}
++
++bool vec_unsigned_shift_right_imm_reg (int numBits, int destReg, bool isDestPhysical, OpndSize vectorUnitSize)
++{
++    Mnemonic op;
++
++    switch (vectorUnitSize)
++    {
++        case OpndSize_16:
++            op = Mnemonic_PSRLW;
++            break;
++        case OpndSize_32:
++            op = Mnemonic_PSRLD;
++            break;
++        case OpndSize_64:
++            op = Mnemonic_PSRLQ;
++            break;
++        default:
++            ALOGD ("JIT_INFO: Cannot support vectorized unsigned shift right for size %d", vectorUnitSize);
++            SET_JIT_ERROR (kJitErrorUnsupportedVectorization);
++            return false;
++            break;
++    }
++
++    dump_imm_reg (op, ATOM_NORMAL_ALU, OpndSize_128, numBits, destReg, isDestPhysical, LowOpndRegType_xmm);
++
++    //If we get here everything went well
++    return true;
++}
++
+ bool vec_horizontal_add_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical, OpndSize vectorUnitSize)
+ {
+     Mnemonic op;
+@@ -4679,7 +4907,32 @@ bool vec_horizontal_add_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bo
+     return true;
+ }
+ 
+-bool vec_extract_imm_reg_reg (int count, int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical, OpndSize vectorUnitSize)
++bool vec_horizontal_sub_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical, OpndSize vectorUnitSize)
++{
++    Mnemonic op;
++
++    switch (vectorUnitSize)
++    {
++        case OpndSize_16:
++            op = Mnemonic_PHSUBW;
++            break;
++        case OpndSize_32:
++            op = Mnemonic_PHSUBD;
++            break;
++        default:
++            ALOGD ("JIT_INFO: Cannot support vectorized horizontal subtract for size %d", vectorUnitSize);
++            SET_JIT_ERROR (kJitErrorUnsupportedVectorization);
++            return false;
++            break;
++    }
++
++    dump_reg_reg (op, ATOM_NORMAL_ALU, OpndSize_128, srcReg, isSrcPhysical, destReg, isDestPhysical, LowOpndRegType_xmm);
++
++    //If we get here everything went well
++    return true;
++}
++
++bool vec_extract_imm_reg_reg (int index, int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical, OpndSize vectorUnitSize)
+ {
+     Mnemonic op;
+ 
+@@ -4716,7 +4969,7 @@ bool vec_extract_imm_reg_reg (int count, int srcReg, bool isSrcPhysical, int des
+     OpndSize immediateSize = OpndSize_8;
+ 
+     //Now generate the extract
+-    dump_imm_reg_reg (op, ATOM_NORMAL_ALU, count, immediateSize, srcReg, isSrcPhysical, srcPhysicalType, sourceSize,
++    dump_imm_reg_reg (op, ATOM_NORMAL_ALU, index, immediateSize, srcReg, isSrcPhysical, srcPhysicalType, sourceSize,
+             destReg, isDestPhysical, destPhysicalType, destSize);
+ 
+     //If we get here everything went well
+diff --git a/vm/compiler/codegen/x86/lightcg/Scheduler.cpp b/vm/compiler/codegen/x86/lightcg/Scheduler.cpp
+index 3fd80bd..c3b6bd0 100644
+--- a/vm/compiler/codegen/x86/lightcg/Scheduler.cpp
++++ b/vm/compiler/codegen/x86/lightcg/Scheduler.cpp
+@@ -359,20 +359,29 @@ MachineModelEntry atomMachineModel[Mnemonic_Count*6] = {
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //PADDB
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //PADDW
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //PADDD
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //PSUBB
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //PSUBW
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //PSUBD
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT0,5},{PORT0,4},{INVP,INVN}, //PMULLW
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT0,5},{PORT0,4},{INVP,INVN}, //PMULLD - SSE4.1 instruction
+     {INVP,INVN},{PORT0,1},{INVP,INVN},{BOTH_PORTS,2},{BOTH_PORTS,3},{INVP,INVN}, //PSLLW
+     {INVP,INVN},{PORT0,1},{INVP,INVN},{BOTH_PORTS,2},{BOTH_PORTS,3},{INVP,INVN}, //PSLLD
+     {INVP,INVN},{PORT0,1},{INVP,INVN},{BOTH_PORTS,2},{BOTH_PORTS,3},{INVP,INVN}, //PSRAW
+     {INVP,INVN},{PORT0,1},{INVP,INVN},{BOTH_PORTS,2},{BOTH_PORTS,3},{INVP,INVN}, //PSRAD
++    {INVP,INVN},{PORT0,1},{INVP,INVN},{BOTH_PORTS,2},{BOTH_PORTS,3},{INVP,INVN}, //PSRLW
++    {INVP,INVN},{PORT0,1},{INVP,INVN},{BOTH_PORTS,2},{BOTH_PORTS,3},{INVP,INVN}, //PSRLD
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT0,3},{INVP,INVN},{INVP,INVN}, //PMOVSXBW - SSE4.1 instruction
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT0,1},{INVP,INVN},{INVP,INVN}, //PSHUFB - SSE3 instruction
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT0,1},{INVP,INVN},{INVP,INVN}, //PSHUFD - 3 operand instruction
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT0,1},{INVP,INVN},{INVP,INVN}, //PSHUFW - 3 operand instruction
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT0,1},{INVP,INVN},{INVP,INVN}, //PSHUFLW - 3 operand instruction
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT0,1},{INVP,INVN},{INVP,INVN}, //PSHUFHW - 3 operand instruction
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,7},{BOTH_PORTS,8},{INVP,INVN}, //PHADDSW - SSE3 instruction
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,7},{BOTH_PORTS,8},{INVP,INVN}, //PHADDW - SSE3 instruction
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,3},{BOTH_PORTS,4},{INVP,INVN}, //PHADDD - SSE3 instruction
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,7},{BOTH_PORTS,8},{INVP,INVN}, //PHSUBSW - SSE3 instruction
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,7},{BOTH_PORTS,8},{INVP,INVN}, //PHSUBW - SSE3 instruction
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,3},{BOTH_PORTS,4},{INVP,INVN}, //PHSUBD - SSE3 instruction
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,4},{INVP,INVN},{INVP,INVN}, //PEXTRB - SSE4.1 3 operand instruction
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,4},{INVP,INVN},{INVP,INVN}, //PEXTRW - 3 operand instruction
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,4},{INVP,INVN},{INVP,INVN}, //PEXTRD - SSE4.1 3 operand instruction
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //MOVDQA
+@@ -537,7 +546,7 @@ inline bool isConvertMnemonic(Mnemonic m) {
+ //! \return whether it is a shuffle operation
+ inline bool isShuffleMnemonic (Mnemonic m)
+ {
+-    return m == Mnemonic_PSHUFD || m == Mnemonic_PSHUFHW || m == Mnemonic_PSHUFLW || m == Mnemonic_PSHUFW;
++    return m == Mnemonic_PSHUFD || m == Mnemonic_PSHUFHW || m == Mnemonic_PSHUFLW || m == Mnemonic_PSHUFB;
+ }
+ 
+ //! \brief Returns true if mnemonic uses and then defines the FLAGS register
+diff --git a/vm/compiler/codegen/x86/lightcg/libenc/enc_defs_ext.h b/vm/compiler/codegen/x86/lightcg/libenc/enc_defs_ext.h
+index d0425dc..53f6d44 100644
+--- a/vm/compiler/codegen/x86/lightcg/libenc/enc_defs_ext.h
++++ b/vm/compiler/codegen/x86/lightcg/libenc/enc_defs_ext.h
+@@ -322,28 +322,38 @@ Mnemonic_STOS,                          // Store string
+ 
+ //
+ Mnemonic_WAIT,                          // Check pending pending unmasked floating-point exception
+-Mnemonic_PADDB,
+-Mnemonic_PADDW,
+-Mnemonic_PADDD,
+-Mnemonic_PMULLW,
+-Mnemonic_PMULLD,
+-Mnemonic_PSLLW,
+-Mnemonic_PSLLD,
+-Mnemonic_PSRAW,
+-Mnemonic_PSRAD,
+-Mnemonic_PMOVSXBW,
+-Mnemonic_PSHUFD,
+-Mnemonic_PSHUFW,
+-Mnemonic_PSHUFLW,
+-Mnemonic_PSHUFHW,
+-Mnemonic_PHADDSW,
+-Mnemonic_PHADDW,
+-Mnemonic_PHADDD,
+-Mnemonic_PEXTRW,
+-Mnemonic_PEXTRD,
+-Mnemonic_MOVDQA,
+-Mnemonic_SHUFPS,
+-Mnemonic_MOVAPS,
++Mnemonic_PADDB,    //!< Add packed byte integers
++Mnemonic_PADDW,    //!< Add packed word integers
++Mnemonic_PADDD,    //!< Add packed doubleword integers
++Mnemonic_PSUBB,    //!< Subtract packed byte integers
++Mnemonic_PSUBW,    //!< Subtract packed word integers
++Mnemonic_PSUBD,    //!< Subtract packed doubleword integers
++Mnemonic_PMULLW,   //!< Multiply packed word integers
++Mnemonic_PMULLD,   //!< Multiply packed doubleword integers
++Mnemonic_PSLLW,    //!< Shift words left and shift in 0s
++Mnemonic_PSLLD,    //!< Shift doublewords left and shift in 0s
++Mnemonic_PSRAW,    //!< Shift words right and shift in sign bits
++Mnemonic_PSRAD,    //!< Shift doublewords right and shift in sign bits
++Mnemonic_PSRLW,    //!< Shift words right and shift in 0s
++Mnemonic_PSRLD,    //!< Shift doublewords right and shift in 0s
++Mnemonic_PMOVSXBW, //!< Sign extend 8 packed signed 8-bit integers in the low 8 bytes to 8 packed signed 16-bit integers
++Mnemonic_PSHUFB,   //!< Shuffle bytes
++Mnemonic_PSHUFD,   //!< Shuffle doublewords
++Mnemonic_PSHUFLW,  //!< Shuffle packed low words
++Mnemonic_PSHUFHW,  //!< Shuffle packed high words
++Mnemonic_PHADDSW,  //!< Add 16-bit signed integers horizontally, then pack saturated integers
++Mnemonic_PHADDW,   //!< Add 16-bit signed integers horizontally, then pack
++Mnemonic_PHADDD,   //!< Add 32-bit signed integers horizontally, then pack
++Mnemonic_PHSUBSW,  //!< Subtract 16-bit signed integers horizontally, then pack saturated integers
++Mnemonic_PHSUBW,   //!< Subtract 16-bit signed integers horizontally, then pack
++Mnemonic_PHSUBD,   //!< Subtract 32-bit signed integers horizontally, then pack
++Mnemonic_PEXTRB,   //!< Extract a byte integer value from xmm
++Mnemonic_PEXTRW,   //!< Extract a word integer value from xmm
++Mnemonic_PEXTRD,   //!< Extract a doubleword integer value from xmm
++Mnemonic_MOVDQA,   //!< Move aligned double quadword
++Mnemonic_SHUFPS,   //!< Shuffle single words
++Mnemonic_MOVAPS,   //!< Move aligned single word
++
+ //
+ Mnemonic_Count
+ } Mnemonic;
+diff --git a/vm/compiler/codegen/x86/lightcg/libenc/enc_tabl.cpp b/vm/compiler/codegen/x86/lightcg/libenc/enc_tabl.cpp
+index 8e3ca30..b60d6b7 100644
+--- a/vm/compiler/codegen/x86/lightcg/libenc/enc_tabl.cpp
++++ b/vm/compiler/codegen/x86/lightcg/libenc/enc_tabl.cpp
+@@ -1745,7 +1745,6 @@ BEGIN_OPCODES()
+ END_OPCODES()
+ END_MNEMONIC()
+ 
+-//Now add all instructions we need for vectorization
+ BEGIN_MNEMONIC(PADDB, MF_NONE, DU_U)
+ BEGIN_OPCODES()
+     {OpcodeInfo::all, {0x66, 0x0F, 0xFC, _r}, {xmm64, xmm_m64}, DU_U },
+@@ -1764,6 +1763,24 @@ BEGIN_OPCODES()
+ END_OPCODES()
+ END_MNEMONIC()
+ 
++BEGIN_MNEMONIC(PSUBB, MF_NONE, DU_U)
++BEGIN_OPCODES()
++    {OpcodeInfo::all, {0x66, 0x0F, 0xF8, _r}, {xmm64, xmm_m64}, DU_U },
++END_OPCODES()
++END_MNEMONIC()
++
++BEGIN_MNEMONIC(PSUBW, MF_NONE, DU_U)
++BEGIN_OPCODES()
++    {OpcodeInfo::all, {0x66, 0x0F, 0xF9, _r}, {xmm64, xmm_m64}, DU_U },
++END_OPCODES()
++END_MNEMONIC()
++
++BEGIN_MNEMONIC(PSUBD, MF_NONE, DU_U)
++BEGIN_OPCODES()
++    {OpcodeInfo::all, {0x66, 0x0F, 0xFA, _r}, {xmm64, xmm_m64}, DU_U },
++END_OPCODES()
++END_MNEMONIC()
++
+ BEGIN_MNEMONIC(PMULLW, MF_NONE, DU_U)
+ BEGIN_OPCODES()
+     {OpcodeInfo::all, {0x66, 0x0F, 0xD5, _r}, {xmm64, xmm_m64}, DU_U },
+@@ -1785,7 +1802,7 @@ END_MNEMONIC()
+ 
+ BEGIN_MNEMONIC(PSLLD, MF_NONE, DU_U)
+ BEGIN_OPCODES()
+-    {OpcodeInfo::all, {0x66, 0x0F, 0xF2, 0x40, _r}, {xmm64, xmm_m64}, DU_U },
++    {OpcodeInfo::all, {0x66, 0x0F, 0xF2, _r}, {xmm64, xmm_m64}, DU_U },
+     {OpcodeInfo::all, {0x66, 0x0F, 0x72, _6, ib}, {xmm64, imm8}, DU_U },
+ END_OPCODES()
+ END_MNEMONIC()
+@@ -1799,28 +1816,40 @@ END_MNEMONIC()
+ 
+ BEGIN_MNEMONIC(PSRAD, MF_NONE, DU_U)
+ BEGIN_OPCODES()
+-    {OpcodeInfo::all, {0x66, 0x0F, 0xE2, 0x40, _r}, {xmm64, xmm_m64}, DU_U },
++    {OpcodeInfo::all, {0x66, 0x0F, 0xE2, _r}, {xmm64, xmm_m64}, DU_U },
+     {OpcodeInfo::all, {0x66, 0x0F, 0x72, _4, ib}, {xmm64, imm8}, DU_U },
+ END_OPCODES()
+ END_MNEMONIC()
+ 
++BEGIN_MNEMONIC(PSRLW, MF_NONE, DU_U)
++BEGIN_OPCODES()
++    {OpcodeInfo::all, {0x66, 0x0F, 0xD1, _r}, {xmm64, xmm_m64}, DU_U },
++    {OpcodeInfo::all, {0x66, 0x0F, 0x71, _2, ib}, {xmm64, imm8}, DU_U },
++END_OPCODES()
++END_MNEMONIC()
++
++BEGIN_MNEMONIC(PSRLD, MF_NONE, DU_U)
++BEGIN_OPCODES()
++    {OpcodeInfo::all, {0x66, 0x0F, 0xD2, _r}, {xmm64, xmm_m64}, DU_U },
++    {OpcodeInfo::all, {0x66, 0x0F, 0x72, _2, ib}, {xmm64, imm8}, DU_U },
++END_OPCODES()
++END_MNEMONIC()
++
+ BEGIN_MNEMONIC(PMOVSXBW, MF_NONE, DU_U)
+ BEGIN_OPCODES()
+     {OpcodeInfo::all, {0x66, 0x0F, 0x38, 0x20, _r}, {xmm64, xmm_m64}, DU_U },
+ END_OPCODES()
+ END_MNEMONIC()
+ 
+-BEGIN_MNEMONIC(PSHUFD, MF_NONE, D_U_U)
++BEGIN_MNEMONIC(PSHUFB, MF_NONE, DU_U)
+ BEGIN_OPCODES()
+-    {OpcodeInfo::all, {0x66, 0x0F, 0x70, _r, ib}, {xmm64, xmm_m64, imm8}, D_U_U },
++    {OpcodeInfo::all, {0x66, 0x0F, 0x38, 0x00, _r}, {xmm64, xmm_m64}, DU_U },
+ END_OPCODES()
+ END_MNEMONIC()
+ 
+-BEGIN_MNEMONIC(PSHUFW, MF_NONE, D_U_U)
++BEGIN_MNEMONIC(PSHUFD, MF_NONE, D_U_U)
+ BEGIN_OPCODES()
+-#ifdef _HAVE_MMX_
+-    {OpcodeInfo::all, {0x0F, 0x70, _r, ib}, {mm64, mm_m64, imm8}, D_U_U },
+-#endif
++    {OpcodeInfo::all, {0x66, 0x0F, 0x70, _r, ib}, {xmm64, xmm_m64, imm8}, D_U_U },
+ END_OPCODES()
+ END_MNEMONIC()
+ 
+@@ -1854,6 +1883,30 @@ BEGIN_OPCODES()
+ END_OPCODES()
+ END_MNEMONIC()
+ 
++BEGIN_MNEMONIC(PHSUBSW, MF_NONE, DU_U)
++BEGIN_OPCODES()
++    {OpcodeInfo::all, {0x66, 0x0F, 0x38, 0x07, _r}, {xmm64, xmm_m64}, DU_U },
++END_OPCODES()
++END_MNEMONIC()
++
++BEGIN_MNEMONIC(PHSUBW, MF_NONE, DU_U)
++BEGIN_OPCODES()
++    {OpcodeInfo::all, {0x66, 0x0F, 0x38, 0x05, _r}, {xmm64, xmm_m64}, DU_U },
++END_OPCODES()
++END_MNEMONIC()
++
++BEGIN_MNEMONIC(PHSUBD, MF_NONE, DU_U)
++BEGIN_OPCODES()
++    {OpcodeInfo::all, {0x66, 0x0F, 0x38, 0x06, _r}, {xmm64, xmm_m64}, DU_U },
++END_OPCODES()
++END_MNEMONIC()
++
++BEGIN_MNEMONIC(PEXTRB, MF_NONE, D_U_U)
++BEGIN_OPCODES()
++    {OpcodeInfo::all, {0x66, 0x0F, 0x3A, 0x14, _r, ib}, {r32, xmm64, imm8}, D_U_U },
++END_OPCODES()
++END_MNEMONIC()
++
+ BEGIN_MNEMONIC(PEXTRW, MF_NONE, D_U_U)
+ BEGIN_OPCODES()
+     {OpcodeInfo::all, {0x66, 0x0F, 0xC5, _r, ib}, {r32, xmm64, imm8}, D_U_U },
+diff --git a/vm/compiler/codegen/x86/pcg/Analysis.cpp b/vm/compiler/codegen/x86/pcg/Analysis.cpp
+index 6d11b72..95d3ff1 100644
+--- a/vm/compiler/codegen/x86/pcg/Analysis.cpp
++++ b/vm/compiler/codegen/x86/pcg/Analysis.cpp
+@@ -1623,10 +1623,21 @@ bool dvmCompilerPcgNewRegisterizeVRAnalysis (CompilationUnitPCG *cUnit)
+                     pcgDefRef (cUnit, ssaRep->defs[0], INTreg);
+                     break;
+ 
++                case kMirOpPackedReduce:
++                    pcgDefRef (cUnit, ssaRep->defs[0], INTreg);
++                    break;
++
+                 case kMirOpConst128b:
+                 case kMirOpMove128b:
+                 case kMirOpPackedAddition:
+                 case kMirOpPackedMultiply:
++                case kMirOpPackedSubtract:
++                case kMirOpPackedShiftLeft:
++                case kMirOpPackedSignedShiftRight:
++                case kMirOpPackedUnsignedShiftRight:
++                case kMirOpPackedAnd:
++                case kMirOpPackedOr:
++                case kMirOpPackedXor:
+                     break;
+ 
+                 default:
+diff --git a/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp b/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
+index 4e6383a..c69eec7 100644
+--- a/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
++++ b/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
+@@ -118,11 +118,12 @@ static bool dvmCompilerPcgTranslateInsn (CompilationUnitPCG *cUnit, MIR *mir)
+                 break;
+ 
+             case kMirOpPackedAddition:
+-                dvmCompilerPcgTranslatePackedAdd (cUnit, mir);
+-                break;
+-
+             case kMirOpPackedMultiply:
+-                dvmCompilerPcgTranslatePackedMul (cUnit, mir);
++            case kMirOpPackedSubtract:
++            case kMirOpPackedAnd:
++            case kMirOpPackedOr:
++            case kMirOpPackedXor:
++                success = dvmCompilerTranslatePackedAlu (cUnit, mir);
+                 break;
+ 
+             case kMirOpPackedAddReduce:
+@@ -132,8 +133,10 @@ static bool dvmCompilerPcgTranslateInsn (CompilationUnitPCG *cUnit, MIR *mir)
+             default:
+                 LOGE ("Jit (PCG): unsupported extended MIR opcode");
+                 assert (0);
++                break;
+         }
+-        return true;
++
++        return success;
+     }
+ 
+     switch (dalvikOpCode)
+diff --git a/vm/compiler/codegen/x86/pcg/LowerExtended.cpp b/vm/compiler/codegen/x86/pcg/LowerExtended.cpp
+index 06f3a8b..569ff60 100644
+--- a/vm/compiler/codegen/x86/pcg/LowerExtended.cpp
++++ b/vm/compiler/codegen/x86/pcg/LowerExtended.cpp
+@@ -257,53 +257,90 @@ void dvmCompilerPcgTranslatePackedMove (CompilationUnitPCG *cUnit, MIR *mir)
+ }
+ 
+ /**
+- * @brief Translate bytecodes of the form XMMdest = XMMdest "op" XMMsrc
+- * @param cUnit the CompilationUnitPCG
+- * @param mir the MIR instruction
+- * @param pcgOpcode the PCG opcode name that defines "op"
++ * @brief Used to obtain the opcode string for vector extended opcodes
++ * @param opcode The extended vector opcode
++ * @param vecUnitSize The unit size of vector operations
++ * @return Returns the string if one can be determined. Otherwise returns 0.
+  */
+-static void translatePackedOp2 (CompilationUnitPCG *cUnit, MIR *mir, const char *pcgOpcode)
++static const char *getPcgOpcodeForPackedExtendedOp (int opcode, int vecUnitSize)
+ {
+-    int sourceXMM = mir->dalvikInsn.vB;
+-    int destXMM = mir->dalvikInsn.vA;
+-    CGInst op1 = dvmCompilerPcgGetXMMReg (cUnit, destXMM);
+-    CGInst op2 = dvmCompilerPcgGetXMMReg (cUnit, sourceXMM);
+-    CGInst inst = CGCreateNewInst (pcgOpcode, "rr", op1, op2);
+-    dvmCompilerPcgSetXMMReg (cUnit, destXMM, inst);
+-}
+-
+-void dvmCompilerPcgTranslatePackedAdd (CompilationUnitPCG *cUnit, MIR *mir)
+-{
+-    const char *pcgOpcode;
+-    int vecUnitSize = mir->dalvikInsn.vC;
++    //For bitwise operations, we do not care about the vector unit size
++    switch (opcode)
++    {
++        case kMirOpPackedXor:
++            return "epxor";
++        case kMirOpPackedOr:
++            return "epor";
++        case kMirOpPackedAnd:
++            return "epand";
++        default:
++            break;
++    }
+ 
+     if (vecUnitSize == 2)
+     {
+-        pcgOpcode = "epaddw";
++        switch (opcode)
++        {
++            case kMirOpPackedMultiply:
++                return "epmullw";
++            case kMirOpPackedAddition:
++                return "epaddw";
++            case kMirOpPackedSubtract:
++                return "epsubw";
++            case kMirOpPackedShiftLeft:
++                return "epsllwi";
++            case kMirOpPackedSignedShiftRight:
++                return "epsrawi";
++            case kMirOpPackedUnsignedShiftRight:
++                return "epsrlwi";
++            default:
++                break;
++        }
+     }
+-    else
++    else if (vecUnitSize == 4)
+     {
+-        pcgOpcode = "epaddd";
++        switch (opcode)
++        {
++            case kMirOpPackedMultiply:
++                return "epmulldx";
++            case kMirOpPackedAddition:
++                return "epaddd";
++            case kMirOpPackedSubtract:
++                return "epsubd";
++            case kMirOpPackedShiftLeft:
++                return "epslldi";
++            case kMirOpPackedSignedShiftRight:
++                return "epsradi";
++            case kMirOpPackedUnsignedShiftRight:
++                return "epsrldi";
++            default:
++                break;
++        }
+     }
+ 
+-    translatePackedOp2 (cUnit, mir, pcgOpcode);
++    //If we get here, we do not know what opcode to use
++    return 0;
+ }
+ 
+-void dvmCompilerPcgTranslatePackedMul (CompilationUnitPCG *cUnit, MIR *mir)
++bool dvmCompilerTranslatePackedAlu (CompilationUnitPCG *cUnit, MIR *mir)
+ {
+     int vecUnitSize = mir->dalvikInsn.vC;
+-    const char *pcgOpcode;
++    const char *pcgOpcode = getPcgOpcodeForPackedExtendedOp (mir->dalvikInsn.opcode, vecUnitSize);
+ 
+-    if (vecUnitSize == 2)
++    if (pcgOpcode == 0)
+     {
+-        pcgOpcode = "epmullw";
+-    }
+-    else
+-    {
+-        pcgOpcode = "epmulldx";
++        ALOGD ("JIT_INFO: Could not find opcode string for extended MIR %x", mir->dalvikInsn.opcode);
++        return false;
+     }
+ 
+-    translatePackedOp2 (cUnit, mir, pcgOpcode);
++    int sourceXMM = mir->dalvikInsn.vB;
++    int destXMM = mir->dalvikInsn.vA;
++    CGInst op1 = dvmCompilerPcgGetXMMReg (cUnit, destXMM);
++    CGInst op2 = dvmCompilerPcgGetXMMReg (cUnit, sourceXMM);
++    CGInst inst = CGCreateNewInst (pcgOpcode, "rr", op1, op2);
++    dvmCompilerPcgSetXMMReg (cUnit, destXMM, inst);
++
++    return true;
+ }
+ 
+ void dvmCompilerPcgTranslatePackedAddReduce (CompilationUnitPCG *cUnit, MIR *mir)
+diff --git a/vm/compiler/codegen/x86/pcg/LowerExtended.h b/vm/compiler/codegen/x86/pcg/LowerExtended.h
+index 5fb3a0a..659aba6 100644
+--- a/vm/compiler/codegen/x86/pcg/LowerExtended.h
++++ b/vm/compiler/codegen/x86/pcg/LowerExtended.h
+@@ -88,18 +88,11 @@ void dvmCompilerPcgTranslatePackedConst (CompilationUnitPCG *cUnit, MIR *mir);
+ void dvmCompilerPcgTranslatePackedMove (CompilationUnitPCG *cUnit, MIR *mir);
+ 
+ /**
+- * @brief Translate a packed add instruction
++ * @brief Translate vectorized bytecodes of the form XMMdest = XMMdest "op" XMMsrc which operate on packed values
+  * @param cUnit the CompilationUnitPCG
+  * @param mir the MIR instruction
+  */
+-void dvmCompilerPcgTranslatePackedAdd (CompilationUnitPCG *cUnit, MIR *mir);
+-
+-/**
+- * @brief Translate a packed mul instruction
+- * @param cUnit the CompilationUnitPCG
+- * @param mir the MIR instruction
+- */
+-void dvmCompilerPcgTranslatePackedMul (CompilationUnitPCG *cUnit, MIR *mir);
++bool dvmCompilerTranslatePackedAlu (CompilationUnitPCG *cUnit, MIR *mir);
+ 
+ /**
+  * @brief Translate a packed add reduce instruction
+diff --git a/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp b/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp
+index 049393b..a1952a2 100644
+--- a/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp
++++ b/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp
+@@ -459,6 +459,10 @@ bool dvmCompilerPcgSupportsExtendedOp (int extendedOpcode)
+         case kMirOpMove128b:
+         case kMirOpPackedAddition:
+         case kMirOpPackedMultiply:
++        case kMirOpPackedSubtract:
++        case kMirOpPackedAnd:
++        case kMirOpPackedOr:
++        case kMirOpPackedXor:
+         case kMirOpPackedAddReduce:
+         case kMirOpCheckStackOverflow:
+             return true;
+-- 
+1.7.4.1
+

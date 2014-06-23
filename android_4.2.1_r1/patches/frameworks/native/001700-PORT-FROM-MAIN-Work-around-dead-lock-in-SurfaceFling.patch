@@ -1,0 +1,147 @@
+From f377175e1a3fae5e21cd274a41c25d71d52c8498 Mon Sep 17 00:00:00 2001
+From: Lingyun Zhu <lingyun.zhu@intel.com>
+Date: Mon, 3 Dec 2012 18:27:13 +0800
+Subject: [PATCH 17/39] [PORT FROM MAIN] Work around dead lock in
+ SurfaceFlinger thread
+
+BZ: 68722
+
+This patch is ported from 75913. (author: Chen, Bin)
+Function removeLayer() called from ~Client() tried to lock the mStateLock
+which had alredy been locked when entering handleTransctionLocked and
+these happened within same thread - SurfaceFlinger (main) thread.
+
+The work around is: removeLayer() only lock the mStateLock if it has not
+been locked by surfaceFlinger thread.
+
+Change-Id: I548c94fbdef77aac74da0973194015df93a6c852
+Signed-off-by: Lingyun Zhu <lingyun.zhu@intel.com>
+Reviewed-on: http://android.intel.com:8080/78374
+Tested-by: Tong, BoX <box.tong@intel.com>
+Reviewed-by: Tong, BoX <box.tong@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+---
+ services/surfaceflinger/SurfaceFlinger.cpp |   57 ++++++++++++++++++----------
+ services/surfaceflinger/SurfaceFlinger.h   |    6 +++
+ 2 files changed, 43 insertions(+), 20 deletions(-)
+
+diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinger/SurfaceFlinger.cpp
+index d267b3b..cd8649f 100644
+--- a/services/surfaceflinger/SurfaceFlinger.cpp
++++ b/services/surfaceflinger/SurfaceFlinger.cpp
+@@ -103,7 +103,9 @@ SurfaceFlinger::SurfaceFlinger()
+         mDebugInTransaction(0),
+         mLastTransactionTime(0),
+         mBootFinished(false),
+-        mAnimFlag(true)
++        mAnimFlag(true),
++        mMutexLocked(false),
++        mSurfaceFlingerThreadId(0)
+ {
+     ALOGI("SurfaceFlinger is starting");
+ 
+@@ -536,6 +538,8 @@ status_t SurfaceFlinger::readyToRun()
+     // start boot animation
+     startBootAnim();
+ 
++    mSurfaceFlingerThreadId = getThreadId();
++
+     return NO_ERROR;
+ }
+ 
+@@ -1041,23 +1045,28 @@ void SurfaceFlinger::handleTransaction(uint32_t transactionFlags)
+ {
+     ATRACE_CALL();
+ 
+-    Mutex::Autolock _l(mStateLock);
+-    const nsecs_t now = systemTime();
+-    mDebugInTransaction = now;
++    {
++        // scope for the mutex
++        Mutex::Autolock _l(mStateLock);
++        mMutexLocked = true;
++        const nsecs_t now = systemTime();
++        mDebugInTransaction = now;
+ 
+-    // Here we're guaranteed that some transaction flags are set
+-    // so we can call handleTransactionLocked() unconditionally.
+-    // We call getTransactionFlags(), which will also clear the flags,
+-    // with mStateLock held to guarantee that mCurrentState won't change
+-    // until the transaction is committed.
++        // Here we're guaranteed that some transaction flags are set
++        // so we can call handleTransactionLocked() unconditionally.
++        // We call getTransactionFlags(), which will also clear the flags,
++        // with mStateLock held to guarantee that mCurrentState won't change
++        // until the transaction is committed.
+ 
+-    transactionFlags = getTransactionFlags(eTransactionMask);
+-    handleTransactionLocked(transactionFlags);
++        transactionFlags = getTransactionFlags(eTransactionMask);
++        handleTransactionLocked(transactionFlags);
+ 
+-    mLastTransactionTime = systemTime() - now;
+-    mDebugInTransaction = 0;
+-    invalidateHwcGeometry();
+-    // here the transaction has been committed
++        mLastTransactionTime = systemTime() - now;
++        mDebugInTransaction = 0;
++        invalidateHwcGeometry();
++        // here the transaction has been committed
++    }
++    mMutexLocked = false;
+ }
+ 
+ void SurfaceFlinger::handleTransactionLocked(uint32_t transactionFlags)
+@@ -1715,11 +1724,19 @@ ssize_t SurfaceFlinger::addClientLayer(const sp<Client>& client,
+ 
+ status_t SurfaceFlinger::removeLayer(const sp<LayerBase>& layer)
+ {
+-    Mutex::Autolock _l(mStateLock);
+-    status_t err = purgatorizeLayer_l(layer);
+-    if (err == NO_ERROR)
+-        setTransactionFlags(eTransactionNeeded);
+-    return err;
++    if(alreadyLockedBySurfaceFlingerThread()){
++        ALOGW("mStateLock already locked by surfaceFlingerThread");
++        status_t err = purgatorizeLayer_l(layer);
++        if (err == NO_ERROR)
++           setTransactionFlags(eTransactionNeeded);
++       return err;
++    }else{
++        Mutex::Autolock _l(mStateLock);
++        status_t err = purgatorizeLayer_l(layer);
++        if (err == NO_ERROR)
++            setTransactionFlags(eTransactionNeeded);
++        return err;
++    }
+ }
+ 
+ status_t SurfaceFlinger::removeLayer_l(const sp<LayerBase>& layerBase)
+diff --git a/services/surfaceflinger/SurfaceFlinger.h b/services/surfaceflinger/SurfaceFlinger.h
+index 890f846..c69f6d2 100644
+--- a/services/surfaceflinger/SurfaceFlinger.h
++++ b/services/surfaceflinger/SurfaceFlinger.h
+@@ -404,6 +404,9 @@ private:
+     void dumpAllLocked(String8& result, char* buffer, size_t SIZE) const;
+     bool startDdmConnection();
+     static void appendSfConfigString(String8& result);
++    bool alreadyLockedBySurfaceFlingerThread(){
++            return (getThreadId() == mSurfaceFlingerThreadId) && mMutexLocked;
++    };
+ 
+     /* ------------------------------------------------------------------------
+      * Attributes
+@@ -469,6 +472,9 @@ private:
+     mutable Mutex mDestroyedLayerLock;
+     Vector<LayerBase const *> mDestroyedLayers;
+ 
++   //for work around the dead lock
++   bool                        mMutexLocked;
++   thread_id_t                 mSurfaceFlingerThreadId;
+     /* ------------------------------------------------------------------------
+      * Feature prototyping
+      */
+-- 
+1.7.9
+

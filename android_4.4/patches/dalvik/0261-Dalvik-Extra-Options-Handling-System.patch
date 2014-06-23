@@ -1,0 +1,475 @@
+From 753108b569c9b9339d3cbe2acbaf05731aa21ef3 Mon Sep 17 00:00:00 2001
+From: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Date: Wed, 29 May 2013 12:30:17 -0700
+Subject: Dalvik: Extra Options Handling System
+
+BZ: 110180
+
+The following patch adds a new option -Xjitextraoptsfile:<file name>. The file
+will be the following repetitive structure:
+
+<process name>
+<process name>
+...
+OPTIONS
+any option you want for the process names, one option per line, stopping at an
+empty line
+
+Notes:
+  - all as a process name applies the options to every process
+  - except does the opposite regarding the decision to apply or not the options
+  - all and except in the same group will not apply the options to anyone
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Ifee4dc824dcbd044bac528f82d420adb0768c63f
+Orig-MCG-Change-Id: If858be176602836da74785309b82e1d6ea557403
+Signed-off-by: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Reviewed-on: http://android.intel.com:8080/123671
+Reviewed-by: Popov, Ivan G <ivan.g.popov@intel.com>
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/Globals.h                       |    6 +
+ vm/Init.cpp                        |  323 ++++++++++++++++++++++++++++++++++--
+ vm/native/dalvik_system_Zygote.cpp |    3 +
+ 3 files changed, 315 insertions(+), 17 deletions(-)
+
+diff --git a/vm/Globals.h b/vm/Globals.h
+index 4c46ca2..e0da5b8 100644
+--- a/vm/Globals.h
++++ b/vm/Globals.h
+@@ -749,6 +749,12 @@ struct DvmGlobals {
+ 
+     /* String pointed here will be deposited on the stack frame of dvmAbort */
+     const char *lastMessage;
++
++    /* String containing the extra option file or 0 */
++    char *extraOptionsFile;
++
++    /* String containing the nice name to appear in ps */
++    char *niceName;
+ };
+ 
+ extern struct DvmGlobals gDvm;
+diff --git a/vm/Init.cpp b/vm/Init.cpp
+index 58e059b..46b7c58 100644
+--- a/vm/Init.cpp
++++ b/vm/Init.cpp
+@@ -167,6 +167,7 @@ static void usage(const char* progName)
+     dvmFprintf(stderr, "  -Xjitnestedloops (Allows nested loops to be compiled or not)\n");
+     dvmFprintf(stderr, "  -Xjittestloops (Whether to test the loop formation)\n");
+     dvmFprintf(stderr, "  -Xjitbranchloops (Allows branches in loops, only tested if nestedloops is also off)\n");
++    dvmFprintf(stderr, "  -Xjitextraoptsfile:<file> handling extra options via a process filtering file\n");
+     dvmFprintf(stderr, "  -Xjitoldloops (Only accept the old loop detection system)\n");
+     dvmFprintf(stderr, "  -Xjitignorepasses:<value> (Ignore certain loop passes, the full name of the pass must be included, see -Xjitlooppasses to get a list)\n");
+     dvmFprintf(stderr, "  -Xjitlooppasses (Prints the loop passes available)\n");
+@@ -799,6 +800,289 @@ static int processXjitconfig(const char* opt) {
+ }
+ #endif
+ 
++/**
++ * @brief Parse the process names
++ * @param option the option file handle
++ * @param cmdLine the command line for the current process
++ * @return whether we should apply the options
++ */
++static bool parseProcessNames(FILE *option, const char *cmdLine)
++{
++    char buffer[1024];
++
++    bool except = false;
++    bool all = false;
++    bool foundName = false;
++
++    //Now read line per line
++    while (fgets(buffer, sizeof(buffer), option) != 0) {
++        //Check that we read the whole line
++        char *ptr = strchr(buffer, '\n');
++
++        if (ptr == 0) {
++            ALOGD("Extra Options: Problem reading a line in file: %s\n", buffer);
++            return false;
++        }
++
++        //Skip empty lines
++        if (ptr == buffer) {
++            continue;
++        }
++
++        //Trim input string
++        char *start = buffer;
++        while (start < ptr && isspace(*start)) {
++            start++;
++        }
++
++        //Trim and zero the end of line
++        while (start < ptr && isspace(*ptr)) {
++            *ptr = '\0';
++            ptr--;
++        }
++
++        // ptr is a last element of trimmed string
++        assert(strlen(start) == ptr - start + 1);
++
++        //Skip empty trimmed lines
++        if (ptr == start && isspace(*ptr)) {
++            continue;
++        }
++
++        //Break at OPTIONS
++        if (strstr(start, "OPTIONS") != 0) {
++            //If it's all or foundName, we should handle it
++            bool res = (all == true || foundName == true);
++
++            //Except will negate it
++            if (except == true) {
++                res = !res;
++            }
++
++            return res;
++        }
++
++        if (strcasecmp(start, "all") == 0) {
++            //Is it all?
++            all = true;
++        } else if (strcasecmp(start, "except") == 0) {
++            //Exception
++            except = true;
++        } else if (start == ptr && *ptr == '*') {
++            // Handle single asterisk '*' as all
++            all = true;
++        } else if (*start == '*' && *ptr == '*') {
++            // Handle asterisk at the start and end of name: '*acbdef*'
++            start++;
++            *ptr = 0;
++            ptr--;
++            if (start == ptr) {
++                all = true;
++            } else if (strstr(cmdLine, start) != 0) {
++                foundName = true;
++            }
++        } else if (*ptr == '*') {
++            // Handle asterisk at the end of name: 'acbdef*'
++            *ptr = 0;
++            if (strstr(cmdLine, start) == cmdLine) {
++                foundName = true;
++            }
++        } else if (*start == '*') {
++            // Handle asterisk at the start of name: '*acbdef'
++            start++;
++            int delta = strlen(cmdLine) - (ptr - start + 1);
++            if (strcmp(cmdLine + delta, start) == 0) {
++                foundName = true;
++            }
++        } else if (strcmp(cmdLine, start) == 0) {
++            foundName = true;
++        }
++    }
++
++    //Got here, we didn't have an OPTIONS
++    return false;
++}
++
++//Forward declaration for the option processing
++static int processOptions(int argc, const char* const argv[], bool ignoreUnrecognized);
++
++/**
++ * @brief Apply options until an empty line or end of file is found
++ * @param optionFile the option file handle
++ * @return whether we hit an empty line instead of the end of file
++ */
++static bool applyOptions(FILE *optionFile)
++{
++    char buffer[1024];
++
++    char *base = buffer;
++
++    //Get a pointer to buffer
++    char **ptrBuffer = &base;
++
++    //Read line per line
++    while (fgets(buffer, sizeof(buffer), optionFile) != 0) {
++        char *ptr = strchr(buffer, '\n');
++
++        //If not found, we have an issue
++        if (ptr == 0) {
++            ALOGD("Extra Options: Problem with applying an option: %s\n", buffer);
++            return false;
++        }
++
++        //If ptr == buffer, we are done: empty line
++        if (buffer == ptr) {
++            return true;
++        }
++
++        //Remove it
++        *ptr = '\0';
++
++        ALOGD("Extra Options: Applying option %s\n", buffer);
++
++        //Ok we have an option, now apply it
++        processOptions(1, ptrBuffer, false);
++    }
++
++    //End of file
++    return false;
++}
++
++/**
++ * Skip lines until an empty line
++ * @param optionFile the option file handler
++ * @return whether we did not hit the EOF before an empty line
++ */
++static bool skipOptions(FILE *optionFile)
++{
++    char buffer[1024];
++
++    //Read line per line
++    while (fgets(buffer, sizeof(buffer), optionFile) != 0) {
++        char *ptr = strchr(buffer, '\n');
++
++        //If not found, we have an issue
++        if (ptr == 0) {
++            ALOGD("Extra Options: Problem with skipping an option: %s\n", buffer);
++            return false;
++        }
++
++        //If ptr == buffer, we are done: empty line
++        if (buffer == ptr) {
++            return true;
++        }
++    }
++
++    //End of file
++    return false;
++}
++
++/**
++ * @brief Handle an extra option file
++ * @param name the file name containing the extra options
++ */
++static void handleExtraOptionsFile(const char *name)
++{
++    //Option not specified
++    if (name == NULL) {
++        ALOGD("Extra Options: not specified\n");
++        return;
++    }
++
++    //Now open the file
++    FILE *optionFile = fopen(name, "r");
++
++    //Error checking
++    if (optionFile == NULL) {
++        ALOGD("Extra Options: Problem opening file for -Xjitextraoptsfile option: %s\n", name);
++        return;
++    }
++
++    char myCmdLine[2048];
++    //Set it to 0
++    memset(myCmdLine, 0, sizeof(myCmdLine));
++
++    if (gDvm.niceName != NULL) {
++        // use process nice name for comparison with option patterns
++        size_t niceNameLen = strlen(gDvm.niceName);
++        if (niceNameLen >= sizeof(myCmdLine)) {
++            niceNameLen = sizeof(myCmdLine) - 1;
++        }
++        strncpy(myCmdLine, gDvm.niceName, niceNameLen);
++        myCmdLine[niceNameLen] = '\0';
++        ALOGD("Extra Options: Process' nice name %s\n", myCmdLine);
++    } else {
++
++        //First job is to see if we care or not, so find our name
++        pid_t mypid = getpid();
++
++        //We want our name so open our proc/cmdline
++        char buffer[1024];
++        snprintf(buffer, sizeof(buffer), "/proc/%d/cmdline", mypid);
++
++        //Open it up
++        FILE *myCmdFile = fopen(buffer, "r");
++
++        if (myCmdFile == 0) {
++            ALOGD("Extra Options: Problem opening the pid's cmdline file: %s\n", buffer);
++            fclose(optionFile), optionFile = 0;
++            return;
++        }
++
++        //Read the first line
++        char *ptr = fgets(myCmdLine, sizeof(myCmdLine), myCmdFile);
++
++        //Find last element not 0
++        int i = sizeof(myCmdLine) - 1;
++        while (i > 0) {
++            //Bail if not '\0'
++            if (myCmdLine[i] != '\0') {
++                break;
++            }
++            //Previous character
++            i--;
++        }
++
++        //Ok now we have what is read and there might be sparseProcessNamesome '\0', replace them
++        while (i > 0) {
++            //Replace if '\0'
++            if (myCmdLine[i] == '\0') {
++                myCmdLine[i] = '_';
++            }
++            //Previous character
++            i--;
++        }
++        ALOGD("Extra Options: Process' Command line %s\n", myCmdLine);
++
++        //Close command file handle
++        fclose(myCmdFile), myCmdFile = 0;
++
++        //If problem reading, bail
++        if (ptr == 0) {
++            ALOGD("Extra Options: Problem reading the pid's cmdline file line\n");
++            fclose(optionFile), optionFile = 0;
++            return;
++        }
++    }
++
++    bool continueParsing = true;
++
++    do {
++        //First find out if we want to apply the options to this process
++        bool shouldApply = parseProcessNames(optionFile, myCmdLine);
++
++        if (shouldApply == true) {
++            continueParsing = applyOptions(optionFile);
++        } else {
++            continueParsing = skipOptions(optionFile);
++        }
++
++    } while (continueParsing == true);
++
++    //Close option file
++    fclose(optionFile), optionFile = 0;
++}
++
+ /*
+  * Process an argument vector full of options.  Unlike standard C programs,
+  * argv[0] does not contain the name of the program.
+@@ -810,8 +1094,7 @@ static int processXjitconfig(const char* opt) {
+  * Returns 0 on success, -1 on failure, and 1 for the special case of
+  * "-version" where we want to stop without showing an error message.
+  */
+-static int processOptions(int argc, const char* const argv[],
+-    bool ignoreUnrecognized)
++int processOptions(int argc, const char* const argv[], bool ignoreUnrecognized)
+ {
+     int i;
+ 
+@@ -819,20 +1102,6 @@ static int processOptions(int argc, const char* const argv[],
+     for (i = 0; i < argc; i++)
+         ALOGV("  %d: '%s'", i, argv[i]);
+ 
+-    /*
+-     * Over-allocate AssertionControl array for convenience.  If allocated,
+-     * the array must be able to hold at least one entry, so that the
+-     * zygote-time activation can do its business.
+-     */
+-    assert(gDvm.assertionCtrl == NULL);
+-    if (argc > 0) {
+-        gDvm.assertionCtrl =
+-            (AssertionControl*) malloc(sizeof(AssertionControl) * argc);
+-        if (gDvm.assertionCtrl == NULL)
+-            return -1;
+-        assert(gDvm.assertionCtrlCount == 0);
+-    }
+-
+     for (i = 0; i < argc; i++) {
+         if (strcmp(argv[i], "-help") == 0) {
+             /* show usage and stop */
+@@ -1280,6 +1549,8 @@ static int processOptions(int argc, const char* const argv[],
+         } else if (strncmp(argv[i], "-Xjitnobackendregisterization", 29) == 0) {
+             gDvmJit.backEndRegisterization = false;
+             gDvmJit.maximumRegisterization = 0;
++        } else if (strncmp(argv[i], "-Xjitextraoptsfile:", 19) == 0) {
++            gDvm.extraOptionsFile = strdup (argv[i] + 19);
+         } else if (strncmp(argv[i], "-Xjitregisterization:", 21) == 0) {
+             char *endptr = NULL;
+             //Get requested style
+@@ -1721,6 +1992,20 @@ std::string dvmStartup(int argc, const char* const argv[],
+     setCommandLineDefaults();
+ 
+     /*
++     * Over-allocate AssertionControl array for convenience.  If allocated,
++     * the array must be able to hold at least one entry, so that the
++     * zygote-time activation can do its business.
++     */
++    assert(gDvm.assertionCtrl == NULL);
++    if (argc > 0) {
++        gDvm.assertionCtrl =
++            (AssertionControl*) malloc(sizeof(AssertionControl) * argc);
++        if (gDvm.assertionCtrl == NULL)
++            return "syntax error";
++        assert(gDvm.assertionCtrlCount == 0);
++    }
++
++    /*
+      * Process the option flags (if any).
+      */
+     int cc = processOptions(argc, argv, ignoreUnrecognized);
+@@ -1906,7 +2191,6 @@ std::string dvmStartup(int argc, const char* const argv[],
+         }
+     }
+ 
+-
+ #ifndef NDEBUG
+     if (!dvmTestHash())
+         ALOGE("dvmTestHash FAILED");
+@@ -2085,6 +2369,9 @@ bool dvmInitAfterZygote()
+     u8 startHeap, startQuit, startJdwp;
+     u8 endHeap, endQuit, endJdwp;
+ 
++    //Now load up any additional options
++    handleExtraOptionsFile (gDvm.extraOptionsFile);
++
+     startHeap = dvmGetRelativeTimeUsec();
+ 
+     /*
+@@ -2314,6 +2601,8 @@ void dvmShutdown()
+     gDvm.jniTrace = NULL;
+     free(gDvm.stackTraceFile);
+     gDvm.stackTraceFile = NULL;
++    free (gDvm.niceName), gDvm.niceName = 0;
++    free (gDvm.extraOptionsFile), gDvm.extraOptionsFile = 0;
+ 
+     /* tell signal catcher to shut down if it was started */
+     dvmSignalCatcherShutdown();
+diff --git a/vm/native/dalvik_system_Zygote.cpp b/vm/native/dalvik_system_Zygote.cpp
+index 4ece79e..a7c2db6 100644
+--- a/vm/native/dalvik_system_Zygote.cpp
++++ b/vm/native/dalvik_system_Zygote.cpp
+@@ -540,6 +540,8 @@ static pid_t forkAndSpecializeCommon(const u4* args, bool isSystemServer)
+             if (!niceName) {
+                 ALOGE("niceName dvmCreateCstrFromString failed");
+                 dvmAbort();
++            } else {
++                gDvm.niceName = strdup(niceName);
+             }
+         }
+     }
+@@ -680,6 +682,7 @@ static pid_t forkAndSpecializeCommon(const u4* args, bool isSystemServer)
+ 
+         unsetSignalHandler();
+         gDvm.zygote = false;
++        ALOGD("Process %d nice name: %s", getpid(), gDvm.niceName);
+         if (!dvmInitAfterZygote()) {
+             ALOGE("error in post-zygote initialization");
+             dvmAbort();
+-- 
+1.7.4.1
+

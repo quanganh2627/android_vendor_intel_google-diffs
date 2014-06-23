@@ -1,0 +1,740 @@
+From b28554033975e5c5819770e40a62e101469371de Mon Sep 17 00:00:00 2001
+From: Zhu,Tianyang <tianyang.zhu@intel.com>
+Date: Wed, 3 Jul 2013 18:16:35 +0800
+Subject: Video-HDMI: A new player will request a ID from MDS when it is created.
+
+BZ: 116726 106070
+
+Handling multiple video playback instances case
+When a player is create, it will request a ID from MDS,
+MDS allocates a unique session ID for every player.
+
+Category: feature differentiation
+Domain: Video.Rendering-HDMI
+Origin: internal
+Upstream-Candidate: no
+
+Change-Id: I3b6c29631d9af1377c12e4a97840c02e0f33c023
+Orig-Change-Id: Ia88bd6bcbffffa549eb5c1aa82afd2ea11d57d4a
+Orig-Change-Id: Iea480055aa3f03f794af1840b4ed673c8582ea3d
+Orig-Change-Id: I1efdacacc7021c9db3faa4eedaf6b400d0e98cfc
+Orig-Change-Id: Ic974e7217dc072f74693e713273c36443a723855
+Orig-Change-Id: Ifcf9e1e203b3bb89f5860f3ca54dce4ff601b63b
+Signed-off-by: Zhu,Tianyang <tianyang.zhu@intel.com>
+Signed-off-by: Jason Hu <jason.hu@intel.com>
+Signed-off-by: Lin Xie <lin.xie@intel.com>
+---
+ media/libmediaplayerservice/Android.mk             |    4 +-
+ media/libmediaplayerservice/MediaPlayerService.cpp |   38 ++++-
+ media/libmediaplayerservice/nuplayer/Android.mk    |    4 +-
+ media/libmediaplayerservice/nuplayer/NuPlayer.cpp  |  135 +++++++++++-------
+ media/libmediaplayerservice/nuplayer/NuPlayer.h    |   21 ++-
+ media/libstagefright/Android.mk                    |   14 +-
+ media/libstagefright/AwesomePlayer.cpp             |  152 +++++++++++++-------
+ media/libstagefright/colorconversion/Android.mk    |    7 +
+ .../colorconversion/SoftwareRenderer.cpp           |    9 ++
+ media/libstagefright/include/AwesomePlayer.h       |   22 +++-
+ 10 files changed, 278 insertions(+), 128 deletions(-)
+
+diff --git a/media/libmediaplayerservice/Android.mk b/media/libmediaplayerservice/Android.mk
+index fc7c01d..c3d9d59 100644
+--- a/media/libmediaplayerservice/Android.mk
++++ b/media/libmediaplayerservice/Android.mk
+@@ -69,9 +69,11 @@ ifeq ($(TARGET_HAS_VPP), true)
+ endif
+ 
+ #ifeq ($(TARGET_HAS_MULTIPLE_DISPLAY),true)
+-#    LOCAL_C_INCLUDES += $(TARGET_OUT_HEADERS)/display
+ #    LOCAL_SHARED_LIBRARIES += libmultidisplay
+ #    LOCAL_CFLAGS += -DTARGET_HAS_MULTIPLE_DISPLAY
++#ifeq ($(USE_MDS_LEGACY),true)
++#    LOCAL_CFLAGS += -DUSE_MDS_LEGACY
++#endif
+ #endif
+ 
+ LOCAL_MODULE:= libmediaplayerservice
+diff --git a/media/libmediaplayerservice/MediaPlayerService.cpp b/media/libmediaplayerservice/MediaPlayerService.cpp
+index bb18869..f613558 100644
+--- a/media/libmediaplayerservice/MediaPlayerService.cpp
++++ b/media/libmediaplayerservice/MediaPlayerService.cpp
+@@ -80,7 +80,12 @@
+ #include "RemoteDisplay.h"
+ 
+ #ifdef TARGET_HAS_MULTIPLE_DISPLAY
++#ifdef USE_MDS_LEGACY
+ #include <display/MultiDisplayClient.h>
++#else
++#include <display/MultiDisplayService.h>
++#include <display/IMultiDisplayVideoControl.h>
++#endif
+ #endif
+ 
+ namespace {
+@@ -90,6 +95,11 @@ using android::OK;
+ using android::BAD_VALUE;
+ using android::NOT_ENOUGH_DATA;
+ using android::Parcel;
++#ifdef TARGET_HAS_MULTIPLE_DISPLAY
++#ifndef USE_MDS_LEGACY
++using namespace android::intel;
++#endif
++#endif
+ 
+ // Max number of entries in the filter.
+ const int kMaxFilterSize = 64;  // I pulled that out of thin air.
+@@ -228,12 +238,28 @@ MediaPlayerService::MediaPlayerService()
+ 
+ #ifdef TARGET_HAS_MULTIPLE_DISPLAY
+     // Reset video playback status in case media server crashes.
+-    MultiDisplayClient* client = new MultiDisplayClient;
+-    if (client) {
+-        MDSVideoSourceInfo info;
+-        memset(&info, 0, sizeof(MDSVideoSourceInfo));
+-        client->setVideoSourceInfo(&info);
+-        delete client;
++#ifdef USE_MDS_LEGACY
++    MultiDisplayClient* mdsclient = new MultiDisplayClient();
++#else
++    sp<IServiceManager> sm = defaultServiceManager();
++    if (sm == NULL) {
++        LOGE("%s: Fail to get service manager", __func__);
++        return;
++    }
++    sp<IMDService> mds = interface_cast<IMDService>(
++            sm->getService(String16(INTEL_MDS_SERVICE_NAME)));
++    if (mds == NULL) {
++        LOGE("%s: Failed to get MDS service", __func__);
++        return;
++    }
++    sp<IMultiDisplayVideoControl> mdsclient = mds->getVideoControl();
++#endif
++    if (mdsclient != NULL) {
++        mdsclient->resetVideoPlayback();
++#ifdef USE_MDS_LEGACY
++        delete mdsclient;
++#endif
++        mdsclient = NULL;
+     }
+ #endif
+ }
+diff --git a/media/libmediaplayerservice/nuplayer/Android.mk b/media/libmediaplayerservice/nuplayer/Android.mk
+index b7b8d10..464f401 100644
+--- a/media/libmediaplayerservice/nuplayer/Android.mk
++++ b/media/libmediaplayerservice/nuplayer/Android.mk
+@@ -31,9 +31,11 @@ LOCAL_SHARED_LIBRARIES += libva \
+ endif
+ 
+ #ifeq ($(TARGET_HAS_MULTIPLE_DISPLAY),true)
+-#    LOCAL_C_INCLUDES += $(TARGET_OUT_HEADERS)/display
+ #    LOCAL_SHARED_LIBRARIES += libmultidisplay
+ #    LOCAL_CFLAGS += -DTARGET_HAS_MULTIPLE_DISPLAY
++#ifeq ($(USE_MDS_LEGACY),true)
++#    LOCAL_CFLAGS += -DUSE_MDS_LEGACY
++#endif
+ #endif
+ 
+ LOCAL_MODULE:= libstagefright_nuplayer
+diff --git a/media/libmediaplayerservice/nuplayer/NuPlayer.cpp b/media/libmediaplayerservice/nuplayer/NuPlayer.cpp
+index f8e5643..ca2a4f5 100644
+--- a/media/libmediaplayerservice/nuplayer/NuPlayer.cpp
++++ b/media/libmediaplayerservice/nuplayer/NuPlayer.cpp
+@@ -175,7 +175,7 @@ NuPlayer::NuPlayer()
+ 
+ NuPlayer::~NuPlayer() {
+ #ifdef TARGET_HAS_MULTIPLE_DISPLAY
+-    setDisplaySource(false);
++    setMDSVideoState_l((int)MDS_VIDEO_UNPREPARED);
+ #endif
+ }
+ 
+@@ -205,53 +205,85 @@ void NuPlayer::setDataSourceAsync(const sp<IStreamSource> &source) {
+ }
+ 
+ #ifdef TARGET_HAS_MULTIPLE_DISPLAY
+-void NuPlayer::setDisplaySource(bool isplaying) {
+-    MDSVideoSourceInfo info;
+-    memset(&info, 0 ,sizeof(&info));
+-    if (isplaying) {
+-        int wcom = 0;
+-        if (mANativeWindow != NULL) {
+-            mANativeWindow->query(mANativeWindow.get(),
+-                    NATIVE_WINDOW_QUEUES_TO_WINDOW_COMPOSER, &wcom);
++void NuPlayer::setMDSVideoState_l(int state) {
++    if (state == MDS_VIDEO_UNPREPARED && mVideoSessionId == -1) {
++        return;
++    }
++    if (mMDClient == NULL) {
++#ifdef USE_MDS_LEGACY
++        mMDClient = new MultiDisplayClient();
++#else
++        sp<IServiceManager> sm = defaultServiceManager();
++        if (sm == NULL) {
++            LOGE("%s: Fail to get service manager", __func__);
++            return;
+         }
+-        if (mVideoDecoder != NULL && wcom == 1) {
+-            if (mMDClient == NULL) {
+-                mMDClient = new MultiDisplayClient();
+-            }
+-            sp<AMessage> msg = NULL;
+-            int32_t displayW, displayH, frameRate;
+-            bool success = false;
+-            displayW = displayH = frameRate = 0;
+-            info.isplaying = true;
+-            info.isprotected = false;
+-            msg = mSource->getFormat(false);
+-            if (msg != NULL) {
+-                success = msg->findInt32("frame-rate", &frameRate);
+-                if (!success)
+-                    frameRate = 0;
+-                success = msg->findInt32("width", &displayW);
+-                if (!success)
+-                    displayW = 0;
+-                success = msg->findInt32("height", &displayH);
+-                if (!success)
+-                    displayH = 0;
+-            }
+-            info.frameRate = frameRate;
+-            info.displayW  = displayW;
+-            info.displayH  = displayH;
+-            mMDClient->setVideoSourceInfo(&info);
+-            mMDClient->setVideoState(MDS_VIDEO_PREPARED);
++        sp<IMDService> mds = interface_cast<IMDService>(
++                sm->getService(String16(INTEL_MDS_SERVICE_NAME)));
++        if (mds == NULL) {
++            LOGE("%s: Failed to get MDS service", __func__);
++            return;
+         }
+-    } else {
+-      if (mMDClient != NULL) {
+-          info.isplaying = false;
+-          info.isprotected = false;
+-          mMDClient->setVideoSourceInfo(&info);
+-          mMDClient->setVideoState(MDS_VIDEO_UNPREPARED);
+-          delete mMDClient;
+-          mMDClient = NULL;
+-      }
++        mMDClient = mds->getVideoControl();
++#endif
++    }
++    if (mVideoSessionId < 0) {
++        mVideoSessionId = mMDClient->allocateVideoSessionId();
++    }
++    mMDClient->updateVideoState(mVideoSessionId, (MDS_VIDEO_STATE)state);
++    if (state == MDS_VIDEO_UNPREPARED) {
++        mVideoSessionId = -1;
++#ifdef USE_MDS_LEGACY
++        delete mMDClient;
++#endif
++        mMDClient = NULL;
++    }
++}
++
++void NuPlayer::setMDSVideoInfo_l() {
++    MDSVideoSourceInfo info;
++    int wcom = 0;
++    if (mNativeWindow == NULL)
++        return;
++    sp<ANativeWindow> win = mNativeWindow->getNativeWindow().get();
++    if (win == NULL)
++        return;
++    /*
++     * 0 means the buffers do not go directly to the window compositor;
++     * 1 means the ANativeWindow DOES send queued buffers
++     * directly to the window compositor;
++     * For more info, refer system/core/include/system/window.h
++     */
++    win->query(win.get(), NATIVE_WINDOW_QUEUES_TO_WINDOW_COMPOSER, &wcom);
++    if (wcom == 0 || mVideoDecoder == NULL ||
++            mMDClient == NULL || mVideoSessionId < 0)
++        return;
++    memset(&info, 0 ,sizeof(&info));
++    sp<AMessage> msg = NULL;
++    int32_t displayW, displayH, frameRate;
++    bool success = false;
++    displayW = displayH = frameRate = 0;
++#ifdef USE_MDS_LEGACY
++    info.isPlaying = true;
++#endif
++    info.isProtected = false;
++    msg = mSource->getFormat(false);
++    if (msg != NULL) {
++        success = msg->findInt32("frame-rate", &frameRate);
++        if (!success)
++            frameRate = 0;
++        success = msg->findInt32("width", &displayW);
++        if (!success)
++            displayW = 0;
++        success = msg->findInt32("height", &displayH);
++        if (!success)
++            displayH = 0;
+     }
++    info.frameRate = frameRate;
++    info.displayW  = displayW;
++    info.displayH  = displayH;
++    mMDClient->updateVideoSourceInfo(mVideoSessionId, info);
++    setMDSVideoState_l((int)MDS_VIDEO_PREPARED);
+ }
+ #endif
+ 
+@@ -345,10 +377,7 @@ void NuPlayer::setVideoSurfaceTextureAsync(
+ 
+     msg->post();
+ #ifdef TARGET_HAS_MULTIPLE_DISPLAY
+-    if (mVideoDecoder != NULL) {
+-        setDisplaySource(false);
+-    }
+-    mANativeWindow = surfaceTextureClient;
++    setMDSVideoState_l((int)MDS_VIDEO_UNPREPARED);
+ #endif
+ }
+ 
+@@ -594,7 +623,6 @@ void NuPlayer::onMessageReceived(const sp<AMessage> &msg) {
+                     schedulePollDuration();
+                 }
+             }
+-
+             status_t err;
+             if ((err = mSource->feedMoreTSData()) != OK) {
+                 if (mAudioDecoder == NULL && mVideoDecoder == NULL) {
+@@ -1082,9 +1110,12 @@ status_t NuPlayer::instantiateDecoder(bool audio, sp<Decoder> *decoder) {
+ #endif
+ 
+ #ifdef TARGET_HAS_MULTIPLE_DISPLAY
+-    if (!audio)
+-        setDisplaySource(true);
++    if (!audio) {
++        setMDSVideoState_l((int)MDS_VIDEO_PREPARING);
++        setMDSVideoInfo_l();
++    }
+ #endif
++
+     return OK;
+ }
+ 
+diff --git a/media/libmediaplayerservice/nuplayer/NuPlayer.h b/media/libmediaplayerservice/nuplayer/NuPlayer.h
+index 2f7bd17..3c10e0c 100644
+--- a/media/libmediaplayerservice/nuplayer/NuPlayer.h
++++ b/media/libmediaplayerservice/nuplayer/NuPlayer.h
+@@ -21,12 +21,18 @@
+ #include <media/MediaPlayerInterface.h>
+ #include <media/stagefright/foundation/AHandler.h>
+ #include <media/stagefright/NativeWindowWrapper.h>
++#ifdef TARGET_HAS_VPP
++#include <NuPlayerVPPProcessor.h>
++#endif
++
+ #ifdef TARGET_HAS_MULTIPLE_DISPLAY
++#ifdef USE_MDS_LEGACY
+ #include <display/MultiDisplayClient.h>
++#else
++#include <display/MultiDisplayService.h>
++#include <display/IMultiDisplayVideoControl.h>
++using namespace android::intel;
+ #endif
+-
+-#ifdef TARGET_HAS_VPP
+-#include <NuPlayerVPPProcessor.h>
+ #endif
+ 
+ namespace android {
+@@ -169,9 +175,14 @@ private:
+     int64_t mVideoLateByUs;
+     int64_t mNumFramesTotal, mNumFramesDropped;
+ #ifdef TARGET_HAS_MULTIPLE_DISPLAY
++#ifdef USE_MDS_LEGACY
+     MultiDisplayClient* mMDClient;
+-    sp<ANativeWindow> mANativeWindow;
+-    void setDisplaySource(bool isplaying);
++#else
++    sp<IMultiDisplayVideoControl> mMDClient;
++#endif
++    int mVideoSessionId;
++    void setMDSVideoInfo_l();
++    void setMDSVideoState_l(int state);
+ #endif
+ 
+     int32_t mVideoScalingMode;
+diff --git a/media/libstagefright/Android.mk b/media/libstagefright/Android.mk
+index ca7351e..b3e43cc 100644
+--- a/media/libstagefright/Android.mk
++++ b/media/libstagefright/Android.mk
+@@ -186,12 +186,6 @@ LOCAL_STATIC_LIBRARIES += \
+ LOCAL_CPPFLAGS += -DUSE_INTEL_MDP
+ endif
+ 
+-#ifeq ($(TARGET_HAS_MULTIPLE_DISPLAY),true)
+-#	LOCAL_C_INCLUDES += $(TARGET_OUT_HEADERS)/display
+-#	LOCAL_SHARED_LIBRARIES += libmultidisplay
+-#    LOCAL_CFLAGS += -DTARGET_HAS_MULTIPLE_DISPLAY
+-#endif
+-
+ LOCAL_SHARED_LIBRARIES += libstlport
+ include external/stlport/libstlport.mk
+ 
+@@ -203,6 +197,14 @@ LOCAL_SHARED_LIBRARIES += \
+ 
+ LOCAL_CFLAGS += -Wno-multichar
+ 
++#ifeq ($(TARGET_HAS_MULTIPLE_DISPLAY),true)
++#    LOCAL_CFLAGS += -DTARGET_HAS_MULTIPLE_DISPLAY
++#ifeq ($(USE_MDS_LEGACY),true)
++#    LOCAL_CFLAGS += -DUSE_MDS_LEGACY
++#endif
++#    LOCAL_SHARED_LIBRARIES += libmultidisplay
++#endif
++
+ LOCAL_MODULE:= libstagefright
+ 
+ LOCAL_MODULE_TAGS := optional
+diff --git a/media/libstagefright/AwesomePlayer.cpp b/media/libstagefright/AwesomePlayer.cpp
+index c8d20a9..aeaa437 100644
+--- a/media/libstagefright/AwesomePlayer.cpp
++++ b/media/libstagefright/AwesomePlayer.cpp
+@@ -154,13 +154,13 @@ struct AwesomeLocalRenderer : public AwesomeRenderer {
+         : mTarget(new SoftwareRenderer(nativeWindow, meta)) {
+     }
+ 
+-    virtual void render(MediaBuffer *buffer) {
++    virtual void render(MediaBuffer *buffer, void *platformPrivate) {
+         render((const uint8_t *)buffer->data() + buffer->range_offset(),
+-               buffer->range_length());
++               buffer->range_length(), platformPrivate);
+     }
+ 
+-    void render(const void *data, size_t size) {
+-        mTarget->render(data, size, NULL);
++    void render(const void *data, size_t size, void *platformPrivate) {
++        mTarget->render(data, size, platformPrivate);
+     }
+ 
+ protected:
+@@ -184,7 +184,7 @@ struct AwesomeNativeWindowRenderer : public AwesomeRenderer {
+         applyRotation(rotationDegrees);
+     }
+ 
+-    virtual void render(MediaBuffer *buffer) {
++    virtual void render(MediaBuffer *buffer, void *platformPrivate) {
+         ATRACE_CALL();
+         int64_t timeUs;
+         CHECK(buffer->meta_data()->findInt64(kKeyTime, &timeUs));
+@@ -261,6 +261,7 @@ AwesomePlayer::AwesomePlayer()
+ #endif
+ #ifdef TARGET_HAS_MULTIPLE_DISPLAY
+       mMDClient(NULL),
++      mVideoSessionId(-1),
+ #endif
+       mLastVideoTimeUs(-1),
+       mTextDriver(NULL),
+@@ -326,7 +327,7 @@ AwesomePlayer::~AwesomePlayer() {
+ 
+     mClient.disconnect();
+ #ifdef TARGET_HAS_MULTIPLE_DISPLAY
+-    setDisplaySource_l(false);
++    setMDSVideoState_l(MDS_VIDEO_UNPREPARED);
+ #endif
+ }
+ 
+@@ -461,60 +462,72 @@ void AwesomePlayer::checkDrmStatus(const sp<DataSource>& dataSource) {
+ }
+ 
+ #ifdef TARGET_HAS_MULTIPLE_DISPLAY
+-void AwesomePlayer::notifyMDSPlayerStatus_l(int status) {
++void AwesomePlayer::setMDSVideoState_l(int state) {
++    ALOGV("MultiDisplay setMDSVideoState: %d", state);
++    if (state == MDS_VIDEO_UNPREPARED && mVideoSessionId == -1) {
++        return;
++    }
+     if (mMDClient == NULL) {
++#ifdef USE_MDS_LEGACY
+         mMDClient = new MultiDisplayClient();
+-    }
+-
+-    if (mMDClient != NULL) {
+-        mMDClient->setVideoState((MDS_VIDEO_STATE)status);
+-
+-        if (status == MDS_VIDEO_UNPREPARED) {
+-            delete mMDClient;
+-            mMDClient = NULL;
++#else
++        sp<IServiceManager> sm = defaultServiceManager();
++        if (sm == NULL) {
++            LOGE("%s: Fail to get service manager", __func__);
++            return;
+         }
+-    } else {
+-        LOGI("NULL MDClient in AwesomePlayer!");
++        sp<IMDService> mds = interface_cast<IMDService>(
++                sm->getService(String16(INTEL_MDS_SERVICE_NAME)));
++        if (mds == NULL) {
++            LOGE("%s: Failed to get MDS service", __func__);
++            return;
++        }
++        mMDClient = mds->getVideoControl();
++#endif
++    }
++    if (mVideoSessionId < 0) {
++        mVideoSessionId = mMDClient->allocateVideoSessionId();
++    }
++    mMDClient->updateVideoState(mVideoSessionId, (MDS_VIDEO_STATE)state);
++    if (state == MDS_VIDEO_UNPREPARED) {
++        mVideoSessionId = -1;
++#ifdef USE_MDS_LEGACY
++        delete mMDClient;
++#endif
++        mMDClient = NULL;
+     }
+ }
+ 
+-void AwesomePlayer::setDisplaySource_l(bool isplaying) {
++void AwesomePlayer::setMDSVideoInfo_l() {
++    ALOGV("MultiDisplay setMDSVideoInfo");
+     MDSVideoSourceInfo info;
++    int wcom = 0;
++    if (mNativeWindow != NULL) {
++        mNativeWindow->query(mNativeWindow.get(),
++                NATIVE_WINDOW_QUEUES_TO_WINDOW_COMPOSER, &wcom);
++        /*
++         * 0 means the buffers do not go directly to the window compositor;
++         * 1 means the ANativeWindow DOES send queued buffers
++         * directly to the window compositor;
++         * For more info, refer system/core/include/system/window.h
++         */
++    }
++    if (wcom == 0 || mVideoSource == NULL ||
++            mMDClient == NULL || mVideoSessionId < 0)
++        return;
+     memset(&info, 0, sizeof(MDSVideoSourceInfo));
+-
+-    if (isplaying) {
+-        if (mVideoSource != NULL) {
+-            if (mMDClient == NULL) {
+-                mMDClient = new MultiDisplayClient();
+-            }
+-            int wcom = 0;
+-            if (mNativeWindow != NULL)
+-                mNativeWindow->query(mNativeWindow.get(), NATIVE_WINDOW_QUEUES_TO_WINDOW_COMPOSER, &wcom);
+-            /*
+-             * 0 means the buffers do not go directly to the window compositor;
+-             * 1 means the ANativeWindow DOES send queued buffers
+-             * directly to the window compositor;
+-             */
+-            if (wcom == 1) {
+-                info.isplaying = true;
+-                info.isprotected = (mDecryptHandle != NULL);
+-                {
+-                    Mutex::Autolock autoLock(mStatsLock);
+-                    info.frameRate = mStats.mFrameRate;
+-                    info.displayW = mStats.mVideoWidth;
+-                    info.displayH = mStats.mVideoHeight;
+-                }
+-                mMDClient->setVideoSourceInfo(&info);
+-                notifyMDSPlayerStatus_l(MDS_VIDEO_PREPARED);
+-            }
+-        }
+-    } else {
+-        if (mMDClient != NULL) {
+-           info.isplaying = false;
+-           info.isprotected = false;
+-           mMDClient->setVideoSourceInfo(&info);
+-        }
++#ifdef USE_MDS_LEGACY
++    info.isPlaying = true;
++#endif
++    info.isProtected = (mDecryptHandle != NULL);
++    {
++        Mutex::Autolock autoLock(mStatsLock);
++        info.frameRate = mStats.mFrameRate;
++        info.displayW = mStats.mVideoWidth;
++        info.displayH = mStats.mVideoHeight;
+     }
++    mMDClient->updateVideoSourceInfo(mVideoSessionId, info);
++    setMDSVideoState_l(MDS_VIDEO_PREPARED);
+ }
+ #endif
+ 
+@@ -1220,7 +1233,7 @@ status_t AwesomePlayer::play_l() {
+     }
+ 
+ #ifdef TARGET_HAS_MULTIPLE_DISPLAY
+-    setDisplaySource_l(true);
++    setMDSVideoInfo_l();
+ #endif
+     return OK;
+ }
+@@ -1589,9 +1602,6 @@ void AwesomePlayer::shutdownVideoDecoder_l() {
+         mVideoBuffer->release();
+         mVideoBuffer = NULL;
+     }
+-#ifdef TARGET_HAS_MULTIPLE_DISPLAY
+-    setDisplaySource_l(false);
+-#endif
+ 
+ #ifdef TARGET_HAS_VPP
+     if (mVPPProcessor != NULL) {
+@@ -1600,8 +1610,16 @@ void AwesomePlayer::shutdownVideoDecoder_l() {
+     }
+ #endif
+ 
++#ifdef TARGET_HAS_MULTIPLE_DISPLAY
++    setMDSVideoState_l(MDS_VIDEO_UNPREPARING);
++#endif
++
+     mVideoSource->stop();
+ 
++#ifdef TARGET_HAS_MULTIPLE_DISPLAY
++    setMDSVideoState_l(MDS_VIDEO_UNPREPARED);
++#endif
++
+     // The following hack is necessary to ensure that the OMX
+     // component is completely released by the time we may try
+     // to instantiate it again.
+@@ -1996,6 +2014,9 @@ status_t AwesomePlayer::initVideoDecoder(uint32_t flags) {
+     }
+ 
+     if (mVideoSource != NULL) {
++#ifdef TARGET_HAS_MULTIPLE_DISPLAY
++        setMDSVideoState_l(MDS_VIDEO_PREPARING);
++#endif
+         int64_t durationUs;
+         if (mVideoTrack->getFormat()->findInt64(kKeyDuration, &durationUs)) {
+             Mutex::Autolock autoLock(mMiscStateLock);
+@@ -2539,7 +2560,28 @@ void AwesomePlayer::onVideoEvent() {
+ 
+     if (mVideoRenderer != NULL) {
+         mSinceLastDropped++;
++#ifdef TARGET_HAS_MULTIPLE_DISPLAY
++        struct IntelPlatformPrivate platformPrivate;
++        struct ANativeWindowBuffer *anwBuff = mVideoBuffer->graphicBuffer().get();
++        if (mVideoSessionId >= 0) {
++            ALOGV("MDS Video session ID is %d, Gfx buffer is %s", mVideoSessionId, (anwBuff == NULL? "null" : "not null"));
++            if (anwBuff != NULL) {
++                // Get mds_video_session_ID
++                // Limitation: support upto 16 concurrent video sessions
++                // native_window usage, bit 24 ~ bit 27 is used to maintain mds video session id
++                // TODO: use macro to replace magic numbers
++                anwBuff->usage |= ((mVideoSessionId << 24) & GRALLOC_USAGE_MDS_SESSION_ID_MASK);
++                anwBuff->usage |= GRALLOC_USAGE_PRIVATE_3;
++            } else {
++                platformPrivate.usage = GRALLOC_USAGE_PRIVATE_3;
++                platformPrivate.usage |= ((mVideoSessionId << 24) & GRALLOC_USAGE_MDS_SESSION_ID_MASK);
++            }
++        }
++
++        mVideoRenderer->render(mVideoBuffer, &platformPrivate);
++#else
+         mVideoRenderer->render(mVideoBuffer);
++#endif
+         if (!mVideoRenderingStarted) {
+             mVideoRenderingStarted = true;
+             notifyListener_l(MEDIA_INFO, MEDIA_INFO_RENDERING_START);
+diff --git a/media/libstagefright/colorconversion/Android.mk b/media/libstagefright/colorconversion/Android.mk
+index 8ea4ed3..b00a0ee 100644
+--- a/media/libstagefright/colorconversion/Android.mk
++++ b/media/libstagefright/colorconversion/Android.mk
+@@ -16,6 +16,13 @@ LOCAL_C_INCLUDES += \
+         $(TARGET_OUT_HEADERS)/libva
+ endif
+ 
++#ifeq ($(TARGET_HAS_MULTIPLE_DISPLAY),true)
++#    LOCAL_CFLAGS += -DTARGET_HAS_MULTIPLE_DISPLAY
++#ifeq ($(USE_MDS_LEGACY),true)
++#    LOCAL_CFLAGS += -DUSE_MDS_LEGACY
++#endif
++#endif
++
+ LOCAL_MODULE:= libstagefright_color_conversion
+ 
+ include $(BUILD_STATIC_LIBRARY)
+diff --git a/media/libstagefright/colorconversion/SoftwareRenderer.cpp b/media/libstagefright/colorconversion/SoftwareRenderer.cpp
+index 77f21b7..1c8b7cc 100644
+--- a/media/libstagefright/colorconversion/SoftwareRenderer.cpp
++++ b/media/libstagefright/colorconversion/SoftwareRenderer.cpp
+@@ -18,6 +18,7 @@
+ #include <utils/Log.h>
+ 
+ #include "../include/SoftwareRenderer.h"
++#include "../include/AwesomePlayer.h"
+ 
+ #include <cutils/properties.h> // for property_get
+ #include <media/stagefright/foundation/ADebug.h>
+@@ -230,6 +231,14 @@ void SoftwareRenderer::render(
+ 
+     CHECK_EQ(0, mapper.unlock(buf->handle));
+ 
++#ifdef TARGET_HAS_MULTIPLE_DISPLAY
++    if (platformPrivate != NULL) {
++        struct IntelPlatformPrivate *p =
++            (struct IntelPlatformPrivate *)platformPrivate;
++        buf->usage |= p->usage;
++    }
++#endif
++
+     if ((err = mNativeWindow->queueBuffer(mNativeWindow.get(), buf,
+             -1)) != 0) {
+         ALOGW("Surface::queueBuffer returned error %d", err);
+diff --git a/media/libstagefright/include/AwesomePlayer.h b/media/libstagefright/include/AwesomePlayer.h
+index 13b291a..e25b440 100644
+--- a/media/libstagefright/include/AwesomePlayer.h
++++ b/media/libstagefright/include/AwesomePlayer.h
+@@ -34,7 +34,13 @@
+ #include <utils/threads.h>
+ #include <drm/DrmManagerClient.h>
+ #ifdef TARGET_HAS_MULTIPLE_DISPLAY
++#ifdef USE_MDS_LEGACY
+ #include <display/MultiDisplayClient.h>
++#else
++#include <display/MultiDisplayService.h>
++#include <display/IMultiDisplayVideoControl.h>
++using namespace android::intel;
++#endif
+ #endif
+ 
+ namespace android {
+@@ -56,13 +62,19 @@ struct WVMExtractor;
+ struct AwesomeRenderer : public RefBase {
+     AwesomeRenderer() {}
+ 
+-    virtual void render(MediaBuffer *buffer) = 0;
++    virtual void render(MediaBuffer *buffer, void *platformPrivate = NULL) = 0;
+ 
+ private:
+     AwesomeRenderer(const AwesomeRenderer &);
+     AwesomeRenderer &operator=(const AwesomeRenderer &);
+ };
+ 
++#ifdef TARGET_HAS_MULTIPLE_DISPLAY
++struct IntelPlatformPrivate {
++    int usage;
++};
++#endif
++
+ struct AwesomePlayer {
+     AwesomePlayer();
+     ~AwesomePlayer();
+@@ -217,7 +229,12 @@ private:
+     bool mWatchForAudioSeekComplete;
+     bool mWatchForAudioEOS;
+ #ifdef TARGET_HAS_MULTIPLE_DISPLAY
++#ifdef USE_MDS_LEGACY
+     MultiDisplayClient* mMDClient;
++#else
++    sp<IMultiDisplayVideoControl> mMDClient;
++#endif
++    int mVideoSessionId;
+ #endif
+ 
+     sp<TimedEventQueue::Event> mVideoEvent;
+@@ -273,7 +290,8 @@ private:
+     status_t setDataSource_l(const sp<DataSource> &dataSource);
+     status_t setDataSource_l(const sp<MediaExtractor> &extractor);
+ #ifdef TARGET_HAS_MULTIPLE_DISPLAY
+-    void setDisplaySource_l(bool isplaying);
++    void setMDSVideoState_l(int status);
++    void setMDSVideoInfo_l();
+ #endif
+     void reset_l();
+     status_t seekTo_l(int64_t timeUs);
+-- 
+1.7.4.1
+

@@ -1,0 +1,1426 @@
+From 7567fb9315357e00f16caa19b5a0e594eed41206 Mon Sep 17 00:00:00 2001
+From: Qiming Shi <qiming.shi@intel.com>
+Date: Sat, 1 Jun 2013 14:57:21 +0800
+Subject: Dalvik: Null and Bound Check Removal
+
+BZ: 65156
+
+Null and Bound Check Removal
+
+The null and bound checks are now checked in the middle-end.
+The pass follows through the Control Flow Graph and then removes any redundancy.
+It can also hoist if a flag is set to true, the current default behavior is no hoisting.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Ib9b1b8248fa4f1df725b6714786d4bfcb1cd42b0
+Orig-MCG-Change-Id: I993caf660212a1ef45b89497fa0f1089441e5316
+Signed-off-by: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/Dvm.mk                                         |    4 +-
+ vm/compiler/Checks.cpp                            |  698 +++++++++++++++++++++
+ vm/compiler/Checks.h                              |   47 ++
+ vm/compiler/Compiler.h                            |    1 +
+ vm/compiler/CompilerIR.h                          |   29 +-
+ vm/compiler/Dataflow.cpp                          |   52 ++
+ vm/compiler/LoopOpt.cpp                           |    4 +
+ vm/compiler/codegen/x86/CodegenInterface.cpp      |  133 +----
+ vm/compiler/codegen/x86/InstructionGeneration.cpp |  206 ++++++
+ vm/compiler/codegen/x86/InstructionGeneration.h   |   84 +++
+ 10 files changed, 1132 insertions(+), 126 deletions(-)
+ create mode 100644 vm/compiler/Checks.cpp
+ create mode 100644 vm/compiler/Checks.h
+ create mode 100644 vm/compiler/codegen/x86/InstructionGeneration.cpp
+ create mode 100644 vm/compiler/codegen/x86/InstructionGeneration.h
+
+diff --git a/vm/Dvm.mk b/vm/Dvm.mk
+index cc36332..ee06308 100644
+--- a/vm/Dvm.mk
++++ b/vm/Dvm.mk
+@@ -347,7 +347,9 @@ ifeq ($(dvm_arch),x86)
+                 compiler/codegen/x86-atom/Schedule.cpp \
+                 compiler/codegen/x86-atom/DataFlow.cpp \
+                 compiler/codegen/x86-atom/GlueOpt.cpp \
+-                compiler/LoopOpt.cpp
++                compiler/codegen/x86-atom/InstructionGeneration.cpp \
++                compiler/LoopOpt.cpp \
++                compiler/Checks.cpp
+         LOCAL_C_INCLUDES += \
+                 hardware/intel/apache-harmony
+         LOCAL_STATIC_LIBRARIES += \
+diff --git a/vm/compiler/Checks.cpp b/vm/compiler/Checks.cpp
+new file mode 100644
+index 0000000..e9bbc0c
+--- /dev/null
++++ b/vm/compiler/Checks.cpp
+@@ -0,0 +1,698 @@
++/*
++ * Copyright (C) 2012 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "Dalvik.h"
++#include "Dataflow.h"
++#include "Loop.h"
++#include "LoopOpt.h"
++#include "Checks.h"
++
++#include <map>
++
++/**
++ * Note:
++ *  The current file contains the hoisting pass framework, it uses two structures:
++ *      - SRemoveData is the general pass information holder for the whole pass
++ *      - STrackers is for a given BasicBlock, it is used to hold information passed through the pass' call chain
++ *
++ *  To add a new hoisting algorithm, follow the STEP keyword throughout the file, they
++ *  show where to add your information (not including the two data structures)
++ */
++
++//STEP 0: Add any information required in the data structures
++/**
++ * @brief sRemoveData is used by the removal algorithm to remember which registers are live for each BasicBlock
++ */
++typedef struct sRemoveData
++{
++    std::map<int, BitVector*> nullChecks;                            /**< @brief map between BasicBlock id and a BitVector */
++    std::map<int, std::map<int, BitVector *> > indexToArrayChecks;   /**< @brief map between BasicBlock id and a map of indices with arrays */
++
++    bool hoistChecks;                                                /**< @brief Do we hoist the checks out or do we leave the first in place? */
++    BitVector *hoistedNullChecks;                                    /**< @brief Remember which arrays we have hoisted already */
++    std::map<int, BitVector *> hoistedArrayToIndexChecks;            /**< @brief Remember which array[index] we've hoisted already */
++}SRemoveData;
++
++/**
++ * @brief sTrackers is used to track progress through a BasicBlock parsing
++ */
++typedef struct sTrackers
++{
++    BitVector *tempNullChecks;                          /**< @brief bit vector for the null checks guaranteed to have been done */
++    std::map<int, BitVector *> *indexToArrayChecks;     /**< @brief map from index to Bitvector representing which checks have been done */
++}STrackers;
++
++//Forward declarations of static functions
++
++/**
++ * @brief Initialize the tempNullCheck bit vector with first predecessor
++ * @param cUnit the CompilationUnit
++ * @param removeData the current SRemoveData information
++ * @param tempNullCheck bit vector representing which registers have been null checked
++ * @param predBB predecessor block
++ */
++static void initializeNullChecks (CompilationUnit *cUnit, SRemoveData *removeData, BitVector *tempNullCheck, BasicBlock *predBB);
++
++/**
++ * @brief Handle new predecessor block
++ * @param removeData the current SRemoveData information
++ * @param tempNullCheck bit vector representing which registers have been null checked
++ * @param predBB predecessor block
++ */
++static void handlePredecessorNull (SRemoveData *removeData, BitVector *tempNullCheck, BasicBlock *predBB);
++
++/**
++ * @brief Initialize the indexToArray map with first predecessor
++ * @param cUnit the CompilationUnit
++ * @param removeData the current SRemoveData information
++ * @param indexToArrayChecks map between index and which array has been checked
++ * @param predBB predecessor block
++ */
++static void initializeIndexToArray (CompilationUnit *cUnit, SRemoveData *removeData, std::map<int, BitVector *> *indexToArrayChecks, BasicBlock *predBB);
++
++/**
++ * @brief Initialize the indexToArray map with first predecessor
++ * @param removeData the current SRemoveData information
++ * @param indexToArrayChecks map between index and which array has been checked
++ * @param predBB predecessor block
++ */
++static void handlePredecessorIndexToArray (SRemoveData *removeData, std::map<int, BitVector *> *indexToArrayChecks, BasicBlock *predBB);
++
++/**
++ * @brief Initialize data for the current BasicBlock
++ * @param cUnit the CompilationUnit
++ * @param ptrRemoveData the current SRemoveData information
++ * @param bb the current BasicBlock
++ * @param tracker the tracker structure for the basic block
++ */
++static void initializeData (CompilationUnit *cUnit, SRemoveData **ptrRemoveData, BasicBlock *bb, STrackers &tracker);
++
++/**
++ * @brief Handle the null check regarding a new MIR instruction
++ * @param cUnit the CompilationUnit
++ * @param removeData the current SRemoveData information
++ * @param nullCheck the array index considered for nullCheck for the given mir
++ * @param mir the MIR instruction
++ * @param tracker the tracker structure for the basic block
++ */
++static void handleNullCheck (CompilationUnit *cUnit, SRemoveData *removeData, int nullCheck, MIR *mir, STrackers &tracker);
++
++
++/**
++ * @brief Handle the bound check regarding a new MIR instruction
++ * @param cUnit the CompilationUnit
++ * @param removeData the current SRemoveData information
++ * @param arrayIndex the array index for the given mir
++ * @param boundCheck the boundcheck index for the given mir
++ * @param mir the MIR instruction
++ * @param tracker the tracker structure for the basic block
++ */
++static void handleBoundCheck (CompilationUnit *cUnit, SRemoveData *removeData, int arrayIndex, int boundCheck, MIR *mir, STrackers &tracker);
++
++/**
++ * @brief Walk a BasicBlock, going through each instruction
++ * @param cUnit the CompilationUnit
++ * @param removeData the current SRemoveData information
++ * @param first the first MIR instruction of the current BasicBlock
++ * @param tracker the tracker structure for the basic block
++ */
++static void walkBasicBlock (CompilationUnit *cUnit, SRemoveData *removeData, MIR *first, STrackers &tracker);
++
++
++/**
++ * @brief Handle the hoisting of an array access via an index
++ * @param cUnit the CompilationUnit
++ * @param removeData the current SRemoveData information
++ * @param mir the MIR instruction
++ * @param array the array SSA register
++ * @param index the array's index access SSA register
++ */
++static void handleIndexHoist (CompilationUnit *cUnit, SRemoveData *removeData, MIR *mir, int array, int index);
++
++/**
++ * @brief Handle the hoisting of a null check for an object access
++ * @param cUnit the CompilationUnit
++ * @param removeData the current SRemoveData information
++ * @param mir the MIR instruction
++ * @param array the array SSA register
++ */
++static void handleNullCheckHoist (CompilationUnit *cUnit, SRemoveData *removeData, MIR *mir, int array);
++
++
++
++//IMPLEMENTATION
++
++/**
++ * @brief Start the removal pass, allocate the map
++ * @param cUnit the CompilationUnit
++ * @param curPass the SPass
++ */
++void dvmCompilerStartCheckRemoval (CompilationUnit *cUnit, SPass *curPass)
++{
++    //STEP 1: Initialize any thing for the pass data here
++    SRemoveData *data = new SRemoveData;
++    curPass->data = static_cast<void *> (data);
++
++    //By default, we don't hoist the checks yet because the entry is not really the entry of the loop
++    data->hoistChecks = false;
++    data->hoistedNullChecks = dvmCompilerAllocBitVector (cUnit->numSSARegs, false);
++    dvmClearAllBits(data->hoistedNullChecks);
++}
++
++/**
++ * @brief End the removal pass, free the map
++ * @param cUnit the CompilationUnit
++ * @param curPass the SPass
++ */
++void dvmCompilerEndCheckRemoval (CompilationUnit *cUnit, SPass *curPass)
++{
++    SRemoveData *data = static_cast<SRemoveData *> (curPass->data);
++
++    //STEP 2: Add any free code here
++
++    /* We don't need to free the BitVectors: they are using the compiler heap
++     * Therefore, just clear the map and free the SRemoveData structure
++     */
++    if (data != NULL)
++    {
++        data->nullChecks.clear ();
++
++        /** Clear index to Array map
++         *  Same as before, no need to free the BitVectors
++         */
++        for (std::map<int, std::map<int, BitVector *> >::iterator it = data->indexToArrayChecks.begin ();
++                it != data->indexToArrayChecks.end ();
++                it++)
++        {
++            std::map<int, BitVector *> &myMap = it->second;
++            myMap.clear ();
++        }
++
++        data->indexToArrayChecks.clear ();
++
++        //Now delete data and clear up curPass->data
++        delete data, data = NULL;
++        curPass->data = NULL;
++    }
++}
++
++//NEXT COUPLE OF FUNCTIONS HANDLE DATA INITIALIZATION WHEN CONSIDERING A NEW BASIC BLOCK
++
++void initializeIndexToArray (CompilationUnit *cUnit, SRemoveData *removeData,
++                                    std::map<int, BitVector *> *indexToArrayChecks, BasicBlock *predBB)
++{
++    //Our current index to array map (in the indexToArrayChecks variable) is going to be the copy of the first one
++    std::map<int, BitVector *> &predMap = removeData->indexToArrayChecks[predBB->id];
++
++    for (std::map<int, BitVector *>::const_iterator it = predMap.begin ();
++            it != predMap.end ();
++            it++)
++    {
++        int key = it->first;
++        BitVector *bv = it->second;
++        //Create a new one for our new BasicBlock
++        BitVector *newBV = dvmCompilerAllocBitVector (cUnit->numSSARegs, false);
++        dvmCopyBitVector (newBV, bv);
++
++        //Add it to our map
++        (*indexToArrayChecks)[key] = newBV;
++    }
++}
++
++
++void initializeNullChecks (CompilationUnit *cUnit, SRemoveData *removeData, BitVector *tempNullCheck, BasicBlock *predBB)
++{
++    //In this case, for the null handling, we are going to be setting every bit to a potential handled
++    //The intersection code will remove all the false positives
++    dvmSetInitialBits (tempNullCheck, cUnit->numSSARegs);
++
++    //First handle the NULL check bitvector
++    BitVector *elem = removeData->nullChecks[predBB->id];
++
++    //Ok if we don't have this, it is because we have a backward branch, ignore it
++    if (elem != NULL)
++    {
++        /* tempNullCheck = tempNullCheck ^ constants already checked */
++        dvmIntersectBitVectors(tempNullCheck, tempNullCheck, elem);
++    }
++}
++
++void handlePredecessorNull (SRemoveData *removeData, BitVector *tempNullCheck, BasicBlock *predBB)
++{
++    //First handle the NULL check bitvector
++    BitVector *elem = removeData->nullChecks[predBB->id];
++
++    //Ok if we don't have this, it is because we have a backward branch, ignore it
++    if (elem != NULL)
++    {
++        /* tempNullCheck = tempNullCheck ^ constants already checked */
++        dvmIntersectBitVectors(tempNullCheck, tempNullCheck, elem);
++    }
++}
++
++void handlePredecessorIndexToArray (SRemoveData *removeData, std::map<int, BitVector *> *indexToArrayChecks,
++                                           BasicBlock *predBB)
++{
++    //Second intersection is the array access check, a little bit more tricky because it is a map first
++    std::map<int, BitVector *> &predIndexToArrayChecks = removeData->indexToArrayChecks[predBB->id];
++
++    //Now we go through ours, if we don't see it in predIndexToArray, we can remove it from ours entirely
++    //We can't do it as we are iterating, so let's put it in a vector
++    std::vector<int> toBeRemoved;
++
++    for (std::map<int, BitVector *>::iterator it = predIndexToArrayChecks.begin ();
++            it != predIndexToArrayChecks.end ();
++            it++)
++    {
++        int index = it->first;
++        BitVector *bv = it->second;
++
++        //Let's see if we have it
++        std::map<int, BitVector *>::iterator gotIt = indexToArrayChecks->find (index);
++
++        if (gotIt != indexToArrayChecks->end ())
++        {
++            //We have more work to do then: we must do an intersection
++            BitVector *ourBV = gotIt->second;
++            dvmIntersectBitVectors(ourBV, ourBV, bv);
++
++            //See if we can remove it
++            if (dvmCountSetBits (ourBV) == 0)
++            {
++                toBeRemoved.push_back (index);
++            }
++        }
++        else
++        {
++            //predIndexToArray does not have it, we can remove it entirely
++            toBeRemoved.push_back (index);
++        }
++    }
++
++    //Now remove the ones we don't need anymore
++    for (std::vector<int>::const_iterator it = toBeRemoved.begin ();
++            it != toBeRemoved.end ();
++            it++)
++    {
++        //No need to free, the compiler heap will do it
++        indexToArrayChecks->erase (*it);
++    }
++}
++
++void initializeData (CompilationUnit *cUnit, SRemoveData **ptrRemoveData, BasicBlock *bb,
++                            STrackers &tracker)
++{
++    SRemoveData *removeData = *ptrRemoveData;
++
++    //Get the block list
++    GrowableList *blockList = &cUnit->blockList;
++
++    //Get data if in loop mode
++    if (cUnit->loopAnalysis != NULL)
++    {
++        //Get the removeData
++        removeData = static_cast<SRemoveData *> (cUnit->loopAnalysis->passData);
++        *ptrRemoveData = removeData;
++
++        if (removeData != NULL)
++        {
++            //STEP 3: Initialize the vectors and update the pointers, update removeData if needed
++
++            //Retrieve our indexToArrayChecks map
++            tracker.indexToArrayChecks = &(removeData->indexToArrayChecks[bb->id]);
++
++            //Set back tempNullCheck to removeData
++            removeData->nullChecks[bb->id] = tracker.tempNullChecks;
++
++            //Get pointers from tracker, more efficient than passing tracker down stream
++            std::map<int, BitVector *> *indexToArrayChecks = tracker.indexToArrayChecks;
++            BitVector *tempNullChecks = tracker.tempNullChecks;
++
++            //Next step is to get the constants that have already been tested from our predecessors
++            BitVectorIterator bvIterator;
++
++            /* Iterate through the predecessors */
++            dvmBitVectorIteratorInit(bb->predecessors, &bvIterator);
++
++            int predIdx = dvmBitVectorIteratorNext(&bvIterator);
++
++            //If we have at least one predecessor
++            if (predIdx != -1)
++            {
++                //Get the basic block
++                BasicBlock *predBB = (BasicBlock *) dvmGrowableListGetElement(blockList, predIdx);
++
++                //STEP 4: handle first predecessor if needed
++
++                //Call for Null checks
++                initializeNullChecks (cUnit, removeData, tempNullChecks, predBB);
++
++                //Call for IndexToArray
++                initializeIndexToArray (cUnit, removeData, indexToArrayChecks, predBB);
++
++                //Get next predecessor
++                predIdx = dvmBitVectorIteratorNext(&bvIterator);
++
++                while (predIdx != -1) {
++                    //Get the basic block
++                    predBB = (BasicBlock *) dvmGrowableListGetElement(blockList, predIdx);
++
++                    //STEP 5: handle new predecessor
++
++                    //Call for null check
++                    handlePredecessorNull (removeData, tempNullChecks, predBB);
++
++                    //Call for IndexToArray
++                    handlePredecessorIndexToArray (removeData, indexToArrayChecks, predBB);
++
++                    //Next predecessor
++                    predIdx = dvmBitVectorIteratorNext(&bvIterator);
++                }
++            }
++        }
++    }
++}
++
++//NEXT COUPLE OF FUNCTIONS HANDLE THE WALKING THROUGH A BASIC BLOCK
++void handleNullCheck (CompilationUnit *cUnit, SRemoveData *removeData, int nullCheck, MIR *mir, STrackers &tracker)
++{
++    //Do we have an index?
++    if (nullCheck >= 0)
++    {
++        int reg = mir->ssaRep->uses[nullCheck];
++
++        BitVector *tempNullCheck = tracker.tempNullChecks;
++
++        //Has it already been tested
++        if (dvmIsBitSet (tempNullCheck, reg) != 0)
++        {
++            //We can remove the null check then
++            mir->OptimizationFlags |= MIR_IGNORE_NULL_CHECK;
++        }
++        else
++        {
++            //Otherwise, we'll leave this one and set it here
++            dvmSetBit (tempNullCheck, reg);
++
++            //Hoist if requested
++            handleNullCheckHoist (cUnit, removeData, mir, reg);
++        }
++    }
++}
++
++void handleBoundCheck (CompilationUnit *cUnit, SRemoveData *removeData, int nullCheck, int boundCheck,
++                              MIR *mir, STrackers &tracker)
++{
++    //Check the bound check via indexToArrayChecks
++    if (boundCheck >= 0)
++    {
++        int array = mir->ssaRep->uses[nullCheck];
++        int index = mir->ssaRep->uses[boundCheck];
++
++        std::map<int, BitVector *> *indexToArrayChecks = tracker.indexToArrayChecks;
++
++        //Check the bounds: first get the right BitVector
++        BitVector *bv = (*indexToArrayChecks)[index];
++
++        if (bv == NULL)
++        {
++            //Create it then
++            bv = dvmCompilerAllocBitVector (cUnit->numSSARegs, false);
++            dvmClearAllBits(bv);
++
++            //Set it because no one ever has here
++            dvmSetBit (bv, array);
++            //Finally store it
++            (*indexToArrayChecks)[index] = bv;
++
++            //Hoist if requested
++            handleIndexHoist (cUnit, removeData, mir, array, index);
++        }
++        else
++        {
++            //Otherwise is it set?
++            if (dvmIsBitSet (bv, array) != 0)
++            {
++                //We can remove the null check then
++                mir->OptimizationFlags |= MIR_IGNORE_RANGE_CHECK;
++            }
++            else
++            {
++                //Otherwise, we'll leave this one and set it here
++                dvmSetBit (bv, array);
++
++                //Hoist if requested
++                handleIndexHoist (cUnit, removeData, mir, array, index);
++            }
++        }
++    }
++}
++
++void walkBasicBlock (CompilationUnit *cUnit, SRemoveData *removeData, MIR *first, STrackers &tracker)
++{
++    for (MIR *mir = first; mir != NULL; mir = mir->next)
++    {
++        DecodedInstruction *dInsn = &mir->dalvikInsn;
++        int dfAttributes =
++            dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
++
++        /* Skip extended MIR instructions */
++        if (dInsn->opcode >= kNumPackedOpcodes) continue;
++
++        int instrFlags = dexGetFlagsFromOpcode(dInsn->opcode);
++
++        /* Instruction is clean */
++        if ((instrFlags & kInstrCanThrow) == 0) continue;
++
++        /*
++         * Currently we can only optimize away null and range checks. Punt on
++         * instructions that can throw due to other exceptions.
++         */
++        if (!(dfAttributes & DF_HAS_NR_CHECKS)) {
++            continue;
++        }
++
++        //STEP 6: add any value dependent on the DataFlow attribute
++        //Set to -1 both
++        int nullCheck = -1;
++        int boundCheck = -1;
++        switch (dfAttributes & DF_HAS_NR_CHECKS) {
++            case DF_NULL_N_RANGE_CHECK_0:
++                nullCheck = 0;
++                boundCheck = nullCheck + 1;
++                break;
++            case DF_NULL_N_RANGE_CHECK_1:
++                nullCheck = 1;
++                boundCheck = nullCheck + 1;
++                break;
++            case DF_NULL_N_RANGE_CHECK_2:
++                nullCheck = 2;
++                boundCheck = nullCheck + 1;
++                break;
++            default:
++                ALOGE("Jit: bad case in dvmCompilerCheckRemoval");
++                dvmCompilerAbort(cUnit);
++                break;
++        }
++
++        //STEP 7: actually decide what to do
++
++        //First check the null register
++        //Little warning: if we are hoisting, we do want this test first before any bound checking
++        //because we do not test null for arrays afterwards, we suppose it has already been done by this code
++        handleNullCheck (cUnit, removeData, nullCheck, mir, tracker);
++
++        //Now handle bound check
++        handleBoundCheck (cUnit, removeData, nullCheck, boundCheck, mir, tracker);
++    }
++}
++
++/**
++ * @brief The removal pass: point of entry remove any redundant checks
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock
++ */
++bool dvmCompilerCheckRemoval (CompilationUnit *cUnit, BasicBlock *bb)
++{
++    SRemoveData *removeData = NULL;
++
++    //Create a tracker
++    STrackers tracker;
++    memset (&tracker, 0, sizeof (tracker));
++
++    //STEP 8: initialize tracker structure
++
++    //Create a bit vector for this one
++    tracker.tempNullChecks = dvmCompilerAllocBitVector (cUnit->numSSARegs, false);
++    dvmClearAllBits(tracker.tempNullChecks);
++
++    //There is a temporary index to array check map in case we are in trace mode
++    std::map<int, BitVector *> temporaryIndexToArrayChecks;
++    tracker.indexToArrayChecks = &temporaryIndexToArrayChecks;
++
++    /* Initialize the data */
++    initializeData (cUnit, &removeData, bb, tracker);
++
++   /* Now tempNullCheck contains exactly which registers have already been tested as Null and the
++    * indexToArrayChecks is up to date for bound checks
++    * Let us go through the basic block and see if we can remove tests
++    */
++    walkBasicBlock (cUnit, removeData, bb->firstMIRInsn, tracker);
++
++    //We have not changed the basic block
++    return false;
++}
++
++void handleIndexHoist (CompilationUnit *cUnit, SRemoveData *removeData, MIR *mir, int arrayReg, int indexReg)
++{
++    //We only hoist if removeData is set, we know what has been hoisted, and we do want to hoist
++    if (removeData != NULL && removeData->hoistedNullChecks != NULL && removeData->hoistChecks == true)
++    {
++        //Ok before going anywhere, we must first check if we hoisted the arrayReg already?
++        //Normally we should have but let us be paranoid
++        if (dvmIsBitSet (removeData->hoistedNullChecks, arrayReg) == true)
++        {
++            //Actually, we only hoist this check if it is a constant (sub == 0)
++            //Technically we could also hoist induction variables but this is currently done
++            //in a previous pass, we could merge them however at some point
++            //We do test index and array because we can only hoist it if both are constants
++            int subNRegArray = dvmConvertSSARegToDalvik(cUnit, arrayReg);
++            int arraySub = DECODE_SUB(subNRegArray);
++            int subNRegIndex = dvmConvertSSARegToDalvik(cUnit, indexReg);
++            int indexSub = DECODE_SUB(subNRegIndex);
++
++            //Now whether we can hoist depends first on the index: is it a constant or an invariant
++            bool canHoist = ( (indexSub == 0) || (dvmIsBitSet (cUnit->isConstantV, indexReg) == true));
++
++            //Then the array must be invariant
++            canHoist = (canHoist && arraySub == 0);
++
++            if (canHoist == true)
++            {
++                //Get entry block
++                BasicBlock *entry = cUnit->entryBlock;
++
++                if (entry != NULL)
++                {
++                    //We can remove the null check then
++                    // Either we already have hoisted it and we are safe
++                    // Or we are going to
++                    mir->OptimizationFlags |= MIR_IGNORE_RANGE_CHECK;
++
++                    //Get bitvector for the array, we use arrays here because we assume there are less arrays than indices..
++                    BitVector *bv = removeData->hoistedArrayToIndexChecks[arrayReg];
++
++                    //For readability, let's reset canHoist to true though it is already
++                    canHoist = true;
++
++                    //If not found, we can try to hoist
++                    if (bv == NULL)
++                    {
++                        //But first create it
++                        bv = dvmCompilerAllocBitVector (cUnit->numSSARegs, false);
++                        dvmClearAllBits (bv);
++                        dvmSetBit (bv, indexReg);
++                    }
++                    else
++                    {
++                        //Then have we already bound checked with indexReg?
++                        // If yes, we don't hoist here
++                        // If no, we hoist
++                        if (dvmIsBitSet (bv, indexReg) == true)
++                        {
++                            canHoist = false;
++                        }
++                        else
++                        {
++                            //Technically we have not hoisted yet but the following tests will always have
++                            //the same outcome, so bail before finding that out next time
++                            dvmSetBit (bv, indexReg);
++                        }
++                    }
++
++                    if (canHoist == true)
++                    {
++                        //Actually generate the hoisting code
++                        MIR *boundCheck = static_cast<MIR *> (dvmCompilerNew (sizeof (*boundCheck), true));
++                        boundCheck->dalvikInsn.opcode = static_cast<Opcode> (kMirOpBoundCheck);
++                        //We only care about the object register and index register
++                        boundCheck->dalvikInsn.vA = arrayReg;
++
++                        //The rest of the bound check depends on whether it is a register or constant
++                        if (indexSub == 0)
++                        {
++                            boundCheck->dalvikInsn.arg[0] = MIR_BOUND_CHECK_REG;
++                            boundCheck->dalvikInsn.arg[1] = indexReg;
++                        }
++                        else
++                        {
++                            boundCheck->dalvikInsn.arg[0] = MIR_BOUND_CHECK_CST;
++                            boundCheck->dalvikInsn.arg[1] = cUnit->constantValues[indexReg];
++                        }
++
++                        boundCheck->dalvikInsn.vC = 0;
++                        boundCheck->ssaRep = mir->ssaRep;
++                        dvmCompilerAppendMIR(entry, boundCheck);
++                    }
++                }
++            }
++        }
++    }
++
++}
++
++
++void handleNullCheckHoist (CompilationUnit *cUnit, SRemoveData *removeData, MIR *mir, int objectReg)
++{
++    //Do we hoist ?
++    if (removeData != NULL && removeData->hoistChecks == true)
++    {
++        int subNRegObject = dvmConvertSSARegToDalvik(cUnit, objectReg);
++        int objectSub = DECODE_SUB(subNRegObject);
++
++        //If so, we can actually only hoist it if the sub is 0
++        //0 meaning that it has never been assigned (and thus never changed in the loop)
++        if (objectSub == 0)
++        {
++            //Get entry block
++            BasicBlock *entry = cUnit->entryBlock;
++
++            if (entry != NULL)
++            {
++                //Have we hoisted it already?
++                if (dvmIsBitSet (removeData->hoistedNullChecks, objectReg) == false)
++                {
++                    //Though we have not hoisted yet, the reasons below will be true for any subsequent request
++                    dvmSetBit (removeData->hoistedNullChecks, objectReg);
++                        //Actually generate the hoisting code
++                        MIR *nullCheck = static_cast<MIR *> (dvmCompilerNew (sizeof (*nullCheck), true));
++                        nullCheck->dalvikInsn.opcode = static_cast<Opcode> (kMirOpNullCheck);
++                        //We only care about the object register
++                        nullCheck->dalvikInsn.vA = objectReg;
++                        nullCheck->dalvikInsn.vB = 0;
++                        nullCheck->dalvikInsn.vC = 0;
++                        nullCheck->ssaRep = mir->ssaRep;
++                        dvmCompilerAppendMIR(entry, nullCheck);
++                }
++
++                //In either case, we can remove it:
++                // Either we have already hoisted it
++                // Or we haven't and we just did
++                mir->OptimizationFlags |= MIR_IGNORE_NULL_CHECK;
++            }
++        }
++    }
++}
+diff --git a/vm/compiler/Checks.h b/vm/compiler/Checks.h
+new file mode 100644
+index 0000000..90d4b06
+--- /dev/null
++++ b/vm/compiler/Checks.h
+@@ -0,0 +1,47 @@
++/*
++ * Copyright (C) 2012 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef DALVIK_VM_CHECKS_H_
++#define DALVIK_VM_CHECKS_H_
++
++#include "Dalvik.h"
++
++//Forward declaration
++struct sPass;
++
++/**
++ * @brief Remove redundant checks start function
++ * @param cUnit the CompilationUnit
++ * @param curPass the current pass SPass
++ */
++void dvmCompilerStartCheckRemoval (CompilationUnit *cUnit, struct sPass *curPass);
++
++/**
++ * @brief Remove redundant checks end function
++ * @param cUnit the CompilationUnit
++ * @param curPass the current pass struct sPass
++ */
++void dvmCompilerEndCheckRemoval (CompilationUnit *cUnit, struct sPass *curPass);
++
++/**
++ * @brief Remove redundant checks
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock
++ * @return returns whether we changed anything in the BasicBlock
++ */
++bool dvmCompilerCheckRemoval (CompilationUnit *cUnit, BasicBlock *bb);
++
++#endif
+diff --git a/vm/compiler/Compiler.h b/vm/compiler/Compiler.h
+index 6e70378..280a69e 100644
+--- a/vm/compiler/Compiler.h
++++ b/vm/compiler/Compiler.h
+@@ -178,6 +178,7 @@ typedef enum DataFlowAnalysisMode {
+     kPreOrderDFSTraversal,      // Depth-First-Search / Pre-Order
+     kPostOrderDFSTraversal,     // Depth-First-Search / Post-Order
+     kPostOrderDOMTraversal,     // Dominator tree / Post-Order
++    kBreadthFirstTraversal,     // Breadth-First Traversal
+ } DataFlowAnalysisMode;
+ 
+ typedef struct CompilerMethodStats {
+diff --git a/vm/compiler/CompilerIR.h b/vm/compiler/CompilerIR.h
+index 73efad8..459113a 100644
+--- a/vm/compiler/CompilerIR.h
++++ b/vm/compiler/CompilerIR.h
+@@ -85,14 +85,41 @@ typedef struct LIR {
+     struct LIR *target;
+ } LIR;
+ 
++/* Used in case of a kMirOpBoundCheck to retrieve information */
++#define MIR_BOUND_CHECK_REG 0
++#define MIR_BOUND_CHECK_CST 1
++
+ enum ExtendedMIROpcode {
++
+     kMirOpFirst = kNumPackedOpcodes,
++    /** @brief PHI node
++      No arguments for the back-end */
+     kMirOpPhi = kMirOpFirst,
++    /** @brief Null and Range Up for Up Loop
++      va: arrayReg, vB: idx Reg, vC: end condition,
++      arg[0]: maxC, arg[1]: minC, arg[2]:branch opcode */
+     kMirOpNullNRangeUpCheck,
++    /** @brief Null and Range for Down Loop
++      va: arrayReg, vB: idx Reg, vC: end condition,
++      arg[0]: maxC, arg[1]: minC, arg[2]:branch opcode */
+     kMirOpNullNRangeDownCheck,
++    /** @brief Check lower bound if an index register
++      va: idxReg, vb:globalMinC */
+     kMirOpLowerBound,
++    /** @brief Punt
++      No arguments for the back end */
+     kMirOpPunt,
+-    kMirOpCheckInlinePrediction,        // Gen checks for predicted inlining
++    /** @brief Gen checks for predicted inlining
++      vC: this, contains call information */
++    kMirOpCheckInlinePrediction,
++    /** @brief Null Check, va: objectReg */
++    kMirOpNullCheck,
++    /** @brief Bound Check using a constant value or invariant register:
++      vA: objectReg, arg[0]=MIR_BOUND_CHECK_REG/CST
++      arg[1]: indexREG or constant
++     */
++    kMirOpBoundCheck,
++    /** @brief Last enumeration: not used except for array bounds */
+     kMirOpLast,
+ };
+ 
+diff --git a/vm/compiler/Dataflow.cpp b/vm/compiler/Dataflow.cpp
+index c7bb892..fa8ae8a 100644
+--- a/vm/compiler/Dataflow.cpp
++++ b/vm/compiler/Dataflow.cpp
+@@ -19,6 +19,8 @@
+ #include "Loop.h"
+ #include "libdex/DexOpcodes.h"
+ 
++#include <queue>
++
+ /*
+  * Main table containing data flow attributes for each bytecode. The
+  * first kNumPackedOpcodes entries are for Dalvik bytecode
+@@ -1898,6 +1900,56 @@ void dvmCompilerDataFlowAnalysisDispatcher(CompilationUnit *cUnit,
+                 change |= (*func)(cUnit, bb);
+             }
+         }
++        /*
++         * Scan all blocks in breadth first manner
++         */
++        else if (dfaMode == kBreadthFirstTraversal) {
++
++            std::queue<BasicBlock *> q;
++
++            //Clear the nodes
++            dvmCompilerDataFlowAnalysisDispatcher (cUnit,
++                    dvmCompilerClearVisitedFlag, kAllNodes, false);
++
++            //Push in the entry basic block
++            if (cUnit->entryBlock != 0)
++            {
++                q.push (cUnit->entryBlock);
++            }
++
++            while (q.size () > 0)
++            {
++                //Get top
++                BasicBlock *bb = q.front ();
++                q.pop ();
++
++                //Paranoid
++                if (bb->visited == true)
++                    continue;
++
++                //Visit it
++                bb->visited = true;
++
++                //Call func function
++                change |= (*func)(cUnit, bb);
++
++                //Now handle queue: only push taken/fallThrough if not yet visited
++                if (bb->taken != NULL && bb->taken->visited == false)
++                {
++                    q.push (bb->taken);
++                }
++
++                if (bb->fallThrough != NULL && bb->fallThrough->visited == false)
++                {
++                    q.push (bb->fallThrough);
++                }
++            }
++
++            //Clear the nodes
++            dvmCompilerDataFlowAnalysisDispatcher (cUnit,
++                    dvmCompilerClearVisitedFlag, kAllNodes, false);
++        }
++
+         /* If isIterative is false, exit the loop after the first iteration */
+         change &= isIterative;
+     }
+diff --git a/vm/compiler/LoopOpt.cpp b/vm/compiler/LoopOpt.cpp
+index 85659ae..24fcdfb 100644
+--- a/vm/compiler/LoopOpt.cpp
++++ b/vm/compiler/LoopOpt.cpp
+@@ -14,6 +14,7 @@
+ * limitations under the License.
+ */
+ 
++#include "Checks.h"
+ #include "Dalvik.h"
+ #include "Dataflow.h"
+ #include "Loop.h"
+@@ -60,6 +61,9 @@ START_PASSES
+                  startInductionAccessDetection, endInductionAccessDetection, NULL, 0),
+     NEW_PASS ("Generate the hoisted code from induction array", kAllNodes, NULL, simpleCountedGate,
+                  NULL, endHoisting, NULL, 0),
++    NEW_PASS ("Check Removal", kAllNodes, NULL, NULL,
++                dvmCompilerStartCheckRemoval, dvmCompilerEndCheckRemoval, dvmCompilerCheckRemoval, 0),
++
+     /* Last element must have and be the only one to have a NULL name, it's our ending check */
+     NEW_PASS (NULL,         /** Pass name */
+          kAllNodes,     /** Type of traversal */
+diff --git a/vm/compiler/codegen/x86/CodegenInterface.cpp b/vm/compiler/codegen/x86/CodegenInterface.cpp
+index 8266434..51f879e 100644
+--- a/vm/compiler/codegen/x86/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/CodegenInterface.cpp
+@@ -23,6 +23,7 @@
+ #include "Lower.h"
+ #include "NcgAot.h"
+ #include "compiler/codegen/CompilerCodegen.h"
++#include "InstructionGeneration.h"
+ 
+ #ifdef HAVE_ANDROID_OS
+ #include <cutils/properties.h>
+@@ -895,130 +896,6 @@ static void handlePCReconstruction(CompilationUnit *cUnit,
+ #endif
+ }
+ 
+-//use O0 code generator for hoisted checks outside of the loop
+-/*
+- * vA = arrayReg;
+- * vB = idxReg;
+- * vC = endConditionReg;
+- * arg[0] = maxC
+- * arg[1] = minC
+- * arg[2] = loopBranchConditionCode
+- */
+-#define P_GPR_1 PhysicalReg_EBX
+-#define P_GPR_2 PhysicalReg_ECX
+-static void genHoistedChecksForCountUpLoop(CompilationUnit *cUnit, MIR *mir)
+-{
+-    /*
+-     * NOTE: these synthesized blocks don't have ssa names assigned
+-     * for Dalvik registers.  However, because they dominate the following
+-     * blocks we can simply use the Dalvik name w/ subscript 0 as the
+-     * ssa name.
+-     */
+-    DecodedInstruction *dInsn = &mir->dalvikInsn;
+-    const int maxC = dInsn->arg[0];
+-
+-    /* assign array in virtual register to P_GPR_1 */
+-    get_virtual_reg(mir->dalvikInsn.vA, OpndSize_32, P_GPR_1, true);
+-    /* assign index in virtual register to P_GPR_2 */
+-    get_virtual_reg(mir->dalvikInsn.vC, OpndSize_32, P_GPR_2, true);
+-    export_pc();
+-    compare_imm_reg(OpndSize_32, 0, P_GPR_1, true);
+-    condJumpToBasicBlock(stream, Condition_E, cUnit->exceptionBlockId);
+-    int delta = maxC;
+-    /*
+-     * If the loop end condition is ">=" instead of ">", then the largest value
+-     * of the index is "endCondition - 1".
+-     */
+-    if (dInsn->arg[2] == OP_IF_GE) {
+-        delta--;
+-    }
+-
+-    if (delta < 0) { //+delta
+-        //if P_GPR_2 is mapped to a VR, we can't do this
+-        alu_binary_imm_reg(OpndSize_32, sub_opc, -delta, P_GPR_2, true);
+-    } else if(delta > 0) {
+-        alu_binary_imm_reg(OpndSize_32, add_opc, delta, P_GPR_2, true);
+-    }
+-    compare_mem_reg(OpndSize_32, offArrayObject_length, P_GPR_1, true, P_GPR_2, true);
+-    condJumpToBasicBlock(stream, Condition_NC, cUnit->exceptionBlockId);
+-}
+-
+-/*
+- * vA = arrayReg;
+- * vB = idxReg;
+- * vC = endConditionReg;
+- * arg[0] = maxC
+- * arg[1] = minC
+- * arg[2] = loopBranchConditionCode
+- */
+-static void genHoistedChecksForCountDownLoop(CompilationUnit *cUnit, MIR *mir)
+-{
+-    DecodedInstruction *dInsn = &mir->dalvikInsn;
+-    const int maxC = dInsn->arg[0];
+-
+-    /* assign array in virtual register to P_GPR_1 */
+-    get_virtual_reg(mir->dalvikInsn.vA, OpndSize_32, P_GPR_1, true);
+-    /* assign index in virtual register to P_GPR_2 */
+-    get_virtual_reg(mir->dalvikInsn.vB, OpndSize_32, P_GPR_2, true);
+-    export_pc();
+-    compare_imm_reg(OpndSize_32, 0, P_GPR_1, true);
+-    condJumpToBasicBlock(stream, Condition_E, cUnit->exceptionBlockId);
+-
+-    if (maxC < 0) {
+-        //if P_GPR_2 is mapped to a VR, we can't do this
+-        alu_binary_imm_reg(OpndSize_32, sub_opc, -maxC, P_GPR_2, true);
+-    } else if(maxC > 0) {
+-        alu_binary_imm_reg(OpndSize_32, add_opc, maxC, P_GPR_2, true);
+-    }
+-    compare_mem_reg(OpndSize_32, offArrayObject_length, P_GPR_1, true, P_GPR_2, true);
+-    condJumpToBasicBlock(stream, Condition_NC, cUnit->exceptionBlockId);
+-
+-}
+-#undef P_GPR_1
+-#undef P_GPR_2
+-
+-/*
+- * vA = idxReg;
+- * vB = minC;
+- */
+-#define P_GPR_1 PhysicalReg_ECX
+-static void genHoistedLowerBoundCheck(CompilationUnit *cUnit, MIR *mir)
+-{
+-    DecodedInstruction *dInsn = &mir->dalvikInsn;
+-    const int minC = dInsn->vB;
+-    get_virtual_reg(mir->dalvikInsn.vA, OpndSize_32, P_GPR_1, true); //array
+-    export_pc();
+-    compare_imm_reg(OpndSize_32, -minC, P_GPR_1, true);
+-    condJumpToBasicBlock(stream, Condition_C, cUnit->exceptionBlockId);
+-}
+-#undef P_GPR_1
+-
+-#ifdef WITH_JIT_INLINING_PHASE2
+-static void genValidationForPredictedInline(CompilationUnit *cUnit, MIR *mir)
+-{
+-    CallsiteInfo *callsiteInfo = mir->meta.callsiteInfo;
+-    if(gDvm.executionMode == kExecutionModeNcgO0) {
+-        get_virtual_reg(mir->dalvikInsn.vC, OpndSize_32, PhysicalReg_EBX, true);
+-        move_imm_to_reg(OpndSize_32, (int) callsiteInfo->clazz, PhysicalReg_ECX, true);
+-        compare_imm_reg(OpndSize_32, 0, PhysicalReg_EBX, true);
+-        export_pc(); //use %edx
+-        conditional_jump_global_API(, Condition_E, "common_errNullObject", false);
+-        move_mem_to_reg(OpndSize_32, offObject_clazz, PhysicalReg_EBX, true, PhysicalReg_EAX, true);
+-        compare_reg_reg(PhysicalReg_ECX, true, PhysicalReg_EAX, true);
+-    } else {
+-        get_virtual_reg(mir->dalvikInsn.vC, OpndSize_32, 5, false);
+-        move_imm_to_reg(OpndSize_32, (int) callsiteInfo->clazz, 4, false);
+-        nullCheck(5, false, 1, mir->dalvikInsn.vC);
+-        move_mem_to_reg(OpndSize_32, offObject_clazz, 5, false, 6, false);
+-        compare_reg_reg(4, false, 6, false);
+-    }
+-
+-    //immdiate will be updated later in genLandingPadForMispredictedCallee
+-    streamMisPred = stream;
+-    callsiteInfo->misPredBranchOver = (LIR*)conditional_jump_int(Condition_NE, 0, OpndSize_8);
+-}
+-#endif
+-
+ /* Extended MIR instructions like PHI */
+ void handleExtendedMIR(CompilationUnit *cUnit, MIR *mir)
+ {
+@@ -1028,6 +905,14 @@ void handleExtendedMIR(CompilationUnit *cUnit, MIR *mir)
+         case kMirOpPhi: {
+             break;
+         }
++        case kMirOpNullCheck: {
++            genHoistedNullCheck (cUnit, mir);
++            break;
++        }
++        case kMirOpBoundCheck: {
++            genHoistedBoundCheck (cUnit, mir);
++            break;
++        }
+         case kMirOpNullNRangeUpCheck: {
+             genHoistedChecksForCountUpLoop(cUnit, mir);
+             break;
+diff --git a/vm/compiler/codegen/x86/InstructionGeneration.cpp b/vm/compiler/codegen/x86/InstructionGeneration.cpp
+new file mode 100644
+index 0000000..8c0a945
+--- /dev/null
++++ b/vm/compiler/codegen/x86/InstructionGeneration.cpp
+@@ -0,0 +1,206 @@
++/*
++ * Copyright (C) 2010-2011 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "Dalvik.h"
++#include "InstructionGeneration.h"
++#include "libdex/DexOpcodes.h"
++#include "compiler/Compiler.h"
++#include "compiler/CompilerIR.h"
++#include "interp/Jit.h"
++#include "libdex/DexFile.h"
++#include "Lower.h"
++#include "NcgAot.h"
++#include "compiler/codegen/CompilerCodegen.h"
++
++#define P_GPR_1 PhysicalReg_EBX
++#define P_GPR_2 PhysicalReg_ECX
++/**
++ * @brief Generate a Null check
++ * @param cUnit the CompilationUnit
++ * @param mir the MIR instruction
++ */
++void genHoistedNullCheck (CompilationUnit *cUnit, MIR *mir)
++{
++    /*
++     * NOTE: these synthesized blocks don't have ssa names assigned
++     * for Dalvik registers.  However, because they dominate the following
++     * blocks we can simply use the Dalvik name w/ subscript 0 as the
++     * ssa name.
++     */
++    /* Assign array in virtual register to P_GPR_1 */
++    get_virtual_reg(mir->dalvikInsn.vA, OpndSize_32, P_GPR_1, true);
++    export_pc();
++    compare_imm_reg(OpndSize_32, 0, P_GPR_1, true);
++    condJumpToBasicBlock(stream, Condition_E, cUnit->exceptionBlockId);
++}
++
++/**
++ * @brief Generate a Bound check:
++      vA arrayReg
++      arg[0] -> determines whether it is a constant or a register
++      arg[1] -> register or constant
++
++      is idx < 0 || idx >= array.length ?
++ * @param cUnit the CompilationUnit
++ * @param mir the MIR instruction
++ */
++void genHoistedBoundCheck (CompilationUnit *cUnit, MIR *mir)
++{
++    /* Assign array in virtual register to P_GPR_1 */
++    get_virtual_reg(mir->dalvikInsn.vA, OpndSize_32, P_GPR_1, true);
++
++    if (mir->dalvikInsn.arg[0] == MIR_BOUND_CHECK_REG)
++    {
++        //Ok let us get the index in P_GPR_2
++        get_virtual_reg(mir->dalvikInsn.arg[1], OpndSize_32, P_GPR_2, true);
++    }
++    else
++    {
++        //Move the constant to P_GPR_2
++        move_imm_to_reg(OpndSize_32, mir->dalvikInsn.arg[1], P_GPR_2, true);
++    }
++    export_pc();
++
++    //Compare array length with index value
++    compare_mem_reg(OpndSize_32, offArrayObject_length, P_GPR_1, true, P_GPR_2, true);
++    //Jump to exception block if array.length <= index
++    condJumpToBasicBlock(stream, Condition_LE, cUnit->exceptionBlockId);
++
++    //Now, compare to 0
++    compare_imm_reg(OpndSize_32, 0, P_GPR_2, true);
++    //Jump to exception if index < 0
++    condJumpToBasicBlock(stream, Condition_L, cUnit->exceptionBlockId);
++}
++
++//use O0 code generator for hoisted checks outside of the loop
++/*
++ * vA = arrayReg;
++ * vB = idxReg;
++ * vC = endConditionReg;
++ * arg[0] = maxC
++ * arg[1] = minC
++ * arg[2] = loopBranchConditionCode
++ */
++void genHoistedChecksForCountUpLoop(CompilationUnit *cUnit, MIR *mir)
++{
++    /*
++     * NOTE: these synthesized blocks don't have ssa names assigned
++     * for Dalvik registers.  However, because they dominate the following
++     * blocks we can simply use the Dalvik name w/ subscript 0 as the
++     * ssa name.
++     */
++    DecodedInstruction *dInsn = &mir->dalvikInsn;
++    const int maxC = dInsn->arg[0];
++
++    //First do the null check
++    genHoistedNullCheck (cUnit, mir);
++
++    /* assign index in virtual register to P_GPR_2 */
++    get_virtual_reg(mir->dalvikInsn.vC, OpndSize_32, P_GPR_2, true);
++
++    int delta = maxC;
++    /*
++     * If the loop end condition is ">=" instead of ">", then the largest value
++     * of the index is "endCondition - 1".
++     */
++    if (dInsn->arg[2] == OP_IF_GE) {
++        delta--;
++    }
++
++    if (delta < 0) { //+delta
++        //if P_GPR_2 is mapped to a VR, we can't do this
++        alu_binary_imm_reg(OpndSize_32, sub_opc, -delta, P_GPR_2, true);
++    } else if(delta > 0) {
++        alu_binary_imm_reg(OpndSize_32, add_opc, delta, P_GPR_2, true);
++    }
++    compare_mem_reg(OpndSize_32, offArrayObject_length, P_GPR_1, true, P_GPR_2, true);
++    condJumpToBasicBlock(stream, Condition_NC, cUnit->exceptionBlockId);
++}
++
++/*
++ * vA = arrayReg;
++ * vB = idxReg;
++ * vC = endConditionReg;
++ * arg[0] = maxC
++ * arg[1] = minC
++ * arg[2] = loopBranchConditionCode
++ */
++void genHoistedChecksForCountDownLoop(CompilationUnit *cUnit, MIR *mir)
++{
++    DecodedInstruction *dInsn = &mir->dalvikInsn;
++    const int maxC = dInsn->arg[0];
++
++    //First do the null check
++    genHoistedNullCheck (cUnit, mir);
++
++    /* assign index in virtual register to P_GPR_2 */
++    get_virtual_reg(mir->dalvikInsn.vB, OpndSize_32, P_GPR_2, true);
++
++    if (maxC < 0) {
++        //if P_GPR_2 is mapped to a VR, we can't do this
++        alu_binary_imm_reg(OpndSize_32, sub_opc, -maxC, P_GPR_2, true);
++    } else if(maxC > 0) {
++        alu_binary_imm_reg(OpndSize_32, add_opc, maxC, P_GPR_2, true);
++    }
++    compare_mem_reg(OpndSize_32, offArrayObject_length, P_GPR_1, true, P_GPR_2, true);
++    condJumpToBasicBlock(stream, Condition_NC, cUnit->exceptionBlockId);
++
++}
++
++#undef P_GPR_1
++#undef P_GPR_2
++
++/*
++ * vA = idxReg;
++ * vB = minC;
++ */
++#define P_GPR_1 PhysicalReg_ECX
++void genHoistedLowerBoundCheck(CompilationUnit *cUnit, MIR *mir)
++{
++    DecodedInstruction *dInsn = &mir->dalvikInsn;
++    const int minC = dInsn->vB;
++    get_virtual_reg(mir->dalvikInsn.vA, OpndSize_32, P_GPR_1, true); //array
++    export_pc();
++    compare_imm_reg(OpndSize_32, -minC, P_GPR_1, true);
++    condJumpToBasicBlock(stream, Condition_C, cUnit->exceptionBlockId);
++}
++#undef P_GPR_1
++
++#ifdef WITH_JIT_INLINING_PHASE2
++void genValidationForPredictedInline(CompilationUnit *cUnit, MIR *mir)
++{
++    CallsiteInfo *callsiteInfo = mir->meta.callsiteInfo;
++    if(gDvm.executionMode == kExecutionModeNcgO0) {
++        get_virtual_reg(mir->dalvikInsn.vC, OpndSize_32, PhysicalReg_EBX, true);
++        move_imm_to_reg(OpndSize_32, (int) callsiteInfo->clazz, PhysicalReg_ECX, true);
++        compare_imm_reg(OpndSize_32, 0, PhysicalReg_EBX, true);
++        export_pc(); //use %edx
++        conditional_jump_global_API(, Condition_E, "common_errNullObject", false);
++        move_mem_to_reg(OpndSize_32, offObject_clazz, PhysicalReg_EBX, true, PhysicalReg_EAX, true);
++        compare_reg_reg(PhysicalReg_ECX, true, PhysicalReg_EAX, true);
++    } else {
++        get_virtual_reg(mir->dalvikInsn.vC, OpndSize_32, 5, false);
++        move_imm_to_reg(OpndSize_32, (int) callsiteInfo->clazz, 4, false);
++        nullCheck(5, false, 1, mir->dalvikInsn.vC);
++        move_mem_to_reg(OpndSize_32, offObject_clazz, 5, false, 6, false);
++        compare_reg_reg(4, false, 6, false);
++    }
++
++    //immdiate will be updated later in genLandingPadForMispredictedCallee
++    streamMisPred = stream;
++    callsiteInfo->misPredBranchOver = (LIR*)conditional_jump_int(Condition_NE, 0, OpndSize_8);
++}
++#endif
+diff --git a/vm/compiler/codegen/x86/InstructionGeneration.h b/vm/compiler/codegen/x86/InstructionGeneration.h
+new file mode 100644
+index 0000000..0237c22
+--- /dev/null
++++ b/vm/compiler/codegen/x86/InstructionGeneration.h
+@@ -0,0 +1,84 @@
++/*
++ * Copyright (C) 2010-2011 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef H_DALVIK_INSTRUCTIONGENERATION
++#define H_DALVIK_INSTRUCTIONGENERATION
++
++#include "Dalvik.h"
++
++/**
++ * @brief Generate a Null check
++ * @param cUnit the CompilationUnit
++ * @param mir the MIR instruction
++ */
++void genHoistedNullCheck (CompilationUnit *cUnit, MIR *mir);
++
++/**
++ * @brief Generate a Bound check:
++      vA arrayReg
++      arg[0] -> determines whether it is a constant or a register
++      arg[1] -> register or constant
++
++      is idx < 0 || idx >= array.length ?
++ * @param cUnit the CompilationUnit
++ * @param mir the MIR instruction
++ */
++void genHoistedBoundCheck (CompilationUnit *cUnit, MIR *mir);
++
++//use O0 code generator for hoisted checks outside of the loop
++/*
++ * @brief Generate the null and upper bound check for a count up loop
++ * vA = arrayReg;
++ * vB = idxReg;
++ * vC = endConditionReg;
++ * arg[0] = maxC
++ * arg[1] = minC
++ * arg[2] = loopBranchConditionCode
++ * @param cUnit the CompilationUnit
++ * @param mir the MIR instruction
++ */
++void genHoistedChecksForCountUpLoop(CompilationUnit *cUnit, MIR *mir);
++
++/*
++ * @brief Generate the null and upper bound check for a count down loop
++ * vA = arrayReg;
++ * vB = idxReg;
++ * vC = endConditionReg;
++ * arg[0] = maxC
++ * arg[1] = minC
++ * arg[2] = loopBranchConditionCode
++ * @param cUnit the CompilationUnit
++ * @param mir the MIR instruction
++ */
++void genHoistedChecksForCountDownLoop(CompilationUnit *cUnit, MIR *mir);
++
++/*
++ * @brief Generate the lower bound check
++ * vA = arrayReg;
++ * vB = minimum constant used for the array;
++ * @param cUnit the CompilationUnit
++ * @param mir the MIR instruction
++ */
++void genHoistedLowerBoundCheck(CompilationUnit *cUnit, MIR *mir);
++
++/*
++ * @brief Generate the validation for a predicted inline
++ * vC actual class
++ * @param cUnit the CompilationUnit
++ * @param mir the MIR instruction
++ */
++void genValidationForPredictedInline(CompilationUnit *cUnit, MIR *mir);
++#endif
+-- 
+1.7.4.1
+

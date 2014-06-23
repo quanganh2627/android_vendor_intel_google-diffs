@@ -1,0 +1,974 @@
+From e0fbee8b538ddeb843bf5d33c6d5a7e7270502a6 Mon Sep 17 00:00:00 2001
+From: Qiming Shi <qiming.shi@intel.com>
+Date: Sat, 1 Jun 2013 15:08:36 +0800
+Subject: Dalvik: Optimizing Null and Bound Check
+
+BZ: 72315
+
+Optimizing Null and Bound Check
+
+The original version lost track of objects if the virtual register was rewritten. Now it keeps track of where elements are from and how they got there.
+
+The patch follows the virtual registers and keeps a "equal to" vector for each virtual register to know if any equal register has been null or bound checked.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Ie9bdde379898edd887efcdc19a8e29d999083c78
+Orig-MCG-Change-Id: Ib5085d80e876c0bf4125579b4a80981d3650e26b
+Signed-off-by: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/Checks.cpp            |  453 ++++++++++++++++++++++++++++++++++++-
+ vm/compiler/CompilerIR.h          |    3 +-
+ vm/compiler/Dataflow.cpp          |   48 ++--
+ vm/compiler/Dataflow.h            |    4 +
+ vm/compiler/Frontend.cpp          |    8 +
+ vm/compiler/LoopOpt.cpp           |   39 +++-
+ vm/compiler/LoopOpt.h             |    8 +
+ vm/compiler/codegen/x86/Lower.cpp |   26 ++-
+ 8 files changed, 539 insertions(+), 50 deletions(-)
+
+diff --git a/vm/compiler/Checks.cpp b/vm/compiler/Checks.cpp
+index 0a211c9..08e6b47 100644
+--- a/vm/compiler/Checks.cpp
++++ b/vm/compiler/Checks.cpp
+@@ -22,6 +22,8 @@
+ 
+ #include <map>
+ 
++#define CHECK_LOG(...)
++
+ /**
+  * Note:
+  *  The current file contains the hoisting pass framework, it uses two structures:
+@@ -53,8 +55,44 @@ typedef struct sTrackers
+ {
+     BitVector *tempNullChecks;                          /**< @brief bit vector for the null checks guaranteed to have been done */
+     std::map<int, BitVector *> *indexToArrayChecks;     /**< @brief map from index to Bitvector representing which checks have been done */
++
++    std::map<int, std::vector<std::pair<int, int> > > replacementRegs; /**< @brief map of replacement registers, for each entry a pair (replacement, color) is provided */
++    int currentColor;                                   /**< @brief Current color regarding writes to memory */
++    std::map<int, std::vector<MIR *> > opcodeMap;       /**< @brief opcodeMap, keeps each MIR via a opcodeMap */
++
++    sTrackers (void);                                   /**< @brief Constructor */
++    ~sTrackers (void);                                  /**< @brief Destructor */
+ }STrackers;
+ 
++STrackers::sTrackers (void)
++{
++    currentColor = 0;
++    tempNullChecks = 0;
++}
++
++STrackers::~sTrackers (void)
++{
++    //Clear maps (not indexToArrayChecks, it isn't ours to clear)
++    for (std::map<int, std::vector<std::pair<int, int> > >::iterator it = replacementRegs.begin ();
++                                                                   it != replacementRegs.end ();
++                                                                   it++)
++    {
++        std::vector<std::pair<int, int> > &v = it->second;
++        v.clear ();
++    }
++    replacementRegs.clear ();
++
++    //Same for opcodeMap
++    for (std::map<int, std::vector<MIR *> >::iterator it = opcodeMap.begin ();
++                                                      it != opcodeMap.end ();
++                                                      it++)
++    {
++        std::vector<MIR *> &v = it->second;
++        v.clear ();
++    }
++    opcodeMap.clear ();
++}
++
+ //Forward declarations of static functions
+ 
+ /**
+@@ -151,6 +189,29 @@ static void handleIndexHoist (CompilationUnit *cUnit, SRemoveData *removeData, M
+  */
+ static void handleNullCheckHoist (CompilationUnit *cUnit, SRemoveData *removeData, MIR *mir, int array);
+ 
++/**
++ * @brief Recursive helper function for usesEqual, compares idx use and then calls itself with +1 if equal, terminates when idx >= number of uses or a difference is seen
++ * @param mir the MIR instruction
++ * @param other the other MIR instruction compared to
++ * @param replacementRegs the replacement register map
++ * @param currentColor the current color for memory writes
++ * @param directMatch is the equality a direct match?
++ * @param idx the index for the use array we are comparing to (default 0)
++ * @param return true if idx >= number of uses
++ */
++static bool usesEqualHelper (const MIR *mir, const MIR *other, std::map<int, std::vector <std::pair <int, int> > > &replacementRegs, int currentColor, bool &directMatch, int idx = 0);
++
++
++/**
++ * @brief Are two MIR using the same registers?
++ * @param mir the MIR instruction
++ * @param other the other MIR instruction compared to
++ * @param replacementRegs the replacement register map to test different possible uses
++ * @param currentColor the current color for memory writes
++ * @param directMatch is the equality a direct match?
++ * @param return whether or not mir and other are using the same registers via a replacementReg or not
++ */
++static bool usesEqual (const MIR *mir, const MIR *other, std::map<int, std::vector <std::pair <int, int> > > &replacementRegs, int currentColor, bool &directMatch);
+ 
+ 
+ //IMPLEMENTATION
+@@ -162,6 +223,12 @@ static void handleNullCheckHoist (CompilationUnit *cUnit, SRemoveData *removeDat
+  */
+ void dvmCompilerStartCheckRemoval (CompilationUnit *cUnit, SPass *curPass)
+ {
++    //We only care about this, if it is a loop
++    if (dvmCompilerTraceIsLoop (cUnit, curPass) == false)
++    {
++        return;
++    }
++
+     //STEP 1: Initialize any thing for the pass data here
+     SRemoveData *data = new SRemoveData;
+     curPass->data = static_cast<void *> (data);
+@@ -203,6 +270,9 @@ void dvmCompilerEndCheckRemoval (CompilationUnit *cUnit, SPass *curPass)
+ 
+         data->indexToArrayChecks.clear ();
+ 
++        // Clear the hoisted information too
++        data->hoistedArrayToIndexChecks.clear ();
++
+         //Now delete data and clear up curPass->data
+         delete data, data = NULL;
+         curPass->data = NULL;
+@@ -394,22 +464,78 @@ void handleNullCheck (CompilationUnit *cUnit, SRemoveData *removeData, int nullC
+     {
+         int reg = mir->ssaRep->uses[nullCheck];
+ 
++        //Get local variables
+         BitVector *tempNullCheck = tracker.tempNullChecks;
++        std::map<int, std::vector<std::pair<int, int> > > &replacementRegs = tracker.replacementRegs;
++        int &currentColor = tracker.currentColor;
++        //We have another possibility, is it equal to another register null checked ?
++        std::vector<std::pair<int, int> > &ourRepl = replacementRegs[reg];
++
++        bool foundOne = false;
+ 
+         //Has it already been tested
+         if (dvmIsBitSet (tempNullCheck, reg) != 0)
+         {
++            CHECK_LOG ( "Register already null checked\n");
++            foundOne = true;
++        }
++        else
++        {
++            for (std::vector<std::pair<int, int> >::const_iterator it = ourRepl.begin ();
++                                                                   it != ourRepl.end ();
++                                                                   it++)
++            {
++                const std::pair<int, int> &pair = *it;
++                int other = pair.first;
++                int color = pair.second;
++
++                //We care about color, can we trust this register ?
++                if (color >= currentColor)
++                {
++                    //And if so is null checked?
++                    if (dvmIsBitSet (tempNullCheck, other) != 0)
++                    {
++                        CHECK_LOG ( "Replacement %d already null checked\n", other);
++                        foundOne = true;
++                        break;
++                    }
++                }
++            }
++        }
++
++        //Set that it is null checked
++        CHECK_LOG ( "Now %d null checked\n", reg);
++        dvmSetBit (tempNullCheck, reg);
++
++        //Have we found a replacement that already did the null check
++        if (foundOne == true)
++        {
+             //We can remove the null check then
+             mir->OptimizationFlags |= MIR_IGNORE_NULL_CHECK;
+         }
+         else
+         {
+-            //Otherwise, we'll leave this one and set it here
+-            dvmSetBit (tempNullCheck, reg);
+-
+             //Hoist if requested
+             handleNullCheckHoist (cUnit, removeData, mir, reg);
+         }
++
++        //Now we can go through each of our replacements and let them know
++        for (std::vector<std::pair<int, int> >::const_iterator it = ourRepl.begin ();
++                it != ourRepl.end ();
++                it++)
++        {
++            const std::pair<int, int> &pair = *it;
++
++            int other = pair.first;
++            int color = pair.second;
++
++            //If right color
++            if (color >= currentColor)
++            {
++                CHECK_LOG ( "Also setting %d as null checked\n", other);
++                dvmSetBit (tempNullCheck, other);
++            }
++        }
+     }
+ }
+ 
+@@ -419,9 +545,13 @@ void handleBoundCheck (CompilationUnit *cUnit, SRemoveData *removeData, int null
+     //Check the bound check via indexToArrayChecks
+     if (boundCheck >= 0)
+     {
++        //Get local values
+         int array = mir->ssaRep->uses[nullCheck];
+         int index = mir->ssaRep->uses[boundCheck];
+ 
++        std::vector<std::pair<int, int> > &arrayRegs = tracker.replacementRegs[array];
++        int &currentColor = tracker.currentColor;
++
+         std::map<int, BitVector *> *indexToArrayChecks = tracker.indexToArrayChecks;
+ 
+         //Check the bounds: first get the right BitVector
+@@ -443,19 +573,70 @@ void handleBoundCheck (CompilationUnit *cUnit, SRemoveData *removeData, int null
+         }
+         else
+         {
+-            //Otherwise is it set?
++            bool foundOne = false;
++
++            //Otherwise is the bit-vector set?
+             if (dvmIsBitSet (bv, array) != 0)
+             {
+-                //We can remove the null check then
+-                mir->OptimizationFlags |= MIR_IGNORE_RANGE_CHECK;
++                foundOne = true;
+             }
+             else
+             {
+-                //Otherwise, we'll leave this one and set it here
+-                dvmSetBit (bv, array);
++                //One last test, can we find a replacement that is already bound check with this index?
++                for (std::vector<std::pair<int, int> >::const_iterator it = arrayRegs.begin ();
++                        it != arrayRegs.end ();
++                        it++)
++                {
++                    const std::pair<int, int> &pair = *it;
++                    int other = pair.first;
++                    int color = pair.second;
++
++                    //If color is good
++                    if (color >= currentColor)
++                    {
++                        //If we actually have seen this one before
++                        if (dvmIsBitSet (bv, other) == true)
++                        {
++                            foundOne = true;
++                            break;
++                        }
++                    }
++                }
++
++                //If still not found
++                if (foundOne == false)
++                {
++                    //Otherwise, we'll leave this one and set it here
++                    dvmSetBit (bv, array);
++
++                    //Hoist if requested
++                    handleIndexHoist (cUnit, removeData, mir, array, index);
++                }
++            }
++
++            if (foundOne == true)
++            {
++                //We can remove the null check then
++                mir->OptimizationFlags |= MIR_IGNORE_RANGE_CHECK;
++            }
+ 
+-                //Hoist if requested
+-                handleIndexHoist (cUnit, removeData, mir, array, index);
++        }
++
++        //Ok, now go through each array equivalent register and let them know they don't need to check this register either
++
++        for (std::vector<std::pair<int, int> >::const_iterator it = arrayRegs.begin ();
++                                                               it != arrayRegs.end ();
++                                                               it++)
++        {
++            const std::pair<int, int> &pair = *it;
++            int other = pair.first;
++            int color = pair.second;
++
++            //If color is good
++            if (color >= currentColor)
++            {
++                //Mark it
++                dvmSetBit (bv, other);
+             }
+         }
+     }
+@@ -463,12 +644,78 @@ void handleBoundCheck (CompilationUnit *cUnit, SRemoveData *removeData, int null
+ 
+ void walkBasicBlock (CompilationUnit *cUnit, SRemoveData *removeData, MIR *first, STrackers &tracker)
+ {
++    //Get local version
++    int &currentColor = tracker.currentColor;
++    std::map<int, std::vector<MIR *> > &opcodeMap = tracker.opcodeMap;
++    std::map<int, std::vector<std::pair<int, int> > > &replacementRegs = tracker.replacementRegs;
++
+     for (MIR *mir = first; mir != NULL; mir = mir->next)
+     {
+         DecodedInstruction *dInsn = &mir->dalvikInsn;
+         int dfAttributes =
+             dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
+ 
++        CHECK_LOG ( "\nHandling %s\n",
++                    dvmCompilerFullDisassembler (cUnit, mir));
++
++        //First check if this a new memory related instruction
++        if ( ( (dfAttributes & DF_IS_CALL) != 0) ||
++             ( (dfAttributes & DF_CLOBBERS_MEMORY) != 0) ||
++             ( (dfAttributes & DF_IS_SETTER) != 0))
++        {
++            currentColor++;
++        }
++
++        //Now before we start throwing things away, let's do a comparison in uses
++        //First get old instructions of same type
++        if (mir->ssaRep != 0)
++        {
++            int opcode = dInsn->opcode;
++            std::vector<MIR *> &list = opcodeMap[opcode];
++
++            //For each check if we have an equality
++            for (std::vector<MIR *>::const_iterator it = list.begin ();
++                    it != list.end ();
++                    it++)
++            {
++                const MIR *other = *it;
++                bool directMatch;
++
++                CHECK_LOG ( "\nComparing it to %s\n",
++                        dvmCompilerFullDisassembler (cUnit, other));
++
++                if (usesEqual (mir, other, replacementRegs, currentColor, directMatch) == true)
++                {
++                    //We have a equality, then we should copy the definitions
++                    int numDefs = mir->ssaRep->numDefs;
++                    int *ourDefs = mir->ssaRep->defs;
++                    int *theirDefs = other->ssaRep->defs;
++
++                    for (int i = 0; i < numDefs; i++)
++                    {
++                        int us = ourDefs[i];
++                        int them = theirDefs[i];
++
++                        //Get vector
++                        std::vector<std::pair<int, int> > &ourRepl = replacementRegs[us];
++
++                        //If it is a direct match, put an absurdly large color value
++                        //This is true because whatever happens to one will be true for the other no matter what regarding null/bound checks
++                        //Otherwise, they'd have to be fetched again and would no longer be the same register anyway
++                        std::pair<int, int> newElem (them,
++                            (directMatch) ? 1000000 : currentColor);
++                        ourRepl.push_back (newElem);
++
++                        CHECK_LOG ( "%d is now equivalent to %d with a color of %d\n", us, them, newElem.second);
++                    }
++                }
++            }
++
++            //Now push it in for future same opcodes
++            CHECK_LOG ( "Pushing into opcode map: %s\n", dvmCompilerFullDisassembler (cUnit, mir));
++            list.push_back (mir);
++        }
++
+         /* Skip extended MIR instructions */
+         if (dInsn->opcode >= kNumPackedOpcodes) continue;
+ 
+@@ -547,7 +794,6 @@ bool dvmCompilerCheckRemoval (CompilationUnit *cUnit, BasicBlock *bb)
+ 
+     //Create a tracker
+     STrackers tracker;
+-    memset (&tracker, 0, sizeof (tracker));
+ 
+     //STEP 8: initialize tracker structure
+ 
+@@ -568,6 +814,9 @@ bool dvmCompilerCheckRemoval (CompilationUnit *cUnit, BasicBlock *bb)
+     */
+     walkBasicBlock (cUnit, removeData, bb->firstMIRInsn, tracker);
+ 
++    //Clear the map before leaving
++    temporaryIndexToArrayChecks.clear ();
++
+     //We have not changed the basic block
+     return false;
+ }
+@@ -712,3 +961,185 @@ void handleNullCheckHoist (CompilationUnit *cUnit, SRemoveData *removeData, MIR
+         }
+     }
+ }
++
++bool usesEqualHelper (const MIR *mir, const MIR *other, std::map<int, std::vector <std::pair <int, int> > > &replacementRegs, int currentColor, bool &directMatch, int idx)
++{
++    //Get both uses array
++    int *ours = mir->ssaRep->uses;
++    int *theirs = other->ssaRep->uses;
++
++    CHECK_LOG ( "Helper compare %d out of %d\n", idx, mir->ssaRep->numUses);
++
++    if (idx == mir->ssaRep->numUses)
++    {
++        //Found it, we finished and we found an equal MIR
++        CHECK_LOG ( "They are the same!\n");
++        return true;
++    }
++
++    int us = ours[idx];
++    int them = theirs[idx];
++
++    //Direct Match ?
++    if (us == them)
++    {
++        directMatch = true;
++        CHECK_LOG ( "They are the same: direct match!\n");
++        return true;
++    }
++
++    //Now find the replacements
++    std::vector<std::pair <int, int> > &usRepl = replacementRegs[us];
++    std::vector<std::pair <int, int> > &themRepl = replacementRegs[them];
++
++    //If no replacement, we are done
++    if (usRepl.size () == 0 && themRepl.size () == 0)
++    {
++        CHECK_LOG ( "Use size is not the same\n");
++        return false;
++    }
++
++    //Otherwise, to simplify the code, if usRepl is empty switch
++    if (usRepl.size () == 0)
++    {
++        return usesEqualHelper (other, mir, replacementRegs, currentColor, directMatch, idx);
++    }
++
++    //Same size: compare each use, we require same order
++    for (std::vector<std::pair<int, int> >::const_iterator it = usRepl.begin ();
++                                                         it != usRepl.end ();
++                                                         it++)
++    {
++        //Get element
++        const std::pair<int, int> &up = *it;
++        int currentUs = up.first;
++        int colorUs = up.second;
++
++        //If color is right, we can compare ourselves
++        CHECK_LOG ( "Our color %d, currentColor %d\n", colorUs, currentColor);
++        if (colorUs >= currentColor)
++        {
++            bool foundOne = false;
++
++            //Compare to real them
++            CHECK_LOG ( "Us %d, them %d\n", currentUs, them);
++            if (currentUs == them)
++            {
++                foundOne = true;
++            }
++            else
++            {
++                //Otherwise go for the replacement
++                for (std::vector<std::pair<int, int> >::const_iterator inner = themRepl.begin ();
++                        inner != themRepl.end ();
++                        inner++)
++                {
++                    const std::pair<int, int> &tp = *inner;
++                    int currentThem = tp.first;
++                    int colorThem = tp.second;
++
++                    CHECK_LOG ( "Us %d, colorThem %d, currentcolor %d\n", currentUs, colorThem, currentColor);
++                    //If color is good, compare them
++                    if (colorThem >= currentColor)
++                    {
++                        CHECK_LOG ( "current Us %d, current them %d\n", currentUs, currentThem);
++                        if (currentUs == currentThem)
++                        {
++                            //We found one, we can break and go to next index
++                            foundOne = true;
++                            break;
++                        }
++                    }
++                }
++            }
++
++            //We found equivalent registers, next index !
++            if (foundOne == true)
++            {
++                //Next index
++                return usesEqualHelper (mir, other, replacementRegs, currentColor, directMatch, idx + 1);
++            }
++            else
++            {
++                //The we are done, we have no match for this one
++                break;
++            }
++        }
++    }
++
++    //We don't have a match
++    CHECK_LOG ( "No match\n");
++    return false;
++}
++
++bool usesEqual (const MIR *mir, const MIR *other, std::map<int, std::vector <std::pair <int, int> > > &replacementRegs, int currentColor, bool &directMatch)
++{
++    //Paranoid
++    assert (other != 0 && other->ssaRep != 0);
++
++    CHECK_LOG ( "Comparing two MIRS\n");
++
++    //Get other's number of uses
++    int num = other->ssaRep->numUses;
++
++    //Is it the same size?
++    if (mir->ssaRep->numUses != num)
++    {
++        CHECK_LOG ( "Not the same uses! (%d, %d)\n", mir->ssaRep->numUses, num);
++        return false;
++    }
++
++    //Call helper
++    //Suppose for the best
++    directMatch = true;
++    bool res = usesEqualHelper (mir, other, replacementRegs, currentColor, directMatch);
++
++    //No need to check the rest
++    if (res == false)
++    {
++        CHECK_LOG ( "Helper says not the same uses\n");
++        return false;
++    }
++
++    //We haven't finished yet actually, we must look at the vA,vB,vC in case there is a constant
++    const DecodedInstruction &us = mir->dalvikInsn;
++    const DecodedInstruction &it = other->dalvikInsn;
++
++    //We need the attributes to check the right virtual register
++    int dfAttributes =
++        dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
++
++    //We only care about the virtual register if it isn't a defined
++    if ( (dfAttributes & DF_DA) == 0 && (dfAttributes & DF_DA_WIDE) == 0)
++    {
++        if (us.vA != it.vA)
++        {
++            ALOGD ("vA is not the same (%d, %d)\n", us.vA, it.vA);
++            return false;
++        }
++    }
++
++    //If they are not used, they must be the same
++    if ( (dfAttributes & DF_UB) == 0 && (dfAttributes & DF_UB_WIDE) == 0)
++    {
++        if (us.vB != it.vB)
++        {
++            CHECK_LOG ( "vB is not the same (%d, %d)\n", us.vB, it.vB);
++            return false;
++        }
++    }
++
++    if ( (dfAttributes & DF_UC) == 0 || (dfAttributes & DF_UC_WIDE) == 0)
++    {
++        if (us.vC != it.vC)
++        {
++            CHECK_LOG ( "vC is not the same (%d, %d)\n", us.vC, it.vC);
++            return false;
++        }
++    }
++
++    //If we got here, the arrays are the same
++    CHECK_LOG ( "They are the same!\n");
++    return true;
++}
++
+diff --git a/vm/compiler/CompilerIR.h b/vm/compiler/CompilerIR.h
+index 459113a..03a9ab3 100644
+--- a/vm/compiler/CompilerIR.h
++++ b/vm/compiler/CompilerIR.h
+@@ -230,7 +230,8 @@ typedef struct CompilationUnit {
+     GrowableList blockList;
+     const Method *method;
+ #ifdef ARCH_IA32
+-    int exceptionBlockId;               // the block corresponding to exception handling
++    int exceptionBlockId;               /**< @brief The block corresponding to exception handling */
++    bool traceIsALoop;                  /**< @brief The trace is a loop */
+ #endif
+     const JitTraceDescription *traceDesc;
+     LIR *firstLIRInsn;
+diff --git a/vm/compiler/Dataflow.cpp b/vm/compiler/Dataflow.cpp
+index 10399f9..2c246a4 100644
+--- a/vm/compiler/Dataflow.cpp
++++ b/vm/compiler/Dataflow.cpp
+@@ -119,31 +119,31 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_DA,
+ 
+     // 1D OP_MONITOR_ENTER vAA
+-    DF_UA | DF_NULL_OBJECT_CHECK_0,
++    DF_UA | DF_NULL_OBJECT_CHECK_0 | DF_CLOBBERS_MEMORY,
+ 
+     // 1E OP_MONITOR_EXIT vAA
+-    DF_UA | DF_NULL_OBJECT_CHECK_0,
++    DF_UA | DF_NULL_OBJECT_CHECK_0 | DF_CLOBBERS_MEMORY,
+ 
+     // 1F OP_CHECK_CAST vAA, type@BBBB
+-    DF_UA,
++    DF_UA | DF_NULL_OBJECT_CHECK_0,
+ 
+     // 20 OP_INSTANCE_OF vA, vB, type@CCCC
+-    DF_DA | DF_UB,
++    DF_DA | DF_UB | DF_NULL_OBJECT_CHECK_0,
+ 
+     // 21 OP_ARRAY_LENGTH vA, vB
+     DF_DA | DF_UB | DF_NULL_OBJECT_CHECK_0,
+ 
+     // 22 OP_NEW_INSTANCE vAA, type@BBBB
+-    DF_DA,
++    DF_DA | DF_CLOBBERS_MEMORY,
+ 
+     // 23 OP_NEW_ARRAY vA, vB, type@CCCC
+-    DF_DA | DF_UB,
++    DF_DA | DF_UB | DF_CLOBBERS_MEMORY,
+ 
+     // 24 OP_FILLED_NEW_ARRAY {vD, vE, vF, vG, vA}
+-    DF_FORMAT_35C,
++    DF_FORMAT_35C | DF_CLOBBERS_MEMORY,
+ 
+     // 25 OP_FILLED_NEW_ARRAY_RANGE {vCCCC .. vNNNN}, type@BBBB
+-    DF_FORMAT_3RC,
++    DF_FORMAT_3RC | DF_CLOBBERS_MEMORY,
+ 
+     // 26 OP_FILL_ARRAY_DATA vAA, +BBBBBBBB
+     DF_UA,
+@@ -363,37 +363,37 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_UA | DF_IS_SETTER,
+ 
+     // 6E OP_INVOKE_VIRTUAL {vD, vE, vF, vG, vA}
+-    DF_FORMAT_35C | DF_NULL_OBJECT_CHECK_0,
++    DF_FORMAT_35C | DF_NULL_OBJECT_CHECK_0 | DF_IS_CALL,
+ 
+     // 6F OP_INVOKE_SUPER {vD, vE, vF, vG, vA}
+-    DF_FORMAT_35C | DF_NULL_OBJECT_CHECK_0,
++    DF_FORMAT_35C | DF_NULL_OBJECT_CHECK_0 | DF_IS_CALL,
+ 
+     // 70 OP_INVOKE_DIRECT {vD, vE, vF, vG, vA}
+-    DF_FORMAT_35C | DF_NULL_OBJECT_CHECK_0,
++    DF_FORMAT_35C | DF_NULL_OBJECT_CHECK_0 | DF_IS_CALL,
+ 
+     // 71 OP_INVOKE_STATIC {vD, vE, vF, vG, vA}
+-    DF_FORMAT_35C,
++    DF_FORMAT_35C | DF_IS_CALL,
+ 
+     // 72 OP_INVOKE_INTERFACE {vD, vE, vF, vG, vA}
+-    DF_FORMAT_35C | DF_NULL_OBJECT_CHECK_0,
++    DF_FORMAT_35C | DF_NULL_OBJECT_CHECK_0 | DF_IS_CALL,
+ 
+     // 73 OP_UNUSED_73
+     DF_NOP,
+ 
+     // 74 OP_INVOKE_VIRTUAL_RANGE {vCCCC .. vNNNN}
+-    DF_FORMAT_3RC | DF_NULL_OBJECT_CHECK_0,
++    DF_FORMAT_3RC | DF_NULL_OBJECT_CHECK_0 | DF_IS_CALL,
+ 
+     // 75 OP_INVOKE_SUPER_RANGE {vCCCC .. vNNNN}
+-    DF_FORMAT_3RC,
++    DF_FORMAT_3RC | DF_IS_CALL,
+ 
+     // 76 OP_INVOKE_DIRECT_RANGE {vCCCC .. vNNNN}
+-    DF_FORMAT_3RC | DF_NULL_OBJECT_CHECK_0,
++    DF_FORMAT_3RC | DF_NULL_OBJECT_CHECK_0 | DF_IS_CALL,
+ 
+     // 77 OP_INVOKE_STATIC_RANGE {vCCCC .. vNNNN}
+-    DF_FORMAT_3RC | DF_NULL_OBJECT_CHECK_0,
++    DF_FORMAT_3RC | DF_NULL_OBJECT_CHECK_0 | DF_IS_CALL,
+ 
+     // 78 OP_INVOKE_INTERFACE_RANGE {vCCCC .. vNNNN}
+-    DF_FORMAT_3RC | DF_NULL_OBJECT_CHECK_0,
++    DF_FORMAT_3RC | DF_NULL_OBJECT_CHECK_0 | DF_IS_CALL,
+ 
+     // 79 OP_UNUSED_79
+     DF_NOP,
+@@ -747,10 +747,10 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_NOP,
+ 
+     // EE OP_EXECUTE_INLINE
+-    DF_FORMAT_35C,
++    DF_FORMAT_35C | DF_IS_CALL,
+ 
+     // EF OP_EXECUTE_INLINE_RANGE
+-    DF_FORMAT_3RC,
++    DF_FORMAT_3RC | DF_IS_CALL,
+ 
+     // F0 OP_INVOKE_OBJECT_INIT_RANGE
+     DF_NOP,
+@@ -777,16 +777,16 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_UA | DF_UB | DF_IS_SETTER | DF_NULL_OBJECT_CHECK_1,
+ 
+     // F8 OP_INVOKE_VIRTUAL_QUICK
+-    DF_FORMAT_35C | DF_NULL_OBJECT_CHECK_0,
++    DF_FORMAT_35C | DF_NULL_OBJECT_CHECK_0 | DF_IS_CALL,
+ 
+     // F9 OP_INVOKE_VIRTUAL_QUICK_RANGE
+-    DF_FORMAT_3RC | DF_NULL_OBJECT_CHECK_0,
++    DF_FORMAT_3RC | DF_NULL_OBJECT_CHECK_0 | DF_IS_CALL,
+ 
+     // FA OP_INVOKE_SUPER_QUICK
+-    DF_FORMAT_35C,
++    DF_FORMAT_35C | DF_IS_CALL,
+ 
+     // FB OP_INVOKE_SUPER_QUICK_RANGE
+-    DF_FORMAT_3RC,
++    DF_FORMAT_3RC | DF_IS_CALL,
+ 
+     // FC OP_IPUT_OBJECT_VOLATILE
+     DF_UA | DF_UB,
+diff --git a/vm/compiler/Dataflow.h b/vm/compiler/Dataflow.h
+index e6e66ce..0ef803d 100644
+--- a/vm/compiler/Dataflow.h
++++ b/vm/compiler/Dataflow.h
+@@ -46,6 +46,8 @@ typedef enum DataFlowAttributePos {
+     kFPC,
+     kGetter,
+     kSetter,
++    kCall,
++    kClobbersMemory,
+ } DataFlowAttributes;
+ 
+ #define DF_NOP                  0
+@@ -74,6 +76,8 @@ typedef enum DataFlowAttributePos {
+ #define DF_FP_C                 (1 << kFPC)
+ #define DF_IS_GETTER            (1 << kGetter)
+ #define DF_IS_SETTER            (1 << kSetter)
++#define DF_IS_CALL              (1 << kCall)
++#define DF_CLOBBERS_MEMORY      (1 << kClobbersMemory)
+ 
+ #define DF_HAS_USES             (DF_UA | DF_UB | DF_UC | DF_UA_WIDE | \
+                                  DF_UB_WIDE | DF_UC_WIDE)
+diff --git a/vm/compiler/Frontend.cpp b/vm/compiler/Frontend.cpp
+index 089c8a8..5b3ea7a 100644
+--- a/vm/compiler/Frontend.cpp
++++ b/vm/compiler/Frontend.cpp
+@@ -20,6 +20,7 @@
+ #include "interp/Jit.h"
+ #include "CompilerInternals.h"
+ #include "Dataflow.h"
++#include "LoopOpt.h"
+ 
+ #define BYTECODE_FILTER
+ 
+@@ -1775,6 +1776,8 @@ static bool compileLoop(CompilationUnit *cUnit, unsigned int startOffset,
+     if (!dvmCompilerBuildLoop(cUnit))
+         goto bail;
+ 
++    //Set that the CompilationUnit is a loop
++    cUnit->traceIsALoop = true;
+     dvmCompilerLoopOpt(cUnit);
+ 
+     /*
+@@ -2417,6 +2420,11 @@ bool dvmCompileTrace(JitTraceDescription *desc, int numMaxInsts,
+     /* Convert MIR to LIR, etc. */
+     dvmCompilerMIR2LIR(&cUnit);
+ #else /* ARCH_IA32 */
++    //Set that the CompilationUnit is not a loop
++    cUnit.traceIsALoop = false;
++    //The loop optimization framework can work for traces as well
++    dvmCompilerLoopOpt(&cUnit);
++
+     /* Convert MIR to LIR, etc. */
+     dvmCompilerMIR2LIR(&cUnit, info);
+ #endif
+diff --git a/vm/compiler/LoopOpt.cpp b/vm/compiler/LoopOpt.cpp
+index 24fcdfb..8c74a12 100644
+--- a/vm/compiler/LoopOpt.cpp
++++ b/vm/compiler/LoopOpt.cpp
+@@ -49,11 +49,11 @@ static bool simpleCountedGate (const CompilationUnit *cUnit, const SPass *curPas
+     };
+ 
+ START_PASSES
+-    NEW_PASS ("Constant values detection", kAllNodes, NULL, NULL,
++    NEW_PASS ("Constant values detection", kAllNodes, NULL, dvmCompilerTraceIsLoop,
+             startConstant, endConstant, dvmCompilerDoConstantPropagation,0),
+-    NEW_PASS ("Induction variable detection", kAllNodes, NULL, NULL,
++    NEW_PASS ("Induction variable detection", kAllNodes, NULL, dvmCompilerTraceIsLoop,
+                  startInductionVariable, endInductionVariable, dvmCompilerFindInductionVariables,0),
+-    NEW_PASS ("Simple Counted Loop Detection", kAllNodes, NULL, NULL,
++    NEW_PASS ("Simple Counted Loop Detection", kAllNodes, NULL, dvmCompilerTraceIsLoop,
+                  NULL, simpleCountedLoopHandler, NULL, 0),
+     NEW_PASS ("Induction variable detection", kAllNodes, NULL, simpleCountedGate,
+                  startInductionVariable, endInductionVariable, dvmCompilerFindInductionVariables, 0),
+@@ -147,7 +147,7 @@ void dvmCompilerLoopOptimizationDriver (CompilationUnit *cUnit)
+   * @param cUnit the CompilationUnit
+   * @param curPass the SPass
+   */
+-static void startConstant (CompilationUnit *cUnit, SPass *curPass)
++void startConstant (CompilationUnit *cUnit, SPass *curPass)
+ {
+     /* Constant propagation */
+     cUnit->isConstantV = dvmCompilerAllocBitVector(cUnit->numSSARegs, false);
+@@ -162,7 +162,7 @@ static void startConstant (CompilationUnit *cUnit, SPass *curPass)
+   * @param cUnit the CompilationUnit
+   * @param curPass the SPass
+   */
+-static void endConstant (CompilationUnit *cUnit, SPass *curPass)
++void endConstant (CompilationUnit *cUnit, SPass *curPass)
+ {
+     dvmCompilerDumpConstants (cUnit);
+ 
+@@ -176,7 +176,7 @@ static void endConstant (CompilationUnit *cUnit, SPass *curPass)
+   * @param cUnit the CompilationUnit
+   * @param curPass the SPass
+   */
+-static void startInductionVariable (CompilationUnit *cUnit, SPass *curPass)
++void startInductionVariable (CompilationUnit *cUnit, SPass *curPass)
+ {
+     LoopAnalysis *loopAnalysis = cUnit->loopAnalysis;
+ 
+@@ -194,7 +194,7 @@ static void startInductionVariable (CompilationUnit *cUnit, SPass *curPass)
+   * @param cUnit the CompilationUnit
+   * @param curPass the SPass
+   */
+-static void endInductionVariable (CompilationUnit *cUnit, SPass *curPass)
++void endInductionVariable (CompilationUnit *cUnit, SPass *curPass)
+ {
+     dvmCompilerDumpIVList (cUnit);
+ 
+@@ -208,7 +208,7 @@ static void endInductionVariable (CompilationUnit *cUnit, SPass *curPass)
+   * @param cUnit the CompilationUnit
+   * @param curPass the SPass
+   */
+-static void startInductionAccessDetection (CompilationUnit *cUnit, SPass *curPass)
++void startInductionAccessDetection (CompilationUnit *cUnit, SPass *curPass)
+ {
+     LoopAnalysis *loopAnalysis = cUnit->loopAnalysis;
+     loopAnalysis->arrayAccessInfo = (GrowableList *)dvmCompilerNew(sizeof(GrowableList), true);
+@@ -223,7 +223,7 @@ static void startInductionAccessDetection (CompilationUnit *cUnit, SPass *curPas
+   * @param cUnit the CompilationUnit
+   * @param curPass the SPass
+   */
+-static void endInductionAccessDetection (CompilationUnit *cUnit, SPass *curPass)
++void endInductionAccessDetection (CompilationUnit *cUnit, SPass *curPass)
+ {
+     LoopAnalysis *loopAnalysis = cUnit->loopAnalysis;
+     loopAnalysis->bodyIsClean = dvmCompilerIVArrayAccess (cUnit);
+@@ -240,7 +240,7 @@ static void endInductionAccessDetection (CompilationUnit *cUnit, SPass *curPass)
+     Function also fills in the loopAnalysis->isSimpleCountedLoop variable
+   * @param cUnit the CompilationUnit
+   */
+-static void simpleCountedLoopHandler (CompilationUnit *cUnit, SPass *curPass)
++void simpleCountedLoopHandler (CompilationUnit *cUnit, SPass *curPass)
+ {
+     bool res = dvmCompilerSimpleCountedLoop(cUnit);
+ 
+@@ -257,7 +257,7 @@ static void simpleCountedLoopHandler (CompilationUnit *cUnit, SPass *curPass)
+   * @param cUnit the CompilationUnit
+   * @param curPass the SPass
+   */
+-static void endHoisting (CompilationUnit *cUnit, SPass *curPass)
++void endHoisting (CompilationUnit *cUnit, SPass *curPass)
+ {
+     /*
+      * Convert the array access information into extended MIR code in the loop header.
+@@ -275,8 +275,17 @@ static void endHoisting (CompilationUnit *cUnit, SPass *curPass)
+   * @param curPass the SPass
+   * @return whether or not the isSimpleCountedLoop variable is set
+   */
+-static bool simpleCountedGate (const CompilationUnit *cUnit, const SPass *curPass)
++bool simpleCountedGate (const CompilationUnit *cUnit, const SPass *curPass)
+ {
++    //First is it a loop ?
++    bool res = dvmCompilerTraceIsLoop (cUnit, curPass);
++
++    //If not, we are done
++    if (res == false)
++    {
++        return res;
++    }
++
+     LoopAnalysis *loopAnalysis = cUnit->loopAnalysis;
+ 
+     //Remove warning
+@@ -284,3 +293,9 @@ static bool simpleCountedGate (const CompilationUnit *cUnit, const SPass *curPas
+ 
+     return loopAnalysis->isSimpleCountedLoop;
+ }
++
++bool dvmCompilerTraceIsLoop (const CompilationUnit *cUnit, const SPass *curPass)
++{
++    return cUnit->traceIsALoop;
++}
++
+diff --git a/vm/compiler/LoopOpt.h b/vm/compiler/LoopOpt.h
+index 1938fb5..7554198 100644
+--- a/vm/compiler/LoopOpt.h
++++ b/vm/compiler/LoopOpt.h
+@@ -60,4 +60,12 @@ typedef struct sPass
+   */
+ void dvmCompilerLoopOptimizationDriver (CompilationUnit *cUnit);
+ 
++/**
++  * @brief The is a trace a loop gate, checks if the CompilationUnit is a loop
++  * @param cUnit the CompilationUnit
++  * @param curPass the SPass
++  * @return whether or not the cUnit represents a loop
++  */
++bool dvmCompilerTraceIsLoop (const CompilationUnit *cUnit, const SPass *curPass);
++
+ #endif
+diff --git a/vm/compiler/codegen/x86/Lower.cpp b/vm/compiler/codegen/x86/Lower.cpp
+index 96a5d41..8fba996 100644
+--- a/vm/compiler/codegen/x86/Lower.cpp
++++ b/vm/compiler/codegen/x86/Lower.cpp
+@@ -522,8 +522,30 @@ int lowerByteCode(const Method* method, const MIR * mir, const u2 * dalvikPC) {
+         } else {
+             note = "";
+         }
+-        LOGI("LOWER %s%s with offsetPC %x offsetNCG %x @%p\n",
+-                decodedString, note, offsetPC, stream - streamMethodStart,
++
++        const char * extraNote = "";
++
++        if ( (mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK) && (mir->OptimizationFlags & MIR_IGNORE_RANGE_CHECK) )
++        {
++            extraNote = " (N | B)";
++        }
++        else
++        {
++            if (mir->OptimizationFlags & MIR_IGNORE_RANGE_CHECK)
++            {
++                extraNote = " (B)";
++            }
++            else
++            {
++                if (mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK)
++                {
++                    extraNote = " (N)";
++                }
++            }
++        }
++
++        LOGI("LOWER %s%s%s with offsetPC %x offsetNCG %x @%p\n",
++                decodedString, note, extraNote, offsetPC, stream - streamMethodStart,
+                 stream);
+     }
+ 
+-- 
+1.7.4.1
+

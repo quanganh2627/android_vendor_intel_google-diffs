@@ -1,0 +1,308 @@
+From ead1147efe6e5657856f4445e75a9847eff3c78e Mon Sep 17 00:00:00 2001
+From: Bijoy Jose <bijoy.a.jose@intel.com>
+Date: Mon, 25 Feb 2013 17:24:38 -0800
+Subject: Dalvik: Loading input arguments for invoke-kind byte codes using 64 bit moves.
+
+BZ:87360
+
+Use 64 bit moves using XMM registers for loading input arguments to
+following byte codes: OP_INVOKE_VIRTUAL, OP_INVOKE_SUPER, OP_INVOKE_DIRECT
+OP_INVOKE_INTERFACE and OP_INVOKE_STATIC.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Ia1cac2a357a9d396d512ea77b56d8ac5c0ed9d97
+Orig-MCG-Change-Id: Ic86483bfcf8a2afe275c29a4cacf53984e710d64
+Signed-off-by: Bijoy Jose <bijoy.a.jose@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/codegen/x86/BytecodeVisitor.cpp |  110 ++++++++++++--------------
+ vm/compiler/codegen/x86/LowerInvoke.cpp     |  100 ++++++++++++++++---------
+ 2 files changed, 116 insertions(+), 94 deletions(-)
+
+diff --git a/vm/compiler/codegen/x86/BytecodeVisitor.cpp b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+index c3c6ecf..feea9ee 100644
+--- a/vm/compiler/codegen/x86/BytecodeVisitor.cpp
++++ b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+@@ -2082,7 +2082,6 @@ int getVirtualRegInfo(VirtualRegInfo* infoArray, const MIR * currentMIR) {
+         updateCurrentBBWithConstraints(PhysicalReg_EAX);
+         num_regs_per_bytecode = 1;
+         break;
+-
+     case OP_INVOKE_VIRTUAL:
+     case OP_INVOKE_SUPER:
+     case OP_INVOKE_DIRECT:
+@@ -2097,56 +2096,38 @@ int getVirtualRegInfo(VirtualRegInfo* infoArray, const MIR * currentMIR) {
+         vF = currentMIR->dalvikInsn.arg[2];
+         vG = currentMIR->dalvikInsn.arg[3];
+         vA = currentMIR->dalvikInsn.arg[4]; //5th argument
+-        if(count == 0) {
+-            if(inst_op == OP_INVOKE_VIRTUAL || inst_op == OP_INVOKE_DIRECT ||
+-               inst_op == OP_INVOKE_INTERFACE || inst_op == OP_INVOKE_VIRTUAL_QUICK ||
+-               inst_op == OP_INVOKE_SUPER_QUICK) {
+-                infoArray[0].regNum = vD;
+-                infoArray[0].refCount = 1;
+-                infoArray[0].accessType = REGACCESS_U;
+-                infoArray[0].physicalType = LowOpndRegType_gp;
+-                num_regs_per_bytecode = 1;
+-            }
+-            num_regs_per_bytecode = 0;
+-        }
+-        else num_regs_per_bytecode = count;
+-        if(count >= 1) {
+-            infoArray[0].regNum = vD;
+-            if(inst_op == OP_INVOKE_VIRTUAL_QUICK ||
+-               inst_op == OP_INVOKE_SUPER_QUICK) {
+-                infoArray[0].refCount = 2;
+-            } else if(inst_op == OP_INVOKE_VIRTUAL || inst_op == OP_INVOKE_DIRECT || inst_op == OP_INVOKE_INTERFACE) {
+-                infoArray[0].refCount = 2;
+-            } else {
+-                infoArray[0].refCount = 1;
++
++        for (int vrNum = 0; vrNum < count; vrNum++) {
++            if (vrNum == 0) {
++                infoArray[num_regs_per_bytecode].regNum = currentMIR->dalvikInsn.arg[vrNum];
++                if (inst_op == OP_INVOKE_VIRTUAL_QUICK || inst_op == OP_INVOKE_SUPER_QUICK
++                    || inst_op == OP_INVOKE_VIRTUAL || inst_op == OP_INVOKE_DIRECT
++                    || inst_op == OP_INVOKE_INTERFACE){
++                        infoArray[num_regs_per_bytecode].refCount = 2;
++                    } else {
++                        infoArray[num_regs_per_bytecode].refCount = 1;
++                    }
++                    infoArray[num_regs_per_bytecode].accessType = REGACCESS_U;
++                    infoArray[num_regs_per_bytecode].physicalType = LowOpndRegType_gp;
++                    num_regs_per_bytecode++;
++            } else if ((vrNum + 1 < count) && // Use XMM registers if adjacent VRs are accessed
++                       (currentMIR->dalvikInsn.arg[vrNum] + 1 == currentMIR->dalvikInsn.arg[vrNum + 1])) {
++                infoArray[num_regs_per_bytecode].regNum = currentMIR->dalvikInsn.arg[vrNum];
++                infoArray[num_regs_per_bytecode].refCount = 1;
++                infoArray[num_regs_per_bytecode].accessType = REGACCESS_U;
++                infoArray[num_regs_per_bytecode].physicalType = LowOpndRegType_xmm;
++                // We can now skip the vrNum+1 which represents the rest of the wide VR
++                vrNum++;
++                num_regs_per_bytecode++;
++            } else { // Use gp registers
++                infoArray[num_regs_per_bytecode].regNum = currentMIR->dalvikInsn.arg[vrNum];
++                infoArray[num_regs_per_bytecode].refCount = 1;
++                infoArray[num_regs_per_bytecode].accessType = REGACCESS_U;
++                infoArray[num_regs_per_bytecode].physicalType = LowOpndRegType_gp;
++                num_regs_per_bytecode++;
+             }
+-            infoArray[0].accessType = REGACCESS_U;
+-            infoArray[0].physicalType = LowOpndRegType_gp;
+-        }
+-        if(count >= 2) {
+-            infoArray[1].regNum = vE;
+-            infoArray[1].refCount = 1;
+-            infoArray[1].accessType = REGACCESS_U;
+-            infoArray[1].physicalType = LowOpndRegType_gp;
+-        }
+-        if(count >= 3) {
+-            infoArray[2].regNum = vF;
+-            infoArray[2].refCount = 1;
+-            infoArray[2].accessType = REGACCESS_U;
+-            infoArray[2].physicalType = LowOpndRegType_gp;
+-        }
+-        if(count >= 4) {
+-            infoArray[3].regNum = vG;
+-            infoArray[3].refCount = 1;
+-            infoArray[3].accessType = REGACCESS_U;
+-            infoArray[3].physicalType = LowOpndRegType_gp;
+-        }
+-        if(count >= 5) {
+-            infoArray[4].regNum = vA;
+-            infoArray[4].refCount = 1;
+-            infoArray[4].accessType = REGACCESS_U;
+-            infoArray[4].physicalType = LowOpndRegType_gp;
+         }
++
+         if(inst_op != OP_INVOKE_VIRTUAL_QUICK && inst_op != OP_INVOKE_SUPER_QUICK)
+             updateCurrentBBWithConstraints(PhysicalReg_EAX);
+         updateCurrentBBWithConstraints(PhysicalReg_ECX);
+@@ -3122,38 +3103,49 @@ int getVirtualRegInfo(VirtualRegInfo* infoArray, const MIR * currentMIR) {
+     }
+     return codeSize;
+ }
+-//! Updates infoArray(TempRegInfo) with temporaries accessed by INVOKE_NO_RANGE
++/**
++ * @brief Updates infoArray(TempRegInfo) with temporaries accessed by INVOKE_NO_RANGE type
++ * @details Allocates both XMM and gp registers for INVOKE_(VIRTUAL,DIRECT,STATIC,INTERFACE,SUPER)
++ * @param infoArray, startIndex of infoArray, currentMIR
++ * @return j the new index of infoArray
++ */
++int updateInvokeNoRange(TempRegInfo* infoArray, int startIndex, const MIR * currentMIR) {
++    int j = startIndex;
++    int count = currentMIR->dalvikInsn.vA;// Max value is 5 (#ofArguments)
+ 
+-//!
+-int updateInvokeNoRange(TempRegInfo* infoArray, int startInd, const MIR * currentMIR) {
+-    int j = startInd;
+-    int count = currentMIR->dalvikInsn.vA;
++    // Use XMM registers to read and store max of 5 arguments
++    infoArray[j].regNum = 22;
++    infoArray[j].refCount = 4; //DUDU Read & Store a pair of VRs. Max refCount is 4, since max #of VR pairs is 2
++    infoArray[j].physicalType = LowOpndRegType_xmm;
++    j++;
++
++    // Use gp registers when 64 bit move is not possible. Upto 5 gp reg may be needed.
+     if(count == 5) {
+-        infoArray[j].regNum = 22;
++        infoArray[j].regNum = 27;
+         infoArray[j].refCount = 2; //DU
+         infoArray[j].physicalType = LowOpndRegType_gp;
+         j++;
+     }
+     if(count >= 4) {
+-        infoArray[j].regNum = 23;
++        infoArray[j].regNum = 26;
+         infoArray[j].refCount = 2; //DU
+         infoArray[j].physicalType = LowOpndRegType_gp;
+         j++;
+     }
+     if(count >= 3) {
+-        infoArray[j].regNum = 24;
++        infoArray[j].regNum = 25;
+         infoArray[j].refCount = 2; //DU
+         infoArray[j].physicalType = LowOpndRegType_gp;
+         j++;
+     }
+     if(count >= 2) {
+-        infoArray[j].regNum = 25;
++        infoArray[j].regNum = 24;
+         infoArray[j].refCount = 2; //DU
+         infoArray[j].physicalType = LowOpndRegType_gp;
+         j++;
+     }
+     if(count >= 1) {
+-        infoArray[j].regNum = 26;
++        infoArray[j].regNum = 23;
+         infoArray[j].refCount = 2; //DU
+         infoArray[j].physicalType = LowOpndRegType_gp;
+         j++;
+diff --git a/vm/compiler/codegen/x86/LowerInvoke.cpp b/vm/compiler/codegen/x86/LowerInvoke.cpp
+index ad10ce6..ec3892d 100644
+--- a/vm/compiler/codegen/x86/LowerInvoke.cpp
++++ b/vm/compiler/codegen/x86/LowerInvoke.cpp
+@@ -642,50 +642,80 @@ int op_invoke_interface_range(const MIR * mir) {
+ #define P_SCRATCH_3 PhysicalReg_EDX
+ #define P_SCRATCH_4 PhysicalReg_ESI
+ #define P_SCRATCH_5 PhysicalReg_EAX
+-//! pass the arguments for invoking method without range
+ 
+-//!
++/**
++ * @brief Pass the arguments for invoking method without range
++ * @details Use both XMM and gp registers for INVOKE_(VIRTUAL, DIRECT, STATIC, INTERFACE, SUPER)
++ * @param decodedInst the decoded Insturction
++ * @return 0 always
++ */
+ int common_invokeMethodNoRange_noJmp(const DecodedInstruction &decodedInst) {
+ #if defined VTUNE_DALVIK
+     int startStreamPtr = (int)stream;
+ #endif
+-
+     u2 count = decodedInst.vA;
+-
+-    // Please note that vA, vD, vE, vF, and vG might have
+-    // invalid values. Check variable "count" before accessing.
+-    u2 vD = decodedInst.arg[0];
+-    u2 vE = decodedInst.arg[1];
+-    u2 vF = decodedInst.arg[2];
+-    u2 vG = decodedInst.arg[3];
+-    u2 vA = decodedInst.arg[4];
+-
+-    int offsetFromSaveArea = -4;
+-    if(count == 5) {
+-        get_virtual_reg(vA, OpndSize_32, 22, false);
+-        move_reg_to_mem(OpndSize_32, 22, false, offsetFromSaveArea-sizeofStackSaveArea, PhysicalReg_FP, true);
+-        offsetFromSaveArea -= 4;
+-    }
+-    if(count >= 4) {
+-        get_virtual_reg(vG, OpndSize_32, 23, false);
+-        move_reg_to_mem(OpndSize_32, 23, false, offsetFromSaveArea-sizeofStackSaveArea, PhysicalReg_FP, true);
+-        offsetFromSaveArea -= 4;
+-    }
+-    if(count >= 3) {
+-        get_virtual_reg(vF, OpndSize_32, 24, false);
+-        move_reg_to_mem(OpndSize_32, 24, false, offsetFromSaveArea-sizeofStackSaveArea, PhysicalReg_FP, true);
+-        offsetFromSaveArea -= 4;
++    int offsetFromSaveArea = -4 * count;
++    int numQuad = 0; // keeping track of xmm moves
++    int numMov = 0; // keeping track of gp moves
++    for (int vrNum = 0; vrNum < count; vrNum++) {
++        if (vrNum != 0 && (vrNum + 1 < count) && decodedInst.arg[vrNum] + 1 == decodedInst.arg[vrNum + 1]) {
++            // move 64 bit values from VR to memory if consecutive VRs are to be copied to memory
++            get_virtual_reg(decodedInst.arg[vrNum], OpndSize_64, 22, false);
++            move_reg_to_mem(OpndSize_64, 22, false, offsetFromSaveArea - sizeofStackSaveArea,
++                            PhysicalReg_FP, true);
++            vrNum++;
++            numQuad++;               // keep track of number of 64 bit moves
++            offsetFromSaveArea += 8; // double the offset for 64 bits
++        } else {
++            // move 32 bit values from VR to memory.
++            // We need to use separate temp reg for each case.
++            if (numMov == 4){
++                get_virtual_reg(decodedInst.arg[vrNum], OpndSize_32, 27, false);
++                move_reg_to_mem(OpndSize_32, 27, false, offsetFromSaveArea - sizeofStackSaveArea,
++                                PhysicalReg_FP, true);
++                offsetFromSaveArea += 4;
++                numMov++;
++            }
++            if (numMov == 3){
++                get_virtual_reg(decodedInst.arg[vrNum], OpndSize_32, 26, false);
++                move_reg_to_mem(OpndSize_32, 26, false, offsetFromSaveArea - sizeofStackSaveArea,
++                                PhysicalReg_FP, true);
++                offsetFromSaveArea += 4;
++                numMov++;
++            }
++            if (numMov == 2){
++                get_virtual_reg(decodedInst.arg[vrNum], OpndSize_32, 25, false);
++                move_reg_to_mem(OpndSize_32, 25, false, offsetFromSaveArea - sizeofStackSaveArea,
++                                PhysicalReg_FP, true);
++                offsetFromSaveArea += 4;
++                numMov++;
++            }
++            if (numMov == 1){
++                get_virtual_reg(decodedInst.arg[vrNum], OpndSize_32, 24, false);
++                move_reg_to_mem(OpndSize_32, 24, false, offsetFromSaveArea - sizeofStackSaveArea,
++                                PhysicalReg_FP, true);
++                offsetFromSaveArea += 4;
++                numMov++;
++            } 
++            if (numMov == 0){
++                get_virtual_reg(decodedInst.arg[vrNum], OpndSize_32, 23, false);
++                move_reg_to_mem(OpndSize_32, 23, false, offsetFromSaveArea - sizeofStackSaveArea,
++                                PhysicalReg_FP, true);
++                offsetFromSaveArea += 4;
++                numMov++;
++            }
++        }
+     }
+-    if(count >= 2) {
+-        get_virtual_reg(vE, OpndSize_32, 25, false);
+-        move_reg_to_mem(OpndSize_32, 25, false, offsetFromSaveArea-sizeofStackSaveArea, PhysicalReg_FP, true);
+-        offsetFromSaveArea -= 4;
++    while(numQuad > 0 && numMov < count){ // refcount update for gp registers not used due to xmm moves
++        updateRefCount2(23+numMov, LowOpndRegType_gp, false);
++        updateRefCount2(23+numMov, LowOpndRegType_gp, false);
++        numMov++;
+     }
+-    if(count >= 1) {
+-        get_virtual_reg(vD, OpndSize_32, 26, false);
+-        move_reg_to_mem(OpndSize_32, 26, false, offsetFromSaveArea-sizeofStackSaveArea, PhysicalReg_FP, true);
++    while(numQuad < 2) { //Max number of arguments is 5. Reading max of 5 VRs needed i.e. upto 2 64 bit moves.
++        updateRefCount2(22, LowOpndRegType_xmm, false);
++        updateRefCount2(22, LowOpndRegType_xmm, false);
++        numQuad++;
+     }
+-
+ #if defined VTUNE_DALVIK
+     if(gDvmJit.vtuneInfo != kVTuneInfoDisabled) {
+         int endStreamPtr = (int)stream;
+-- 
+1.7.4.1
+

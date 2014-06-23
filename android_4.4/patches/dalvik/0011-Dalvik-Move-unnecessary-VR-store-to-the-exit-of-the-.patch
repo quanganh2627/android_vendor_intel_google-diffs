@@ -1,0 +1,321 @@
+From ecdef8647b5206d368a7cf3a542a04f265c27e51 Mon Sep 17 00:00:00 2001
+From: Yixin Shou <yixin.shou@intel.com>
+Date: Mon, 2 Jul 2012 08:46:37 -0700
+Subject: Dalvik: Move unnecessary VR store to the exit of the loop
+
+BZ: 75820
+
+Implemented an optimization that move unnecessary VR store during loop iteration
+to the exit of the loop to alleviate the cost of unaligned memory access.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I8b9401ecb3f89e053ddb765b4fea51a19c7df051
+Orig-MCG-Change-Id: Iedbe0db8f159ea47d7046a6a1682b0f23ff0bcd9
+Signed-off-by: Yixin Shou <yixin.shou@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/codegen/x86/AnalysisO1.cpp       |   70 +++++++++++++++++++++++++-
+ vm/compiler/codegen/x86/CodegenInterface.cpp |   32 +++++++++---
+ vm/compiler/codegen/x86/Lower.cpp            |    3 +
+ vm/compiler/codegen/x86/Lower.h              |    4 ++
+ vm/compiler/codegen/x86/LowerJump.cpp        |   52 ++++++++++++++++---
+ 5 files changed, 144 insertions(+), 17 deletions(-)
+
+diff --git a/vm/compiler/codegen/x86/AnalysisO1.cpp b/vm/compiler/codegen/x86/AnalysisO1.cpp
+index a9fd5ce..f0e5531 100644
+--- a/vm/compiler/codegen/x86/AnalysisO1.cpp
++++ b/vm/compiler/codegen/x86/AnalysisO1.cpp
+@@ -3986,6 +3986,38 @@ bool isLastByteCodeOfLiveRange(int compileIndex) {
+     return false;
+ }
+ 
++// check if virtual register has loop independent dependence
++bool loopIndepUse(int compileIndex) {
++    int k = compileIndex;
++    OpndSize tSize = getRegSize(compileTable[k].physicalType);
++    int index;
++    bool retCode = false;
++
++    /* check live ranges of the low half */
++    index = searchMemTable(compileTable[k].regNum);
++    if(index < 0) {
++        LOGE("ERROR in finding VR %d in memTable\n", compileTable[k].regNum);
++        return false;
++    }
++    LiveRange* ptr = memVRTable[index].ranges;
++    if (ptr != NULL && ptr->start > 0)
++        retCode = true;
++    if(!retCode) return false;
++    if(tSize == OpndSize_32) return true;
++
++    /* check for the high half */
++    index = searchMemTable(compileTable[k].regNum+1);
++    if(index < 0) {
++        LOGE("ERROR in finding VR %d in memTable\n", compileTable[k].regNum+1);
++        return false;
++    }
++    ptr = memVRTable[index].ranges;
++    if (ptr != NULL && ptr->start > 0)
++       return true;
++    return false;
++}
++
++
+ //! check whether the current bytecode is in a live range that extends to end of a basic block
+ 
+ //!for 64 bit, return true if true for both low half and high half
+@@ -4218,6 +4250,8 @@ int freeReg(bool spillGL) {
+             /* check entries with reference count of zero and is mapped to a physical register */
+             bool typeA = !isVirtualReg(compileTable[k].physicalType);
+             bool freeCrit = true, delayFreeing = false;
++            bool loopIndep64 = false;
++            OpndSize tSize = getRegSize(compileTable[k].physicalType);
+             bool typeC = false, typeB = false, reachEnd = false;
+             if(isVirtualReg(compileTable[k].physicalType)) {
+                 /* VRs in the compile table */
+@@ -4255,8 +4289,9 @@ int freeReg(bool spillGL) {
+                        or
+                        last bytecode of a live range reaching end of BB if not counting the fake usage at end
+                 */
++                loopIndep64 = (traceMode == kJitLoop) && (tSize == OpndSize_64) && loopIndepUse(k) && !branchInLoop;
+                 typeB = (freeCrit || boolB) &&
+-                        (compileTable[k].gType != GLOBALTYPE_GG) &&
++                        (compileTable[k].gType != GLOBALTYPE_GG) && !loopIndep64 &&
+                         !delayFreeing;
+             }
+             if(typeA || typeB || typeC) {
+@@ -4577,6 +4612,39 @@ void constVREndOfBB() {
+     }
+ }
+ 
++// check if it's needed to store VR at the exit of the loop
++bool hasVRStoreExitOfLoop() {
++    int k;
++    for(k=0; k < num_compile_entries; k++)
++       if(isVirtualReg(compileTable[k].physicalType) &&
++          compileTable[k].refCount == 0 &&
++          compileTable[k].physicalReg != PhysicalReg_Null &&
++          compileTable[k].gType != GLOBALTYPE_GG &&
++          loopIndepUse(k))
++           return true;
++    return false;
++}
++
++/*
++  Dump VR back to memory at the loop exit branch
++*/
++void storeVRExitOfLoop() {
++    int k;
++    for(k=0; k < num_compile_entries; k++) {
++       if(isVirtualReg(compileTable[k].physicalType) &&
++          compileTable[k].refCount == 0 &&
++          compileTable[k].physicalReg != PhysicalReg_Null &&
++          compileTable[k].gType != GLOBALTYPE_GG &&
++          loopIndepUse(k)) {
++#ifdef DEBUG_ENDOFBB
++           LOGI("EXITOFLOOP SPILL VR %d %d\n", compileTable[k].regNum, compileTable[k].physicalType);
++#endif
++           spillLogicalReg(k, true);
++       }
++    }
++    syncAllRegs();
++}
++
+ //!handles GG VRs at end of a basic block
+ 
+ //!make sure all GG VRs are in pre-defined physical registers
+diff --git a/vm/compiler/codegen/x86/CodegenInterface.cpp b/vm/compiler/codegen/x86/CodegenInterface.cpp
+index 9ea18c7..6e0813c 100644
+--- a/vm/compiler/codegen/x86/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/CodegenInterface.cpp
+@@ -1022,7 +1022,7 @@ static void setupLoopEntryBlock(CompilationUnit *cUnit, BasicBlock *entry,
+ }
+ 
+ /* check whether we can merge the block at index i with its target block */
+-bool mergeBlock(BasicBlock *bb) {
++bool mergeBlock(BasicBlock *bb, CompilationUnit *cUnit) {
+     if(bb->blockType == kDalvikByteCode &&
+        bb->firstMIRInsn != NULL &&
+        (bb->lastMIRInsn->dalvikInsn.opcode == OP_GOTO_16 ||
+@@ -1033,6 +1033,8 @@ bool mergeBlock(BasicBlock *bb) {
+         //ALOGI("merge blocks ending with goto at index %d", i);
+         MIR* prevInsn = bb->lastMIRInsn->prev;
+         if(bb->taken == NULL) return false;
++        if(cUnit->jitMode == kJitLoop && bb->taken == cUnit->entryBlock->fallThrough)
++            return false;
+         MIR* mergeInsn = bb->taken->firstMIRInsn;
+         if(mergeInsn == NULL) return false;
+         if(prevInsn == NULL) {//the block has a single instruction
+@@ -1043,6 +1045,7 @@ bool mergeBlock(BasicBlock *bb) {
+         mergeInsn->prev = prevInsn;
+         bb->lastMIRInsn = bb->taken->lastMIRInsn;
+         bb->taken->firstMIRInsn = NULL; //block being merged in
++        bb->taken->lastMIRInsn = NULL; //block being merged in
+         bb->fallThrough = bb->taken->fallThrough;
+         bb->taken = bb->taken->taken;
+         return true;
+@@ -1114,6 +1117,18 @@ void printEmittedCodeBlock(unsigned char *startAddr, unsigned char *endAddr)
+     }
+ }
+ 
++// Return true if there are branch inside loop
++bool hasBranchInLoop(CompilationUnit *cUnit)
++{
++    BasicBlock *firstBB = cUnit->entryBlock->fallThrough;
++    if(firstBB->taken && firstBB->taken == cUnit->backChainBlock)
++       return false;
++    if(firstBB->fallThrough && firstBB->fallThrough == cUnit->backChainBlock)
++       return false;
++    return true;
++}
++
++
+ /* 4 is the number of additional bytes needed for chaining information for trace:
+  * 2 bytes for chaining cell count offset and 2 bytes for chaining cell offset */
+ #define EXTRA_BYTES_FOR_CHAINING 4
+@@ -1129,6 +1144,8 @@ void dvmCompilerMIR2LIR(CompilationUnit *cUnit, JitTranslationInfo *info)
+     GrowableList chainingListByType[kChainingCellLast];
+     unsigned int i, padding;
+ 
++    traceMode = cUnit->jitMode;
++
+     /*
+      * Initialize various types chaining lists.
+      */
+@@ -1175,12 +1192,11 @@ void dvmCompilerMIR2LIR(CompilationUnit *cUnit, JitTranslationInfo *info)
+     startOfTrace(cUnit->method, labelList, cUnit->exceptionBlockId, cUnit);
+     if(gDvm.executionMode == kExecutionModeNcgO1) {
+         //merge blocks ending with "goto" with the fall through block
+-        if (cUnit->jitMode != kJitLoop)
+-            for (i = 0; i < blockList->numUsed; i++) {
+-                bb = (BasicBlock *) blockList->elemList[i];
+-                bool merged = mergeBlock(bb);
+-                while(merged) merged = mergeBlock(bb);
+-            }
++        for (i = 0; i < blockList->numUsed; i++) {
++            bb = (BasicBlock *) blockList->elemList[i];
++            bool merged = mergeBlock(bb, cUnit);
++            while(merged) merged = mergeBlock(bb, cUnit);
++        }
+         for (i = 0; i < blockList->numUsed; i++) {
+             bb = (BasicBlock *) blockList->elemList[i];
+             if(bb->blockType == kDalvikByteCode &&
+@@ -1191,6 +1207,8 @@ void dvmCompilerMIR2LIR(CompilationUnit *cUnit, JitTranslationInfo *info)
+         preprocessingTrace();
+     }
+ 
++    branchInLoop = cUnit->jitMode == kJitLoop && hasBranchInLoop(cUnit);
++
+     /* Handle the content in each basic block */
+     for (i = 0; ; i++) {
+         MIR *mir;
+diff --git a/vm/compiler/codegen/x86/Lower.cpp b/vm/compiler/codegen/x86/Lower.cpp
+index d0e7f92..d43185a 100644
+--- a/vm/compiler/codegen/x86/Lower.cpp
++++ b/vm/compiler/codegen/x86/Lower.cpp
+@@ -56,6 +56,9 @@ int currentExceptionBlockIdx = -1;
+ LowOpBlockLabel* traceLabelList = NULL;
+ BasicBlock* traceCurrentBB = NULL;
+ MIR* traceCurrentMIR = NULL;
++JitMode traceMode = kJitTrace;
++bool branchInLoop = false;
++
+ bool scheduling_is_on = false;
+ 
+ int common_invokeMethodNoRange();
+diff --git a/vm/compiler/codegen/x86/Lower.h b/vm/compiler/codegen/x86/Lower.h
+index 630ccb9..a1c0619 100644
+--- a/vm/compiler/codegen/x86/Lower.h
++++ b/vm/compiler/codegen/x86/Lower.h
+@@ -595,6 +595,8 @@ void goToState(int);
+ void transferToState(int);
+ void globalVREndOfBB(const Method*);
+ void constVREndOfBB();
++bool hasVRStoreExitOfLoop();
++void storeVRExitOfLoop();
+ void startNativeCode(int num, int type);
+ void endNativeCode();
+ void donotSpillReg(int physicalReg);
+@@ -1206,6 +1208,8 @@ void startOfBasicBlock(struct BasicBlock* bb);
+ extern LowOpBlockLabel* traceLabelList;
+ extern struct BasicBlock* traceCurrentBB;
+ extern struct MIR* traceCurrentMIR;
++extern JitMode traceMode;
++extern bool branchInLoop;
+ void startOfTrace(const Method* method, LowOpBlockLabel* labelList, int, CompilationUnit*);
+ void endOfTrace(bool freeOnly);
+ LowOp* jumpToBasicBlock(char* instAddr, int targetId);
+diff --git a/vm/compiler/codegen/x86/LowerJump.cpp b/vm/compiler/codegen/x86/LowerJump.cpp
+index d4b0df3..cb27d66 100644
+--- a/vm/compiler/codegen/x86/LowerJump.cpp
++++ b/vm/compiler/codegen/x86/LowerJump.cpp
+@@ -927,18 +927,52 @@ int common_goto(s4 tmp) { //tmp: target basic block id
+     unconditional_jump_int(relativeNCG, size);
+     return 1;
+ }
++
+ int common_if(s4 tmp, ConditionCode cc_next, ConditionCode cc) {
+     bool unknown;
+     OpndSize size;
+-    int relativeNCG = traceCurrentBB->taken ? traceCurrentBB->taken->id : 0;
+-
+-    if(traceCurrentBB->taken)
+-        relativeNCG = getRelativeNCG(traceCurrentBB->taken->id, JmpCall_cond, &unknown, &size);
+-    conditional_jump_int(cc, relativeNCG, size);
+-    relativeNCG = traceCurrentBB->fallThrough ? traceCurrentBB->fallThrough->id : 0;
+-    if(traceCurrentBB->fallThrough)
+-        relativeNCG = getRelativeNCG(traceCurrentBB->fallThrough->id, JmpCall_uncond, &unknown, &size);
+-    unconditional_jump_int(relativeNCG, size);
++    int relativeNCG;
++
++    if (traceMode == kJitLoop && !branchInLoop && hasVRStoreExitOfLoop()) {
++        if (traceCurrentBB->taken && traceCurrentBB->taken->blockType == kChainingCellNormal) {
++            conditional_jump(cc, ".vr_store_at_loop_exit", true);
++            relativeNCG = traceCurrentBB->fallThrough ? traceCurrentBB->fallThrough->id : 0;
++            if(!scheduling_is_on && traceCurrentBB->fallThrough)
++                relativeNCG = getRelativeNCG(traceCurrentBB->fallThrough->id, JmpCall_uncond, &unknown, &size);
++            unconditional_jump_int(relativeNCG, size);
++            insertLabel(".vr_store_at_loop_exit", true);
++            storeVRExitOfLoop();
++            relativeNCG = traceCurrentBB->taken ? traceCurrentBB->taken->id : 0;
++            if(!scheduling_is_on && traceCurrentBB->taken)
++                relativeNCG = getRelativeNCG(traceCurrentBB->taken->id, JmpCall_uncond, &unknown, &size);
++            unconditional_jump_int(relativeNCG, size);
++        }
++        else if (traceCurrentBB->fallThrough && traceCurrentBB->fallThrough->blockType == kChainingCellNormal) {
++            conditional_jump(cc_next, ".vr_store_at_loop_exit", true);
++            relativeNCG = traceCurrentBB->taken ? traceCurrentBB->taken->id : 0;
++            if(!scheduling_is_on && traceCurrentBB->taken)
++                relativeNCG = getRelativeNCG(traceCurrentBB->taken->id, JmpCall_uncond, &unknown, &size);
++            unconditional_jump_int(relativeNCG, size);
++            insertLabel(".vr_store_at_loop_exit", true);
++            storeVRExitOfLoop();
++            relativeNCG = traceCurrentBB->fallThrough ? traceCurrentBB->fallThrough->id : 0;
++            if(!scheduling_is_on && traceCurrentBB->fallThrough)
++                relativeNCG = getRelativeNCG(traceCurrentBB->fallThrough->id, JmpCall_uncond, &unknown, &size);
++            unconditional_jump_int(relativeNCG, size);
++        }
++        else
++           LOGE("ERROR in common_if\n");
++    }
++    else {
++        relativeNCG = traceCurrentBB->taken ? traceCurrentBB->taken->id : 0;
++        if(!scheduling_is_on && traceCurrentBB->taken)
++            relativeNCG = getRelativeNCG(traceCurrentBB->taken->id, JmpCall_cond, &unknown, &size);
++        conditional_jump_int(cc, relativeNCG, size);
++        relativeNCG = traceCurrentBB->fallThrough ? traceCurrentBB->fallThrough->id : 0;
++        if(!scheduling_is_on && traceCurrentBB->fallThrough)
++            relativeNCG = getRelativeNCG(traceCurrentBB->fallThrough->id, JmpCall_uncond, &unknown, &size);
++        unconditional_jump_int(relativeNCG, size);
++    }
+     return 2;
+ }
+ 
+-- 
+1.7.4.1
+

@@ -1,0 +1,3819 @@
+From 1340770e2f5c4c76a3b73cc2ab47b469ed4c5058 Mon Sep 17 00:00:00 2001
+From: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Date: Tue, 9 Jul 2013 11:56:40 -0700
+Subject: Dalvik: PCG: Getting Loops Accepted
+
+BZ: 121055
+
+This patch adds a new block type kFromInterpreter and allows PCG to jump
+back there from the interpreter. Thus now loops can be accepted because
+the CFG better models the entry points.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I340e6bd9cbe7ea7ef9778925a7dcfb71164152e3
+Orig-MCG-Change-Id: I3cfd98efbf9f6b7993cd64865d264d53f962fb60
+Signed-off-by: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Signed-off-by: Eric Dittert <eric.dittert@intel.com>
+Signed-off-by: Tim Hartley <timothy.d.hartley@intel.com>
+Reviewed-on: http://android.intel.com:8080/116872
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: Lupusoru, Razvan A <razvan.a.lupusoru@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/BBOptimization.cpp                     |   99 ++-
+ vm/compiler/BBOptimization.h                       |   10 +-
+ vm/compiler/Checks.cpp                             |    2 +-
+ vm/compiler/Compiler.h                             |    3 -
+ vm/compiler/CompilerIR.h                           |    3 +-
+ vm/compiler/CompilerUtility.h                      |    8 +
+ vm/compiler/Dataflow.cpp                           |   44 +-
+ vm/compiler/Dataflow.h                             |    3 +-
+ vm/compiler/IntermediateRep.cpp                    |    4 +-
+ vm/compiler/InvariantRemoval.cpp                   |    6 +-
+ vm/compiler/Loop.cpp                               |   49 +-
+ vm/compiler/Loop.h                                 |    4 +-
+ vm/compiler/LoopInformation.cpp                    |   40 +-
+ vm/compiler/LoopInformation.h                      |    9 +
+ vm/compiler/LoopOpt.cpp                            |   24 +-
+ vm/compiler/LoopOpt.h                              |    3 +-
+ vm/compiler/SSATransformation.cpp                  |   14 +-
+ vm/compiler/Utility.cpp                            |   51 ++-
+ vm/compiler/Utility.h                              |   39 +
+ vm/compiler/Vectorization.cpp                      |    1 +
+ vm/compiler/codegen/CompilerCodegen.h              |    2 +-
+ .../codegen/x86/lightcg/CodegenInterface.cpp       |    3 +-
+ vm/compiler/codegen/x86/pcg/Analysis.cpp           |   24 +-
+ vm/compiler/codegen/x86/pcg/Android.mk             |   36 +-
+ vm/compiler/codegen/x86/pcg/BasicBlockPCG.h        |    9 +-
+ .../codegen/x86/pcg/ChainingCellException.cpp      |   37 +-
+ vm/compiler/codegen/x86/pcg/CodeGeneration.cpp     |  414 +++++++----
+ vm/compiler/codegen/x86/pcg/CompilationUnitPCG.cpp |    4 +-
+ vm/compiler/codegen/x86/pcg/CompilationUnitPCG.h   |    2 +
+ vm/compiler/codegen/x86/pcg/Labels.cpp             |    2 +-
+ vm/compiler/codegen/x86/pcg/LowerALU.cpp           |    2 +-
+ vm/compiler/codegen/x86/pcg/LowerArray.cpp         |    2 +-
+ vm/compiler/codegen/x86/pcg/LowerCall.cpp          |   35 +-
+ vm/compiler/codegen/x86/pcg/LowerGetPut.cpp        |    2 +-
+ vm/compiler/codegen/x86/pcg/LowerJump.cpp          |    7 +-
+ vm/compiler/codegen/x86/pcg/LowerMemory.cpp        |    2 +-
+ vm/compiler/codegen/x86/pcg/LowerOther.cpp         |   49 +--
+ vm/compiler/codegen/x86/pcg/PcgInterface.cpp       |    7 +-
+ vm/compiler/codegen/x86/pcg/PersistentInfo.h       |    2 +-
+ vm/compiler/codegen/x86/pcg/Utility.cpp            |  650 -----------------
+ vm/compiler/codegen/x86/pcg/Utility.h              |  149 ----
+ vm/compiler/codegen/x86/pcg/UtilityPCG.cpp         |  763 ++++++++++++++++++++
+ vm/compiler/codegen/x86/pcg/UtilityPCG.h           |  164 +++++
+ 43 files changed, 1629 insertions(+), 1154 deletions(-)
+ create mode 100644 vm/compiler/Utility.h
+ delete mode 100644 vm/compiler/codegen/x86/pcg/Utility.cpp
+ delete mode 100644 vm/compiler/codegen/x86/pcg/Utility.h
+ create mode 100644 vm/compiler/codegen/x86/pcg/UtilityPCG.cpp
+ create mode 100644 vm/compiler/codegen/x86/pcg/UtilityPCG.h
+
+diff --git a/vm/compiler/BBOptimization.cpp b/vm/compiler/BBOptimization.cpp
+index 33f4d56..89307ca 100644
+--- a/vm/compiler/BBOptimization.cpp
++++ b/vm/compiler/BBOptimization.cpp
+@@ -14,12 +14,13 @@
+  * limitations under the License.
+  */
+ 
++#include "BBOptimization.h"
+ #include "Dalvik.h"
+ #include "Dataflow.h"
+ #include "Loop.h"
+ #include "LoopInformation.h"
+ #include "LoopOpt.h"
+-#include "BBOptimization.h"
++#include "Utility.h"
+ 
+ /**
+  * @brief Helper function to dvmCompilerMergeBasicBlocks
+@@ -647,7 +648,7 @@ void dvmCompilerFormLoop (CompilationUnit *cUnit, Pass *pass)
+ static void reorderHelper (CompilationUnit *cUnit, BasicBlock *bb)
+ {
+     //Has it been visited or is it 0?
+-    if (bb == 0 || dvmIsBitSet (cUnit->tempBlockV, bb->id))
++    if (bb == 0 || dvmIsBitSet (cUnit->tempBlockV, bb->id) == true)
+     {
+         return;
+     }
+@@ -726,34 +727,13 @@ static void reorderHelper (CompilationUnit *cUnit, BasicBlock *bb)
+ 
+ void dvmCompilerReorder (CompilationUnit *cUnit, Pass *pass)
+ {
+-    BasicBlock *start = 0;
+-
+-    //Iterate through them
+-    GrowableListIterator bbiterator;
+-    dvmGrowableListIteratorInit (&cUnit->blockList, &bbiterator);
+-
+-    while (true)
+-    {
+-        //Get next element
+-        BasicBlock *bbscan = (BasicBlock *) dvmGrowableListIteratorNext (&bbiterator);
+-        if (bbscan == NULL)
+-        {
+-            break;
+-        }
+-
+-        //If we found the entry block
+-        if (bbscan->blockType == kEntryBlock)
+-        {
+-            start = bbscan;
+-            break;
+-        }
+-    }
++    //Get a growable list for the entries of the cUnit
++    GrowableList list;
++    //Initialize it
++    dvmInitGrowableList (&list, 1);
+ 
+-    //If no start, bail
+-    if (start == 0)
+-    {
+-        return;
+-    }
++    //Find the entry points
++    dvmCompilerFindEntries (cUnit, &list);
+ 
+     //First let us reset the block list
+     dvmClearGrowableList (& (cUnit->blockList));
+@@ -767,11 +747,28 @@ void dvmCompilerReorder (CompilationUnit *cUnit, Pass *pass)
+     //Clear tempBlockV
+     dvmClearAllBits (cUnit->tempBlockV);
+ 
+-    //Now go through the BasicBlocks DFS with a twist for the loops
+-    reorderHelper (cUnit, start);
++    //Iterate through the list of entries
++    GrowableListIterator bbiterator;
++    dvmGrowableListIteratorInit (&list, &bbiterator);
++
++    //Now walk the list
++    while (true)
++    {
++        //Get next element
++        BasicBlock *bbscan = (BasicBlock *) dvmGrowableListIteratorNext (&bbiterator);
++
++        //Paranoid
++        if (bbscan == NULL)
++        {
++            break;
++        }
++
++        //Now go through the BasicBlocks DFS with a twist for the loops
++        reorderHelper (cUnit, bbscan);
++    }
+ 
+-    //Finally, if we have the puntBlock add it
+-    if (cUnit->puntBlock != 0)
++    //Finally, if we have the puntBlock that has not been added add it
++    if (cUnit->puntBlock != 0 && dvmIsBitSet (cUnit->tempBlockV, cUnit->puntBlock->id) == false)
+     {
+         dvmInsertGrowableList (& (cUnit->blockList), (intptr_t) (cUnit->puntBlock));
+         dvmSetBit (cUnit->tempBlockV, cUnit->puntBlock->id);
+@@ -799,8 +796,7 @@ void dvmCompilerReorder (CompilationUnit *cUnit, Pass *pass)
+         id++;
+     }
+ 
+-    //Since the blocks have been reordered, the peeling information is
+-    //no longer valid. Invalidate it
++    //Since the blocks have been reordered, the peeling information is no longer valid
+     LoopInformation *info = cUnit->loopInformation;
+ 
+     if (info != 0)
+@@ -1364,3 +1360,36 @@ bool dvmCompilerRemoveGoto (CompilationUnit *cUnit, BasicBlock *bb)
+     }
+     return false;
+ }
++
++bool dvmCompilerFillUsedVector (CompilationUnit *cUnit, BasicBlock *bb)
++{
++    for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        //Get SSA
++        SSARepresentation *ssaRep = mir->ssaRep;
++
++        if (ssaRep == 0)
++        {
++            continue;
++        }
++
++        //Go through the uses
++        int numUses = ssaRep->numUses;
++
++        for (int i = 0; i < numUses; i++)
++        {
++            //Get use
++            int ssaNum = ssaRep->uses[i];
++
++            //Get VR
++            int vr = dvmExtractSSARegister (cUnit, ssaNum);
++
++            //Set the bit in the used VRs' bitvector
++            dvmSetBit (cUnit->usedVRs, vr);
++        }
++    }
++
++    //Function did not instructions in the BB
++    return false;
++}
++
+diff --git a/vm/compiler/BBOptimization.h b/vm/compiler/BBOptimization.h
+index 334724a..a180f0c 100644
+--- a/vm/compiler/BBOptimization.h
++++ b/vm/compiler/BBOptimization.h
+@@ -54,7 +54,7 @@ void dvmCompilerFormLoop (CompilationUnit *cUnit, Pass *pass);
+  * @param cUnit the CompilationUnit
+  * @param pass the current pass
+  */
+-void dvmCompilerTestLoop (CompilationUnit *cunit, Pass *pass);
++void dvmCompilerTestLoop (CompilationUnit *cUnit, Pass *pass);
+ 
+ /**
+  * @brief Form the loop by inserting pre/post blocks and backward branches for loops
+@@ -110,4 +110,12 @@ bool dvmCompilerLocalValueNumbering (CompilationUnit *cUnit, BasicBlock *bb);
+  */
+ bool dvmCompilerRemoveGoto (CompilationUnit *cUnit, BasicBlock *bb);
+ 
++/**
++ * @brief Get the used virtual registers in the BasicBlock and fill cUnit->usedVRs
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock
++ * @return returns whether we changed any field in the BasicBlock structure and would like a second call on it
++ */
++bool dvmCompilerFillUsedVector (CompilationUnit *cUnit, BasicBlock *bb);
++
+ #endif
+diff --git a/vm/compiler/Checks.cpp b/vm/compiler/Checks.cpp
+index 1d19391..ab41d91 100644
+--- a/vm/compiler/Checks.cpp
++++ b/vm/compiler/Checks.cpp
+@@ -1206,7 +1206,7 @@ bool usesEqual (const MIR *mir, const MIR *other, std::map<int, std::vector <std
+     {
+         if (us.vA != it.vA)
+         {
+-            ALOGD ("vA is not the same (%d, %d)\n", us.vA, it.vA);
++            CHECK_LOG ("vA is not the same (%d, %d)\n", us.vA, it.vA);
+             return false;
+         }
+     }
+diff --git a/vm/compiler/Compiler.h b/vm/compiler/Compiler.h
+index 3c3456b..f9f7254 100644
+--- a/vm/compiler/Compiler.h
++++ b/vm/compiler/Compiler.h
+@@ -349,9 +349,6 @@ MIR *dvmCompilerFindHighestMIRInColor (MIR *elem);
+ /* Find the lowest MIR in the color */
+ MIR *dvmCompilerFindLowestMIRInColor (MIR *elem);
+ 
+-/* Get the next BasicBlock from a BitVector */
+-BasicBlock *dvmCompilerGetNextBasicBlockViaBitVector (BitVectorIterator &bvIterator, const GrowableList &blockList);
+-
+ /* Build the def use chains */
+ bool dvmCompilerBuildDefUseChain (CompilationUnit *cUnit, BasicBlock *bb);
+ 
+diff --git a/vm/compiler/CompilerIR.h b/vm/compiler/CompilerIR.h
+index 1c8230d..11b3343 100644
+--- a/vm/compiler/CompilerIR.h
++++ b/vm/compiler/CompilerIR.h
+@@ -70,7 +70,7 @@ typedef enum BBType {
+     kExceptionHandling,
+     kCatchEntry,
+     kPreBackwardBlock,
+-    kVectorized
++    kFromInterpreter,        /**< @brief BasicBlock representing an entry from interpreter other than entry */
+ } BBType;
+ 
+ typedef enum JitMode {
+@@ -454,6 +454,7 @@ typedef struct CompilationUnit {
+     BitVector *tempBlockV;
+     BitVector *tempDalvikRegisterV;
+     BitVector *tempSSARegisterV;        // numSSARegs
++    BitVector *usedVRs;                 //Which VRs are being used
+ 
+     SPhiVectors phi;
+ 
+diff --git a/vm/compiler/CompilerUtility.h b/vm/compiler/CompilerUtility.h
+index f220997..950e0b7 100644
+--- a/vm/compiler/CompilerUtility.h
++++ b/vm/compiler/CompilerUtility.h
+@@ -71,6 +71,14 @@ intptr_t dvmGrowableListGetElement(const GrowableList *gList, size_t idx);
+ size_t dvmGrowableListSize(const GrowableList *gList);
+ 
+ BitVector* dvmCompilerAllocBitVector(unsigned int startBits, bool expandable);
++
++/**
++ * @brief Allocate an expandable BitVector, set to 0
++ * @return an expandable BitVector, 0 if there is a problem
++ */
++BitVector *dvmCompilerAllocBitVector (void);
++
++BitVector* dvmCompilerAllocBitVector(unsigned int startBits, bool expandable);
+ bool dvmCompilerSetBit(BitVector* pBits, unsigned int num);
+ bool dvmCompilerClearBit(BitVector* pBits, unsigned int num);
+ void dvmCompilerMarkAllBits(BitVector *pBits, bool set);
+diff --git a/vm/compiler/Dataflow.cpp b/vm/compiler/Dataflow.cpp
+index 5b0e7eb..22edc1e 100644
+--- a/vm/compiler/Dataflow.cpp
++++ b/vm/compiler/Dataflow.cpp
+@@ -1813,7 +1813,7 @@ static void handleSSADef(CompilationUnit *cUnit, int *defs, int dalvikReg,
+     defs[regIndex] = ssaReg;
+ }
+ 
+-/* Loop up new SSA names for format_35c instructions */
++/* Look up new SSA names for format_35c instructions */
+ static void dataFlowSSAFormat35C(CompilationUnit *cUnit, MIR *mir)
+ {
+     DecodedInstruction *dInsn = &mir->dalvikInsn;
+@@ -1823,17 +1823,19 @@ static void dataFlowSSAFormat35C(CompilationUnit *cUnit, MIR *mir)
+     //Do we need more space ?
+     if (numUses > mir->ssaRep->numUses)
+     {
+-        mir->ssaRep->numUses = numUses;
+         mir->ssaRep->uses = static_cast <int *> (dvmCompilerNew (sizeof (* (mir->ssaRep->uses)) * numUses, false));
+         mir->ssaRep->defWhere = static_cast<MIR **> (dvmCompilerNew (sizeof (* (mir->ssaRep->defWhere)) * numUses, true));
+     }
+ 
++    //Set size of ssaRep to new size
++    mir->ssaRep->numUses = numUses;
++
+     for (i = 0; i < numUses; i++) {
+         handleSSAUse(cUnit, mir->ssaRep->uses, dInsn->arg[i], i);
+     }
+ }
+ 
+-/* Loop up new SSA names for format_3rc instructions */
++/* Look up new SSA names for format_3rc instructions */
+ static void dataFlowSSAFormat3RC(CompilationUnit *cUnit, MIR *mir)
+ {
+     DecodedInstruction *dInsn = &mir->dalvikInsn;
+@@ -1843,11 +1845,13 @@ static void dataFlowSSAFormat3RC(CompilationUnit *cUnit, MIR *mir)
+     //Do we need more space ?
+     if (numUses > mir->ssaRep->numUses)
+     {
+-        mir->ssaRep->numUses = numUses;
+         mir->ssaRep->uses = static_cast <int *> (dvmCompilerNew (sizeof (* (mir->ssaRep->uses)) * numUses, false));
+         mir->ssaRep->defWhere = static_cast<MIR **> (dvmCompilerNew (sizeof (* (mir->ssaRep->defWhere)) * numUses, true));
+     }
+ 
++    //Set size of ssaRep to new size
++    mir->ssaRep->numUses = numUses;
++
+     for (i = 0; i < numUses; i++) {
+         handleSSAUse(cUnit, mir->ssaRep->uses, dInsn->vC+i, i);
+     }
+@@ -1950,8 +1954,7 @@ static void dataFlowSSAFormatExtendedOp(CompilationUnit *cUnit, MIR *mir)
+     {
+         mir->ssaRep->defs = static_cast<int *> (dvmCompilerNew (sizeof(*(mir->ssaRep->defs)) * numDefs, false));
+         mir->ssaRep->fpDef = static_cast<bool *> (dvmCompilerNew (sizeof(*(mir->ssaRep->fpDef)) * numDefs, false));
+-        mir->ssaRep->usedNext = static_cast<SUsedChain **> (dvmCompilerNew (sizeof(*(mir->ssaRep->usedNext)) * numDefs,
+-                true));
++        mir->ssaRep->usedNext = static_cast<SUsedChain **> (dvmCompilerNew (sizeof(*(mir->ssaRep->usedNext)) * numDefs, true));
+     }
+ 
+     //Initialize the number of uses and defs for the ssa
+@@ -1989,14 +1992,14 @@ bool dvmCompilerDoSSAConversion(CompilationUnit *cUnit, BasicBlock *bb)
+     bb->visited = true;
+ 
+     //Next remember SSA state at entrance
+-    if (bb->dataFlowInfo->dalvikToSSAMap == 0)
++    if (bb->dataFlowInfo->dalvikToSSAMapEntrance == 0)
+     {
+-        bb->dataFlowInfo->dalvikToSSAMap = static_cast<int *> (dvmCompilerNew (sizeof (* (bb->dataFlowInfo->dalvikToSSAMap)) * cUnit->numDalvikRegisters, false));
++        bb->dataFlowInfo->dalvikToSSAMapEntrance = static_cast<int *> (dvmCompilerNew (sizeof (* (bb->dataFlowInfo->dalvikToSSAMapEntrance)) * cUnit->numDalvikRegisters, true));
+     }
+ 
+     //Remember the state we were at when starting the BasicBlock
+-    memcpy(bb->dataFlowInfo->dalvikToSSAMap, cUnit->dalvikToSSAMap,
+-           sizeof (* (bb->dataFlowInfo->dalvikToSSAMap)) * cUnit->numDalvikRegisters);
++    memcpy(bb->dataFlowInfo->dalvikToSSAMapEntrance, cUnit->dalvikToSSAMap,
++           sizeof (* (bb->dataFlowInfo->dalvikToSSAMapEntrance)) * cUnit->numDalvikRegisters);
+ 
+     for (mir = bb->firstMIRInsn; mir; mir = mir->next) {
+         //If not yet generated
+@@ -2120,12 +2123,21 @@ bool dvmCompilerDoSSAConversion(CompilationUnit *cUnit, BasicBlock *bb)
+     }
+ 
+ 
+-    //For a lot of reasons we want to swap now bb->dataFlowInfo->dalvikToSSAMap and the cUnit->dalvikToSSAMap:
+-    //  1) We want to pop back to the state we were in when we started the BasicBlock (thus bb -> cUnit)
+-    //  2) We want the BB's children to be able to know what was the last state when doing this BasicBlock (thus cUnit -> bb)
+-    int *tmp = cUnit->dalvikToSSAMap;
+-    cUnit->dalvikToSSAMap = bb->dataFlowInfo->dalvikToSSAMap;
+-    bb->dataFlowInfo->dalvikToSSAMap = tmp;
++    //Do we have an exit?
++    if (bb->dataFlowInfo->dalvikToSSAMapExit == 0)
++    {
++        bb->dataFlowInfo->dalvikToSSAMapExit = static_cast<int *> (dvmCompilerNew (sizeof (* (bb->dataFlowInfo->dalvikToSSAMapExit)) * cUnit->numDalvikRegisters, true));
++    }
++
++    //Copy the state also to exit, this is used by any PHI operand calculation
++    memcpy(bb->dataFlowInfo->dalvikToSSAMapExit, cUnit->dalvikToSSAMap,
++           sizeof (* (bb->dataFlowInfo->dalvikToSSAMapExit)) * cUnit->numDalvikRegisters);
++
++
++    //Copy the entrance back to cUnit, this is used to know the SSA registers associated to VRs at the entrance of a BB
++    memcpy (cUnit->dalvikToSSAMap, bb->dataFlowInfo->dalvikToSSAMapEntrance,
++           sizeof (* (bb->dataFlowInfo->dalvikToSSAMapEntrance)) * cUnit->numDalvikRegisters);
++
+ 
+     return true;
+ }
+diff --git a/vm/compiler/Dataflow.h b/vm/compiler/Dataflow.h
+index ce5cc3f..9fc6c19 100644
+--- a/vm/compiler/Dataflow.h
++++ b/vm/compiler/Dataflow.h
+@@ -118,7 +118,8 @@ typedef struct BasicBlockDataFlow {
+     BitVector *liveInV;
+     BitVector *liveOutV;
+     BitVector *phiV;
+-    int *dalvikToSSAMap;
++    int *dalvikToSSAMapExit;
++    int *dalvikToSSAMapEntrance;
+ } BasicBlockDataFlow;
+ 
+ /**
+diff --git a/vm/compiler/IntermediateRep.cpp b/vm/compiler/IntermediateRep.cpp
+index 36f3ec3..011a48b 100644
+--- a/vm/compiler/IntermediateRep.cpp
++++ b/vm/compiler/IntermediateRep.cpp
+@@ -14,10 +14,12 @@
+  * limitations under the License.
+  */
+ 
++#include <map>
++
+ #include "Dalvik.h"
+ #include "CompilerInternals.h"
+ #include "Dataflow.h"
+-#include <map>
++#include "Utility.h"
+ 
+ /**
+  * @brief Used to replace child of basic block and update predecessors.
+diff --git a/vm/compiler/InvariantRemoval.cpp b/vm/compiler/InvariantRemoval.cpp
+index 209a127..62c9de5 100644
+--- a/vm/compiler/InvariantRemoval.cpp
++++ b/vm/compiler/InvariantRemoval.cpp
+@@ -14,6 +14,7 @@
+  * limitations under the License.
+  */
+ 
++#include "BBOptimization.h"
+ #include "CompilerIR.h"
+ #include "Dalvik.h"
+ #include "Dataflow.h"
+@@ -24,6 +25,7 @@
+ #include "LoopOpt.h"
+ #include "Checks.h"
+ #include <vector>
++#include "Utility.h"
+ 
+ /**
+  * @brief Are the uses of the MIR instruction all defined in the chosen map
+@@ -1232,7 +1234,7 @@ static std::vector<MIR *> selectInvariants (CompilationUnit *cUnit, BasicBlock *
+             }
+ 
+             //We should have domination information nor dataflow info
+-            if (loopExit->dominators == 0 || loopExit->dataFlowInfo == 0 || loopExit->dataFlowInfo->dalvikToSSAMap == 0)
++            if (loopExit->dominators == 0 || loopExit->dataFlowInfo == 0 || loopExit->dataFlowInfo->dalvikToSSAMapExit == 0)
+             {
+                 continue;
+             }
+@@ -1252,7 +1254,7 @@ static std::vector<MIR *> selectInvariants (CompilationUnit *cUnit, BasicBlock *
+                 int dalvikReg = dvmExtractSSARegister (cUnit, mir->ssaRep->uses[use]);
+                 int regVersion = dvmExtractSSASubscript (cUnit, mir->ssaRep->uses[use]);
+ 
+-                int exitRegVersion = DECODE_SUB (loopExit->dataFlowInfo->dalvikToSSAMap[dalvikReg]);
++                int exitRegVersion = DECODE_SUB (loopExit->dataFlowInfo->dalvikToSSAMapExit[dalvikReg]);
+ 
+                 //The version the iput is using does not match exit version
+                 if (regVersion != exitRegVersion)
+diff --git a/vm/compiler/Loop.cpp b/vm/compiler/Loop.cpp
+index 4027c75..aa8a221 100644
+--- a/vm/compiler/Loop.cpp
++++ b/vm/compiler/Loop.cpp
+@@ -2428,24 +2428,41 @@ static bool insertBlockBeforeBackward (CompilationUnit *cUnit,
+ }
+ 
+ /**
+- * @brief Walks through all of the nested loops to insert prebackward blocks.
++ * @brief Add a block before the preheader of type kFromInterpreter
+  * @param cUnit the Compilation Unit
+  * @param info the information of Loop we are looking at
++ * @param data required by interface (not used)
++ * @return true to continue iteration over loops
+  */
+-static void insertPreBackwardWalker (CompilationUnit *cUnit, LoopInformation *info)
++static bool insertBlockFromInterpreter (CompilationUnit *cUnit, LoopInformation *info, void *data)
+ {
+-    //If info is 0, there is nothing to do
+-    if (info == 0)
++    //Get the preheader
++    BasicBlock *preHeader = info->getPreHeader ();
++
++    if (preHeader != 0)
+     {
+-        return;
++        //Also add a from interpreter node
++        BasicBlock *fromInterpreter = dvmCompilerNewBBinCunit (cUnit, kFromInterpreter);
++
++        //Link fromInterpreter to preHeader
++        fromInterpreter->fallThrough = preHeader;
++
++        //Paranoid
++        assert (preHeader->predecessors != 0);
++
++        //Set predecessor bit
++        dvmSetBit (preHeader->predecessors, fromInterpreter->id);
+     }
+ 
+-    //Actually do the work
+-    info->iterate (cUnit, insertBlockBeforeBackward);
++    //Unused parameter
++    (void) data;
++
++    //Continue iterating
++    return true;
+ }
+ 
+ /**
+- * @brief Inserts a basic block before Backward Chaining Cell.
++ * @brief Inserts a basic block before Backward Chaining Cell and one before the preheader.
+  * @details The newly inserted basic blocks takes the write back requests and
+  * MIRs from chaining cell in order to help backend which cannot handle
+  * Backward Chaining Cell like a bytecode block. It also ensures that the
+@@ -2454,14 +2471,22 @@ static void insertPreBackwardWalker (CompilationUnit *cUnit, LoopInformation *in
+  * @param cUnit the CompilationUnit
+  * @param currentPass the Pass
+  */
+-void dvmCompilerInsertPreBackward (CompilationUnit *cUnit, Pass *currentPass)
++void dvmCompilerInsertLoopHelperBlocks (CompilationUnit *cUnit, Pass *currentPass)
+ {
+     //Now let's go through the loop information
+     LoopInformation *info = cUnit->loopInformation;
+ 
+-    //Call helper so we can insert prebackward block for all backward
+-    //chaining cells
+-    insertPreBackwardWalker (cUnit, info);
++    //If info is 0, there is nothing to do
++    if (info == 0)
++    {
++        return;
++    }
++
++    //Actually do the work
++    info->iterate (cUnit, insertBlockBeforeBackward);
++
++    //Now do it for the from interpreter
++    info->iterate (cUnit, insertBlockFromInterpreter);
+ 
+     //Unused argument
+     (void) currentPass;
+diff --git a/vm/compiler/Loop.h b/vm/compiler/Loop.h
+index 13d3929..a905404 100644
+--- a/vm/compiler/Loop.h
++++ b/vm/compiler/Loop.h
+@@ -108,7 +108,7 @@ void dvmCompilerGenHoistedChecks(CompilationUnit *cUnit, Pass* pass);
+ #endif
+ 
+ /**
+- * @brief Inserts a basic block before Backward Chaining Cell.
++ * @brief Inserts a basic block before Backward Chaining Cell, and one before the preheader
+  * @details The newly inserted basic blocks takes the write back requests and
+  * MIRs from chaining cell in order to help backend which cannot handle
+  * Backward Chaining Cell like a bytecode block. It also ensures that the
+@@ -117,5 +117,5 @@ void dvmCompilerGenHoistedChecks(CompilationUnit *cUnit, Pass* pass);
+  * @param cUnit the CompilationUnit
+  * @param currentPass the Pass
+  */
+-void dvmCompilerInsertPreBackward (CompilationUnit *cUnit, Pass *currentPass);
++void dvmCompilerInsertLoopHelperBlocks (CompilationUnit *cUnit, Pass *currentPass);
+ #endif  // DALVIK_VM_LOOP_H_
+diff --git a/vm/compiler/LoopInformation.cpp b/vm/compiler/LoopInformation.cpp
+index 5196cbf..fcca39b 100644
+--- a/vm/compiler/LoopInformation.cpp
++++ b/vm/compiler/LoopInformation.cpp
+@@ -18,6 +18,7 @@
+ #include "Dalvik.h"
+ #include "Dataflow.h"
+ #include "LoopInformation.h"
++#include "Utility.h"
+ 
+ #include <map>
+ #include <stack>
+@@ -214,11 +215,19 @@ static bool getAllBBInLoop (CompilationUnit *cUnit, BasicBlock *entry, BitVector
+         BasicBlock *cur = workStack.top ();
+         workStack.pop ();
+ 
++        //Check if we have domination information, we might not because domination is only created if the block is reachable.
++        //For example, From Interpreter blocks are not reachable from the entry block, and thus don't get domination information
++        if (cur->dominators == 0)
++        {
++            continue;
++        }
++
+         if (dvmIsBitSet (cur->dominators, entry->id) == 0)
+         {
+             // it is not a normal loop
+             return false;
+         }
++
+         dvmSetBit (basicBlocks, cur->id);
+ 
+         dvmBitVectorIteratorInit(cur->predecessors, &bvIterator);
+@@ -287,7 +296,6 @@ static void getOutsFromLoop (CompilationUnit *cUnit, BitVector *basicBlocks, Bit
+ 
+ LoopInformation * LoopInformation::getLoopInformation (CompilationUnit *cUnit, LoopInformation *current)
+ {
+-
+     if (cUnit->quitLoopMode == true)
+     {
+         return 0;
+@@ -373,6 +381,35 @@ LoopInformation * LoopInformation::getLoopInformation (CompilationUnit *cUnit, L
+             info->preHeader = 0;
+         }
+ 
++        //Also get its from interpreter node
++        if (info->preHeader != 0)
++        {
++            BitVector *predecessors = info->preHeader->predecessors;
++
++            //Set to 0 before iterating
++            info->fromInterpreter = 0;
++
++            //Go through predecessors
++            BitVectorIterator bvIterator;
++            dvmBitVectorIteratorInit (predecessors, &bvIterator);
++
++            for (BasicBlock *current = dvmCompilerGetNextBasicBlockViaBitVector (bvIterator, cUnit->blockList); current != 0;
++                             current = dvmCompilerGetNextBasicBlockViaBitVector (bvIterator, cUnit->blockList))
++            {
++                if (current->blockType == kFromInterpreter)
++                {
++                    //Set it for info
++                    info->fromInterpreter = current;
++
++                    //Set it as non hidden
++                    current->hidden = false;
++
++                    //We are done
++                    break;
++                }
++            }
++        }
++
+         // Last thing, we do not want kPreBackwardBlock and kChainingCellBackwardBranch to be in our loop
+         BitVectorIterator bvIterator;
+         dvmBitVectorIteratorInit (info->backward, &bvIterator);
+@@ -438,6 +475,7 @@ void LoopInformation::init (void)
+     countUpLoop = false;
+     ssaBIV = 0;
+     endConditionReg = -1; // -1 for validation reasons
++    fromInterpreter = 0;
+ 
+     if (interIterationVariables == 0)
+     {
+diff --git a/vm/compiler/LoopInformation.h b/vm/compiler/LoopInformation.h
+index 8e28c46..7f8ae8f 100644
+--- a/vm/compiler/LoopInformation.h
++++ b/vm/compiler/LoopInformation.h
+@@ -56,6 +56,9 @@ class LoopInformation
+         /** @brief Preheader of the loop */
+         BasicBlock *preHeader;
+ 
++        /** @brief BasicBlock representing the entry from interpreter, it goes to the preHeader */
++        BasicBlock *fromInterpreter;
++
+         /** @brief Backward Chaining Cells of the loop */
+         BitVector *backward;
+ 
+@@ -172,6 +175,12 @@ class LoopInformation
+         LoopInformation *getPrevSibling (void) const {return siblingPrev;};
+ 
+         /**
++         * @brief Get from interpreter block
++         * @return the from interpreter block
++         */
++        BasicBlock *getFromInterpreter (void) const {return fromInterpreter;}
++
++        /**
+          * @brief Get nested loop
+          * @return the nested loop
+          */
+diff --git a/vm/compiler/LoopOpt.cpp b/vm/compiler/LoopOpt.cpp
+index ee3e08d..4b51505 100644
+--- a/vm/compiler/LoopOpt.cpp
++++ b/vm/compiler/LoopOpt.cpp
+@@ -29,11 +29,13 @@
+ #include "Pass.h"
+ #include "RegisterizationME.h"
+ #include "Vectorization.h"
++#include "Utility.h"
+ 
+ /**
+  * @brief Static functions defined below
+  */
+ static void handlePassFlag (CompilationUnit *cUnit, Pass *pass);
++static bool checkLoopsGate (const CompilationUnit *cUnit, Pass *pass);
+ 
+ /**
+  * @brief Three macros to help pass definitions
+@@ -51,7 +53,7 @@ static void handlePassFlag (CompilationUnit *cUnit, Pass *pass);
+ 
+ START_PASSES
+     //Check if the loops are like we want right now (nested or not, branches or not)
+-    NEW_PASS ("Reject_Loops", kAllNodes, 0, dvmCompilerCheckLoops, 0, 0, 0, 0, 0),
++    NEW_PASS ("Reject_Loops", kAllNodes, 0, checkLoopsGate, 0, 0, 0, 0, 0),
+     //This loop formation is used when the new loop filtering is active
+     NEW_PASS ("Form_Loop", kAllNodes, 0, dvmCompilerTraceIsLoopNewSystem,
+                 dvmCompilerFormLoop, 0, 0, 0, kOptimizationBasicBlockChange | kLoopStructureChange),
+@@ -104,8 +106,8 @@ START_PASSES
+                 0, dvmCompilerRegisterize, 0, 0, 0),
+     NEW_PASS ("Fix_Chaining_Cells", kAllNodesAndNew, 0, 0,
+                 0, 0, dvmCompilerFixChainingCellPredecessors, 0, kOptimizationBasicBlockChange | kLoopStructureChange),
+-    NEW_PASS ("Insert_Prebackward_Block", kAllNodesAndNew, 0, 0,
+-                    0, dvmCompilerInsertPreBackward, 0, 0, kOptimizationBasicBlockChange | kLoopStructureChange),
++    NEW_PASS ("Insert_LoopHelper_Blocks", kAllNodesAndNew, 0, 0,
++                    0, dvmCompilerInsertLoopHelperBlocks, 0, 0, kOptimizationBasicBlockChange | kLoopStructureChange),
+     NEW_PASS ("Reorder_Blocks", kBreadthFirstTraversal, 0, 0,
+                 dvmCompilerReorder, 0, 0, 0, kOptimizationBasicBlockChange | kLoopStructureChange),
+ 
+@@ -322,7 +324,7 @@ static bool exitLoopHelper (LoopInformation *info, void *data)
+     return dvmCountSetBits (info->getExitLoops ()) <= 1;
+ }
+ 
+-bool dvmCompilerCheckLoops (const CompilationUnit *cUnit, Pass *curPass)
++bool dvmCompilerCheckLoops (const CompilationUnit *cUnit)
+ {
+     // Build loop information
+     LoopInformation *loopInfo = LoopInformation::getLoopInformation (const_cast<CompilationUnit *>(cUnit), 0);
+@@ -418,6 +420,20 @@ bool dvmCompilerCheckLoops (const CompilationUnit *cUnit, Pass *curPass)
+     return true;
+ }
+ 
++/**
++ * @brief Check if the loops are formed the way we want (nested / branches on / off)
++ * @param cUnit the CompilationUnit
++ * @param curPass the current Pass
++ * @return Whether to continue as a loop or bail
++ */
++bool checkLoopsGate (const CompilationUnit *cUnit, Pass *curPass)
++{
++    //Unused parameter
++    (void) curPass;
++
++    return dvmCompilerCheckLoops (cUnit);
++}
++
+ //Get a given pass
+ Pass *dvmCompilerGetPass (const char *name)
+ {
+diff --git a/vm/compiler/LoopOpt.h b/vm/compiler/LoopOpt.h
+index 80f1c3a..b78e838 100644
+--- a/vm/compiler/LoopOpt.h
++++ b/vm/compiler/LoopOpt.h
+@@ -74,10 +74,9 @@ void dvmCompilerPrintIgnorePasses (void);
+ /**
+  * @brief Check if the loops are formed the way we want (nested / branches on / off)
+  * @param cUnit the CompilationUnit
+- * @param curPass the Pass
+  * @return Whether to continue as a loop or bail
+  */
+-bool dvmCompilerCheckLoops (const CompilationUnit *cUnit, Pass *curPass);
++bool dvmCompilerCheckLoops (const CompilationUnit *cUnit);
+ 
+ /**
+  * @brief Verify that hoisted checks optimization is applicable
+diff --git a/vm/compiler/SSATransformation.cpp b/vm/compiler/SSATransformation.cpp
+index 7f67083..5a09ab9 100644
+--- a/vm/compiler/SSATransformation.cpp
++++ b/vm/compiler/SSATransformation.cpp
+@@ -688,7 +688,7 @@ static bool insertPhiNodeOperands(CompilationUnit *cUnit, BasicBlock *bb)
+ 
+             //Now get the SSA combination (SSA register, SSA Subscript) via the SSA map at the exit of the predecessor
+             int encodedSSAValue =
+-                predBB->dataFlowInfo->dalvikToSSAMap[dalvikReg];
++                predBB->dataFlowInfo->dalvikToSSAMapExit[dalvikReg];
+ 
+             //Get the SSA register itself
+             int ssaReg = DECODE_REG(encodedSSAValue);
+@@ -1007,6 +1007,18 @@ bool dvmCompilerCalculateBasicBlockInformation (CompilationUnit *cUnit, bool fil
+     //Calculate Predecessors
+     dvmCompilerCalculatePredecessors (cUnit);
+ 
++    //Get the used elements
++    //First allocate if necessary
++    if (cUnit->usedVRs == 0)
++    {
++        cUnit->usedVRs = dvmCompilerAllocBitVector (1, true);
++    }
++    //Clear it
++    dvmClearAllBits (cUnit->usedVRs);
++
++    //Now dispatch
++    dvmCompilerDataFlowAnalysisDispatcher(cUnit, dvmCompilerFillUsedVector, kAllNodes, false);
++
+     //If we want to filter the loop
+     if (filter == true)
+     {
+diff --git a/vm/compiler/Utility.cpp b/vm/compiler/Utility.cpp
+index 783c4a6..c9e6c37 100644
+--- a/vm/compiler/Utility.cpp
++++ b/vm/compiler/Utility.cpp
+@@ -16,6 +16,7 @@
+ 
+ #include "Dalvik.h"
+ #include "CompilerInternals.h"
++#include "Utility.h"
+ 
+ static ArenaMemBlock *arenaHead, *currentArena;
+ static int numArenaBlocks;
+@@ -326,7 +327,9 @@ void dvmCompilerDumpCompilationUnit(CompilationUnit *cUnit)
+         "PC Reconstruction",
+         "Exception Handling",
+         "Catch Entry",
+-        "PreBackward Block"
++        "PreBackward Block",
++        "Code Block with Vectorized MIRs",
++        "From Interpreter",
+     };
+ 
+     ALOGD("Compiling %s %s", cUnit->method->clazz->descriptor,
+@@ -443,6 +446,11 @@ void dvmCompilerDumpStats(void)
+     }
+ }
+ 
++BitVector* dvmCompilerAllocBitVector(void)
++{
++    return dvmAllocBitVector (1, true, true);
++}
++
+ /*
+  * Allocate a bit vector with enough space to hold at least the specified
+  * number of bits.
+@@ -588,6 +596,9 @@ void dvmGetBlockName(BasicBlock *bb, char *name)
+          case kPreBackwardBlock:
+              snprintf(name, BLOCK_NAME_LEN, "prebackward%04x", bb->id);
+              break;
++         case kFromInterpreter:
++             snprintf(name, BLOCK_NAME_LEN, "fromInterpreter%04x", bb->id);
++             break;
+          default:
+             snprintf(name, BLOCK_NAME_LEN, "??");
+             break;
+@@ -628,3 +639,41 @@ bool dvmCompilerIsMIRConditional (MIR *mir)
+ 
+     return result;
+ }
++
++void dvmCompilerFindEntries (CompilationUnit *cUnit, GrowableList *list)
++{
++    //Get an iterator over the BasicBlocks
++    GrowableListIterator iterator;
++    dvmGrowableListIteratorInit (& (cUnit->blockList), &iterator);
++
++    //Walk the CompilationUnit's BasicBlocks
++    while (true)
++    {
++        //Get next element
++        BasicBlock *bb = (BasicBlock *) dvmGrowableListIteratorNext(&iterator);
++
++        //Are we done?
++        if (bb == NULL)
++        {
++            break;
++        }
++
++        //If hidden, we can skip
++        if (bb->hidden == true)
++        {
++            continue;
++        }
++
++        //Paranoid
++        assert (bb->predecessors != 0);
++
++        //Does it have no predecessors?
++        if (dvmCountSetBits (bb->predecessors) == 0)
++        {
++            intptr_t elem = (intptr_t) (bb);
++
++            //Add it to our list
++            dvmInsertGrowableList (list, elem);
++        }
++    }
++}
+diff --git a/vm/compiler/Utility.h b/vm/compiler/Utility.h
+new file mode 100644
+index 0000000..23b705b
+--- /dev/null
++++ b/vm/compiler/Utility.h
+@@ -0,0 +1,39 @@
++/*
++ * Copyright (C) 2013 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef DALVIK_VM_UTILITY_H_
++#define DALVIK_VM_UTILITY_H_
++
++//Forward declarations
++struct CompilationUnit;
++struct GrowableList;
++
++/**
++ * @brief Find the entry points of the CompilationUnit
++ * @param cUnit the CompilationUnit
++ * @param list the GrowableList to contain all the entry-point BasicBlocks
++ */
++void dvmCompilerFindEntries (CompilationUnit *cUnit, GrowableList *list);
++
++/**
++ * @brief Get the next BasicBlock when considering a BasicBlock index BitVector
++ * @param bvIterator the BitVector iterator
++ * @param blockList The list of basic blocks
++ * @return 0 if finished, the BasicBlock otherwise
++ */
++BasicBlock *dvmCompilerGetNextBasicBlockViaBitVector (BitVectorIterator &bvIterator, const GrowableList &blockList);
++
++#endif
+diff --git a/vm/compiler/Vectorization.cpp b/vm/compiler/Vectorization.cpp
+index 5ba71c7..5a83aa2 100644
+--- a/vm/compiler/Vectorization.cpp
++++ b/vm/compiler/Vectorization.cpp
+@@ -25,6 +25,7 @@
+ #include "LoopOpt.h"
+ #include "Pass.h"
+ #include "Vectorization.h"
++#include "Utility.h"
+ 
+ enum VectorizedType
+ {
+diff --git a/vm/compiler/codegen/CompilerCodegen.h b/vm/compiler/codegen/CompilerCodegen.h
+index 4a28b90..36c6a7c 100644
+--- a/vm/compiler/codegen/CompilerCodegen.h
++++ b/vm/compiler/codegen/CompilerCodegen.h
+@@ -23,7 +23,7 @@
+ #define MAX_CHAINED_SWITCH_CASES    64
+ 
+ /* Size of various inlined chaining cell structures, in bytes */
+-#define BACKWARD_BRANCH_CC_SIZE     29
++#define BACKWARD_BRANCH_CC_SIZE     25
+ #define SINGLETON_CC_SIZE           17
+ #define PREDICTED_CC_SIZE           20
+ #define HOT_CC_SIZE                 17
+diff --git a/vm/compiler/codegen/x86/lightcg/CodegenInterface.cpp b/vm/compiler/codegen/x86/lightcg/CodegenInterface.cpp
+index 90b70ac..baaeafe 100644
+--- a/vm/compiler/codegen/x86/lightcg/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/lightcg/CodegenInterface.cpp
+@@ -1756,6 +1756,7 @@ static void printTrace(CompilationUnit_O1 *cUnit, std::vector<CodeBlockElem> &co
+             break;
+ 
+         case kDalvikByteCode:
++        case kFromInterpreter:
+             if (code_ptr < next_code_ptr) {
+                 printEmittedCodeBlock((unsigned char *) code_ptr,
+                                       (unsigned char *) next_code_ptr);
+@@ -2232,7 +2233,7 @@ static void compilerMIR2LIRJit(CompilationUnit_O1 *cUnit, JitTranslationInfo *in
+                 break;
+             case kDalvikByteCode:
+             case kPreBackwardBlock:
+-            case kVectorized:
++            case kFromInterpreter:
+                 //If hidden, we don't generate code
+                 if (bbO1->hidden == false)
+                 {
+diff --git a/vm/compiler/codegen/x86/pcg/Analysis.cpp b/vm/compiler/codegen/x86/pcg/Analysis.cpp
+index 44286b7..9ad9dda 100644
+--- a/vm/compiler/codegen/x86/pcg/Analysis.cpp
++++ b/vm/compiler/codegen/x86/pcg/Analysis.cpp
+@@ -19,7 +19,7 @@
+ #include "BasicBlockPCG.h"
+ #include "CompilationUnitPCG.h"
+ #include "Dataflow.h"
+-#include "Utility.h"
++#include "UtilityPCG.h"
+ 
+ /**
+  * @brief Merge pcgDtype variables
+@@ -329,13 +329,13 @@ static void initGensAndKills (CompilationUnitPCG *cUnit)
+         assert (bb != 0);
+ 
+         // Allocate and initialize the bit vectors
+-        bb->ins = dvmCompilerAllocBitVector (bvSize, false);
+-        bb->outs = dvmCompilerAllocBitVector (bvSize, false);
++        bb->dirtyIns = dvmCompilerAllocBitVector (bvSize, false);
++        bb->dirtyOuts = dvmCompilerAllocBitVector (bvSize, false);
+         bb->kills = dvmCompilerAllocBitVector (bvSize, false);
+ 
+         //Clear the bitvectors
+-        dvmClearAllBits (bb->ins);
+-        dvmClearAllBits (bb->outs);
++        dvmClearAllBits (bb->dirtyIns);
++        dvmClearAllBits (bb->dirtyOuts);
+         dvmClearAllBits (bb->kills);
+ 
+         //Go through each instruction
+@@ -370,12 +370,12 @@ static void initGensAndKills (CompilationUnitPCG *cUnit)
+                 // Add all defs of this VR to the kills set.
+                 // Remove all defs of this VR from the gens set.
+                 dvmUnifyBitVectors (bb->kills, bb->kills, vrDefsBv);
+-                dvmSubtractBitVectors (bb->outs, bb->outs, vrDefsBv);
++                dvmSubtractBitVectors (bb->dirtyOuts, bb->dirtyOuts, vrDefsBv);
+ 
+                 // Add this def to the gens set
+                 if (info.registerize == true)
+                 {
+-                    dvmSetBit (bb->outs, ssaNum);
++                    dvmSetBit (bb->dirtyOuts, ssaNum);
+                     dvmClearBit(bb->kills, ssaNum);
+                 }
+ 
+@@ -392,7 +392,7 @@ static void initGensAndKills (CompilationUnitPCG *cUnit)
+                     if ((flags & kInstrInvoke) != 0)
+                     {
+                         dvmSetInitialBits (bb->kills, bvSize);
+-                        dvmClearAllBits (bb->outs);
++                        dvmClearAllBits (bb->dirtyOuts);
+                     }
+                 }
+             }
+@@ -421,8 +421,8 @@ static void propagateOuts (CompilationUnitPCG *cUnit)
+         {
+             BasicBlockPCG *bb = (BasicBlockPCG *)blockList->elemList[i];
+ 
+-            BitVector *ins = bb->ins;
+-            BitVector *outs = bb->outs;
++            BitVector *ins = bb->dirtyIns;
++            BitVector *outs = bb->dirtyOuts;
+             BitVector *kills = bb->kills;
+             BitVectorIterator it;
+             int predId;
+@@ -432,7 +432,7 @@ static void propagateOuts (CompilationUnitPCG *cUnit)
+             while ( (predId = dvmBitVectorIteratorNext (&it)) != -1)
+             {
+                 BasicBlockPCG *bb = (BasicBlockPCG *) blockList->elemList[predId];
+-                BitVector *predOuts = bb->outs;
++                BitVector *predOuts = bb->dirtyOuts;
+ 
+                 if (first == true)
+                 {
+@@ -490,7 +490,7 @@ static void pcgAvoidDeferredWritebacks (CompilationUnitPCG *cUnit)
+ 
+         if (bb->blockType < kChainingCellLast)
+         {
+-            dvmUnifyBitVectors (tempBV, tempBV, bb->ins);
++            dvmUnifyBitVectors (tempBV, tempBV, bb->dirtyIns);
+         }
+     }
+ 
+diff --git a/vm/compiler/codegen/x86/pcg/Android.mk b/vm/compiler/codegen/x86/pcg/Android.mk
+index a09867f..886cbe4 100644
+--- a/vm/compiler/codegen/x86/pcg/Android.mk
++++ b/vm/compiler/codegen/x86/pcg/Android.mk
+@@ -44,22 +44,22 @@ LOCAL_ALLOW_UNDEFINED_SYMBOLS := true
+ TARGET_LIBGCC = $(shell $(TARGET_CC) -m32 -print-libgcc-file-name)
+ #LOCAL_LDFLAGS += -Wl,--whole-archive $(TARGET_LIBGCC) -Wl,--no-whole-archive
+ LOCAL_STATIC_LIBRARIES += libpcg libirc_pcg libsvml libgnustl_static
+-LOCAL_SRC_FILES := Analysis.cpp \
+-    Client.cpp \
+-    CompilationUnitPCG.cpp \
+-    LowerALU.cpp \
+-    LowerCall.cpp \
+-    LowerJump.cpp \
+-    LowerOther.cpp \
+-    PersistentInfo.cpp \
++LOCAL_SRC_FILES := \
++    Analysis.cpp \
+     ChainingCellException.cpp \
+     CodeGeneration.cpp \
++    CompilationUnitPCG.cpp \
+     Labels.cpp \
++    LowerALU.cpp \
+     LowerArray.cpp \
++    LowerCall.cpp \
+     LowerGetPut.cpp \
++    LowerJump.cpp \
+     LowerMemory.cpp \
++    LowerOther.cpp \
+     PcgInterface.cpp \
+-    Utility.cpp
++    PersistentInfo.cpp \
++    UtilityPCG.cpp
+ 
+ LOCAL_SHARED_LIBRARIES += libcutils libdvm libdl
+ LOCAL_C_INCLUDES += \
+@@ -103,22 +103,24 @@ ifeq ($(WITH_HOST_DALVIK),true)
+     LOCAL_ALLOW_UNDEFINED_SYMBOLS := true
+     TARGET_LIBGCC = $(shell $(TARGET_CC) -m32 -print-libgcc-file-name)
+     LOCAL_STATIC_LIBRARIES += libpcg_host libirc_pcg libsvml
+-    LOCAL_SRC_FILES := Analysis.cpp \
++    LOCAL_SRC_FILES := \
++        Analysis.cpp \
+         Client.cpp \
+-        CompilationUnitPCG.cpp \
+-        LowerALU.cpp \
+-        LowerCall.cpp \
+-        LowerJump.cpp \
+-        LowerOther.cpp \
+-        PersistentInfo.cpp \
+         ChainingCellException.cpp \
+         CodeGeneration.cpp \
++        CompilationUnitPCG.cpp \
+         Labels.cpp \
++        LowerALU.cpp \
+         LowerArray.cpp \
++        LowerCall.cpp \
+         LowerGetPut.cpp \
++        LowerJump.cpp \
+         LowerMemory.cpp \
++        LowerOther.cpp \
+         PcgInterface.cpp \
+-        Utility.cpp
++        PersistentInfo.cpp \
++        UtilityPCG.cpp
++
+     LOCAL_C_INCLUDES += \
+         dalvik \
+         dalvik/vm \
+diff --git a/vm/compiler/codegen/x86/pcg/BasicBlockPCG.h b/vm/compiler/codegen/x86/pcg/BasicBlockPCG.h
+index a7d0c4b..e0a21c4 100644
+--- a/vm/compiler/codegen/x86/pcg/BasicBlockPCG.h
++++ b/vm/compiler/codegen/x86/pcg/BasicBlockPCG.h
+@@ -62,12 +62,11 @@ struct BasicBlockPCG: public BasicBlock
+         /** @brief This boolean exists so that we can avoid binding block labels, if possible to maximize block local optimization opportunities */
+         bool possiblyReferenced;
+ 
+-        //TODO aren't these duplicates, we have data flow information...
+-        /** @brief Live-ins */
+-        BitVector *ins;
++        /** @brief Dirty-ins */
++        BitVector *dirtyIns;
+ 
+-        /** @brief Live-outs */
+-        BitVector *outs;
++        /** @brief Dirty-outs */
++        BitVector *dirtyOuts;
+ 
+         /** @brief Kills */
+         BitVector *kills;
+diff --git a/vm/compiler/codegen/x86/pcg/ChainingCellException.cpp b/vm/compiler/codegen/x86/pcg/ChainingCellException.cpp
+index 2d244b4..fa61dff 100644
+--- a/vm/compiler/codegen/x86/pcg/ChainingCellException.cpp
++++ b/vm/compiler/codegen/x86/pcg/ChainingCellException.cpp
+@@ -27,6 +27,7 @@
+ #include "LowerMemory.h"
+ #include "LowerOther.h"
+ #include "Utility.h"
++#include "UtilityPCG.h"
+ #include "NcgHelper.h"
+ #include "PersistentInfo.h"
+ #include "Singleton.h"
+@@ -546,15 +547,6 @@ static uint8_t* dvmCompilerPcgEmitBackwardBranchChainingCell (CompilationUnitPCG
+     }
+     currCachePtr += 4;
+ 
+-    // Since backward branch need to match the format of the other CCs,
+-    // we need to lay down the isMove flag here, too
+-    * ( (unsigned int*)currCachePtr) = 0;
+-    if (cUnit->checkDebugMask (DebugMaskBytecode) == true)
+-    {
+-        ALOGI ("    isMove: 0x%08x\n", * ( (int *)currCachePtr));
+-    }
+-    currCachePtr += 4;
+-
+     // Lay down the code address of the loop header.
+     int64_t loopHeaderOffset;
+ 
+@@ -603,10 +595,33 @@ static uint8_t* dvmCompilerPcgEmitBackwardBranchChainingCell (CompilationUnitPCG
+     }
+     currCachePtr += 4;
+ 
+-    // Lay down the code address for the start of the trace.  This is the
++    //Get the label for the from interpreter node
++    CGLabel fromInterpLabel = 0;
++
++    if (loopInfo != 0)
++    {
++        BasicBlockPCG *bb = (BasicBlockPCG *) loopInfo->getFromInterpreter ();
++
++        BasicBlockPCG *fromInterpBlock = (BasicBlockPCG *) (bb);
++
++        //Paranoid
++        assert (fromInterpBlock != 0);
++
++        if (fromInterpBlock != 0)
++        {
++            fromInterpLabel = fromInterpBlock->cgLabel;
++        }
++    }
++
++    //Paranoid
++    assert (fromInterpLabel != 0);
++
++    // Lay down the code address for the from interpreter node.  This is the
+     // address to which dvmJitToInterpBackwardBranch transfers control after
+     // patching the backward branch.
+-    * ( (const uint8_t**)currCachePtr) = startAddr;
++    int64_t fromInterpOffset = 0;
++    CGGetLabelNameAndOffset (fromInterpLabel, &fromInterpOffset);
++    * ( (const uint8_t**)currCachePtr) = startAddr + (int32_t) fromInterpOffset;
+ 
+     if (cUnit->checkDebugMask (DebugMaskBytecode) == true)
+     {
+diff --git a/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp b/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
+index 8b98ce1..c546de1 100644
+--- a/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
++++ b/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
+@@ -36,6 +36,7 @@
+ #include "PersistentInfo.h"
+ #include "Singleton.h"
+ #include "Utility.h"
++#include "UtilityPCG.h"
+ #include <list>
+ 
+ /**
+@@ -59,7 +60,9 @@ static bool dvmCompilerPcgTranslateInsn (CompilationUnitPCG *cUnit, MIR *mir)
+         const u4 cBufLen = 2048;
+         char mybuf[cBufLen];
+         dvmCompilerExtendedDisassembler (cUnit, mir, &mir->dalvikInsn, mybuf, cBufLen);
+-        ALOGI ("%s\n", mybuf);
++        ALOGI ("LOWER %s %s\n", mybuf,
++            (mir->OptimizationFlags & MIR_CALLEE) ? " (inlined)" : ""
++        );
+     }
+ 
+     if (dalvikOpCode >= kNumPackedOpcodes)
+@@ -792,16 +795,269 @@ static bool dvmCompilerPcgTranslateInsn (CompilationUnitPCG *cUnit, MIR *mir)
+ }
+ 
+ /**
++ * @brief Handle the from interpreter node
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock
++ * @return true if success
++ */
++static bool handleFromInterpreter (CompilationUnitPCG *cUnit, BasicBlockPCG *bb)
++{
++    //Bind the block label
++    dvmCompilerPcgBindBlockLabel (bb);
++
++    //Create entry stub
++    dvmCompilerPcgCreateEntryStub (cUnit);
++
++    //Let us get the preheader we care about
++    BasicBlockPCG *preheader = static_cast<BasicBlockPCG *> (bb->fallThrough);
++
++    //Paranoid
++    if (preheader == 0)
++    {
++        //TODO: should add an error handler here
++        return true;
++    }
++
++    //Check dataflow info
++    BasicBlockDataFlow *info = preheader->dataFlowInfo;
++
++    assert (info != 0);
++
++    //Get entrance
++    int *dalvikToSSAMapEntrance = info->dalvikToSSAMapEntrance;
++
++    //Get its live ins
++    BitVector *ins = info->liveInV;
++
++    //Paranoid
++    assert (ins != 0);
++
++    //Live-ins are a bit over conservative and can contain VRs that don't even exist in the cUnit
++    BitVector *reallyIns = dvmCompilerAllocBitVector (1, true);
++    //Intersect now
++    dvmIntersectBitVectors (reallyIns, ins, cUnit->usedVRs);
++
++    //Now iterate on the ins
++    BitVectorIterator bvIterator;
++    dvmBitVectorIteratorInit (reallyIns, &bvIterator);
++
++    //Now handle each SSA live in
++    while (true)
++    {
++        //Get VR
++        int vr = dvmBitVectorIteratorNext (&bvIterator);
++
++        //If finished, we are done
++        if (vr == -1)
++        {
++            break;
++        }
++
++        //Get combination SSA_Subscript
++        int ssaCombo = dalvikToSSAMapEntrance[vr];
++
++        //Now we only want the SSA number
++        int ssaNum = DECODE_REG (ssaCombo);
++
++        //Handle initial load
++        dvmCompilerPcgHandleInitialLoad (cUnit, bb, ssaNum, false);
++    }
++
++    //Now jump to preheader
++    dvmCompilerPcgTranslateDirectJumpToBlock (preheader);
++
++    //Report success
++    return true;
++}
++
++/**
++ * @brief Check if the BasicBlockPCG is possibly referenced, if not report failure
++ * @param cUnit the CompilationUnitPCG
++ * @param bb the BasicBlockPCG
++ * @return whether or not the BasicBlockPCG is possibly referenced
++ */
++static bool checkPossiblyReferenced (const CompilationUnitPCG *cUnit, const BasicBlockPCG *bb)
++{
++    if (bb->possiblyReferenced == false)
++    {
++        if (cUnit->checkDebugMask (DebugMaskBytecode) == true)
++        {
++            ALOGI ("XXXXXX block [%d] is not referenced. Skipping any IL.\n", bb->id);
++        }
++
++        //Report it is not
++        return false;
++    }
++
++    //Report it is
++    return true;
++}
++
++/**
++ * @brief Handle a pre backward branch block
++ * @param cUnit the CompilationUnitPCG
++ * @param bb the pre backward branch block
++ */
++static void handlePreBackwardBlock (CompilationUnitPCG *cUnit, BasicBlockPCG *bb)
++{
++    // First create a symbol and associate it with the label of the pre backward block.
++    CGLabel cgLabel = CGCreateLabel();
++    CGSymbol cgSymbol;
++    std::string blockName;
++    dvmCompilerPcgGetBlockName (bb, blockName);
++    //We want the block to have an aligned symbol information, to get all jumps towards it aligned
++    cgSymbol = dvmCompilerPcgCreateSymbol (blockName, 0, true);
++    cUnit->addLabelSymbolPair(cgLabel, cgSymbol);
++
++    // Now find the backward branch chaining cell block and store the
++    // symbol so we can capture its address when we generate the CC.
++    BasicBlockPCG *bwccBlock = (BasicBlockPCG*)bb->fallThrough;
++    if (bwccBlock == NULL || bwccBlock->blockType != kChainingCellBackwardBranch)
++    {
++        ALOGI("Unexpected CFG for pre backward block");
++        exit(-1);
++    }
++    bwccBlock->writebackTargetSymbol = cgSymbol;
++
++    // Find the loop header block. This block is the target
++    // of the back edge of the loop in loop traces.
++    CGLabel loopHeadLabel = CGLabelInvalid;
++    BasicBlockPCG *loopHeader = NULL;
++    LoopInformation *loopInfo = cUnit->loopInformation;
++
++    if (loopInfo != 0)
++    {
++        loopHeader = (BasicBlockPCG *) loopInfo->getEntryBlock ();
++    }
++
++    if (loopHeader != 0)
++    {
++        loopHeadLabel = loopHeader->cgLabel;
++    }
++
++    // Generate the patchable jump.  We generate an unconditional jump
++    // here and rely on PCG to optimize it if the predecessor block ends
++    // in a conditional jump to this block.  The possible branch targets
++    // are the pre backward block label (before the jump is patched) and
++    // the loop head (after the jump is patched).
++    CGInst jsr = CGCreateNewInst ("jsr", "n", cgSymbol);
++    CGAddIndirectBranchTarget(jsr, cgLabel);
++    assert(loopHeadLabel != 0);
++    CGAddIndirectBranchTarget(jsr, loopHeadLabel);
++    CGBindLabel(cgLabel);
++}
++
++/**
++ * @brief Generate the code for a generic BasicBlock
++ * @param cUnit the CompilationUnitPCG
++ * @param bb the pre backward branch block
++ * @return success or not
++ */
++static bool handleBBCodeGeneration (CompilationUnitPCG *cUnit, BasicBlockPCG *bb)
++{
++    // Track the modified SSANums so that we can do the proper writebacks at side exits.
++    BitVector *currModBV = cUnit->getCurrMod ();
++
++    dvmCopyBitVector (currModBV, bb->dirtyIns);
++
++    for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        if (dvmCompilerPcgTranslateInsn (cUnit, mir) == false)
++        {
++            return false;
++        }
++
++        // Update the mod SSANum set.
++        for (int i = 0; i < mir->ssaRep->numDefs; i++)
++        {
++            int ssaNum = mir->ssaRep->defs[i];
++            u2 vrNum = dvmExtractSSARegister (cUnit, ssaNum);
++
++            // Remove any defs of this VR from the mod set
++            BitVector *bv = cUnit->getSSANumSet (vrNum);
++            dvmSubtractBitVectors (currModBV, currModBV, bv);
++
++            //Get the information
++            SSANumInfo &info = cUnit->getSSANumInformation (ssaNum);
++
++            // Add this define
++            if (info.registerize == true)
++            {
++                dvmSetBit (currModBV, ssaNum);
++            }
++        }
++    }
++
++    //Handle fallthrough now
++    if (bb->fallThrough && bb->fallThrough->blockType != kExitBlock && bb->fallThrough->blockType != kPCReconstruction)
++    {
++        if (dvmCompilerPcgBlockEndsInInvoke (bb) == false)
++        {
++            dvmCompilerPcgDoWritebacksOnEdge (cUnit, bb, (BasicBlockPCG *) bb->fallThrough);
++
++            BasicBlockPCG *bbPCG = (BasicBlockPCG *) (bb->fallThrough);
++            dvmCompilerPcgTranslateDirectJumpToBlock (bbPCG);
++        }
++    }
++
++    //Handle taken now
++    if (bb->taken != 0 && dvmCompilerPcgBlockEndsInInvoke (bb) == false)
++    {
++        CGBindLabel (bb->takenLabel);
++        dvmCompilerPcgDoWritebacksOnEdge (cUnit, bb, (BasicBlockPCG *) bb->taken);
++
++        BasicBlockPCG *bbPCG = (BasicBlockPCG *) (bb->taken);
++        dvmCompilerPcgTranslateDirectJumpToBlock (bbPCG);
++    }
++
++    //Report success
++    return true;
++}
++
++/**
++ * @brief Handle the code generation of a generic BasicBlock
++ * @param cUnit the CompilationUnitPCG
++ * @param bb the pre backward branch block
++ * @return success or not
++ */
++bool handleGeneralBasicBlock (CompilationUnitPCG *cUnit, BasicBlockPCG *bb)
++{
++    //First check if it is possibly referenced
++    if (checkPossiblyReferenced (cUnit, bb) == false)
++    {
++        //If it isn't referenced, we are done so we report success
++        return true;
++    }
++
++    //Next bind the block label
++    dvmCompilerPcgBindBlockLabel (bb);
++
++    //Prebackward branch has a specific pre code generation sequence
++    if (bb->blockType == kPreBackwardBlock)
++    {
++        // The backward branch chaining cell needs to know the address of the
++        // corresponding pre-backward block.  Create that association when
++        // we see the pre-backward block.
++        handlePreBackwardBlock (cUnit, bb);
++    }
++
++    //Now handle code generation for the block
++    if (handleBBCodeGeneration (cUnit, bb) == false)
++    {
++        //Report failure
++        return false;
++    }
++
++    //Report success
++    return true;
++}
++/**
+  * @brief Translate the BasicBlock
+  * @param cUnit the CompilationUnitPCG
+  * @param bb the BasicBlock
+- * @param blockId the blockId
+  */
+-//TODO in theory blockId is redundant with bb->id
+-static bool dvmCompilerPcgTranslateBB (CompilationUnitPCG *cUnit, BasicBlockPCG *bb, int blockId)
++static bool dvmCompilerPcgTranslateBB (CompilationUnitPCG *cUnit, BasicBlockPCG *bb)
+ {
+-    MIR *mir;
+-
+     if (cUnit->checkDebugMask (DebugMaskBytecode) == true) {
+         BasicBlockPCG *ft = (BasicBlockPCG *) (bb->fallThrough);
+         BasicBlockPCG *taken = (BasicBlockPCG *) (bb->taken);
+@@ -873,135 +1129,28 @@ static bool dvmCompilerPcgTranslateBB (CompilationUnitPCG *cUnit, BasicBlockPCG
+         case kPCReconstruction:
+             return true;
+ 
++        case kFromInterpreter:
++            handleFromInterpreter (cUnit, bb);
++            return true;
++
+         case kExitBlock:
+         case kDalvikByteCode:
+         case kPreBackwardBlock:
+-            break;
+-
+-        default:
+-            ALOGE ("\n+++ PCG ERROR +++ Unknown block type seen : %d.",
+-                   (int)bb->blockType);
+-            exit (-1);
+-    }
+-
+-    if (!bb->possiblyReferenced)
+-    {
+-        if (cUnit->checkDebugMask (DebugMaskBytecode) == true)
+-        {
+-            ALOGI ("XXXXXX block [%d] is not referenced. "
+-                    "skipping any IL.\n", blockId);
+-        }
+-
+-        return true;
+-    }
+-
+-    dvmCompilerPcgBindBlockLabel (bb);
+-
+-    // The backward branch chaining cell needs to know the address of the
+-    // corresponding pre-backward block.  Create that association when
+-    // we see the pre-backward block.
+-    if (bb->blockType == kPreBackwardBlock)
+-    {
+-        // First create a symbol and associate it with the label of the pre backward block.
+-        CGLabel cgLabel = CGCreateLabel();
+-        CGSymbol cgSymbol;
+-        std::string blockName;
+-        dvmCompilerPcgGetBlockName (bb, blockName);
+-        //We want the block to have an aligned symbol information, to get all jumps towards it aligned
+-        cgSymbol = dvmCompilerPcgCreateSymbol (blockName, 0, true);
+-        cUnit->addLabelSymbolPair(cgLabel, cgSymbol);
+-
+-        // Now find the backward branch chaining cell block and store the
+-        // symbol so we can capture its address when we generate the CC.
+-        BasicBlockPCG *bwccBlock = (BasicBlockPCG*)bb->fallThrough;
+-        if (bwccBlock == NULL || bwccBlock->blockType != kChainingCellBackwardBranch)
+-        {
+-            ALOGI("Unexpected CFG for pre backward block");
+-            exit(-1);
+-        }
+-        bwccBlock->writebackTargetSymbol = cgSymbol;
+-
+-        // Find the loop header block. This block is the target
+-        // of the back edge of the loop in loop traces.
+-        CGLabel loopHeadLabel = CGLabelInvalid;
+-        BasicBlockPCG *loopHeader = NULL;
+-        LoopInformation *loopInfo = cUnit->loopInformation;
+-
+-        if (loopInfo != 0)
+-        {
+-            loopHeader = (BasicBlockPCG *) loopInfo->getEntryBlock ();
+-        }
+ 
+-        if (loopHeader != 0)
+-        {
+-            loopHeadLabel = loopHeader->cgLabel;
+-        }
+-
+-        // Generate the patchable jump.  We generate an unconditional jump
+-        // here and rely on PCG to optimize it if the predecessor block ends
+-        // in a conditional jump to this block.  The possible branch targets
+-        // are the pre backward block label (before the jump is patched) and
+-        // the loop head (after the jump is patched).
+-        //dlkdlk
+-        CGInst jsr = CGCreateNewInst ("jsr", "n", cgSymbol);
+-        CGAddIndirectBranchTarget(jsr, cgLabel);
+-        assert(loopHeadLabel != 0);
+-        CGAddIndirectBranchTarget(jsr, loopHeadLabel);
+-        CGBindLabel(cgLabel);
+-    }
+-
+-    // Track the modified SSANums so that we can do the proper writebacks at
+-    // side exits.
+-    BitVector *currModBV = cUnit->getCurrMod ();
+-
+-    dvmCopyBitVector (currModBV, bb->ins);
+-
+-    for (mir = bb->firstMIRInsn; mir; mir = mir->next)
+-    {
+-        if (dvmCompilerPcgTranslateInsn (cUnit, mir) == false)
+-        {
+-            return false;
+-        }
+-
+-        // Update the mod SSANum set.
+-        for (int i = 0; i < mir->ssaRep->numDefs; i++)
+-        {
+-            int ssaNum = mir->ssaRep->defs[i];
+-            u2 vrNum = dvmExtractSSARegister (cUnit, ssaNum);
+-
+-            // Remove any defs of this VR from the mod set
+-            BitVector *bv = cUnit->getSSANumSet (vrNum);
+-            dvmSubtractBitVectors (currModBV, currModBV, bv);
+-
+-            //Get the information
+-            SSANumInfo &info = cUnit->getSSANumInformation (ssaNum);
+-
+-            // Add this define
+-            if (info.registerize == true)
++            //Handle the general basic block
++            if (handleGeneralBasicBlock (cUnit, bb) == false)
+             {
+-                dvmSetBit (currModBV, ssaNum);
++                //Return failure
++                return false;
+             }
+-        }
+-    }
+-
+-    if (bb->fallThrough && bb->fallThrough->blockType != kExitBlock && bb->fallThrough->blockType != kPCReconstruction)
+-    {
+-        if (dvmCompilerPcgBlockEndsInInvoke (bb) == false)
+-        {
+-            dvmCompilerPcgDoWritebacksOnEdge (cUnit, bb, (BasicBlockPCG *) bb->fallThrough);
+-
+-            BasicBlockPCG *bbPCG = (BasicBlockPCG *) (bb->fallThrough);
+-            dvmCompilerPcgTranslateDirectJumpToBlock (bbPCG);
+-        }
+-    }
+ 
+-    if (bb->taken != 0 && dvmCompilerPcgBlockEndsInInvoke (bb) == false)
+-    {
+-        CGBindLabel (bb->takenLabel);
+-        dvmCompilerPcgDoWritebacksOnEdge (cUnit, bb, (BasicBlockPCG *) bb->taken);
++            //Send out a success return
++            return true;
+ 
+-        BasicBlockPCG *bbPCG = (BasicBlockPCG *) (bb->taken);
+-        dvmCompilerPcgTranslateDirectJumpToBlock (bbPCG);
++        default:
++            ALOGE ("\n+++ PCG ERROR +++ Unknown block type seen : %d.",
++                    (int)bb->blockType);
++            exit (-1);
+     }
+ 
+     return true;
+@@ -1047,7 +1196,8 @@ static bool dvmCompilerPcgTranslateCUnit (CompilationUnitPCG *cUnit, JitTranslat
+         // need to be processed, because we must lay down the chaining cell
+         // regardless of whether it is referenced in the code, and we need
+         // its chainingCellSymbol in order to do that.
+-        if (bb->possiblyReferenced == false && bb->blockType != kExceptionHandling && bb->blockType >= kChainingCellLast)
++        if (bb->possiblyReferenced == false && bb->blockType != kFromInterpreter &&
++                                               bb->blockType != kExceptionHandling && bb->blockType >= kChainingCellLast)
+         {
+             continue;
+         }
+@@ -1056,7 +1206,6 @@ static bool dvmCompilerPcgTranslateCUnit (CompilationUnitPCG *cUnit, JitTranslat
+         // not need them depending on the contents of the MIR.  Also capture
+         // any other necessary information about the block.  For symbols, use
+         // 0 as the address for now.  It cannot be resolved until later.
+-        //
+         bb->cgLabel = CGCreateLabel ();
+         bb->takenLabel = CGCreateLabel ();
+         bb->blockBound = false;
+@@ -1130,7 +1279,7 @@ static bool dvmCompilerPcgTranslateCUnit (CompilationUnitPCG *cUnit, JitTranslat
+         }
+         else
+         {
+-            if (dvmCompilerPcgTranslateBB (cUnit, bb, i) == false)
++            if (dvmCompilerPcgTranslateBB (cUnit, bb) == false)
+             {
+                 return false;
+             }
+@@ -1149,7 +1298,6 @@ static bool dvmCompilerPcgTranslateCUnit (CompilationUnitPCG *cUnit, JitTranslat
+     // loaded in the predicted chaining code.  For some reason, they model this
+     // as a taken branch to the kChainingCellInvokePredicted chaining cell from
+     // the invoke block in the MIR.
+-    //
+     for (i = 0; i < kChainingCellGap; i++)
+     {
+         if (i == kChainingCellNormal || i == kChainingCellBackwardBranch || i == kChainingCellHot)
+@@ -1180,7 +1328,7 @@ static bool dvmCompilerPcgTranslateCUnit (CompilationUnitPCG *cUnit, JitTranslat
+ 
+                 dvmCompilerPcgBindBlockLabel (bb);
+ 
+-                dvmCompilerPcgGenerateWritebacks (cUnit, bb->ins);
++                dvmCompilerPcgGenerateWritebacks (cUnit, bb->dirtyIns);
+ 
+                 // Define the parms for the jsr here.
+                 CGInst parmEdi = dvmCompilerPcgGenerateVMPtrMov (cUnit);
+@@ -1343,7 +1491,7 @@ void dvmCompilerPcgEmitCode (CompilationUnitPCG *cUnit, JitTranslationInfo* info
+                 cacheStartPtr, stream);
+     }
+ 
+-    if (cUnit->checkDebugMask (DebugMaskDisasm) == true)
++    if (cUnit->printMe == true)
+     {
+         ALOGD("-------- PCG: Emit trace for [%s%s@%#x] binary code starts at %p (cache start %p)",
+                 cUnit->method->clazz->descriptor, cUnit->method->name,
+diff --git a/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.cpp b/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.cpp
+index cb98ef8..f83bba1 100644
+--- a/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.cpp
++++ b/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.cpp
+@@ -17,7 +17,7 @@
+ #include "Analysis.h"
+ #include "CompilationUnitPCG.h"
+ #include "Labels.h"
+-#include "Utility.h"
++#include "UtilityPCG.h"
+ 
+ uint32_t CompilationUnitPCG::traceID = 0;
+ 
+@@ -46,7 +46,7 @@ CompilationUnitPCG::CompilationUnitPCG (CompilationUnit *cUnit)
+         debugLevel = tmp;
+     }
+ 
+-    //Set certain debug printing if printMe is true
++    //If we are in verbose mode, print out elements
+     if (cUnit->printMe == true)
+     {
+         setDebugLevel (DebugMaskBytecode);
+diff --git a/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.h b/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.h
+index d13f7c1..998464d 100644
+--- a/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.h
++++ b/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.h
+@@ -61,6 +61,7 @@ enum DebugMasks
+ enum OptimizationFlags
+ {
+     OptimizationFlagsSpeculativeNullChecks, /**< @brief Do we want speculative null checks? */
++    OptimizationFlagsAcceptLoops,           /**< @brief Do we want to accept loops? */
+ };
+ 
+ /**
+@@ -69,6 +70,7 @@ enum OptimizationFlags
+ enum OptimizationMasks
+ {
+     OptimizationMaskSpeculativeNullChecks = (1 << OptimizationFlagsSpeculativeNullChecks),  /**< @brief Do we want speculative null checks? */
++    OptimizationMaskAcceptLoops = (1 << OptimizationFlagsAcceptLoops),                      /**< @brief Do we want to accept loops? */
+ };
+ 
+ /**
+diff --git a/vm/compiler/codegen/x86/pcg/Labels.cpp b/vm/compiler/codegen/x86/pcg/Labels.cpp
+index 04ecd5e..61f888a 100644
+--- a/vm/compiler/codegen/x86/pcg/Labels.cpp
++++ b/vm/compiler/codegen/x86/pcg/Labels.cpp
+@@ -21,7 +21,7 @@
+ #include "Labels.h"
+ #include "PersistentInfo.h"
+ #include "Singleton.h"
+-#include "Utility.h"
++#include "UtilityPCG.h"
+ 
+ // Perform symbol relocation.  The input argument is the address of the start of the routine
+ void dvmCompilerPcgResolveSymbolReferences (const CompilationUnitPCG *cUnit, uint8_t *codePtr)
+diff --git a/vm/compiler/codegen/x86/pcg/LowerALU.cpp b/vm/compiler/codegen/x86/pcg/LowerALU.cpp
+index 7dc5251..06e93f8 100644
+--- a/vm/compiler/codegen/x86/pcg/LowerALU.cpp
++++ b/vm/compiler/codegen/x86/pcg/LowerALU.cpp
+@@ -20,7 +20,7 @@
+ #include "CompilerIR.h"
+ #include "Dataflow.h"
+ #include "LowerALU.h"
+-#include "Utility.h"
++#include "UtilityPCG.h"
+ 
+ void dvmCompilerPcgTranslateMove (CompilationUnitPCG *cUnit, MIR *mir)
+ {
+diff --git a/vm/compiler/codegen/x86/pcg/LowerArray.cpp b/vm/compiler/codegen/x86/pcg/LowerArray.cpp
+index 3b3cf8a..e4b7255 100644
+--- a/vm/compiler/codegen/x86/pcg/LowerArray.cpp
++++ b/vm/compiler/codegen/x86/pcg/LowerArray.cpp
+@@ -21,7 +21,7 @@
+ #include "LowerArray.h"
+ #include "LowerCall.h"
+ #include "LowerMemory.h"
+-#include "Utility.h"
++#include "UtilityPCG.h"
+ #include "LowerOther.h"
+ 
+ void dvmCompilerPcgTranslateNewArray (CompilationUnitPCG *cUnit, MIR *mir)
+diff --git a/vm/compiler/codegen/x86/pcg/LowerCall.cpp b/vm/compiler/codegen/x86/pcg/LowerCall.cpp
+index ec4fe6a..91400f1 100644
+--- a/vm/compiler/codegen/x86/pcg/LowerCall.cpp
++++ b/vm/compiler/codegen/x86/pcg/LowerCall.cpp
+@@ -25,7 +25,7 @@
+ #include "LowerOther.h"
+ #include "PersistentInfo.h"
+ #include "Singleton.h"
+-#include "Utility.h"
++#include "UtilityPCG.h"
+ 
+ CGSymbol dvmCompilerPcgGetInvokeTarget (CompilationUnitPCG *cUnit, const BasicBlockPCG *bb, bool *needsCfgArc)
+ {
+@@ -54,35 +54,6 @@ CGSymbol dvmCompilerPcgGetInvokeTarget (CompilationUnitPCG *cUnit, const BasicBl
+     return sym;
+ }
+ 
+-/**
+- * @brief Add post invoke entry code
+- * @param cUnit the CompilationUnitPCG
+- */
+-static void dvmCompilerPcgAddPostInvokeEntryCode (CompilationUnitPCG *cUnit)
+-{
+-    CGInst entry_inst = CGCreateNewInst ("entry", "");
+-    CGSetRreg (entry_inst, "esp");
+-
+-    CGInst inst = entry_inst;
+-    inst = CGCreateNewInst ("spsubi", "ri", inst, 0);
+-    CGSetRreg (inst, "esp");
+-
+-    inst = CGCreateNewInst ("idef", "a", entry_inst);
+-    CGSetRreg (inst, "edi");
+-    inst = CGCreateNewInst ("mov", "r", inst);
+-    CGAddTempDef (cUnit->getVMPtrReg (), inst);
+-
+-    CGInst pcgVmPtr = CGGetTempUseInst (cUnit->getVMPtrReg ());
+-    cUnit->setVMPtr (pcgVmPtr);
+-
+-    inst = CGCreateNewInst ("idef", "a", entry_inst);
+-    CGSetRreg (inst, "ebp");
+-    inst = CGCreateNewInst ("mov", "r", inst);
+-    CGAddTempDef (cUnit->getFramePtrReg (), inst);
+-    CGInst pcgFramePtr = CGGetTempUseInst (cUnit->getFramePtrReg ());
+-    cUnit->setFramePtr (pcgFramePtr);
+-}
+-
+ void dvmCompilerPcgTranslateInvokeVirtual (CompilationUnitPCG *cUnit, MIR *mir)
+ {
+     BasicBlockPCG *bb = static_cast<BasicBlockPCG *> (mir->bb);
+@@ -785,14 +756,14 @@ void dvmCompilerPcgCommonInvokeMethodJmp (CompilationUnitPCG *cUnit, BasicBlockP
+     if (fallthroughNeedsCfgEdge == true)
+     {
+         CGBindLabel (newFallThroughLabel);
+-        dvmCompilerPcgAddPostInvokeEntryCode (cUnit);
++        dvmCompilerPcgCreateEntryStub (cUnit);
+         dvmCompilerPcgTranslateDirectJumpToBlock ((BasicBlockPCG *) bb->fallThrough);
+     }
+ 
+     if (takenNeedsCfgEdge == true)
+     {
+         CGBindLabel (newTakenLabel);
+-        dvmCompilerPcgAddPostInvokeEntryCode (cUnit);
++        dvmCompilerPcgCreateEntryStub (cUnit);
+         dvmCompilerPcgTranslateDirectJumpToBlock ((BasicBlockPCG *) bb->taken);
+     }
+ }
+diff --git a/vm/compiler/codegen/x86/pcg/LowerGetPut.cpp b/vm/compiler/codegen/x86/pcg/LowerGetPut.cpp
+index 56a976d..ef07a04 100644
+--- a/vm/compiler/codegen/x86/pcg/LowerGetPut.cpp
++++ b/vm/compiler/codegen/x86/pcg/LowerGetPut.cpp
+@@ -24,7 +24,7 @@
+ #include "LowerOther.h"
+ #include "PersistentInfo.h"
+ #include "Singleton.h"
+-#include "Utility.h"
++#include "UtilityPCG.h"
+ 
+ void dvmCompilerPcgTranslateIput (CompilationUnitPCG *cUnit, MIR *mir)
+ {
+diff --git a/vm/compiler/codegen/x86/pcg/LowerJump.cpp b/vm/compiler/codegen/x86/pcg/LowerJump.cpp
+index 44ef274..80ed31c 100644
+--- a/vm/compiler/codegen/x86/pcg/LowerJump.cpp
++++ b/vm/compiler/codegen/x86/pcg/LowerJump.cpp
+@@ -19,7 +19,7 @@
+ #include "Dataflow.h"
+ #include "LowerJump.h"
+ #include "LowerMemory.h"
+-#include "Utility.h"
++#include "UtilityPCG.h"
+ 
+ void dvmCompilerPcgTranslateDirectJumpToBlock (BasicBlockPCG *bb)
+ {
+@@ -242,7 +242,6 @@ void dvmCompilerPcgDoWritebacksOnEdge (CompilationUnitPCG *cUnit, BasicBlockPCG
+     // We have to write back any register that is live out of "from" but not
+     // live into "to".  If "to" is a pre backward block, the edge is really to
+     // the loop header.
+-    //
+ 
+     if (to->blockType == kPreBackwardBlock)
+     {
+@@ -251,8 +250,8 @@ void dvmCompilerPcgDoWritebacksOnEdge (CompilationUnitPCG *cUnit, BasicBlockPCG
+     }
+ 
+     BitVector *tempBV = cUnit->getTemporaryBitVector ();
+-    dvmCopyBitVector (tempBV, from->outs);
+-    dvmSubtractBitVectors (tempBV, tempBV, to->ins);
++    dvmCopyBitVector (tempBV, from->dirtyOuts);
++    dvmSubtractBitVectors (tempBV, tempBV, to->dirtyIns);
+     dvmCompilerPcgGenerateWritebacks (cUnit, tempBV);
+     cUnit->freeTemporaryBitVector (tempBV);
+ }
+diff --git a/vm/compiler/codegen/x86/pcg/LowerMemory.cpp b/vm/compiler/codegen/x86/pcg/LowerMemory.cpp
+index 44d067d..9571955 100644
+--- a/vm/compiler/codegen/x86/pcg/LowerMemory.cpp
++++ b/vm/compiler/codegen/x86/pcg/LowerMemory.cpp
+@@ -18,7 +18,7 @@
+ #include "CompilerIR.h"
+ #include "Lower.h"
+ #include "LowerJump.h"
+-#include "Utility.h"
++#include "UtilityPCG.h"
+ 
+ //TODO see how to remove this
+ // Self PTR from ebp (cUnit->getFramePtr ())
+diff --git a/vm/compiler/codegen/x86/pcg/LowerOther.cpp b/vm/compiler/codegen/x86/pcg/LowerOther.cpp
+index 0138a49..2e783cc 100644
+--- a/vm/compiler/codegen/x86/pcg/LowerOther.cpp
++++ b/vm/compiler/codegen/x86/pcg/LowerOther.cpp
+@@ -18,6 +18,7 @@
+ #include "ChainingCellException.h"
+ #include "CompilationUnitPCG.h"
+ #include "Dataflow.h"
++#include "Labels.h"
+ #include "LowerCall.h"
+ #include "LowerJump.h"
+ #include "LowerMemory.h"
+@@ -25,7 +26,7 @@
+ #include "PersistentInfo.h"
+ #include "Singleton.h"
+ #include "Utility.h"
+-#include "Labels.h"
++#include "UtilityPCG.h"
+ 
+ CGInst dvmCompilerPcgGenerateVMPtrMov (CompilationUnitPCG *cUnit)
+ {
+@@ -584,9 +585,6 @@ void dvmCompilerPcgTranslateSparseSwitch (CompilationUnitPCG *cUnit, MIR *mir)
+ 
+ void dvmCompilerPcgAddVRInterfaceCode (CompilationUnitPCG *cUnit)
+ {
+-    const char *pcgOpcode;
+-    int32_t size;
+-
+     if (cUnit->checkDebugMask (DebugMaskRegisterizeVRs) == true)
+     {
+         ALOGI ("    BEGIN Generating Entry Loads.\n    =============================\n");
+@@ -597,44 +595,11 @@ void dvmCompilerPcgAddVRInterfaceCode (CompilationUnitPCG *cUnit)
+     const std::set<int> &references = cUnit->getReferences ();
+     for (std::set<int>::const_iterator it = references.begin (); it != references.end (); ++it)
+     {
+-        int ssaNum;
+-        u2 virtualReg;
+-        pcgDtype dtype;
+-
+-        ssaNum = *it;
+-
+-        virtualReg = dvmExtractSSARegister (cUnit, ssaNum);
+-        dtype = dvmCompilerPcgGetDtypeForSSANum (cUnit, ssaNum);
+-
+-        //Get information
+-        SSANumInfo &info = cUnit->getSSANumInformation (ssaNum);
+-
+-        if (info.checkedForNull == true)
+-        {
+-            // speculative null check has already loaded this ssa
+-            if (cUnit->checkDebugMask (DebugMaskRegisterizeVRs) == true)
+-            {
+-                ALOGI ("    Not generating entry load for v%d_%d."
+-                        " Already null checked.\n",
+-                        virtualReg,
+-                        DECODE_SUB (dvmConvertSSARegToDalvik (cUnit, ssaNum)));
+-            }
+-            continue;
+-        }
+-
+-        if (cUnit->checkDebugMask (DebugMaskRegisterizeVRs) == true)
+-        {
+-            ALOGI ("    Generating entry load for v%d_%d.\n", virtualReg,
+-                    DECODE_SUB (dvmConvertSSARegToDalvik (cUnit, ssaNum)));
+-        }
+-
+-        CGAddr addr = CGCreateAddr (cUnit->getVMPtr (), CGInstInvalid, 0, CGSymbolInvalid, virtualReg * 4);
+-
+-        size = dvmCompilerPcgGetOpcodeAndSizeForDtype (dtype, &pcgOpcode);
+-
+-        void *handle = dvmCompilerPcgGetVRHandle (virtualReg, size);
+-        CGInst load = CGCreateNewInst (pcgOpcode, "m", addr, size, handle);
+-        CGAddTempDef (info.parentSSANum, load);
++        //Get a local version
++        int ssaNum = *it;
++
++        //Now call the initial load helper
++        dvmCompilerPcgHandleInitialLoad (cUnit, 0, ssaNum, true);
+     }
+ 
+     if (cUnit->checkDebugMask (DebugMaskRegisterizeVRs) == true)
+diff --git a/vm/compiler/codegen/x86/pcg/PcgInterface.cpp b/vm/compiler/codegen/x86/pcg/PcgInterface.cpp
+index 8c78257..a41c0ac 100644
+--- a/vm/compiler/codegen/x86/pcg/PcgInterface.cpp
++++ b/vm/compiler/codegen/x86/pcg/PcgInterface.cpp
+@@ -28,7 +28,7 @@
+ #include "NcgHelper.h"
+ #include "PersistentInfo.h"
+ #include "Singleton.h"
+-#include "Utility.h"
++#include "UtilityPCG.h"
+ #include "LoopOpt.h"
+ 
+ /**
+@@ -257,9 +257,6 @@ extern "C" bool dalvikPluginInit (void)
+ 
+     setupPcgJit();
+ 
+-    dvmCompilerRemovePass("Invariant_Removal");
+-    dvmCompilerRemovePass("Iget_Iput_Removal");
+-    dvmCompilerRemovePass("Accumulation_Sinking");
+-    dvmCompilerRemovePass("DDDO_Optimization");
++    dvmCompilerRemovePass ("Vectorization");
+     return true;
+ }
+diff --git a/vm/compiler/codegen/x86/pcg/PersistentInfo.h b/vm/compiler/codegen/x86/pcg/PersistentInfo.h
+index 2a2d34f..f15c974 100644
+--- a/vm/compiler/codegen/x86/pcg/PersistentInfo.h
++++ b/vm/compiler/codegen/x86/pcg/PersistentInfo.h
+@@ -20,7 +20,7 @@
+ #include <map>
+ 
+ #include "libpcg.h"
+-#include "Utility.h"
++#include "UtilityPCG.h"
+ 
+ class PersistentInfo
+ {
+diff --git a/vm/compiler/codegen/x86/pcg/Utility.cpp b/vm/compiler/codegen/x86/pcg/Utility.cpp
+deleted file mode 100644
+index fecc498..0000000
+--- a/vm/compiler/codegen/x86/pcg/Utility.cpp
++++ /dev/null
+@@ -1,650 +0,0 @@
+-/*
+- * Copyright (C) 2013 Intel Corporation
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-#include "BasicBlockPCG.h"
+-#include "CodeGeneration.h"
+-#include "CodegenErrors.h"
+-#include "CompilationUnitPCG.h"
+-#include "Dataflow.h"
+-#include "Labels.h"
+-#include "LowerMemory.h"
+-#include "LowerOther.h"
+-#include "PersistentInfo.h"
+-#include "Singleton.h"
+-#include "Utility.h"
+-
+-/**
+- * @brief Get a call and register from a type
+- * @param dtype the pcgDtype
+- * @param rregPtr the register to use
+- * @return the call opcode
+- */
+-static const char *getCallOpcodeAndRreg (pcgDtype dtype, const char **rregPtr)
+-{
+-    switch (dtype)
+-    {
+-        case INTreg:
+-            *rregPtr = "eax";
+-            return "icall";
+-
+-        case LLreg:
+-            *rregPtr = "eax";
+-            return "lcall";
+-
+-        case NOreg:
+-            *rregPtr = "";
+-            return "call";
+-
+-        case FPreg32:
+-            *rregPtr = "st";
+-            return "f32call";
+-
+-        case FPreg64:
+-            *rregPtr = "st";
+-            return "f64call";
+-
+-        default:
+-            break;
+-    }
+-
+-    // We can add support for FP results, but they aren't currently needed, so just give an error here.
+-    ALOGE ("PCG Error: Unsupported call dtype");
+-    assert(0);
+-    SET_JIT_ERROR(kJitErrorPcgUnsupportedCallDataType);
+-    *rregPtr = "";
+-    return "";
+-}
+-
+-int32_t dvmCompilerPcgGetOpcodeAndSizeForDtype (pcgDtype dtype, const char **opcPtr)
+-{
+-    int32_t size;
+-    const char *pcgOpcode;
+-
+-    switch (dtype)
+-    {
+-        case INTreg:
+-            pcgOpcode = "mov";
+-            size = 4;
+-            break;
+-
+-        case LLreg:
+-            pcgOpcode = "lmov";
+-            size = 8;
+-            break;
+-
+-        case VXreg32:
+-            pcgOpcode = "movss1";
+-            size = 4;
+-            break;
+-
+-        case DPVXreg64:
+-            pcgOpcode = "movsd1";
+-            size = 8;
+-            break;
+-
+-        case FPreg32:
+-            pcgOpcode = "f32mov";
+-            size = 4;
+-            break;
+-
+-        case FPreg64:
+-            pcgOpcode = "f64mov";
+-            size = 8;
+-            break;
+-
+-        default:
+-            ALOGE ("\n+++ PCG ERROR +++ Unexpected data type seen : %d.",
+-                  dtype);
+-            assert (0);
+-            SET_JIT_ERROR(kJitErrorPcgUnexpectedDataType);
+-            return -1;
+-    }
+-
+-    *opcPtr = pcgOpcode;
+-    return size;
+-}
+-
+-pcgDtype dvmCompilerPcgGetDtypeForSSANum (CompilationUnitPCG *cUnit, int ssaNum)
+-{
+-    //Get information
+-    SSANumInfo &info = cUnit->getSSANumInformation (ssaNum);
+-
+-    return dvmCompilerPcgGetDtypeForSSANum (cUnit, ssaNum, info);
+-}
+-
+-pcgDtype dvmCompilerPcgGetDtypeForSSANum (CompilationUnitPCG *cUnit, int ssaNum, SSANumInfo &info)
+-{
+-    int parentSSANum = info.parentSSANum;
+-
+-    if (ssaNum != parentSSANum)
+-    {
+-        //TODO: the original code did a find without checking so this is semantically different
+-        //TODO: figure out if we care or use the safe version and add a check...
+-        SSANumInfo &parent = cUnit->getSSANumInformation (parentSSANum);
+-
+-        return parent.dtype;
+-    }
+-
+-    return info.dtype;
+-}
+-
+-void dvmCompilerPcgSetDtypeForSSANum (CompilationUnitPCG *cUnit, int ssaNum, pcgDtype dtype)
+-{
+-    //TODO: Same issue as above, before we had a find and no check for end, so this is diff
+-    //See if we care
+-    SSANumInfo *info = & (cUnit->getSSANumInformation (ssaNum));
+-
+-    //Get parent SSA
+-    int parentSSANum = info->parentSSANum;
+-
+-    //See if we have a parent
+-    if (ssaNum != parentSSANum)
+-    {
+-        //Get its information
+-        info = & (cUnit->getSSANumInformation (parentSSANum));
+-    }
+-
+-    //TODO: ask why we don't set the ssaNum, only its parent in certain cases
+-    info->dtype = dtype;
+-}
+-
+-CGInst dvmCompilerPcgGetVirtualReg (CompilationUnitPCG *cUnit, int ssaNum, const char *pcgOpcode, uint32_t loadSize)
+-{
+-    //Get parent ssaNum
+-    SSANumInfo *info = & (cUnit->getSSANumInformation (ssaNum));
+-    ssaNum = info->parentSSANum;
+-
+-    //TODO handle dynamic_cast better
+-    int dalvikReg = dvmConvertSSARegToDalvik (dynamic_cast<CompilationUnit *> (cUnit), ssaNum);
+-
+-    if (info->registerize == true)
+-    {
+-        //Get its parent SSA information
+-        info = & (cUnit->getSSANumInformation (ssaNum));
+-        return CGGetTempUseInst (info->parentSSANum);
+-    }
+-
+-    u2 virtualReg = DECODE_REG (dalvikReg);
+-
+-    void *handle = dvmCompilerPcgGetVRHandle (virtualReg, loadSize);
+-    CGAddr addr = CGCreateAddr (cUnit->getVMPtr (), CGInstInvalid, 0, CGSymbolInvalid,
+-                               virtualReg * 4);
+-
+-    return CGCreateNewInst (pcgOpcode, "m", addr, loadSize, handle);
+-}
+-
+-void dvmCompilerPcgSetVirtualReg (CompilationUnitPCG *cUnit, int ssaNum, const char *pcgOpcode,
+-                             uint32_t storeSize, CGInst storeVal)
+-{
+-    //Get parent ssaNum
+-    SSANumInfo *info = & (cUnit->getSSANumInformation (ssaNum));
+-    ssaNum = info->parentSSANum;
+-
+-    if (info->registerize == true)
+-    {
+-        pcgDtype regDtype = dvmCompilerPcgGetDtypeForSSANum (cUnit, ssaNum);
+-        dvmCompilerPcgGetOpcodeAndSizeForDtype (regDtype, &pcgOpcode);
+-        CGInst copy = CGCreateNewInst (pcgOpcode, "r", storeVal);
+-
+-        //Get its parent SSA information
+-        SSANumInfo &parent = cUnit->getSSANumInformation (ssaNum);
+-        CGAddTempDef (parent.parentSSANum, copy);
+-
+-        if (parent.deferWriteback == true)
+-        {
+-            return;
+-        }
+-    }
+-
+-    u2 virtualReg = dvmExtractSSARegister (cUnit, ssaNum);
+-
+-    void *handle = dvmCompilerPcgGetVRHandle (virtualReg, storeSize);
+-    CGAddr addr = CGCreateAddr (cUnit->getVMPtr (), CGInstInvalid, 0, CGSymbolInvalid,
+-                               virtualReg * 4);
+-
+-    CGCreateNewInst (pcgOpcode, "mr", addr, storeSize, handle, storeVal);
+-}
+-
+-void* dvmCompilerPcgGetVRHandle (u2 virtualReg, uint32_t size)
+-{
+-    // Start with a non-zero handle, because PCG assigns a special meaning to a null handle.
+-    intptr_t handle = 0x2;
+-
+-    if (size == 8)
+-    {
+-        handle |= 0x4;
+-    }
+-    handle |= virtualReg << 3;
+-
+-    return (void*)handle;
+-}
+-
+-bool dvmCompilerPcgBlockEndsInInvoke (BasicBlockPCG *bb)
+-{
+-    MIR *mir = bb->lastMIRInsn;
+-
+-    //If no instruction, we are done
+-    if (mir == 0)
+-    {
+-        return false;
+-    }
+-
+-    //Get the opcode
+-    int opcode = mir->dalvikInsn.opcode;
+-
+-    //Get the flags
+-    int flags = dvmCompilerGetOpcodeFlags (opcode);
+-
+-    if ((flags & kInstrInvoke) == 0) {
+-        return false;
+-    }
+-
+-    if ( (mir->OptimizationFlags & MIR_INLINED) != 0) {
+-        return false;
+-    }
+-
+-    return true;
+-}
+-
+-void dvmCompilerPcgGetBlockName (BasicBlockPCG *bb, std::string &label)
+-{
+-    //Create a unique ID number
+-    static int id = 0;
+-
+-    const char *baseName = 0;
+-
+-    int idToEmit = (bb == 0) ? id : bb->id;
+-
+-    int blockType = (bb == 0) ? kDalvikByteCode : bb->blockType;
+-
+-    //Clear label
+-    label = "";
+-
+-    switch (blockType)
+-    {
+-        case kChainingCellNormal:
+-            baseName = "normalChainingCell";
+-            break;
+-
+-        case kChainingCellInvokePredicted:
+-            baseName = "invokePredictedChainingCell";
+-            break;
+-
+-        case kChainingCellInvokeSingleton:
+-            baseName = "invokeSingletonChainingCell";
+-            break;
+-
+-        case kChainingCellHot:
+-            baseName = "hotChainingCell";
+-            break;
+-
+-        case kChainingCellBackwardBranch:
+-            baseName = "backwardBranchChainingCell";
+-            break;
+-
+-        case kPreBackwardBlock:
+-            baseName = "preBackwardBlock";
+-            break;
+-
+-        default:
+-            baseName = "dalvikBlock_CL";
+-            idToEmit = static_cast<int> ( (bb == 0) ? idToEmit : bb->cgLabel);
+-            break;
+-    }
+-
+-    assert (baseName != 0);
+-
+-    //Create the string
+-    char buffer[1024];
+-    snprintf (buffer, sizeof (buffer), "%s%d_%d", baseName, idToEmit, id);
+-
+-    //Increment counter
+-    id++;
+-
+-    //Create label
+-    label = buffer;
+-}
+-
+-/**
+- * @brief Dump a bitvector using SSA for the index
+- * @param cUnit the CompilationUnit
+- * @param bv the BitVector
+- * @param n the maximum index we want to dump with
+- */
+-static void dumpBitVector (CompilationUnit *cUnit, BitVector *bv, int n)
+-{
+-    char buffer[512];
+-    std::string s = "{ ";
+-    for (int i = 0; i < n; i ++)
+-    {
+-        if (dvmIsBitSet (bv, i) == true)
+-        {
+-            int dalvikReg = dvmConvertSSARegToDalvik (cUnit, i);
+-
+-            //Decode the SSA register
+-            u2 vrNum = DECODE_REG (dalvikReg);
+-            u2 vrSub = DECODE_SUB (dalvikReg);
+-
+-            //Get the numbers in a char*
+-            snprintf (buffer, sizeof (buffer), "%d_%d ", vrNum, vrSub);
+-
+-            //Append it
+-            s += buffer;
+-        }
+-    }
+-
+-    s += "}";
+-
+-    ALOGI ("%s", s.c_str ());
+-}
+-
+-void dvmCompilerPcgDumpModRegInfo (CompilationUnitPCG *cUnit)
+-{
+-    ALOGI ("\nModified VR info for trace %d\n", cUnit->getTraceID ());
+-    ALOGI ("===============================\n");
+-    GrowableList *blockList = &cUnit->blockList;
+-
+-    for (unsigned int i = 0; i < blockList->numUsed; i++)
+-    {
+-        BasicBlockPCG *bb = (BasicBlockPCG *) blockList->elemList[i];
+-
+-        ALOGI ("\nBlock %d ins:  ", i);
+-        dumpBitVector (cUnit, bb->ins, cUnit->numSSARegs);
+-        ALOGI ("\n");
+-        for (MIR *mir = bb->firstMIRInsn; mir; mir = mir->next)
+-        {
+-            char mybuf[2048];
+-            dvmCompilerExtendedDisassembler (cUnit, mir, &mir->dalvikInsn, mybuf, sizeof (mybuf));
+-            ALOGI ("%s\n", mybuf);
+-        }
+-        ALOGI ("Block %d outs: ", i);
+-        dumpBitVector (cUnit, bb->outs, cUnit->numSSARegs);
+-        ALOGI ("\n");
+-
+-        if (bb->taken != 0 || bb->fallThrough != 0)
+-        {
+-            ALOGI ("Succs:");
+-            if (bb->taken != 0)
+-            {
+-                BasicBlockPCG *taken = (BasicBlockPCG *) (bb->taken);
+-                char takenName[BLOCK_NAME_LEN];
+-                dvmGetBlockName (taken, takenName);
+-
+-                ALOGI (" T%d%s", bb->taken->id, takenName);
+-            }
+-            if (bb->fallThrough != 0) {
+-                BasicBlockPCG *ft = (BasicBlockPCG *) (bb->fallThrough);
+-
+-                char ftName[BLOCK_NAME_LEN];
+-                dvmGetBlockName (ft, ftName);
+-                ALOGI (" F%d%s", bb->fallThrough->id, ftName);
+-            }
+-            ALOGI ("\n");
+-        }
+-    }
+-}
+-
+-const char* dvmCompilerPcgGetDtypeName (pcgDtype dtype)
+-{
+-    static const char *names[] = {"NOreg", "INTreg", "LLreg", "VXreg32", "DPVXreg64", "FPreg32", "FPreg64", "Any", "Any4", "Any8"};
+-
+-    if (dtype >= MaxType)
+-    {
+-        return "InvalidType";
+-    }
+-
+-    return names[dtype];
+-}
+-
+-/**
+- * @details Useful interface routine that allows us to selectively use PCG or the existing dalvik JIT.
+- */
+-bool dvmCompilerPcgSupportTrace (CompilationUnit *cUnit)
+-{
+-    GrowableList *blockList = &cUnit->blockList;
+-    bool traceOk = true;
+-    int usePcg;
+-    int bytecodeCount = 0;
+-    int bwcc = 0;
+-
+-    //First check if we have a loop
+-    LoopInformation *info = cUnit->loopInformation;
+-
+-    if (info != 0)
+-    {
+-        //Get the entry block for trace
+-        BasicBlock *entry = cUnit->entryBlock;
+-
+-        //Get the loop preheader
+-        BasicBlock *pre = info->getPreHeader ();
+-
+-        //Because PCG returns to entry after backward chaining, we need to ensure
+-        //that we only accept cases where the entry is the preheader so that it
+-        //is semantically correct.
+-        if (pre != entry)
+-        {
+-            ALOGI("\n::::: Not using PCG - trace entry does not match loop preheader ::::\n");
+-            return false;
+-        }
+-    }
+-
+-    //Is there an option saying don't use it?
+-    if (dvmExtractBackendOption ("UsePcg", &usePcg) && usePcg == 0)
+-    {
+-        return false;
+-    }
+-
+-    for (unsigned int i = 0; i < blockList->numUsed; i++)
+-    {
+-        BasicBlockPCG* bb = (BasicBlockPCG *) blockList->elemList[i];
+-
+-        if (bb->blockType == kChainingCellBackwardBranch)
+-        {
+-            bwcc++;
+-        }
+-
+-        for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
+-        {
+-            Opcode dalvikOpCode = mir->dalvikInsn.opcode;
+-
+-            MIR *faultyMIR = 0;
+-
+-            //Increment the bytecode count
+-            bytecodeCount++;
+-
+-            switch (dalvikOpCode)
+-            {
+-                case OP_BREAKPOINT:
+-                case OP_THROW_VERIFICATION_ERROR:
+-                case OP_INVOKE_OBJECT_INIT_RANGE:
+-                    // Not yet implemented opcodes
+-                    faultyMIR = mir;
+-                    break;
+-
+-                default:
+-                    break;
+-            }
+-
+-            if (faultyMIR != 0)
+-            {
+-                traceOk = false;
+-
+-                //TODO: Probably not log in the same way or maybe not always log...
+-                ALOGI ("\n:::::Not Using PCG for : \n");
+-                char mybuf[2048];
+-                dvmCompilerExtendedDisassembler (cUnit, mir, &mir->dalvikInsn, mybuf, sizeof (mybuf));
+-                ALOGI ("%s\n", mybuf);
+-            }
+-        }
+-    }
+-
+-    //If more than one BWCC, bail
+-    if (bwcc > 1)
+-    {
+-        ALOGI("\n::::: Not using PCG - multiple BWCC ::::\n");
+-        return false;
+-    }
+-
+-    //If the count is over what we really can handle
+-    int zexpCount = 0;
+-    if (traceOk == true && dvmExtractBackendOption ("zexpCount", &zexpCount))
+-    {
+-        if (bytecodeCount > zexpCount)
+-        {
+-            return false;
+-        }
+-    }
+-
+-    //Little debug solution to only compile certain traces
+-    static int counter = 0;
+-    int max;
+-    if (!dvmExtractBackendOption ("Brutus", &max))
+-    {
+-        max = -1;
+-    }
+-
+-    if (traceOk == true && (max == -1 || counter < max))
+-    {
+-        counter++;
+-        return true;
+-    }
+-
+-    ALOGI ("JIT_INFO: Refusing trace: %s - %s - %d\n",
+-                        cUnit->method->clazz->descriptor, cUnit->method->name,
+-                        cUnit->entryBlock ? cUnit->entryBlock->startOffset : -1);
+-    return false;
+-}
+-
+-CGInst dvmCompilerPcgGetResClasses (CGInst selfPtr)
+-{
+-    CGInst ret = dvmCompilerPcgCreateSimpleLoad (selfPtr, offsetof (Thread, interpSave.methodClassDex));
+-    ret = dvmCompilerPcgCreateSimpleLoad (ret, OFFSETOF_MEMBER (DvmDex,pResClasses));
+-    return ret;
+-}
+-
+-/**
+- * @details  Create a call to a routine that uses the standard X86 calling convention,
+- * i.e. arguments on the stack. The number of arguments is specified by
+- * nArgs, and the actual arguments are specified in a variable argument list.
+- * Each argument is specified by two arguments: pcgDtype, CGInst.
+- * The result data type is given by resultDtype, which can be NOreg. All
+- * result types are supported.
+- *
+- * This routine currently assumes that EDI and EBP are needed by the callee.
+- * That may not be necessary.
+- */
+-CGInst dvmCompilerPcgGenerateX86Call (CompilationUnitPCG *cUnit, const char *targetName, pcgDtype resultDtype, int nArgs, ...)
+-{
+-    CGSymbol target = singletonPtr<PersistentInfo> ()->getCallBack (targetName);
+-    const char *rreg;
+-    const char *callOpc = getCallOpcodeAndRreg (resultDtype, &rreg);
+-    const char *copyOpc;
+-    int32_t stackSize, offset, i;
+-    va_list args;
+-    CGInst spIl;
+-    CGInst parms[3];
+-
+-    // Compute the required stack size to hold outgoing arguments.
+-    stackSize = 0;
+-    va_start (args, nArgs);
+-    for (i = 0; i < nArgs; i++)
+-    {
+-        pcgDtype argDtype = (pcgDtype) va_arg (args, int);
+-
+-        // Advance past the actual argument.  It isn't needed here.
+-        va_arg (args, CGInst);
+-
+-        stackSize += dvmCompilerPcgGetOpcodeAndSizeForDtype (argDtype, &copyOpc);
+-    }
+-    va_end (args);
+-
+-    //We must align the stack
+-    int32_t remainder = stackSize % 16;
+-
+-    if (remainder != 0)
+-    {
+-        stackSize += (16 - remainder);
+-    }
+-
+-    spIl = CGCreateNewInst ("sub", "ri", CGGetStackPointerDef (), stackSize);
+-    CGSetRreg (spIl, "esp");
+-
+-    // Store the outgoing arguments to the stack.
+-    offset = 0;
+-    va_start (args, nArgs);
+-    for (i = 0; i < nArgs; i++)
+-    {
+-        pcgDtype argDtype = (pcgDtype)va_arg (args, int);
+-        CGInst arg = va_arg (args, CGInst);
+-
+-        int32_t argSize = dvmCompilerPcgGetOpcodeAndSizeForDtype (argDtype, &copyOpc);
+-        dvmCompilerPcgCreateTypedStore (spIl, CGInstInvalid, 0, CGSymbolInvalid, offset,
+-                argDtype, arg);
+-        offset += argSize;
+-    }
+-    va_end (args);
+-
+-    parms[0] = dvmCompilerPcgGenerateVMPtrMov (cUnit);
+-    parms[1] = dvmCompilerPcgGenerateFramePtrMov (cUnit);
+-    parms[2] = CGInstInvalid;
+-    CGInst theCall = CGCreateNewInst (callOpc, "nl", target, parms);
+-    CGSetRreg (theCall, rreg);
+-    spIl = CGCreateNewInst ("add", "ri", CGGetStackPointerDef (), stackSize);
+-    CGSetRreg (spIl, "esp");
+-
+-    if (resultDtype != NOreg)
+-    {
+-        dvmCompilerPcgGetOpcodeAndSizeForDtype (resultDtype, &copyOpc);
+-        theCall = CGCreateNewInst (copyOpc, "r", theCall);
+-    }
+-
+-    return theCall;
+-}
+-
+-CGInst dvmCompilerPcgResolveClass(CompilationUnitPCG *cUnit, u4 classIdx)
+-{
+-    CGInst parms[4];
+-    CGLabel classResolvedLabel = CGCreateLabel ();
+-    CGTemp classPtrTemp = cUnit->getCurrentTemporaryVR (true);
+-    CGInst resClasses = dvmCompilerPcgGetResClasses (dvmCompilerPcgGetSelfPointer (cUnit));
+-    CGInst resClass = dvmCompilerPcgCreateSimpleLoad (resClasses, classIdx * 4);
+-    CGAddTempDef (classPtrTemp, resClass);
+-
+-    // I am just guessing that the common case is that the class is already resolved.
+-    CGCreateNewInst ("cjcc", "rcrbp", resClass, "ne",
+-                     CGCreateNewInst ("mov", "i", 0),
+-                     classResolvedLabel, 95);
+-
+-    dvmCompilerPcgExportPC (cUnit);
+-    CGInst tmpInst = CGCreateNewInst ("mov", "i", classIdx);
+-    parms[0] = dvmCompilerPcgGenerateVMPtrMov (cUnit);
+-    parms[1] = dvmCompilerPcgGenerateFramePtrMov (cUnit);
+-    parms[2] = CGCreateNewInst ("mov", "r", tmpInst);
+-    parms[3] = CGInstInvalid;
+-    CGSetRreg (parms[2], "eax");
+-    CGSymbol target = singletonPtr<PersistentInfo> ()->getCallBack (".class_resolve");
+-
+-    CGInst call = CGCreateNewInst ("icall", "nl", target, parms);
+-    CGSetRreg (call, "eax");
+-    CGInst callResult = CGCreateNewInst ("mov", "r", call);
+-    CGAddTempDef (classPtrTemp, callResult);
+-
+-    CGBindLabel (classResolvedLabel);
+-
+-    //Get resulting CGInst
+-    CGInst res = CGGetTempUseInst (classPtrTemp);
+-    return res;
+-}
+diff --git a/vm/compiler/codegen/x86/pcg/Utility.h b/vm/compiler/codegen/x86/pcg/Utility.h
+deleted file mode 100644
+index 6a6fe80..0000000
+--- a/vm/compiler/codegen/x86/pcg/Utility.h
++++ /dev/null
+@@ -1,149 +0,0 @@
+-/*
+- * Copyright  (C) 2013 Intel Corporation
+- *
+- * Licensed under the Apache License, Version 2.0  (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-#ifndef H_UTILITY
+-#define H_UTILITY
+-
+-#include <string>
+-
+-#include "CompilerIR.h"
+-#include "DataStructures.h"
+-
+-//Forward declarations
+-struct BasicBlockPCG;
+-class CompilationUnitPCG;
+-
+-/**
+- * @brief Should we be using PCG for the trace
+- * @param cUnit the CompilationUnit
+- * @return whether we want to handle the trace
+- */
+-bool dvmCompilerPcgSupportTrace (CompilationUnit *cUnit);
+-
+-/**
+- * @brief Get a pcgDtype name
+- * @param dtype the pcgDtype
+- * @return the const char* associated to dtype
+- */
+-const char* dvmCompilerPcgGetDtypeName (pcgDtype dtype);
+-
+-/**
+- * @brief Dump the register information
+- * @param cUnit the CompilationUnitPCG
+- */
+-void dvmCompilerPcgDumpModRegInfo (CompilationUnitPCG *cUnit);
+-
+-/**
+- * @brief Set the DType for a given SSA
+- * @param cUnit the CompilationUnitPCG
+- * @param ssaNum the SSA number
+- * @param dtype the type of the SSA register
+- */
+-void dvmCompilerPcgSetDtypeForSSANum(CompilationUnitPCG *cUnit, int ssaNum, pcgDtype dtype);
+-
+-/**
+- * @brief Get the DType for a given SSA
+- * @param cUnit the CompilationUnitPCG
+- * @param ssaNum the SSA number
+- * @param info the SSANumInfo
+- * @return the pcgDtype for the given ssaNum
+- */
+-pcgDtype dvmCompilerPcgGetDtypeForSSANum(CompilationUnitPCG *cUnit, int ssaNum, SSANumInfo &info);
+-
+-/**
+- * @brief Get the DType for a given SSA
+- * @param cUnit the CompilationUnitPCG
+- * @param ssaNum the SSA number
+- * @return the pcgDtype for the given ssaNum
+- */
+-pcgDtype dvmCompilerPcgGetDtypeForSSANum(CompilationUnitPCG *cUnit, int ssaNum);
+-
+-/**
+- * @brief Get the opcode and size for a given dtype move
+- * @param dtype the pcgDtype
+- * @param opc_ptr the name of the move opcode associated
+- * @return the size for the dtype move
+- */
+-//TODO: this should return a boolean and fill in size and opc via the arguments
+-int32_t dvmCompilerPcgGetOpcodeAndSizeForDtype (pcgDtype dtype, const char **opc_ptr);
+-
+-/**
+- * @brief Return a handle for a given virtual register
+- * @param virtualReg the virtual register
+- * @param size the size
+- * @return a non valid pointer to the handler
+- * @details: the function guarantees that the combination virtualReg, size provides a non 0 unique handle
+- */
+-void* dvmCompilerPcgGetVRHandle (u2 virtualReg, uint32_t size);
+-
+-/**
+- * @brief Get a virtual register
+- * @param cUnit the CompilationUnitPCG
+- * @param ssaNum the SSA number
+- * @param pcgOpcode the opcode
+- * @param loadSize the size of the load
+- * @return the load for the virtual register
+- */
+-CGInst dvmCompilerPcgGetVirtualReg (CompilationUnitPCG *cUnit, int ssaNum, const char *pcgOpcode, uint32_t loadSize);
+-
+-/**
+- * @brief Set a virtual register
+- * @param cUnit the CompilationUnitPCG
+- * @param ssaNum the SSA number
+- * @param pcgOpcode the opcode
+- * @param storeSize the size of the store
+- * @param store_val what we are storing
+- */
+-void dvmCompilerPcgSetVirtualReg (CompilationUnitPCG *cUnit, int ssaNum, const char *pcgOpcode, uint32_t storeSize, CGInst store_val);
+-
+-/**
+- * @brief Get a block name
+- * @param bb the BasicBlockPCG
+- * @param label the block name is set there
+- * @return a string representation of bb
+- */
+-void dvmCompilerPcgGetBlockName (BasicBlockPCG *bb, std::string &label);
+-
+-/**
+- * @brief Does the basic block finish with an invoke?
+- * @param bb the BasicBlockPCG
+- * @return whether or not the BasicBlockPCG ends with an invoke
+- */
+-bool dvmCompilerPcgBlockEndsInInvoke (BasicBlockPCG *bb);
+-
+-/**
+- * @brief Get the ResClasses
+- * @param selfPtr the self pointer
+- */
+-CGInst dvmCompilerPcgGetResClasses (CGInst selfPtr);
+-
+-/**
+- * @brief Generate X86 call
+- * @param cUnit the CompilationUnitPCG
+- * @param targetName the target name
+- * @param resultDtype the result type
+- * @param nArgs the number of arguments
+- */
+-CGInst dvmCompilerPcgGenerateX86Call (CompilationUnitPCG *cUnit, const char *targetName, pcgDtype resultDtype, int nArgs, ...);
+-
+-/**
+- * @brief Resolve a Class
+- * @param cUnit the CompilationUnitPCG
+- * @param classIdx the class index
+- * @return the instruction containing the class information
+- */
+-CGInst dvmCompilerPcgResolveClass(CompilationUnitPCG *cUnit, u4 classIdx);
+-#endif
+diff --git a/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp b/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp
+new file mode 100644
+index 0000000..1063774
+--- /dev/null
++++ b/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp
+@@ -0,0 +1,763 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "BasicBlockPCG.h"
++#include "CodeGeneration.h"
++#include "CodegenErrors.h"
++#include "CompilationUnitPCG.h"
++#include "Dataflow.h"
++#include "Labels.h"
++#include "LowerMemory.h"
++#include "LoopOpt.h"
++#include "LowerOther.h"
++#include "PersistentInfo.h"
++#include "Singleton.h"
++#include "UtilityPCG.h"
++
++/**
++ * @brief Get a call and register from a type
++ * @param dtype the pcgDtype
++ * @param rregPtr the register to use
++ * @return the call opcode
++ */
++static const char *getCallOpcodeAndRreg (pcgDtype dtype, const char **rregPtr)
++{
++    switch (dtype)
++    {
++        case INTreg:
++            *rregPtr = "eax";
++            return "icall";
++
++        case LLreg:
++            *rregPtr = "eax";
++            return "lcall";
++
++        case NOreg:
++            *rregPtr = "";
++            return "call";
++
++        case FPreg32:
++            *rregPtr = "st";
++            return "f32call";
++
++        case FPreg64:
++            *rregPtr = "st";
++            return "f64call";
++
++        default:
++            break;
++    }
++
++    // We can add support for FP results, but they aren't currently needed, so just give an error here.
++    ALOGE ("PCG Error: Unsupported call dtype");
++    assert(0);
++    SET_JIT_ERROR(kJitErrorPcgUnsupportedCallDataType);
++    *rregPtr = "";
++    return "";
++}
++
++int32_t dvmCompilerPcgGetOpcodeAndSizeForDtype (pcgDtype dtype, const char **opcPtr)
++{
++    int32_t size;
++    const char *pcgOpcode;
++
++    switch (dtype)
++    {
++        case INTreg:
++            pcgOpcode = "mov";
++            size = 4;
++            break;
++
++        case LLreg:
++            pcgOpcode = "lmov";
++            size = 8;
++            break;
++
++        case VXreg32:
++            pcgOpcode = "movss1";
++            size = 4;
++            break;
++
++        case DPVXreg64:
++            pcgOpcode = "movsd1";
++            size = 8;
++            break;
++
++        case FPreg32:
++            pcgOpcode = "f32mov";
++            size = 4;
++            break;
++
++        case FPreg64:
++            pcgOpcode = "f64mov";
++            size = 8;
++            break;
++
++        default:
++            ALOGE ("\n+++ PCG ERROR +++ Unexpected data type seen : %d.",
++                  dtype);
++            assert (0);
++            SET_JIT_ERROR(kJitErrorPcgUnexpectedDataType);
++            return -1;
++    }
++
++    *opcPtr = pcgOpcode;
++    return size;
++}
++
++pcgDtype dvmCompilerPcgGetDtypeForSSANum (CompilationUnitPCG *cUnit, int ssaNum)
++{
++    //Get information
++    SSANumInfo &info = cUnit->getSSANumInformation (ssaNum);
++
++    return dvmCompilerPcgGetDtypeForSSANum (cUnit, ssaNum, info);
++}
++
++pcgDtype dvmCompilerPcgGetDtypeForSSANum (CompilationUnitPCG *cUnit, int ssaNum, SSANumInfo &info)
++{
++    int parentSSANum = info.parentSSANum;
++
++    if (ssaNum != parentSSANum)
++    {
++        //TODO: the original code did a find without checking so this is semantically different
++        //TODO: figure out if we care or use the safe version and add a check...
++        SSANumInfo &parent = cUnit->getSSANumInformation (parentSSANum);
++
++        return parent.dtype;
++    }
++
++    return info.dtype;
++}
++
++void dvmCompilerPcgSetDtypeForSSANum (CompilationUnitPCG *cUnit, int ssaNum, pcgDtype dtype)
++{
++    //TODO: Same issue as above, before we had a find and no check for end, so this is diff
++    //See if we care
++    SSANumInfo *info = & (cUnit->getSSANumInformation (ssaNum));
++
++    //Get parent SSA
++    int parentSSANum = info->parentSSANum;
++
++    //See if we have a parent
++    if (ssaNum != parentSSANum)
++    {
++        //Get its information
++        info = & (cUnit->getSSANumInformation (parentSSANum));
++    }
++
++    //TODO: ask why we don't set the ssaNum, only its parent in certain cases
++    info->dtype = dtype;
++}
++
++CGInst dvmCompilerPcgGetVirtualReg (CompilationUnitPCG *cUnit, int ssaNum, const char *pcgOpcode, uint32_t loadSize)
++{
++    //Get parent ssaNum
++    SSANumInfo *info = & (cUnit->getSSANumInformation (ssaNum));
++    ssaNum = info->parentSSANum;
++
++    //TODO handle dynamic_cast better
++    int dalvikReg = dvmConvertSSARegToDalvik (dynamic_cast<CompilationUnit *> (cUnit), ssaNum);
++
++    if (info->registerize == true)
++    {
++        //Get its parent SSA information
++        info = & (cUnit->getSSANumInformation (ssaNum));
++        return CGGetTempUseInst (info->parentSSANum);
++    }
++
++    u2 virtualReg = DECODE_REG (dalvikReg);
++
++    void *handle = dvmCompilerPcgGetVRHandle (virtualReg, loadSize);
++    CGAddr addr = CGCreateAddr (cUnit->getVMPtr (), CGInstInvalid, 0, CGSymbolInvalid,
++                               virtualReg * 4);
++
++    return CGCreateNewInst (pcgOpcode, "m", addr, loadSize, handle);
++}
++
++void dvmCompilerPcgSetVirtualReg (CompilationUnitPCG *cUnit, int ssaNum, const char *pcgOpcode,
++                             uint32_t storeSize, CGInst storeVal)
++{
++    //Get parent ssaNum
++    SSANumInfo *info = & (cUnit->getSSANumInformation (ssaNum));
++    ssaNum = info->parentSSANum;
++
++    if (info->registerize == true)
++    {
++        pcgDtype regDtype = dvmCompilerPcgGetDtypeForSSANum (cUnit, ssaNum);
++        dvmCompilerPcgGetOpcodeAndSizeForDtype (regDtype, &pcgOpcode);
++        CGInst copy = CGCreateNewInst (pcgOpcode, "r", storeVal);
++
++        //Get its parent SSA information
++        SSANumInfo &parent = cUnit->getSSANumInformation (ssaNum);
++        CGAddTempDef (parent.parentSSANum, copy);
++
++        if (parent.deferWriteback == true)
++        {
++            return;
++        }
++    }
++
++    u2 virtualReg = dvmExtractSSARegister (cUnit, ssaNum);
++
++    void *handle = dvmCompilerPcgGetVRHandle (virtualReg, storeSize);
++    CGAddr addr = CGCreateAddr (cUnit->getVMPtr (), CGInstInvalid, 0, CGSymbolInvalid,
++                               virtualReg * 4);
++
++    CGCreateNewInst (pcgOpcode, "mr", addr, storeSize, handle, storeVal);
++}
++
++void* dvmCompilerPcgGetVRHandle (u2 virtualReg, uint32_t size)
++{
++    // Start with a non-zero handle, because PCG assigns a special meaning to a null handle.
++    intptr_t handle = 0x2;
++
++    if (size == 8)
++    {
++        handle |= 0x4;
++    }
++    handle |= virtualReg << 3;
++
++    return (void*)handle;
++}
++
++bool dvmCompilerPcgBlockEndsInInvoke (BasicBlockPCG *bb)
++{
++    MIR *mir = bb->lastMIRInsn;
++
++    //If no instruction, we are done
++    if (mir == 0)
++    {
++        return false;
++    }
++
++    //Get the opcode
++    int opcode = mir->dalvikInsn.opcode;
++
++    //Get the flags
++    int flags = dvmCompilerGetOpcodeFlags (opcode);
++
++    if ((flags & kInstrInvoke) == 0) {
++        return false;
++    }
++
++    if ( (mir->OptimizationFlags & MIR_INLINED) != 0) {
++        return false;
++    }
++
++    return true;
++}
++
++void dvmCompilerPcgGetBlockName (BasicBlockPCG *bb, std::string &label)
++{
++    //Create a unique ID number
++    static int id = 0;
++
++    const char *baseName = 0;
++
++    int idToEmit = (bb == 0) ? id : bb->id;
++
++    int blockType = (bb == 0) ? kDalvikByteCode : bb->blockType;
++
++    //Clear label
++    label = "";
++
++    switch (blockType)
++    {
++        case kChainingCellNormal:
++            baseName = "normalChainingCell";
++            break;
++
++        case kChainingCellInvokePredicted:
++            baseName = "invokePredictedChainingCell";
++            break;
++
++        case kChainingCellInvokeSingleton:
++            baseName = "invokeSingletonChainingCell";
++            break;
++
++        case kChainingCellHot:
++            baseName = "hotChainingCell";
++            break;
++
++        case kChainingCellBackwardBranch:
++            baseName = "backwardBranchChainingCell";
++            break;
++
++        case kPreBackwardBlock:
++            baseName = "preBackwardBlock";
++            break;
++
++        default:
++            baseName = "dalvikBlock_CL";
++            idToEmit = static_cast<int> ( (bb == 0) ? idToEmit : bb->cgLabel);
++            break;
++    }
++
++    assert (baseName != 0);
++
++    //Create the string
++    char buffer[1024];
++    snprintf (buffer, sizeof (buffer), "%s%d_%d", baseName, idToEmit, id);
++
++    //Increment counter
++    id++;
++
++    //Create label
++    label = buffer;
++}
++
++/**
++ * @brief Dump a bitvector using SSA for the index
++ * @param cUnit the CompilationUnit
++ * @param bv the BitVector
++ * @param n the maximum index we want to dump with
++ */
++static void dumpBitVector (CompilationUnit *cUnit, BitVector *bv, int n)
++{
++    char buffer[512];
++    std::string s = "{ ";
++    for (int i = 0; i < n; i ++)
++    {
++        if (dvmIsBitSet (bv, i) == true)
++        {
++            int dalvikReg = dvmConvertSSARegToDalvik (cUnit, i);
++
++            //Decode the SSA register
++            u2 vrNum = DECODE_REG (dalvikReg);
++            u2 vrSub = DECODE_SUB (dalvikReg);
++
++            //Get the numbers in a char*
++            snprintf (buffer, sizeof (buffer), "%d_%d ", vrNum, vrSub);
++
++            //Append it
++            s += buffer;
++        }
++    }
++
++    s += "}";
++
++    ALOGI ("%s", s.c_str ());
++}
++
++void dvmCompilerPcgDumpModRegInfo (CompilationUnitPCG *cUnit)
++{
++    ALOGI ("\nModified VR info for trace %d\n", cUnit->getTraceID ());
++    ALOGI ("===============================\n");
++    GrowableList *blockList = &cUnit->blockList;
++
++    for (unsigned int i = 0; i < blockList->numUsed; i++)
++    {
++        BasicBlockPCG *bb = (BasicBlockPCG *) blockList->elemList[i];
++
++        ALOGI ("\nBlock %d dirtyIns:  ", i);
++        dumpBitVector (cUnit, bb->dirtyIns, cUnit->numSSARegs);
++        ALOGI ("\n");
++        for (MIR *mir = bb->firstMIRInsn; mir; mir = mir->next)
++        {
++            char mybuf[2048];
++            dvmCompilerExtendedDisassembler (cUnit, mir, &mir->dalvikInsn, mybuf, sizeof (mybuf));
++            ALOGI ("%s\n", mybuf);
++        }
++        ALOGI ("Block %d outs: ", i);
++        dumpBitVector (cUnit, bb->dirtyOuts, cUnit->numSSARegs);
++        ALOGI ("\n");
++
++        if (bb->taken != 0 || bb->fallThrough != 0)
++        {
++            ALOGI ("Succs:");
++            if (bb->taken != 0)
++            {
++                BasicBlockPCG *taken = (BasicBlockPCG *) (bb->taken);
++                char takenName[BLOCK_NAME_LEN];
++                dvmGetBlockName (taken, takenName);
++
++                ALOGI (" T%d%s", bb->taken->id, takenName);
++            }
++            if (bb->fallThrough != 0) {
++                BasicBlockPCG *ft = (BasicBlockPCG *) (bb->fallThrough);
++
++                char ftName[BLOCK_NAME_LEN];
++                dvmGetBlockName (ft, ftName);
++                ALOGI (" F%d%s", bb->fallThrough->id, ftName);
++            }
++            ALOGI ("\n");
++        }
++    }
++}
++
++const char* dvmCompilerPcgGetDtypeName (pcgDtype dtype)
++{
++    static const char *names[] = {"NOreg", "INTreg", "LLreg", "VXreg32", "DPVXreg64", "FPreg32", "FPreg64", "Any", "Any4", "Any8"};
++
++    if (dtype >= MaxType)
++    {
++        return "InvalidType";
++    }
++
++    return names[dtype];
++}
++
++/**
++ * @details Useful interface routine that allows us to selectively use PCG or the existing dalvik JIT.
++ */
++bool dvmCompilerPcgSupportTrace (CompilationUnit *cUnit)
++{
++    GrowableList *blockList = &cUnit->blockList;
++    bool traceOk = true;
++    int usePcg;
++    int bytecodeCount = 0;
++    int bwcc = 0;
++
++    //First check if we have a loop
++    LoopInformation *info = cUnit->loopInformation;
++
++    if (info != 0)
++    {
++        //First step is: PCG right now does not support nested loops or branches, what does gDvmJit have set?
++        bool acceptance = ( (gDvmJit.branchLoops == true) || (gDvmJit.nestedLoops == true));
++
++        //Reset them here
++        if (acceptance == true)
++        {
++            gDvmJit.branchLoops = false;
++            gDvmJit.nestedLoops = false;
++        }
++
++        //Because PCG returns to entry after backward chaining, we need to ensure
++        //that we only accept cases where the entry is the preheader so that it
++        //is semantically correct.
++
++        //For the moment PCG refuses nested loops
++        if (info->getNested () != 0)
++        {
++            return false;
++        }
++
++        //Last step is: was acceptance true?
++        if (acceptance == true)
++        {
++            //If so, we might have accepted something we don't want to, let's see
++            if (dvmCompilerCheckLoops (cUnit) == false)
++            {
++                return false;
++            }
++        }
++
++        //Finally, loops are not accepted by default until proved safe
++        int tmp = 0;
++        //Let us see what we have in the backend options concerning optimizations
++        bool res = dvmExtractBackendOption ("OptimizationLevel", &tmp);
++
++        if (res == true)
++        {
++            //If the flag is not set, we bail
++            if ( (tmp & OptimizationMaskAcceptLoops) == 0)
++            {
++                return false;
++            }
++        }
++        else
++        {
++            //Then reject
++            return false;
++        }
++    }
++
++    //Is there an option saying don't use it?
++    if (dvmExtractBackendOption ("UsePcg", &usePcg) && usePcg == 0)
++    {
++        return false;
++    }
++
++    for (unsigned int i = 0; i < blockList->numUsed; i++)
++    {
++        BasicBlockPCG* bb = (BasicBlockPCG *) blockList->elemList[i];
++
++        if (bb->blockType == kChainingCellBackwardBranch)
++        {
++            bwcc++;
++        }
++
++        for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++        {
++            Opcode dalvikOpCode = mir->dalvikInsn.opcode;
++
++            MIR *faultyMIR = 0;
++
++            //Increment the bytecode count
++            bytecodeCount++;
++
++            switch (dalvikOpCode)
++            {
++                case OP_BREAKPOINT:
++                case OP_THROW_VERIFICATION_ERROR:
++                case OP_INVOKE_OBJECT_INIT_RANGE:
++                    // Not yet implemented opcodes
++                    faultyMIR = mir;
++                    break;
++
++                default:
++                    break;
++            }
++
++            if (faultyMIR != 0)
++            {
++                traceOk = false;
++
++                //TODO: Probably not log in the same way or maybe not always log...
++                ALOGI ("\n:::::Not Using PCG for : \n");
++                char mybuf[2048];
++                dvmCompilerExtendedDisassembler (cUnit, mir, &mir->dalvikInsn, mybuf, sizeof (mybuf));
++                ALOGI ("%s\n", mybuf);
++            }
++        }
++    }
++
++    //If more than one BWCC, bail
++    if (bwcc > 1)
++    {
++        ALOGI("\n::::: Not using PCG - multiple BWCC ::::\n");
++        return false;
++    }
++
++    //If the count is over what we really can handle
++    int zexpCount = 0;
++    if (traceOk == true && dvmExtractBackendOption ("zexpCount", &zexpCount))
++    {
++        if (bytecodeCount > zexpCount)
++        {
++            return false;
++        }
++    }
++
++    //Anyway we have a max authorized
++    if (bytecodeCount > JIT_MAX_TRACE_LEN)
++    {
++        return false;
++    }
++
++    //Little debug solution to only compile certain traces
++    static int counter = 0;
++    int max;
++    if (!dvmExtractBackendOption ("Brutus", &max))
++    {
++        max = -1;
++    }
++
++    if (traceOk == true && (max == -1 || counter < max))
++    {
++        counter++;
++        return true;
++    }
++
++    ALOGI ("JIT_INFO: Refusing trace: %s - %s - %d\n",
++                        cUnit->method->clazz->descriptor, cUnit->method->name,
++                        cUnit->entryBlock ? cUnit->entryBlock->startOffset : -1);
++    return false;
++}
++
++CGInst dvmCompilerPcgGetResClasses (CGInst selfPtr)
++{
++    CGInst ret = dvmCompilerPcgCreateSimpleLoad (selfPtr, offsetof (Thread, interpSave.methodClassDex));
++    ret = dvmCompilerPcgCreateSimpleLoad (ret, OFFSETOF_MEMBER (DvmDex,pResClasses));
++    return ret;
++}
++
++/**
++ * @details  Create a call to a routine that uses the standard X86 calling convention,
++ * i.e. arguments on the stack. The number of arguments is specified by
++ * nArgs, and the actual arguments are specified in a variable argument list.
++ * Each argument is specified by two arguments: pcgDtype, CGInst.
++ * The result data type is given by resultDtype, which can be NOreg. All
++ * result types are supported.
++ *
++ * This routine currently assumes that EDI and EBP are needed by the callee.
++ * That may not be necessary.
++ */
++CGInst dvmCompilerPcgGenerateX86Call (CompilationUnitPCG *cUnit, const char *targetName, pcgDtype resultDtype, int nArgs, ...)
++{
++    CGSymbol target = singletonPtr<PersistentInfo> ()->getCallBack (targetName);
++    const char *rreg;
++    const char *callOpc = getCallOpcodeAndRreg (resultDtype, &rreg);
++    const char *copyOpc;
++    int32_t stackSize, offset, i;
++    va_list args;
++    CGInst spIl;
++    CGInst parms[3];
++
++    // Compute the required stack size to hold outgoing arguments.
++    stackSize = 0;
++    va_start (args, nArgs);
++    for (i = 0; i < nArgs; i++)
++    {
++        pcgDtype argDtype = (pcgDtype) va_arg (args, int);
++
++        // Advance past the actual argument.  It isn't needed here.
++        va_arg (args, CGInst);
++
++        stackSize += dvmCompilerPcgGetOpcodeAndSizeForDtype (argDtype, &copyOpc);
++    }
++    va_end (args);
++
++    //We must align the stack
++    int32_t remainder = stackSize % 16;
++
++    if (remainder != 0)
++    {
++        stackSize += (16 - remainder);
++    }
++
++    spIl = CGCreateNewInst ("sub", "ri", CGGetStackPointerDef (), stackSize);
++    CGSetRreg (spIl, "esp");
++
++    // Store the outgoing arguments to the stack.
++    offset = 0;
++    va_start (args, nArgs);
++    for (i = 0; i < nArgs; i++)
++    {
++        pcgDtype argDtype = (pcgDtype)va_arg (args, int);
++        CGInst arg = va_arg (args, CGInst);
++
++        int32_t argSize = dvmCompilerPcgGetOpcodeAndSizeForDtype (argDtype, &copyOpc);
++        dvmCompilerPcgCreateTypedStore (spIl, CGInstInvalid, 0, CGSymbolInvalid, offset,
++                argDtype, arg);
++        offset += argSize;
++    }
++    va_end (args);
++
++    parms[0] = dvmCompilerPcgGenerateVMPtrMov (cUnit);
++    parms[1] = dvmCompilerPcgGenerateFramePtrMov (cUnit);
++    parms[2] = CGInstInvalid;
++    CGInst theCall = CGCreateNewInst (callOpc, "nl", target, parms);
++    CGSetRreg (theCall, rreg);
++    spIl = CGCreateNewInst ("add", "ri", CGGetStackPointerDef (), stackSize);
++    CGSetRreg (spIl, "esp");
++
++    if (resultDtype != NOreg)
++    {
++        dvmCompilerPcgGetOpcodeAndSizeForDtype (resultDtype, &copyOpc);
++        theCall = CGCreateNewInst (copyOpc, "r", theCall);
++    }
++
++    return theCall;
++}
++
++void dvmCompilerPcgCreateEntryStub (CompilationUnitPCG *cUnit)
++{
++    CGInst entry_inst = CGCreateNewInst ("entry", "");
++    CGSetRreg (entry_inst, "esp");
++
++    CGInst inst = entry_inst;
++    inst = CGCreateNewInst ("spsubi", "ri", inst, 0);
++    CGSetRreg (inst, "esp");
++
++    inst = CGCreateNewInst ("idef", "a", entry_inst);
++    CGSetRreg (inst, "edi");
++    inst = CGCreateNewInst ("mov", "r", inst);
++    CGAddTempDef (cUnit->getVMPtrReg (), inst);
++
++    inst = CGCreateNewInst ("idef", "a", entry_inst);
++    CGSetRreg (inst, "ebp");
++    inst = CGCreateNewInst ("mov", "r", inst);
++    CGAddTempDef (cUnit->getFramePtrReg (), inst);
++}
++
++
++void dvmCompilerPcgHandleInitialLoad (CompilationUnitPCG *cUnit, BasicBlock *bb, int ssaNum, bool considerSpeculative)
++{
++    //Get virtual register
++    u2 virtualReg = dvmExtractSSARegister (cUnit, ssaNum);
++
++    //Get type
++    pcgDtype dtype = dvmCompilerPcgGetDtypeForSSANum (cUnit, ssaNum);
++
++    //Get information
++    SSANumInfo &info = cUnit->getSSANumInformation (ssaNum);
++
++    if (considerSpeculative == true)
++    {
++        if (info.checkedForNull == true)
++        {
++            // speculative null check has already loaded this ssa
++            if (cUnit->checkDebugMask (DebugMaskRegisterizeVRs) == true)
++            {
++                ALOGI ("    Not generating entry load for v%d_%d. Already null checked.\n",
++                        virtualReg,
++                        DECODE_SUB (dvmConvertSSARegToDalvik (cUnit, ssaNum)));
++            }
++
++            //If already null checked, we can bail
++            return;
++        }
++    }
++
++    if (cUnit->checkDebugMask (DebugMaskRegisterizeVRs) == true)
++    {
++        //Get BB identifier if we have one
++        int id = (bb == 0) ? -1 : bb->id;
++
++        ALOGI ("    Generating load for BB %d for v%d_%d.\n", id, virtualReg,
++                DECODE_SUB (dvmConvertSSARegToDalvik (cUnit, ssaNum)));
++    }
++
++    CGAddr addr = CGCreateAddr (cUnit->getVMPtr (), CGInstInvalid, 0, CGSymbolInvalid, virtualReg * 4);
++
++    //Get size and opcode
++    const char *pcgOpcode = 0;
++    int32_t size = dvmCompilerPcgGetOpcodeAndSizeForDtype (dtype, &pcgOpcode);
++
++    //Get the handle for the VR
++    void *handle = dvmCompilerPcgGetVRHandle (virtualReg, size);
++
++    //Create the load and add temporary definition
++    CGInst load = CGCreateNewInst (pcgOpcode, "m", addr, size, handle);
++    CGAddTempDef (info.parentSSANum, load);
++}
++
++CGInst dvmCompilerPcgResolveClass(CompilationUnitPCG *cUnit, u4 classIdx)
++{
++    CGInst parms[4];
++    CGLabel classResolvedLabel = CGCreateLabel ();
++    CGTemp classPtrTemp = cUnit->getCurrentTemporaryVR (true);
++    CGInst resClasses = dvmCompilerPcgGetResClasses (dvmCompilerPcgGetSelfPointer (cUnit));
++    CGInst resClass = dvmCompilerPcgCreateSimpleLoad (resClasses, classIdx * 4);
++    CGAddTempDef (classPtrTemp, resClass);
++
++    // I am just guessing that the common case is that the class is already resolved.
++    CGCreateNewInst ("cjcc", "rcrbp", resClass, "ne",
++                     CGCreateNewInst ("mov", "i", 0),
++                     classResolvedLabel, 95);
++
++    dvmCompilerPcgExportPC (cUnit);
++    CGInst tmpInst = CGCreateNewInst ("mov", "i", classIdx);
++    parms[0] = dvmCompilerPcgGenerateVMPtrMov (cUnit);
++    parms[1] = dvmCompilerPcgGenerateFramePtrMov (cUnit);
++    parms[2] = CGCreateNewInst ("mov", "r", tmpInst);
++    parms[3] = CGInstInvalid;
++    CGSetRreg (parms[2], "eax");
++    CGSymbol target = singletonPtr<PersistentInfo> ()->getCallBack (".class_resolve");
++
++    CGInst call = CGCreateNewInst ("icall", "nl", target, parms);
++    CGSetRreg (call, "eax");
++    CGInst callResult = CGCreateNewInst ("mov", "r", call);
++    CGAddTempDef (classPtrTemp, callResult);
++
++    CGBindLabel (classResolvedLabel);
++
++    //Get resulting CGInst
++    CGInst res = CGGetTempUseInst (classPtrTemp);
++    return res;
++}
+diff --git a/vm/compiler/codegen/x86/pcg/UtilityPCG.h b/vm/compiler/codegen/x86/pcg/UtilityPCG.h
+new file mode 100644
+index 0000000..6cbdc3f
+--- /dev/null
++++ b/vm/compiler/codegen/x86/pcg/UtilityPCG.h
+@@ -0,0 +1,164 @@
++/*
++ * Copyright  (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0  (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef H_UTILITYPCG
++#define H_UTILITYPCG
++
++#include <string>
++
++#include "CompilerIR.h"
++#include "DataStructures.h"
++
++//Forward declarations
++struct BasicBlockPCG;
++class CompilationUnitPCG;
++
++/**
++ * @brief Should we be using PCG for the trace
++ * @param cUnit the CompilationUnit
++ * @return whether we want to handle the trace
++ */
++bool dvmCompilerPcgSupportTrace (CompilationUnit *cUnit);
++
++/**
++ * @brief Get a pcgDtype name
++ * @param dtype the pcgDtype
++ * @return the const char* associated to dtype
++ */
++const char* dvmCompilerPcgGetDtypeName (pcgDtype dtype);
++
++/**
++ * @brief Dump the register information
++ * @param cUnit the CompilationUnitPCG
++ */
++void dvmCompilerPcgDumpModRegInfo (CompilationUnitPCG *cUnit);
++
++/**
++ * @brief Set the DType for a given SSA
++ * @param cUnit the CompilationUnitPCG
++ * @param ssaNum the SSA number
++ * @param dtype the type of the SSA register
++ */
++void dvmCompilerPcgSetDtypeForSSANum(CompilationUnitPCG *cUnit, int ssaNum, pcgDtype dtype);
++
++/**
++ * @brief Get the DType for a given SSA
++ * @param cUnit the CompilationUnitPCG
++ * @param ssaNum the SSA number
++ * @param info the SSANumInfo
++ * @return the pcgDtype for the given ssaNum
++ */
++pcgDtype dvmCompilerPcgGetDtypeForSSANum(CompilationUnitPCG *cUnit, int ssaNum, SSANumInfo &info);
++
++/**
++ * @brief Get the DType for a given SSA
++ * @param cUnit the CompilationUnitPCG
++ * @param ssaNum the SSA number
++ * @return the pcgDtype for the given ssaNum
++ */
++pcgDtype dvmCompilerPcgGetDtypeForSSANum(CompilationUnitPCG *cUnit, int ssaNum);
++
++/**
++ * @brief Get the opcode and size for a given dtype move
++ * @param dtype the pcgDtype
++ * @param opc_ptr the name of the move opcode associated
++ * @return the size for the dtype move
++ */
++//TODO: this should return a boolean and fill in size and opc via the arguments
++int32_t dvmCompilerPcgGetOpcodeAndSizeForDtype (pcgDtype dtype, const char **opc_ptr);
++
++/**
++ * @brief Return a handle for a given virtual register
++ * @param virtualReg the virtual register
++ * @param size the size
++ * @return a non valid pointer to the handler
++ * @details: the function guarantees that the combination virtualReg, size provides a non 0 unique handle
++ */
++void* dvmCompilerPcgGetVRHandle (u2 virtualReg, uint32_t size);
++
++/**
++ * @brief Get a virtual register
++ * @param cUnit the CompilationUnitPCG
++ * @param ssaNum the SSA number
++ * @param pcgOpcode the opcode
++ * @param loadSize the size of the load
++ * @return the load for the virtual register
++ */
++CGInst dvmCompilerPcgGetVirtualReg (CompilationUnitPCG *cUnit, int ssaNum, const char *pcgOpcode, uint32_t loadSize);
++
++/**
++ * @brief Set a virtual register
++ * @param cUnit the CompilationUnitPCG
++ * @param ssaNum the SSA number
++ * @param pcgOpcode the opcode
++ * @param storeSize the size of the store
++ * @param store_val what we are storing
++ */
++void dvmCompilerPcgSetVirtualReg (CompilationUnitPCG *cUnit, int ssaNum, const char *pcgOpcode, uint32_t storeSize, CGInst store_val);
++
++/**
++ * @brief Get a block name
++ * @param bb the BasicBlockPCG
++ * @param label the block name is set there
++ * @return a string representation of bb
++ */
++void dvmCompilerPcgGetBlockName (BasicBlockPCG *bb, std::string &label);
++
++/**
++ * @brief Does the basic block finish with an invoke?
++ * @param bb the BasicBlockPCG
++ * @return whether or not the BasicBlockPCG ends with an invoke
++ */
++bool dvmCompilerPcgBlockEndsInInvoke (BasicBlockPCG *bb);
++
++/**
++ * @brief Get the ResClasses
++ * @param selfPtr the self pointer
++ */
++CGInst dvmCompilerPcgGetResClasses (CGInst selfPtr);
++
++/**
++ * @brief Generate X86 call
++ * @param cUnit the CompilationUnitPCG
++ * @param targetName the target name
++ * @param resultDtype the result type
++ * @param nArgs the number of arguments
++ */
++CGInst dvmCompilerPcgGenerateX86Call (CompilationUnitPCG *cUnit, const char *targetName, pcgDtype resultDtype, int nArgs, ...);
++
++/**
++ * @brief Generate an entry stub
++ * @param cUnit the CompilationUnitPCG
++ */
++void dvmCompilerPcgCreateEntryStub (CompilationUnitPCG *cUnit);
++
++/**
++ * @brief Handle initial load of a SSA register
++ * @param cUnit the CompilationUnitPCG
++ * @param bb the BasicBlock
++ * @param ssaNum the SSA register we wish to load in
++ * @param considerSpeculative should we be considering speculative loads
++ */
++void dvmCompilerPcgHandleInitialLoad (CompilationUnitPCG *cUnit, BasicBlock *bb, int ssaNum, bool considerSpeculative);
++
++/**
++ * @brief Resolve a Class
++ * @param cUnit the CompilationUnitPCG
++ * @param classIdx the class index
++ * @return the instruction containing the class information
++ */
++CGInst dvmCompilerPcgResolveClass(CompilationUnitPCG *cUnit, u4 classIdx);
++#endif
+-- 
+1.7.4.1
+

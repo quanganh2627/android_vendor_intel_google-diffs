@@ -1,0 +1,2929 @@
+From 1e084116e684e4804a71cce410a266d48612233f Mon Sep 17 00:00:00 2001
+From: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Date: Mon, 7 Jan 2013 18:49:03 -0800
+Subject: Dalvik: Instruction Scheduling for Atom Phase 2 (memleak fixed)
+
+BZ: 77993
+
+This patch contains functional improvements for instruction scheduling. It
+also addresses some memory leak issues which led to original submission to
+be reverted.
+
+Functional changes and optimizations:
+-Revamped longest path algorithm which no longer makes mistakes in finding
+critical path
+-Simplified dependency graph algorithm so that UseDef is semantically equivalent
+to Use and then Def
+-Debugging support so that dependency graph can be printed out in dot format
+-Asserts have been added to catch unsupported mnemonics or mnemonics that
+don't have proper entries in the machine model
+-Removed false dependencies between x87 and ALU ops
+-Proper ALU op tagging so that proper dependency graph is made
+-Automatic fallback to UseDef of resource when not sure
+-Updated some of the instruction latencies and port usages to match latest
+Atom Optimization Manual Section 13.4 (April 2012)
+-Arena allocator is used for persistent allocations on heap
+-Heuristics for address generation stalls (enabled)
+-Heuristics for memory load latency (disabled by default)
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I5de6dd82c570ec4a60f1c2945530a275a06895a0
+Orig-MCG-Change-Id: I02c13d139df9e879795df50b30833338a66cfb8f
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/Globals.h                                 |   12 +
+ vm/compiler/codegen/x86/AnalysisO1.cpp       |    6 +-
+ vm/compiler/codegen/x86/CodegenInterface.cpp |   27 +
+ vm/compiler/codegen/x86/Lower.h              |   69 +-
+ vm/compiler/codegen/x86/LowerHelper.cpp      |  125 ++--
+ vm/compiler/codegen/x86/LowerJump.cpp        |   10 +-
+ vm/compiler/codegen/x86/Schedule.cpp         | 1455 ++++++++++++++------------
+ vm/compiler/codegen/x86/Scheduler.h          |   61 +-
+ 8 files changed, 1005 insertions(+), 760 deletions(-)
+
+diff --git a/vm/Globals.h b/vm/Globals.h
+index 2e69821..8490abb 100644
+--- a/vm/Globals.h
++++ b/vm/Globals.h
+@@ -960,6 +960,18 @@ struct DvmJitGlobals {
+     /* Framework requests to disable the JIT for good */
+     bool disableJit;
+ 
++#if defined(ARCH_IA32)
++    /** @brief Identifier for cpu family
++     *  @details http://software.intel.com/en-us/articles/intel-architecture-and-
++     *  processor-identification-with-cpuid-model-and-family-numbers */
++    int cpuFamily;
++
++    /** @brief Identifier for cpu model
++     *  @details http://software.intel.com/en-us/articles/intel-architecture-and-
++     *  processor-identification-with-cpuid-model-and-family-numbers */
++    int cpuModel;
++#endif
++
+ #if defined(SIGNATURE_BREAKPOINT)
+     /* Signature breakpoint */
+     u4 signatureBreakpointSize;         // # of words
+diff --git a/vm/compiler/codegen/x86/AnalysisO1.cpp b/vm/compiler/codegen/x86/AnalysisO1.cpp
+index 92481b0..e326488 100644
+--- a/vm/compiler/codegen/x86/AnalysisO1.cpp
++++ b/vm/compiler/codegen/x86/AnalysisO1.cpp
+@@ -25,6 +25,8 @@
+ #include "interp/InterpDefs.h"
+ #include "libdex/Leb128.h"
+ #include "Scheduler.h"
++#include "Singleton.h"
++
+ 
+ /* compilation flags to turn on debug printout */
+ //#define DEBUG_COMPILE_TABLE
+@@ -640,13 +642,13 @@ int codeGenBasicBlockJit(const Method* method, BasicBlock* bb) {
+ #endif
+             // Basic block here also means new native basic block
+             if (gDvmJit.scheduling)
+-                g_SchedulerInstance.signalEndOfNativeBasicBlock();
++                singletonPtr<Scheduler>()->signalEndOfNativeBasicBlock();
+ 
+             int cg_ret = codeGenBasicBlock(method, currentBB);
+ 
+             // End of managed basic block means end of native basic block
+             if (gDvmJit.scheduling)
+-                g_SchedulerInstance.signalEndOfNativeBasicBlock();
++                singletonPtr<Scheduler>()->signalEndOfNativeBasicBlock();
+ 
+             currentBB = NULL;
+             return cg_ret;
+diff --git a/vm/compiler/codegen/x86/CodegenInterface.cpp b/vm/compiler/codegen/x86/CodegenInterface.cpp
+index 642439c..06a2b64 100644
+--- a/vm/compiler/codegen/x86/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/CodegenInterface.cpp
+@@ -118,10 +118,21 @@ bool dvmIsOpcodeSupportedByJit(const DecodedInstruction & insn)
+ //! implementation always returns true)
+ bool dvmCompilerArchInit() {
+ #ifdef HAVE_ANDROID_OS
++    // Used to get global properties
+     char propertyBuffer[PROPERTY_VALUE_MAX];
+ #endif
+     unsigned long propertyValue;
+ 
++    // Used to identify cpu
++    int familyAndModelInformation;
++    const int familyIdMask = 0xF00;
++    const int familyIdShift = 8;
++    const int modelMask = 0XF0;
++    const int modelShift = 4;
++    const int modelWidth = 4;
++    const int extendedModelIdMask = 0xF0000;
++    const int extendedModelShift = 16;
++
+     // Initialize JIT table size
+     if(gDvmJit.jitTableSize == 0 || (gDvmJit.jitTableSize & (gDvmJit.jitTableSize - 1))) {
+         // JIT table size has not been initialized yet or is not a power of two
+@@ -175,6 +186,7 @@ bool dvmCompilerArchInit() {
+             gDvmJit.codeCacheSize = static_cast<unsigned int>(propertyValue);
+     }
+ 
++    // Print out values used
+     LOGV("JIT threshold set to %hu",gDvmJit.threshold);
+     LOGV("JIT table size set to %u",gDvmJit.jitTableSize);
+     LOGV("JIT code cache size set to %u",gDvmJit.codeCacheSize);
+@@ -182,6 +194,21 @@ bool dvmCompilerArchInit() {
+     //Disable Method-JIT
+     gDvmJit.disableOpt |= (1 << kMethodJit);
+ 
++    // Now determine machine model
++    asm volatile (
++            "movl $1, %%eax\n\t"
++            "pushl %%ebx\n\t"
++            "cpuid\n\t"
++            "popl %%ebx\n\t"
++            "movl %%eax, %0"
++            : "=r" (familyAndModelInformation)
++            :
++            : "eax", "ecx", "edx");
++    gDvmJit.cpuFamily = (familyAndModelInformation & familyIdMask) >> familyIdShift;
++    gDvmJit.cpuModel = (((familyAndModelInformation & extendedModelIdMask)
++            >> extendedModelShift) << modelWidth)
++            + ((familyAndModelInformation & modelMask) >> modelShift);
++
+ #if defined(WITH_SELF_VERIFICATION)
+     /* Force into blocking mode */
+     gDvmJit.blockingMode = true;
+diff --git a/vm/compiler/codegen/x86/Lower.h b/vm/compiler/codegen/x86/Lower.h
+index 8be895f..2df932a 100644
+--- a/vm/compiler/codegen/x86/Lower.h
++++ b/vm/compiler/codegen/x86/Lower.h
+@@ -274,15 +274,20 @@ enum MemoryAccessType {
+ //! \enum UseDefEntryType
+ //! \brief Defines types of resources on which there can be a dependency.
+ enum UseDefEntryType {
+-    //! \brief Control flags
++    //! \brief Control flags, EFLAGS register
+     UseDefType_Ctrl,
+     //! \brief Floating-point stack
++    //! \details This is a very generic resource for x87 operations and
++    //! doesn't break down different possible resources like control word,
++    //! status word, FPU flags, etc. All of x87 resources fall into this
++    //! type of resource.
+     UseDefType_Float,
+     //! \brief Dalvik virtual register. Corresponds to MemoryAccess_VR
+     UseDefType_MemVR,
+     //! \brief Spill region. Corresponds to MemoryAccess_SPILL
+     UseDefType_MemSpill,
+     //! \brief Unclassified memory access. Corresponds to MemoryAccess_Unknown
++    //! \details No memory disambiguation will be done with unknown accesses
+     UseDefType_MemUnknown,
+     //! \brief Register
+     UseDefType_Reg
+@@ -299,17 +304,35 @@ enum DependencyType {
+     Dependency_WAR,
+ };
+ 
++//! \enum LatencyBetweenNativeInstructions
++//! \brief Defines reasons for what causes pipeline stalls
++//! between two instructions.
++//! \warning Make sure that if adding new reasons here,
++//! the scheduler needs updated with the actual latency value.
++//! \see mapLatencyReasonToValue
++enum LatencyBetweenNativeInstructions {
++    //! \brief No latency between the two instructions
++    Latency_None = 0,
++    //! \brief Stall in address generation phase of pipeline
++    //! when register is not available.
++    Latency_Agen_stall,
++    //! \brief Stall when a memory load is blocked by a store
++    //! and there is no store forwarding.
++    Latency_Load_blocked_by_store,
++    //! \brief Stall due to cache miss during load from memory
++    Latency_Memory_Load,
++};
++
+ //! \brief Defines a relationship between a resource and its producer.
+ struct UseDefProducerEntry {
+     //! \brief Resource type on which there is a dependency.
+     UseDefEntryType type;
+-    //! \brief Logical or physical register this resource is
++    //! \brief Virtual or physical register this resource is
+     //! associated with.
+     //! \details When physical, this is of enum type PhysicalReg.
+-    //! When logical, this is the index of the logical register.
++    //! When VR, this is the virtual register number.
+     //! When there is no register related dependency, this is
+     //! negative.
+-    //! \todo Is this correct? What about VRs?
+     int regNum;
+     //! \brief Corresponds to LowOp::slotId to keep track of producer.
+     unsigned int producerSlot;
+@@ -319,13 +342,12 @@ struct UseDefProducerEntry {
+ struct UseDefUserEntry {
+     //! \brief Resource type on which there is a dependency.
+     UseDefEntryType type;
+-    //! \brief Logical or physical register this resource is
++    //! \brief Virtual or physical register this resource is
+     //! associated with.
+     //! \details When physical, this is of enum type PhysicalReg.
+-    //! When logical, this is the index of the logical register.
++    //! When VR, this is the virtual register number.
+     //! When there is no register related dependency, this is
+     //! negative.
+-    //! \todo Is this correct? What about VRs?
+     int regNum;
+     //! \brief A list of LowOp::slotId to keep track of all users
+     //! of this resource.
+@@ -339,10 +361,13 @@ struct DependencyInformation {
+     //! \brief Holds the LowOp::slotId of the LIR that causes this
+     //! data dependence.
+     unsigned int lowopSlotId;
++    //! \brief Description for what causes the edge latency
++    //! \see LatencyBetweenNativeInstructions
++    LatencyBetweenNativeInstructions causeOfEdgeLatency;
+     //! \brief Holds latency information for edges in the
+     //! dependency graph, not execute to execute latency for the
+     //! instructions.
+-    int latency;
++    int edgeLatency;
+ };
+ 
+ //! \brief Holds general information about an operand.
+@@ -405,8 +430,7 @@ struct LowOpndMem {
+     bool hasScale;
+     //! \brief Defines type of memory access.
+     MemoryAccessType mType;
+-    //! \brief
+-    //! \todo What is this used for?
++    //! \brief If positive, this represents the VR number
+     int index;
+ };
+ 
+@@ -440,7 +464,7 @@ struct LowOp {
+     //! \brief Logical time for when the LIR is ready.
+     //! \details This field is used only for scheduling.
+     int readyTime;
+-    //! \brief Logical time for when the LIR is scheduled.
++    //! \brief Cycle in which LIR is scheduled for issue.
+     //! \details This field is used only for scheduling.
+     int scheduledTime;
+     //! \brief Execute to execute time for this instruction.
+@@ -451,22 +475,6 @@ struct LowOp {
+     //! \details This field is used only for scheduling.
+     //! \see MachineModelEntry::issuePortType
+     int portType;
+-    //! \brief Holds information about LowOps on which current LowOp
+-    //! depends on (predecessors).
+-    //! \details For example, if a LowOp with slotId of 3 depends on
+-    //! LowOp with slotId of 2 because of a RAW, then the LowOp with
+-    //! slotId of 3 will have an entry in the predecessorDependencies
+-    //! with a Dependency_RAW and slotId of 2. This field is used
+-    //! only for scheduling.
+-    std::vector<DependencyInformation> predecessorDependencies;
+-    //! \brief Holds information about LowOps that depend on current
+-    //! LowOp (successors).
+-    //! \details For example, if a LowOp with slotId of 3 depends on
+-    //! LowOp with slotId of 2 because of a RAW, then the LowOp with
+-    //! slotId of 2 will have an entry in the successorDependencies
+-    //! with a Dependency_RAW and slotId of 3. This field is used
+-    //! only for scheduling.
+-    std::vector<DependencyInformation> successorDependencies;
+     //! \brief Weight of longest path in dependency graph from
+     //! current instruction to end of the basic block.
+     //! \details This field is used only for scheduling.
+@@ -682,9 +690,6 @@ extern LabelMap* VMAPIWorklist;
+ extern int ncgClassNum;
+ extern int ncgMethodNum;
+ 
+-class Scheduler;
+-extern Scheduler g_SchedulerInstance;
+-
+ bool existATryBlock(Method* method, int startPC, int endPC);
+ // interface between register allocator & lowering
+ extern int num_removed_nullCheck;
+@@ -1336,10 +1341,10 @@ LowOpImmMem* dump_imm_mem(Mnemonic m, AtomOpCode m2, OpndSize size,
+                    int imm,
+                    int disp, int base_reg, bool isBasePhysical,
+                    MemoryAccessType mType, int mIndex, bool chaining);
+-LowOpRegMem* dump_fp_mem(Mnemonic m, OpndSize size, int reg,
++LowOpRegMem* dump_fp_mem(Mnemonic m, AtomOpCode m2, OpndSize size, int reg,
+                   int disp, int base_reg, bool isBasePhysical,
+                   MemoryAccessType mType, int mIndex);
+-LowOpMemReg* dump_mem_fp(Mnemonic m, OpndSize size,
++LowOpMemReg* dump_mem_fp(Mnemonic m, AtomOpCode m2, OpndSize size,
+                   int disp, int base_reg, bool isBasePhysical,
+                   MemoryAccessType mType, int mIndex,
+                   int reg);
+diff --git a/vm/compiler/codegen/x86/LowerHelper.cpp b/vm/compiler/codegen/x86/LowerHelper.cpp
+index 939dad8..4774545 100644
+--- a/vm/compiler/codegen/x86/LowerHelper.cpp
++++ b/vm/compiler/codegen/x86/LowerHelper.cpp
+@@ -47,6 +47,7 @@ When allocating a physical register for an operand, we can't spill the operands
+ #include <math.h>
+ #include "interp/InterpState.h"
+ #include "Scheduler.h"
++#include "Singleton.h"
+ 
+ extern "C" int64_t __divdi3(int64_t, int64_t);
+ extern "C" int64_t __moddi3(int64_t, int64_t);
+@@ -158,7 +159,7 @@ inline LowOpLabel* lower_label(Mnemonic m, OpndSize size, int imm,
+         stream = encoder_imm(m, size, imm, stream);
+         return NULL;
+     }
+-    LowOpLabel * op = g_SchedulerInstance.allocateNewEmptyLIR<LowOpLabel>();
++    LowOpLabel * op = singletonPtr<Scheduler>()->allocateNewEmptyLIR<LowOpLabel>();
+     op->opCode = m;
+     op->opCode2 = ATOM_NORMAL;
+     op->opndSrc.size = size;
+@@ -166,7 +167,7 @@ inline LowOpLabel* lower_label(Mnemonic m, OpndSize size, int imm,
+     op->numOperands = 1;
+     snprintf(op->labelOpnd.label, LABEL_SIZE, "%s", label);
+     op->labelOpnd.isLocal = isLocal;
+-    g_SchedulerInstance.updateUseDefInformation_imm(op);
++    singletonPtr<Scheduler>()->updateUseDefInformation_imm(op);
+     return op;
+ }
+ 
+@@ -185,13 +186,13 @@ LowOpLabel* dump_label(Mnemonic m, OpndSize size, int imm, const char* label,
+ LowOpBlock* dump_blockid_imm(Mnemonic m, int targetBlockId) {
+     assert(gDvmJit.scheduling && "Scheduling must be turned on before "
+                 "calling dump_blockid_imm");
+-    LowOpBlock* op = g_SchedulerInstance.allocateNewEmptyLIR<LowOpBlock>();
++    LowOpBlock* op = singletonPtr<Scheduler>()->allocateNewEmptyLIR<LowOpBlock>();
+     op->opCode = m;
+     op->opCode2 = ATOM_NORMAL;
+     op->opndSrc.type = LowOpndType_BlockId;
+     op->numOperands = 1;
+     op->blockIdOpnd.value = targetBlockId;
+-    g_SchedulerInstance.updateUseDefInformation_imm(op);
++    singletonPtr<Scheduler>()->updateUseDefInformation_imm(op);
+     return op;
+ }
+ 
+@@ -205,14 +206,14 @@ LowOpImm* lower_imm(Mnemonic m, OpndSize size, int imm) {
+         stream = encoder_imm(m, size, imm, stream);
+         return NULL;
+     }
+-    LowOpImm* op = g_SchedulerInstance.allocateNewEmptyLIR<LowOpImm>();
++    LowOpImm* op = singletonPtr<Scheduler>()->allocateNewEmptyLIR<LowOpImm>();
+     op->opCode = m;
+     op->opCode2 = ATOM_NORMAL;
+     op->opndSrc.size = size;
+     op->opndSrc.type = LowOpndType_Imm;
+     op->numOperands = 1;
+     op->immOpnd.value = imm;
+-    g_SchedulerInstance.updateUseDefInformation_imm(op);
++    singletonPtr<Scheduler>()->updateUseDefInformation_imm(op);
+     return op;
+ }
+ 
+@@ -262,7 +263,7 @@ LowOpMem* lower_mem(Mnemonic m, AtomOpCode m2, OpndSize size, int disp,
+     }
+     if (!isBasePhysical)
+         dvmAbort();
+-    LowOpMem* op = g_SchedulerInstance.allocateNewEmptyLIR<LowOpMem>();
++    LowOpMem* op = singletonPtr<Scheduler>()->allocateNewEmptyLIR<LowOpMem>();
+     op->opCode = m;
+     op->opCode2 = m2;
+     op->opndSrc.size = size;
+@@ -271,7 +272,7 @@ LowOpMem* lower_mem(Mnemonic m, AtomOpCode m2, OpndSize size, int disp,
+     op->memOpnd.mType = MemoryAccess_Unknown;
+     op->memOpnd.index = -1;
+     set_mem_opnd(&(op->memOpnd), disp, base_reg, isBasePhysical);
+-    g_SchedulerInstance.updateUseDefInformation_mem(op);
++    singletonPtr<Scheduler>()->updateUseDefInformation_mem(op);
+     return op;
+ }
+ 
+@@ -301,14 +302,14 @@ LowOpReg* lower_reg(Mnemonic m, AtomOpCode m2, OpndSize size, int reg,
+     }
+     if (!isPhysical)
+         dvmAbort();
+-    LowOpReg* op = g_SchedulerInstance.allocateNewEmptyLIR<LowOpReg>();
++    LowOpReg* op = singletonPtr<Scheduler>()->allocateNewEmptyLIR<LowOpReg>();
+     op->opCode = m;
+     op->opCode2 = m2;
+     op->opndSrc.size = size;
+     op->opndSrc.type = LowOpndType_Reg;
+     op->numOperands = 1;
+     set_reg_opnd(&(op->regOpnd), reg, isPhysical, type);
+-    g_SchedulerInstance.updateUseDefInformation_reg(op);
++    singletonPtr<Scheduler>()->updateUseDefInformation_reg(op);
+     return op;
+ }
+ 
+@@ -374,7 +375,7 @@ LowOpRegReg* lower_reg_to_reg(Mnemonic m, AtomOpCode m2, OpndSize size, int regS
+     if (!isPhysical && !isPhysical2)
+         dvmAbort();
+ 
+-    LowOpRegReg* op = g_SchedulerInstance.allocateNewEmptyLIR<LowOpRegReg>();
++    LowOpRegReg* op = singletonPtr<Scheduler>()->allocateNewEmptyLIR<LowOpRegReg>();
+     op->opCode = m;
+     op->opCode2 = m2;
+     op->opndDest.size = overridden_size;
+@@ -384,7 +385,7 @@ LowOpRegReg* lower_reg_to_reg(Mnemonic m, AtomOpCode m2, OpndSize size, int regS
+     op->numOperands = 2;
+     set_reg_opnd(&(op->regDest), regDest, isPhysical2, overridden_type);
+     set_reg_opnd(&(op->regSrc), regSrc, isPhysical, type);
+-    g_SchedulerInstance.updateUseDefInformation_reg_to_reg(op);
++    singletonPtr<Scheduler>()->updateUseDefInformation_reg_to_reg(op);
+ 
+     return op;
+ }
+@@ -501,7 +502,7 @@ LowOpMemReg* lower_mem_to_reg(Mnemonic m, AtomOpCode m2, OpndSize size, int disp
+     }
+     if (!isBasePhysical && !isPhysical)
+         dvmAbort();
+-    LowOpMemReg* op = g_SchedulerInstance.allocateNewEmptyLIR<LowOpMemReg>();
++    LowOpMemReg* op = singletonPtr<Scheduler>()->allocateNewEmptyLIR<LowOpMemReg>();
+     op->opCode = m;
+     op->opCode2 = m2;
+     op->opndDest.size = overridden_size;
+@@ -513,7 +514,7 @@ LowOpMemReg* lower_mem_to_reg(Mnemonic m, AtomOpCode m2, OpndSize size, int disp
+     set_mem_opnd(&(op->memSrc), disp, base_reg, isBasePhysical);
+     op->memSrc.mType = mType;
+     op->memSrc.index = mIndex;
+-    g_SchedulerInstance.updateUseDefInformation_mem_to_reg(op);
++    singletonPtr<Scheduler>()->updateUseDefInformation_mem_to_reg(op);
+     return op;
+ }
+ 
+@@ -677,7 +678,7 @@ LowOpMemReg* lower_mem_scale_to_reg(Mnemonic m, OpndSize size, int base_reg,
+     }
+     if (!isBasePhysical && !isIndexPhysical && !isPhysical)
+         dvmAbort();
+-    LowOpMemReg* op = g_SchedulerInstance.allocateNewEmptyLIR<LowOpMemReg>();
++    LowOpMemReg* op = singletonPtr<Scheduler>()->allocateNewEmptyLIR<LowOpMemReg>();
+     op->opCode = m;
+     op->opCode2 = ATOM_NORMAL;
+     op->opndDest.size = overridden_size;
+@@ -690,7 +691,7 @@ LowOpMemReg* lower_mem_scale_to_reg(Mnemonic m, OpndSize size, int base_reg,
+     set_reg_opnd(&(op->regDest), reg, isPhysical, overridden_type);
+     set_mem_opnd_scale(&(op->memSrc), base_reg, isBasePhysical, disp,
+             index_reg, isIndexPhysical, scale);
+-    g_SchedulerInstance.updateUseDefInformation_mem_scale_to_reg(op);
++    singletonPtr<Scheduler>()->updateUseDefInformation_mem_to_reg(op);
+     return op;
+ }
+ 
+@@ -739,7 +740,7 @@ LowOpRegMem* lower_reg_to_mem_scale(Mnemonic m, OpndSize size, int reg,
+     }
+     if (!isBasePhysical && !isIndexPhysical && !isPhysical)
+         dvmAbort();
+-    LowOpRegMem* op = g_SchedulerInstance.allocateNewEmptyLIR<LowOpRegMem>();
++    LowOpRegMem* op = singletonPtr<Scheduler>()->allocateNewEmptyLIR<LowOpRegMem>();
+     op->opCode = m;
+     op->opCode2 = ATOM_NORMAL;
+     op->opndDest.size = size;
+@@ -752,7 +753,7 @@ LowOpRegMem* lower_reg_to_mem_scale(Mnemonic m, OpndSize size, int reg,
+     set_reg_opnd(&(op->regSrc), reg, isPhysical, type);
+     set_mem_opnd_scale(&(op->memDest), base_reg, isBasePhysical, disp,
+             index_reg, isIndexPhysical, scale);
+-    g_SchedulerInstance.updateUseDefInformation_reg_to_mem_scale(op);
++    singletonPtr<Scheduler>()->updateUseDefInformation_reg_to_mem(op);
+     return op;
+ }
+ 
+@@ -793,7 +794,7 @@ LowOpRegMem* lower_reg_to_mem(Mnemonic m, AtomOpCode m2, OpndSize size, int reg,
+     }
+     if (!isBasePhysical && !isPhysical)
+         dvmAbort();
+-    LowOpRegMem* op = g_SchedulerInstance.allocateNewEmptyLIR<LowOpRegMem>();
++    LowOpRegMem* op = singletonPtr<Scheduler>()->allocateNewEmptyLIR<LowOpRegMem>();
+     op->opCode = m;
+     op->opCode2 = m2;
+     op->opndDest.size = size;
+@@ -805,7 +806,7 @@ LowOpRegMem* lower_reg_to_mem(Mnemonic m, AtomOpCode m2, OpndSize size, int reg,
+     set_mem_opnd(&(op->memDest), disp, base_reg, isBasePhysical);
+     op->memDest.mType = mType;
+     op->memDest.index = mIndex;
+-    g_SchedulerInstance.updateUseDefInformation_reg_to_mem(op);
++    singletonPtr<Scheduler>()->updateUseDefInformation_reg_to_mem(op);
+     return op;
+ }
+ 
+@@ -857,7 +858,7 @@ LowOpImmReg* lower_imm_to_reg(Mnemonic m, AtomOpCode m2, OpndSize size, int imm,
+     }
+     if (!isPhysical)
+         dvmAbort();
+-    LowOpImmReg* op = g_SchedulerInstance.allocateNewEmptyLIR<LowOpImmReg>();
++    LowOpImmReg* op = singletonPtr<Scheduler>()->allocateNewEmptyLIR<LowOpImmReg>();
+     op->opCode = m;
+     op->opCode2 = m2;
+     op->opndDest.size = size;
+@@ -867,7 +868,7 @@ LowOpImmReg* lower_imm_to_reg(Mnemonic m, AtomOpCode m2, OpndSize size, int imm,
+     op->opndSrc.type = chaining ? LowOpndType_Chain : LowOpndType_Imm;
+     set_reg_opnd(&(op->regDest), reg, isPhysical, type);
+     op->immSrc.value = imm;
+-    g_SchedulerInstance.updateUseDefInformation_imm_to_reg(op);
++    singletonPtr<Scheduler>()->updateUseDefInformation_imm_to_reg(op);
+     return op;
+ }
+ 
+@@ -906,7 +907,7 @@ LowOpImmMem* lower_imm_to_mem(Mnemonic m, AtomOpCode m2, OpndSize size, int imm,
+     }
+     if (!isBasePhysical)
+         dvmAbort();
+-    LowOpImmMem* op = g_SchedulerInstance.allocateNewEmptyLIR<LowOpImmMem>();
++    LowOpImmMem* op = singletonPtr<Scheduler>()->allocateNewEmptyLIR<LowOpImmMem>();
+     op->opCode = m;
+     op->opCode2 = m2;
+     op->opndDest.size = size;
+@@ -918,7 +919,7 @@ LowOpImmMem* lower_imm_to_mem(Mnemonic m, AtomOpCode m2, OpndSize size, int imm,
+     op->immSrc.value = imm;
+     op->memDest.mType = mType;
+     op->memDest.index = mIndex;
+-    g_SchedulerInstance.updateUseDefInformation_imm_to_mem(op);
++    singletonPtr<Scheduler>()->updateUseDefInformation_imm_to_mem(op);
+     return op;
+ }
+ 
+@@ -956,8 +957,9 @@ LowOpImmMem* dump_imm_mem(Mnemonic m, AtomOpCode m2, OpndSize size, int imm,
+ //!update fields of LowOp and generate a x86 instruction that uses the FP stack and takes one mem operand
+ 
+ //!
+-LowOpRegMem* lower_fp_to_mem(Mnemonic m, OpndSize size, int reg, int disp,
+-        int base_reg, bool isBasePhysical, MemoryAccessType mType, int mIndex) {
++LowOpRegMem* lower_fp_to_mem(Mnemonic m, AtomOpCode m2, OpndSize size, int reg,
++        int disp, int base_reg, bool isBasePhysical, MemoryAccessType mType,
++        int mIndex) {
+     if (!gDvmJit.scheduling) {
+         stream = encoder_fp_mem(m, size, reg, disp, base_reg, isBasePhysical,
+                 stream);
+@@ -965,9 +967,9 @@ LowOpRegMem* lower_fp_to_mem(Mnemonic m, OpndSize size, int reg, int disp,
+     }
+     if (!isBasePhysical)
+         dvmAbort();
+-    LowOpRegMem* op = g_SchedulerInstance.allocateNewEmptyLIR<LowOpRegMem>();
++    LowOpRegMem* op = singletonPtr<Scheduler>()->allocateNewEmptyLIR<LowOpRegMem>();
+     op->opCode = m;
+-    op->opCode2 = ATOM_NORMAL;
++    op->opCode2 = m2;
+     op->opndDest.size = size;
+     op->opndDest.type = LowOpndType_Mem;
+     op->opndSrc.size = size;
+@@ -978,21 +980,22 @@ LowOpRegMem* lower_fp_to_mem(Mnemonic m, OpndSize size, int reg, int disp,
+     set_mem_opnd(&(op->memDest), disp, base_reg, isBasePhysical);
+     op->memDest.mType = mType;
+     op->memDest.index = mIndex;
+-    g_SchedulerInstance.updateUseDefInformation_fp_to_mem(op);
++    singletonPtr<Scheduler>()->updateUseDefInformation_fp_to_mem(op);
+     return op;
+ }
+ 
+-LowOpRegMem* dump_fp_mem(Mnemonic m, OpndSize size, int reg, int disp,
+-        int base_reg, bool isBasePhysical, MemoryAccessType mType, int mIndex) {
++LowOpRegMem* dump_fp_mem(Mnemonic m, AtomOpCode m2, OpndSize size, int reg,
++        int disp, int base_reg, bool isBasePhysical, MemoryAccessType mType,
++        int mIndex) {
+     if (gDvm.executionMode == kExecutionModeNcgO1) {
+         freeReg(true);
+         int baseAll = registerAlloc(LowOpndRegType_gp, base_reg, isBasePhysical,
+                 true);
+-        return lower_fp_to_mem(m, size, reg, disp, baseAll,
++        return lower_fp_to_mem(m, m2, size, reg, disp, baseAll,
+                 true /*isBasePhysical*/, mType, mIndex);
+     } else {
+-        return lower_fp_to_mem(m, size, reg, disp, base_reg, isBasePhysical, mType,
+-                mIndex);
++        return lower_fp_to_mem(m, m2, size, reg, disp, base_reg, isBasePhysical,
++                mType, mIndex);
+     }
+     return NULL;
+ }
+@@ -1000,8 +1003,9 @@ LowOpRegMem* dump_fp_mem(Mnemonic m, OpndSize size, int reg, int disp,
+ //!update fields of LowOp and generate a x86 instruction that uses the FP stack and takes one mem operand
+ 
+ //!
+-LowOpMemReg* lower_mem_to_fp(Mnemonic m, OpndSize size, int disp, int base_reg,
+-        bool isBasePhysical, MemoryAccessType mType, int mIndex, int reg) {
++LowOpMemReg* lower_mem_to_fp(Mnemonic m, AtomOpCode m2, OpndSize size, int disp,
++        int base_reg, bool isBasePhysical, MemoryAccessType mType, int mIndex,
++        int reg) {
+     if (!gDvmJit.scheduling) {
+         stream = encoder_mem_fp(m, size, disp, base_reg, isBasePhysical, reg,
+                 stream);
+@@ -1009,9 +1013,9 @@ LowOpMemReg* lower_mem_to_fp(Mnemonic m, OpndSize size, int disp, int base_reg,
+     }
+     if (!isBasePhysical)
+         dvmAbort();
+-    LowOpMemReg* op = g_SchedulerInstance.allocateNewEmptyLIR<LowOpMemReg>();
++    LowOpMemReg* op = singletonPtr<Scheduler>()->allocateNewEmptyLIR<LowOpMemReg>();
+     op->opCode = m;
+-    op->opCode2 = ATOM_NORMAL;
++    op->opCode2 = m2;
+     op->opndDest.size = size;
+     op->opndDest.type = LowOpndType_Reg;
+     op->opndSrc.size = size;
+@@ -1022,21 +1026,22 @@ LowOpMemReg* lower_mem_to_fp(Mnemonic m, OpndSize size, int disp, int base_reg,
+     set_mem_opnd(&(op->memSrc), disp, base_reg, isBasePhysical);
+     op->memSrc.mType = mType;
+     op->memSrc.index = mIndex;
+-    g_SchedulerInstance.updateUseDefInformation_mem_to_fp(op);
++    singletonPtr<Scheduler>()->updateUseDefInformation_mem_to_fp(op);
+     return op;
+ }
+ 
+-LowOpMemReg* dump_mem_fp(Mnemonic m, OpndSize size, int disp, int base_reg,
+-        bool isBasePhysical, MemoryAccessType mType, int mIndex, int reg) {
++LowOpMemReg* dump_mem_fp(Mnemonic m, AtomOpCode m2, OpndSize size, int disp,
++        int base_reg, bool isBasePhysical, MemoryAccessType mType, int mIndex,
++        int reg) {
+     if (gDvm.executionMode == kExecutionModeNcgO1) {
+         freeReg(true);
+         int baseAll = registerAlloc(LowOpndRegType_gp, base_reg, isBasePhysical,
+                 true);
+-        return lower_mem_to_fp(m, size, disp, baseAll, true /*isBasePhysical*/,
+-                mType, mIndex, reg);
++        return lower_mem_to_fp(m, m2, size, disp, baseAll,
++                true /*isBasePhysical*/, mType, mIndex, reg);
+     } else {
+-        return lower_mem_to_fp(m, size, disp, base_reg, isBasePhysical, mType,
+-                mIndex, reg);
++        return lower_mem_to_fp(m, m2, size, disp, base_reg, isBasePhysical,
++                mType, mIndex, reg);
+     }
+     return NULL;
+ }
+@@ -1095,14 +1100,14 @@ void convert_integer(OpndSize srcSize, OpndSize dstSize) { //cbw, cwd, cdq
+ //!
+ void load_fp_stack(LowOp* op, OpndSize size, int disp, int base_reg, bool isBasePhysical) {//fld(s|l)
+     Mnemonic m = Mnemonic_FLD;
+-    dump_mem_fp(m, size, disp, base_reg, isBasePhysical, MemoryAccess_Unknown, -1, 0); //ST0
++    dump_mem_fp(m, ATOM_NORMAL, size, disp, base_reg, isBasePhysical, MemoryAccess_Unknown, -1, 0); //ST0
+ }
+ //! fild: load from memory (int or long) to stack
+ 
+ //!
+ void load_int_fp_stack(OpndSize size, int disp, int base_reg, bool isBasePhysical) {//fild(ll|l)
+     Mnemonic m = Mnemonic_FILD;
+-    dump_mem_fp(m, size, disp, base_reg, isBasePhysical, MemoryAccess_Unknown, -1, 0); //ST0
++    dump_mem_fp(m, ATOM_NORMAL, size, disp, base_reg, isBasePhysical, MemoryAccess_Unknown, -1, 0); //ST0
+ }
+ //!fild: load from memory (absolute addr)
+ 
+@@ -1115,14 +1120,14 @@ void load_int_fp_stack_imm(OpndSize size, int imm) {//fild(ll|l)
+ //!
+ void store_fp_stack(LowOp* op, bool pop, OpndSize size, int disp, int base_reg, bool isBasePhysical) {//fst(p)(s|l)
+     Mnemonic m = pop ? Mnemonic_FSTP : Mnemonic_FST;
+-    dump_fp_mem(m, size, 0, disp, base_reg, isBasePhysical, MemoryAccess_Unknown, -1);
++    dump_fp_mem(m, ATOM_NORMAL, size, 0, disp, base_reg, isBasePhysical, MemoryAccess_Unknown, -1);
+ }
+ //!fist: store from stack to memory (int or long)
+ 
+ //!
+ void store_int_fp_stack(LowOp* op, bool pop, OpndSize size, int disp, int base_reg, bool isBasePhysical) {//fist(p)(l)
+     Mnemonic m = pop ? Mnemonic_FISTP : Mnemonic_FIST;
+-    dump_fp_mem(m, size, 0, disp, base_reg, isBasePhysical, MemoryAccess_Unknown, -1);
++    dump_fp_mem(m, ATOM_NORMAL, size, 0, disp, base_reg, isBasePhysical, MemoryAccess_Unknown, -1);
+ }
+ //!cmp reg, mem
+ 
+@@ -1254,9 +1259,9 @@ void load_fp_stack_VR_all(OpndSize size, int vB, Mnemonic m) {
+                     MemoryAccess_VR, vB, getTypeFromIntSize(size));
+ #endif
+         }
+-        dump_mem_fp(m, size, 4*vB, PhysicalReg_FP, true, MemoryAccess_VR, vB, 0);
++        dump_mem_fp(m, ATOM_NORMAL, size, 4*vB, PhysicalReg_FP, true, MemoryAccess_VR, vB, 0);
+     } else {
+-        dump_mem_fp(m, size, 4*vB, PhysicalReg_FP, true, MemoryAccess_VR, vB, 0);
++        dump_mem_fp(m, ATOM_NORMAL, size, 4*vB, PhysicalReg_FP, true, MemoryAccess_VR, vB, 0);
+     }
+ }
+ //!load VR(float or double) to stack
+@@ -1278,7 +1283,7 @@ void load_int_fp_stack_VR(OpndSize size, int vA) {//fild(ll|l)
+ //!
+ void store_fp_stack_VR(bool pop, OpndSize size, int vA) {//fst(p)(s|l)
+     Mnemonic m = pop ? Mnemonic_FSTP : Mnemonic_FST;
+-    dump_fp_mem(m, size, 0, 4*vA, PhysicalReg_FP, true, MemoryAccess_VR, vA);
++    dump_fp_mem(m, ATOM_NORMAL, size, 0, 4*vA, PhysicalReg_FP, true, MemoryAccess_VR, vA);
+     if(gDvm.executionMode == kExecutionModeNcgO1) {
+         if(size == OpndSize_32)
+             updateVirtualReg(vA, LowOpndRegType_fs_s);
+@@ -1291,7 +1296,7 @@ void store_fp_stack_VR(bool pop, OpndSize size, int vA) {//fst(p)(s|l)
+ //!
+ void store_int_fp_stack_VR(bool pop, OpndSize size, int vA) {//fist(p)(l)
+     Mnemonic m = pop ? Mnemonic_FISTP : Mnemonic_FIST;
+-    dump_fp_mem(m, size, 0, 4*vA, PhysicalReg_FP, true, MemoryAccess_VR, vA);
++    dump_fp_mem(m, ATOM_NORMAL, size, 0, 4*vA, PhysicalReg_FP, true, MemoryAccess_VR, vA);
+     if(gDvm.executionMode == kExecutionModeNcgO1) {
+         if(size == OpndSize_32)
+             updateVirtualReg(vA, LowOpndRegType_fs_s);
+@@ -1324,9 +1329,9 @@ void fpu_VR(ALU_Opcode opc, OpndSize size, int vA) {
+         if(!isInMemory(vA, size)) {
+             ALOGE("fpu_VR");
+         }
+-        dump_mem_fp(m, size, 4*vA, PhysicalReg_FP, true, MemoryAccess_VR, vA, 0);
++        dump_mem_fp(m, ATOM_NORMAL_ALU, size, 4*vA, PhysicalReg_FP, true, MemoryAccess_VR, vA, 0);
+     } else {
+-        dump_mem_fp(m, size, 4*vA, PhysicalReg_FP, true, MemoryAccess_VR, vA, 0);
++        dump_mem_fp(m, ATOM_NORMAL_ALU, size, 4*vA, PhysicalReg_FP, true, MemoryAccess_VR, vA, 0);
+     }
+ }
+ //! cmp imm reg
+@@ -1448,11 +1453,11 @@ inline LowOp* lower_return() {
+         stream = encoder_return(stream);
+         return NULL;
+     }
+-    LowOp * op = g_SchedulerInstance.allocateNewEmptyLIR<LowOp>();
++    LowOp * op = singletonPtr<Scheduler>()->allocateNewEmptyLIR<LowOp>();
+     op->numOperands = 0;
+     op->opCode = Mnemonic_RET;
+     op->opCode2 = ATOM_NORMAL;
+-    g_SchedulerInstance.updateUseDefInformation(op);
++    singletonPtr<Scheduler>()->updateUseDefInformation(op);
+     return op;
+ }
+ 
+@@ -1575,7 +1580,7 @@ void alu_sd_binary_VR_reg(ALU_Opcode opc, int vA, int reg, bool isPhysical, bool
+         updateRefCount(vA, type);
+     }
+     else {
+-        dump_mem_reg(m, ATOM_NORMAL, size, 4*vA, PhysicalReg_FP, true,
++        dump_mem_reg(m, ATOM_NORMAL_ALU, size, 4*vA, PhysicalReg_FP, true,
+                     MemoryAccess_VR, vA, reg, isPhysical, LowOpndRegType_xmm);
+     }
+ }
+@@ -1625,7 +1630,7 @@ void alu_binary_VR_reg(OpndSize size, ALU_Opcode opc, int vA, int reg, bool isPh
+         updateRefCount(vA, getTypeFromIntSize(size));
+     }
+     else {
+-        dump_mem_reg(m, ATOM_NORMAL, size, 4*vA, PhysicalReg_FP, true,
++        dump_mem_reg(m, ATOM_NORMAL_ALU, size, 4*vA, PhysicalReg_FP, true,
+             MemoryAccess_VR, vA, reg, isPhysical, getTypeFromIntSize(size));
+     }
+ }
+@@ -1660,7 +1665,7 @@ void alu_binary_reg_mem(OpndSize size, ALU_Opcode opc,
+ //!
+ void fpu_mem(LowOp* op, ALU_Opcode opc, OpndSize size, int disp, int base_reg, bool isBasePhysical) {
+     Mnemonic m = map_of_fpu_opcode_2_mnemonic[opc];
+-    dump_mem_fp(m, size, disp, base_reg, isBasePhysical, MemoryAccess_Unknown, -1, 0);
++    dump_mem_fp(m, ATOM_NORMAL_ALU, size, disp, base_reg, isBasePhysical, MemoryAccess_Unknown, -1, 0);
+ }
+ //!SSE 32-bit ALU
+ 
+diff --git a/vm/compiler/codegen/x86/LowerJump.cpp b/vm/compiler/codegen/x86/LowerJump.cpp
+index aeabb0e..8c6ac36 100644
+--- a/vm/compiler/codegen/x86/LowerJump.cpp
++++ b/vm/compiler/codegen/x86/LowerJump.cpp
+@@ -27,6 +27,7 @@
+ #include "interp/InterpDefs.h"
+ #include "NcgHelper.h"
+ #include "Scheduler.h"
++#include "Singleton.h"
+ 
+ #if defined VTUNE_DALVIK
+ #include "compiler/JitProfiling.h"
+@@ -111,6 +112,12 @@ otherwise, an entry is created in globalMap.
+ */
+ int insertLabel(const char* label, bool checkDup) {
+     LabelMap* item = NULL;
++
++    // We are inserting a label. Someone might want to jump to it
++    // so flush scheduler's queue
++    if (gDvmJit.scheduling)
++        singletonPtr<Scheduler>()->signalEndOfNativeBasicBlock();
++
+     if(!checkDup) {
+         item = (LabelMap*)malloc(sizeof(LabelMap));
+         if(item == NULL) {
+@@ -128,9 +135,6 @@ int insertLabel(const char* label, bool checkDup) {
+         return 0;
+     }
+ 
+-    if (gDvmJit.scheduling)
+-        g_SchedulerInstance.signalEndOfNativeBasicBlock(); /* will update stream */
+-
+     item = (LabelMap*)malloc(sizeof(LabelMap));
+     if(item == NULL) {
+         ALOGE("Memory allocation failed");
+diff --git a/vm/compiler/codegen/x86/Schedule.cpp b/vm/compiler/codegen/x86/Schedule.cpp
+index 168822f..4edfcbd 100644
+--- a/vm/compiler/codegen/x86/Schedule.cpp
++++ b/vm/compiler/codegen/x86/Schedule.cpp
+@@ -23,10 +23,6 @@
+ #include "interp/InterpDefs.h"
+ #include "Scheduler.h"
+ 
+-//! \brief Used to replace all calls to printf to calls to LOGD.
+-//! \details Needs to be commented out when running on host.
+-#define printf LOGD
+-
+ //! \def DISABLE_ATOM_SCHEDULING_STATISTICS
+ //! \brief Disables printing of scheduling statistics.
+ //! \details Defining this macro disables printing of scheduling statistics pre
+@@ -39,24 +35,19 @@
+ //! Undefine macro when debugging scheduler implementation.
+ #define DISABLE_DEBUG_ATOM_SCHEDULER
+ 
+-//! \def ENABLE_BASIC_BLOCK_DUMP
+-//! \brief Enables scheduler to wait until it has formed a basic block.
+-//! \details Defining this macro allows scheduler to dump the x86 instructions as
+-//! a basic block instead of doing it one-at-a-time as they come in.
+-//! Undefined macro when trying to debug basic block detection.
+-#define ENABLE_BASIC_BLOCK_DUMP
+-
+-//! \def DISABLE_MACHINE_MODEL_CHECK
+-//! \brief Disables checks on the machine model.
+-//! \details Defining this macro disables checks of the machine model.
+-//! Undefining this leads to Dalvik aborting when invalid information
+-//! is used from machine model. For example, Dalvik will abort when an
+-//! instruction does not have latency information.
+-#define DISABLE_MACHINE_MODEL_CHECK
+-
+-//! \def g_SchedulerInstance
+-//! \brief Global Atom instruction scheduler instance
+-Scheduler g_SchedulerInstance;
++//! \def DISABLE_DEPENDENGY_GRAPH_DEBUG
++//! \brief Disables printing of dependency graph
++//! \details Undefine this macro when wanting to debug dependency graph.
++//! The dot files for each basic block will be dumped to folder /data/local/tmp
++//! and the name for each file will be depengraph_<pid>_<stream_start_of_BB>.dot
++#define DISABLE_DEPENDENGY_GRAPH_DEBUG
++
++#ifndef DISABLE_DEPENDENGY_GRAPH_DEBUG
++#include <fstream>
++#include <sstream>
++#include <string>
++#include <set>
++#endif
+ 
+ //! \enum IssuePort
+ //! \brief Defines possible combinations of port-binding information for use
+@@ -75,6 +66,25 @@ enum IssuePort {
+     BOTH_PORTS
+ };
+ 
++#ifndef DISABLE_DEPENDENGY_GRAPH_DEBUG
++//! \brief Transforms from IssuePort enum to a string representation.
++inline const char * getIssuePort(IssuePort port) {
++    switch (port) {
++    case INVALID_PORT:
++        return "invalid";
++    case PORT0:
++        return "0";
++    case PORT1:
++        return "1";
++    case EITHER_PORT:
++        return "either";
++    case BOTH_PORTS:
++        return "both";
++    }
++    return "Invalid";
++}
++#endif
++
+ //! \def MachineModelEntry
+ //! \brief Information needed to define the machine model for each x86 mnemonic.
+ struct MachineModelEntry {
+@@ -111,8 +121,9 @@ struct MachineModelEntry {
+ //! imm_to_reg, imm_to_mem, reg_to_reg, mem_to_reg and reg_to_mem
+ //!
+ //! This table matches content from Intel 64 and IA-32 Architectures Optimization
+-//! Reference Manual (April 2011), Section 13.4
+-//! \todo Make sure that the invalid entries are never used in the algorithm
++//! Reference Manual (April 2012), Section 13.4
++//! \warning This table is not complete and if new mnemonics are used that do not have an
++//! entry, then the schedule selection will not be optimal.
+ MachineModelEntry atomMachineModel[Mnemonic_Count*6] = {
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //NULL, Null
+     {INVP,INVN},{EITHER_PORT,1},{PORT0,1},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //ADC
+@@ -124,24 +135,24 @@ MachineModelEntry atomMachineModel[Mnemonic_Count*6] = {
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //BSR
+     {BOTH_PORTS,1},{BOTH_PORTS,1},{EITHER_PORT,2},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //CALL
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //CMC
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{INVP,INVN},{INVP,INVN}, //CWD, CDQ
+-
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{INVP,INVN},{INVP,INVN}, //CMOV_O
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{INVP,INVN},{INVP,INVN}, //CMOV_NO
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{INVP,INVN},{INVP,INVN}, //CMOV_B,NAE,C
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{INVP,INVN},{INVP,INVN}, //CMOV_NB,AE,NC
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{INVP,INVN},{INVP,INVN}, //CMOV_Z,E
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{INVP,INVN},{INVP,INVN}, //CMOV_NZ,NE
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{INVP,INVN},{INVP,INVN}, //CMOV_BE,NA
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{INVP,INVN},{INVP,INVN}, //CMOV_NBE,A
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{INVP,INVN},{INVP,INVN}, //CMOV_S
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{INVP,INVN},{INVP,INVN}, //CMOV_NS
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{INVP,INVN},{INVP,INVN}, //CMOV_P,PE
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{INVP,INVN},{INVP,INVN}, //CMOV_NP,PO
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{INVP,INVN},{INVP,INVN}, //CMOV_L,NGE
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{INVP,INVN},{INVP,INVN}, //CMOV_NL,GE
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{INVP,INVN},{INVP,INVN}, //CMOV_LE,NG
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{INVP,INVN},{INVP,INVN}, //CMOV_NLE,G
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT0,1},{INVP,INVN},{INVP,INVN}, //CWD, CDQ
++
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //CMOV_O
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //CMOV_NO
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //CMOV_B,NAE,C
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //CMOV_NB,AE,NC
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //CMOV_Z,E
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //CMOV_NZ,NE
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //CMOV_BE,NA
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //CMOV_NBE,A
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //CMOV_S
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //CMOV_NS
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //CMOV_P,PE
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //CMOV_NP,PO
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //CMOV_L,NGE
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //CMOV_NL,GE
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //CMOV_LE,NG
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //CMOV_NLE,G
+ 
+     {INVP,INVN},{EITHER_PORT,1},{PORT0,1},{EITHER_PORT,1},{PORT0,1},{PORT0,1}, //CMP
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //CMPXCHG
+@@ -150,40 +161,40 @@ MachineModelEntry atomMachineModel[Mnemonic_Count*6] = {
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //CMPSW
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //CMPSD
+ 
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //CVTSD2SS
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //CVTSD2SI
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //CVTTSD2SI
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //CVTSS2SD
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //CVTSS2SI
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //CVTTSS2SI
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //CVTSI2SD
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //CVTSI2SS
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,7},{BOTH_PORTS,8},{INVP,INVN}, //CVTSD2SS
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,8},{BOTH_PORTS,9},{INVP,INVN}, //CVTSD2SI
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,8},{BOTH_PORTS,9},{INVP,INVN}, //CVTTSD2SI
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,7},{BOTH_PORTS,8},{INVP,INVN}, //CVTSS2SD
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,9},{BOTH_PORTS,10},{INVP,INVN}, //CVTSS2SI
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,9},{BOTH_PORTS,10},{INVP,INVN}, //CVTTSS2SI
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,7},{INVP,INVN},{INVP,INVN}, //CVTSI2SD
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,6},{INVP,INVN},{INVP,INVN}, //CVTSI2SS
+ 
+     {INVP,INVN},{BOTH_PORTS,9},{INVP,INVN},{BOTH_PORTS,9},{BOTH_PORTS,10},{INVP,INVN}, //COMISD
+     {INVP,INVN},{BOTH_PORTS,9},{INVP,INVN},{BOTH_PORTS,9},{BOTH_PORTS,10},{INVP,INVN}, //COMISS
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //DEC
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,64},{BOTH_PORTS,64},{INVP,INVN}, //DIVSD
++    {INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //DEC
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,62},{BOTH_PORTS,62},{INVP,INVN}, //DIVSD
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,34},{BOTH_PORTS,34},{INVP,INVN}, //DIVSS
+ 
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //ENTER
+-    {INVP,INVN},{INVP,INVN},{BOTH_PORTS,5},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //FLDCW
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //FADDP
++    {INVP,INVN},{INVP,INVN},{BOTH_PORTS,5},{INVP,INVN},{BOTH_PORTS,5},{INVP,INVN}, //FLDCW
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT1,5},{INVP,INVN}, //FADDP
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //FLDZ
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //FADD
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //FSUBP
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //FSUB
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT1,5},{INVP,INVN}, //FADD
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT1,5},{INVP,INVN}, //FSUBP
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT1,5},{INVP,INVN}, //FSUB
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //FISUB
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //FMUL
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //FMULP
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //FDIVP
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //FDIV
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT0,5},{INVP,INVN}, //FMUL
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT0,5},{INVP,INVN}, //FMULP
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT0,65},{INVP,INVN}, //FDIVP
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT0,65},{INVP,INVN}, //FDIV
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT1,1},{INVP,INVN},{INVP,INVN}, //FUCOM
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //FUCOMI
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT1,1},{INVP,INVN},{INVP,INVN}, //FUCOMP
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //FUCOMIP
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //FUCOMPP
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //FRNDINT
+-    {INVP,INVN},{INVP,INVN},{BOTH_PORTS,5},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //FNSTCW
++    {INVP,INVN},{INVP,INVN},{BOTH_PORTS,5},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,5}, //FNSTCW
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //FSTSW
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //FNSTSW
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,5},{INVP,INVN}, //FILD
+@@ -195,15 +206,15 @@ MachineModelEntry atomMachineModel[Mnemonic_Count*6] = {
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //FCLEX
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //FCHS
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //FNCLEX
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,2}, //FIST
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,2}, //FISTP
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,6}, //FIST
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,6}, //FISTP
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //FISTTP
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //FPREM
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //FPREM1
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,2}, //FST fp_mem
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,2}, //FSTP
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //FSQRT
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //FABS
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1}, //FST fp_mem
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1}, //FSTP
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT0,65},{INVP,INVN}, //FSQRT
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{INVP,INVN}, //FABS
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //FSIN
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //FCOS
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //FPTAN
+@@ -217,7 +228,8 @@ MachineModelEntry atomMachineModel[Mnemonic_Count*6] = {
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //XCHG
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //DIV
+     {INVP,INVN},{BOTH_PORTS,57},{BOTH_PORTS,57},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //IDIV
+-    {INVP,INVN},{BOTH_PORTS,6},{BOTH_PORTS,6},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //MUL
++    {INVP,INVN},{BOTH_PORTS,6},{BOTH_PORTS,7},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //MUL
++    // This table does not support IMUL with single reg or mem operand
+     {INVP,INVN},{PORT0,5},{PORT0,5},{PORT0,5},{PORT0,5},{INVP,INVN}, //IMUL
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //INC
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //INT3
+@@ -257,8 +269,8 @@ MachineModelEntry atomMachineModel[Mnemonic_Count*6] = {
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //MOVAPD
+     {INVP,INVN},{PORT0,1},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{PORT0,1}, //MOVSD
+     {INVP,INVN},{PORT0,1},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{PORT0,1}, //MOVSS
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT0,1},{INVP,INVN}, //MOVSX
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT0,1},{INVP,INVN}, //MOVZX
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT0,1},{PORT0,1},{INVP,INVN}, //MOVSX
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT0,1},{PORT0,1},{INVP,INVN}, //MOVZX
+ 
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT0,5},{PORT0,5},{INVP,INVN}, //MULSD
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT0,4},{PORT0,4},{INVP,INVN}, //MULSS
+@@ -268,14 +280,14 @@ MachineModelEntry atomMachineModel[Mnemonic_Count*6] = {
+     {INVP,INVN},{EITHER_PORT,1},{PORT0,1},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //OR
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //PREFETCH
+ 
+-    {INVP,INVN},{EITHER_PORT,1},{PORT0,1},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //PADDQ
+-    {INVP,INVN},{EITHER_PORT,1},{PORT0,1},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //PAND
+-    {INVP,INVN},{EITHER_PORT,1},{PORT0,1},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //POR
+-    {INVP,INVN},{EITHER_PORT,1},{PORT0,1},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //PSUBQ
+-    {INVP,INVN},{EITHER_PORT,1},{PORT0,1},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //PANDN
+-    {INVP,INVN},{PORT0,1},{INVP,INVN},{BOTH_PORTS,2},{BOTH_PORTS,3},{INVP,INVN}, //PSLLQ
+-    {INVP,INVN},{PORT0,1},{INVP,INVN},{BOTH_PORTS,2},{BOTH_PORTS,3},{INVP,INVN}, //PSRLQ
+-    {INVP,INVN},{EITHER_PORT,1},{PORT0,1},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //PXOR
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,2},{EITHER_PORT,3},{INVP,INVN}, //PADDQ
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //PAND
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //POR
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,2},{EITHER_PORT,3},{INVP,INVN}, //PSUBQ
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //PANDN
++    {INVP,INVN},{EITHER_PORT,1},{INVP,INVN},{EITHER_PORT,2},{EITHER_PORT,3},{INVP,INVN}, //PSLLQ
++    {INVP,INVN},{EITHER_PORT,1},{INVP,INVN},{EITHER_PORT,2},{EITHER_PORT,3},{INVP,INVN}, //PSRLQ
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //PXOR
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //POP
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //POPFD
+     {INVP,INVN},{BOTH_PORTS,1},{BOTH_PORTS,2},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //PUSH
+@@ -306,16 +318,16 @@ MachineModelEntry atomMachineModel[Mnemonic_Count*6] = {
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //ROL
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //RCL
+     {INVP,INVN},{PORT0,1},{PORT0,1},{PORT0,1},{INVP,INVN},{INVP,INVN}, //SHR
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //SHRD
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //SHLD
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,4},{BOTH_PORTS,4},{BOTH_PORTS,2}, //SHRD
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,4},{BOTH_PORTS,4},{BOTH_PORTS,2}, //SHLD
+     {INVP,INVN},{EITHER_PORT,1},{PORT0,1},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //SBB
+     {INVP,INVN},{EITHER_PORT,1},{PORT0,1},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //SUB
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT1,5},{BOTH_PORTS,5},{INVP,INVN}, //SUBSD
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT1,5},{BOTH_PORTS,5},{INVP,INVN}, //SUBSS
+ 
+     {INVP,INVN},{EITHER_PORT,1},{PORT0,1},{EITHER_PORT,1},{INVP,INVN},{INVP,INVN}, //TEST
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //UCOMISD
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //UCOMISS
++    {INVP,INVN},{BOTH_PORTS,9},{INVP,INVN},{BOTH_PORTS,9},{BOTH_PORTS,10},{INVP,INVN}, //UCOMISD
++    {INVP,INVN},{BOTH_PORTS,9},{INVP,INVN},{BOTH_PORTS,9},{BOTH_PORTS,10},{INVP,INVN}, //UCOMISS
+     {INVP,INVN},{EITHER_PORT,1},{PORT0,1},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //XOR
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //XORPD
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //XORPS
+@@ -422,10 +434,6 @@ inline int getAtomMnemonicLatency_reg_to_mem(Mnemonic m) {
+     return atomMachineModel[m*6+5].executeToExecuteLatency;
+ }
+ 
+-//! \def EDGE_LATENCY
+-//! \brief Defines weight of edges in the dependency graph.
+-#define EDGE_LATENCY 0
+-
+ #ifndef DISABLE_DEBUG_ATOM_SCHEDULER
+ //! \brief Transforms from LowOpndDefUse enum to string representation of the usedef
+ //! \see LowOpndDefUse
+@@ -470,11 +478,29 @@ inline bool isMoveMnemonic(Mnemonic m) {
+             || m == Mnemonic_MOVSS || m == Mnemonic_MOVZX || m == Mnemonic_MOVSX;
+ }
+ 
++//! \brief Returns true if mnemonic is used for comparisons.
++//! \details Returns false for FPU comparison mnemonics.
++inline bool isCompareMnemonic(Mnemonic m) {
++    return m == Mnemonic_CMP || m == Mnemonic_COMISD || m == Mnemonic_COMISS
++            || m == Mnemonic_TEST;
++}
++
+ //! \brief Returns true if mnemonic uses and then defines the FLAGS register
+ inline bool usesAndDefinesFlags(Mnemonic m) {
+     return m == Mnemonic_ADC || m == Mnemonic_SBB;
+ }
+ 
++//! \brief Returns true if ALU mnemonic has a variant that has implicit
++//! register usage.
++//! \details Returns true for div, idiv, mul, imul, and cdq. However, note
++//! that implicit register usage is dependent on variant being used. For example,
++//! only idiv with single reg operand has implicit register usage.
++inline bool isAluOpWithImplicitRegisterUsage(Mnemonic m) {
++    return m == Mnemonic_DIV || m == Mnemonic_IDIV
++            || m == Mnemonic_IMUL || m == Mnemonic_MUL
++            || m == Mnemonic_CDQ;
++}
++
+ //! \brief Detects whether the mnemonic is a native basic block delimiter.
+ //! \details Unconditional jumps, conditional jumps, calls, and returns
+ //! always end a native basic block.
+@@ -483,6 +509,58 @@ inline bool Scheduler::isBasicBlockDelimiter(Mnemonic m) {
+             || (m >= Mnemonic_Jcc && m < Mnemonic_JMP) || m == Mnemonic_RET);
+ }
+ 
++//! \details Defines a mapping between the reason for edge latencies between
++//! instructions and the actual latency value.
++//! \see LatencyBetweenNativeInstructions
++static int mapLatencyReasonToValue[] = {
++    // Latency_None
++    0,
++    // Latency_Agen_stall
++    3,
++    //Latency_Load_blocked_by_store
++    0,
++    //Latency_Memory_Load
++    0,
++};
++
++//! \brief Atom scheduler destructor
++Scheduler::~Scheduler(void) {
++    // Clear all scheduler data structures
++    this->reset();
++}
++
++//! \brief Resets data structures used by Scheduler
++void Scheduler::reset(void) {
++    queuedLIREntries.clear();
++    scheduledLIREntries.clear();
++
++    for (std::vector<UseDefUserEntry>::iterator it = userEntries.begin();
++            it != userEntries.end(); ++it) {
++        it->useSlotsList.clear();
++    }
++    userEntries.clear();
++
++    for (std::map<LowOp*, Dependencies>::iterator it =
++            dependencyAssociation.begin(); it != dependencyAssociation.end();
++            it++) {
++        Dependencies &d = it->second;
++        d.predecessorDependencies.clear();
++        d.successorDependencies.clear();
++    }
++    dependencyAssociation.clear();
++
++    // Safe to clear
++    producerEntries.clear();
++    ctrlEntries.clear();
++}
++
++//! \brief Returns true if Scheduler has no LIRs in its
++//! queue for scheduling.
++//! \return true when Scheduler queue is empty
++bool Scheduler::isQueueEmpty() const {
++    return queuedLIREntries.empty();
++}
++
+ //! \brief Given an access to a resource (Control, register, VR, unknown memory
+ //! access), this updates dependency graph, usedef information, and control flags.
+ //! \details Algorithm description for dependency update:
+@@ -501,13 +579,16 @@ inline bool Scheduler::isBasicBlockDelimiter(Mnemonic m) {
+ //! \param regNum is a number corresponding to a physical register or a Dalvik
+ //! virtual register. When physical, this is of enum type PhysicalReg.
+ //! \param defuse definition, usage, or both
++//! \param edgeLatency Weight to use on the edge.
+ //! \param op LIR for which to update dependencies
+ void Scheduler::updateDependencyGraph(UseDefEntryType type, int regNum,
+-        LowOpndDefUse defuse, LowOp* op) {
++        LowOpndDefUse defuse, LatencyBetweenNativeInstructions causeOfLatency,
++        LowOp* op) {
+ #ifndef DISABLE_DEBUG_ATOM_SCHEDULER
+     const char * string_defuse = getUseDefType(defuse);
+     const char * string_type = getUseDefEntryType(type);
+-    printf("updateDependencyGraph for <%s %d> at slot %d %s\n", string_type,
++    ALOGD("---updateDependencyGraph for resource <%s %d> "
++            "at slot %d with %s---\n", string_type,
+             regNum, op->slotId, string_defuse);
+ #endif
+ 
+@@ -515,6 +596,8 @@ void Scheduler::updateDependencyGraph(UseDefEntryType type, int regNum,
+     unsigned int index_for_user = userEntries.size();
+     unsigned int index_for_producer = producerEntries.size();
+ 
++    // Look for the producer of this resource. If none is found, then
++    // index_for_producer will remain length of producerEntries list.
+     if (type != UseDefType_Ctrl) {
+         for (k = 0; k < producerEntries.size(); ++k) {
+             if (producerEntries[k].type == type
+@@ -524,6 +607,9 @@ void Scheduler::updateDependencyGraph(UseDefEntryType type, int regNum,
+             }
+         }
+     }
++
++    // Look for the users of this resource. If none are found, then
++    // index_for_user will remain length of userEntries list.
+     for (k = 0; k < userEntries.size(); ++k) {
+         if (userEntries[k].type == type && userEntries[k].regNum == regNum) {
+             index_for_user = k;
+@@ -531,54 +617,75 @@ void Scheduler::updateDependencyGraph(UseDefEntryType type, int regNum,
+         }
+     }
+ #ifndef DISABLE_DEBUG_ATOM_SCHEDULER
+-    printf("index_for_producer %d %d index_for_user %d %d\n",
++    ALOGD("index_for_producer %d %d index_for_user %d %d\n",
+             index_for_producer, producerEntries.size(),
+             index_for_user, userEntries.size());
+ #endif
+ 
+-    if (defuse == LowOpndDefUse_Use) {
+-        // insert RAW from producer
++    if (defuse == LowOpndDefUse_Use || defuse == LowOpndDefUse_UseDef) {
++        // If use or usedef, then there is a RAW dependency from producer
++        // of the resource.
+         if (type != UseDefType_Ctrl
+                 && index_for_producer != producerEntries.size()) {
++            assert(producerEntries[index_for_producer].producerSlot != op->slotId);
+ #ifndef DISABLE_DEBUG_ATOM_SCHEDULER
+-            printf("insert RAW from %d to %d due to <%s %d>\n",
++            ALOGD("RAW dependency from %d to %d due to resource <%s %d>\n",
+                     producerEntries[index_for_producer].producerSlot, op->slotId, string_type, regNum);
+ #endif
+             DependencyInformation ds;
+             ds.dataHazard = Dependency_RAW;
+             ds.lowopSlotId = producerEntries[index_for_producer].producerSlot;
+-            ds.latency = EDGE_LATENCY;
+-            op->predecessorDependencies.push_back(ds);
++            ds.causeOfEdgeLatency = causeOfLatency;
++            ds.edgeLatency = mapLatencyReasonToValue[causeOfLatency];
++            // If producer is a memory load, then also add memory latency
++            if (isMoveMnemonic(queuedLIREntries[ds.lowopSlotId]->opCode) &&
++                    queuedLIREntries[ds.lowopSlotId]->opndSrc.type == LowOpndType_Mem) {
++                // If memory load latency is greater than current latency,
++                // replace it with the memory load
++                if (mapLatencyReasonToValue[Latency_Memory_Load] > ds.edgeLatency) {
++                    ds.causeOfEdgeLatency = Latency_Memory_Load;
++                    ds.edgeLatency += mapLatencyReasonToValue[Latency_Memory_Load];
++                }
++            }
++            dependencyAssociation[op].predecessorDependencies.push_back(ds);
+         }
++        // For Ctrl dependencies, when there is a user of a resource
++        // it depends on the last producer. However, the last producer
++        // depends on all previous producers. This is done as an
++        // optimization because flag writers don't need to depend on
++        // each other unless there is a flag reader.
+         if (type == UseDefType_Ctrl && ctrlEntries.size() > 0) {
+             // insert RAW from the last producer
+-            int lastSlot = ctrlEntries.back();
++            assert(ctrlEntries.back() != op->slotId);
+ #ifndef DISABLE_DEBUG_ATOM_SCHEDULER
+-            printf("insert RAW from %d to %d due to Ctrl\n",
+-                    lastSlot, op->slotId);
++            ALOGD("insert RAW from %d to %d due to Ctrl\n",
++                    ctrlEntries.back(), op->slotId);
+ #endif
+             DependencyInformation ds;
+             ds.dataHazard = Dependency_RAW;
+-            ds.lowopSlotId = lastSlot;
+-            ds.latency = EDGE_LATENCY;
+-            op->predecessorDependencies.push_back(ds);
++            ds.lowopSlotId = ctrlEntries.back();
++            ds.causeOfEdgeLatency = causeOfLatency;
++            ds.edgeLatency = mapLatencyReasonToValue[causeOfLatency];
++            dependencyAssociation[op].predecessorDependencies.push_back(ds);
+             // insert WAW from earlier producers to the last producer
+-            unsigned int k2;
+-            LowOp* opLast = (queuedLIREntries[lastSlot]);
+-            for (k2 = 0; k2 < ctrlEntries.size() - 1; k2++) {
++            LowOp* opLast = (queuedLIREntries[ctrlEntries.back()]);
++            for (k = 0; k < ctrlEntries.size() - 1; k++) {
++                assert(ctrlEntries[k] != opLast->slotId);
+ #ifndef DISABLE_DEBUG_ATOM_SCHEDULER
+-                printf("insert WAW from %d to %d due to Ctrl\n", ctrlEntries[k2], lastSlot);
++                ALOGD("insert WAW from %d to %d due to Ctrl\n", ctrlEntries[k], ctrlEntries.back());
+ #endif
+                 DependencyInformation ds;
+                 ds.dataHazard = Dependency_WAW;
+-                ds.lowopSlotId = ctrlEntries[k2];
+-                ds.latency = EDGE_LATENCY;
+-                opLast->predecessorDependencies.push_back(ds);
++                ds.lowopSlotId = ctrlEntries[k];
++                ds.causeOfEdgeLatency = causeOfLatency;
++                ds.edgeLatency = mapLatencyReasonToValue[causeOfLatency];
++                dependencyAssociation[opLast].predecessorDependencies.push_back(ds);
+             }
+         }
+-        // update userEntries
++
++        // If this is the first use of this resource, then an
++        // entry should be created in the userEntries list
+         if (index_for_user == userEntries.size()) {
+-            // insert an entry in userTable
+             UseDefUserEntry entry;
+             entry.type = type;
+             entry.regNum = regNum;
+@@ -586,125 +693,81 @@ void Scheduler::updateDependencyGraph(UseDefEntryType type, int regNum,
+         } else if (type == UseDefType_Ctrl) {
+             userEntries[index_for_user].useSlotsList.clear();
+         }
++        // Add current op as user of resource
++        userEntries[index_for_user].useSlotsList.push_back(op->slotId);
+ #ifndef DISABLE_DEBUG_ATOM_SCHEDULER
+-        printf("insert use for <%s %d> @ slot %d\n", string_type, regNum, op->slotId);
++        ALOGD("op with slot %d uses resource <%s %d>\n", op->slotId, string_type, regNum);
+ #endif
+-        userEntries[index_for_user].useSlotsList.push_back(op->slotId);
++
+         if (type == UseDefType_Ctrl)
+             ctrlEntries.clear();
+-    } else if (defuse == LowOpndDefUse_Def) {
+-        // insert WAR from earlier uses
+-        // insert WAW from earlier producer
++    }
++
++    if (defuse == LowOpndDefUse_Def || defuse == LowOpndDefUse_UseDef) {
++        // If def or usedef, then there is a WAR dependency from earlier users
++        // of this resource and a WAW dependency due to earlier producer
+         if (index_for_user != userEntries.size()) {
+-            for (unsigned int k2 = 0; k2 < userEntries[index_for_user].useSlotsList.size();
+-                    k2++) {
+-                if (userEntries[index_for_user].useSlotsList[k2] == op->slotId)
+-                    continue;
++            // Go through every user of resource and update current op with a WAR
++            // from each user.
++            for (k = 0; k < userEntries[index_for_user].useSlotsList.size();
++                    k++) {
++                if (userEntries[index_for_user].useSlotsList[k] == op->slotId)
++                    continue; // No need to create dependency on self
+ #ifndef DISABLE_DEBUG_ATOM_SCHEDULER
+-                printf("insert WAR from %d to %d due to <%s %d>\n",
+-                        userEntries[index_for_user].useSlotsList[k2], op->slotId, string_type, regNum);
++                ALOGD("WAR dependency from %d to %d due to resource <%s %d>\n",
++                        userEntries[index_for_user].useSlotsList[k], op->slotId, string_type, regNum);
+ #endif
+                 DependencyInformation ds;
+                 ds.dataHazard = Dependency_WAR;
+-                ds.lowopSlotId = userEntries[index_for_user].useSlotsList[k2];
+-                ds.latency = EDGE_LATENCY;
+-                op->predecessorDependencies.push_back(ds);
++                ds.lowopSlotId = userEntries[index_for_user].useSlotsList[k];
++                ds.causeOfEdgeLatency = causeOfLatency;
++                ds.edgeLatency = mapLatencyReasonToValue[causeOfLatency];
++                dependencyAssociation[op].predecessorDependencies.push_back(ds);
+             }
+         }
+         if (type != UseDefType_Ctrl
+                 && index_for_producer != producerEntries.size()) {
++            // There is WAW dependency from earlier producer to current producer
++            // For Ctrl resource, WAW is not relevant until there is a reader
++            assert(producerEntries[index_for_producer].producerSlot != op->slotId);
+ #ifndef DISABLE_DEBUG_ATOM_SCHEDULER
+-            printf("insert WAW from %d to %d due to <%s %d>\n",
++            ALOGD("WAW dependency from %d to %d due to resource <%s %d>\n",
+                     producerEntries[index_for_producer].producerSlot, op->slotId, string_type, regNum);
+ #endif
+             DependencyInformation ds;
+             ds.dataHazard = Dependency_WAW;
+             ds.lowopSlotId = producerEntries[index_for_producer].producerSlot;
+-            ds.latency = EDGE_LATENCY;
+-            op->predecessorDependencies.push_back(ds);
++            ds.causeOfEdgeLatency = causeOfLatency;
++            ds.edgeLatency = mapLatencyReasonToValue[causeOfLatency];
++            dependencyAssociation[op].predecessorDependencies.push_back(ds);
+         }
+-        // update producerTable
+-        // clear corresponding use slots for entry in userEntries
++
+         if (type != UseDefType_Ctrl
+                 && index_for_producer == producerEntries.size()) {
+-            // insert an entry in producerEntries
++            // If we get here it means that this the first known producer
++            // of this resource and therefore we should keep track of this
+             UseDefProducerEntry entry;
+             entry.type = type;
+             entry.regNum = regNum;
+             producerEntries.push_back(entry);
+         }
+ #ifndef DISABLE_DEBUG_ATOM_SCHEDULER
+-        printf("insert def for <%s %d> @ slot %d\n", string_type, regNum, op->slotId);
++        ALOGD("op with slot %d produces/defines resource <%s %d>\n",
++                op->slotId, string_type, regNum);
+ #endif
+         if (type != UseDefType_Ctrl)
++            // Add current op as producer of resource
+             producerEntries[index_for_producer].producerSlot = op->slotId;
+-        else { // insert into ctrlEntries
++        else {
++            // Save the current op as one of the producers of this resource
+             ctrlEntries.push_back(op->slotId);
+         }
+-        if (type != UseDefType_Ctrl && index_for_user != userEntries.size()) {
+-            userEntries[index_for_user].useSlotsList.clear();
+-        }
+-    } else if (defuse == LowOpndDefUse_UseDef) {
+-        // type can not be Ctrl
+-        // insert RAW from producer
+-        // insert WAR from earlier user
+-        // insert WAW from earlier producer
+-        if (index_for_producer != producerEntries.size()) {
+-#ifndef DISABLE_DEBUG_ATOM_SCHEDULER
+-            printf("insert RAW from %d to %d due to <%s %d>\n",
+-                    producerEntries[index_for_producer].producerSlot, op->slotId, string_type, regNum);
+-#endif
+-            DependencyInformation ds;
+-            ds.dataHazard = Dependency_RAW;
+-            ds.lowopSlotId = producerEntries[index_for_producer].producerSlot;
+-            ds.latency = EDGE_LATENCY;
+-            op->predecessorDependencies.push_back(ds);
+-
+-#if 0 // inserting WAW is possibly redundant so section is commented out
+-#ifndef DISABLE_DEBUG_ATOM_SCHEDULER
+-            printf("insert WAW from %d to %d due to <%s %d>",
+-                    producerEntries[index_for_producer].producerSlot, op->slotId, string_type, regNum);
+-#endif
+-            DependencyInformation ds_waw;
+-            ds_waw.dataHazard = Dependency_WAW;
+-            ds_waw.lowopSlotId =
+-                    producerEntries[index_for_producer].producerSlot;
+-            ds_waw.latency = EDGE_LATENCY;
+-            op->predecessorDependencies.push_back(ds_waw);
+-#endif
+ 
+-
+-        }
+-        if (index_for_user != userEntries.size()) {
+-            for (unsigned int k2 = 0; k2 < userEntries[index_for_user].useSlotsList.size();
+-                    k2++) {
+-                if (userEntries[index_for_user].useSlotsList[k2] == op->slotId)
+-                    continue;
+-#ifndef DISABLE_DEBUG_ATOM_SCHEDULER
+-                printf("insert WAR from %d to %d due to <%s %d>\n",
+-                        userEntries[index_for_user].useSlotsList[k2], op->slotId, string_type, regNum);
+-#endif
+-                DependencyInformation ds;
+-                ds.dataHazard = Dependency_WAR;
+-                ds.lowopSlotId = userEntries[index_for_user].useSlotsList[k2];
+-                ds.latency = EDGE_LATENCY;
+-                op->predecessorDependencies.push_back(ds);
+-            }
+-        }
+-        // update producerEntries
+-        // clear corresponding use slots for entry in userEntries
+-        if (index_for_producer == producerEntries.size()) {
+-            // insert an entry in producerEntries
+-            UseDefProducerEntry entry;
+-            entry.type = type;
+-            entry.regNum = regNum;
+-            producerEntries.push_back(entry);
+-        }
+-#ifndef DISABLE_DEBUG_ATOM_SCHEDULER
+-        printf("insert def for <%s %d> @ slot %d\n", string_type, regNum, op->slotId);
+-#endif
+-        producerEntries[index_for_producer].producerSlot = op->slotId;
+-        if (index_for_user != userEntries.size()) {
++        // Since this a new producer of the resource, we can now forget
++        // all past users. This behavior is also correct if current op is
++        // user and then producer because when handling usedef, use is
++        // handled first.
++        if (type != UseDefType_Ctrl && index_for_user != userEntries.size()) {
+             userEntries[index_for_user].useSlotsList.clear();
+         }
+     }
+@@ -719,66 +782,101 @@ void Scheduler::updateDependencyGraph(UseDefEntryType type, int regNum,
+ //! \param op LIR for which to update dependencies
+ void Scheduler::updateDependencyGraphForMem(LowOpndMem & mOpnd, LowOpndDefUse defuse,
+         LowOp* op) {
+-    updateDependencyGraph(UseDefType_Reg, mOpnd.m_base.regNum, LowOpndDefUse_Use, op);
+-    if (mOpnd.hasScale)
+-        updateDependencyGraph(UseDefType_Reg, mOpnd.m_index.regNum, LowOpndDefUse_Use,
+-                op);
+     MemoryAccessType mType = mOpnd.mType;
+     int index = mOpnd.index;
+-
+-    // be conservative, if one of the operands has size 64, assume it is size 64
+     bool is64 = false;
++
++    // Update dependency on registers used
++    updateDependencyGraph(UseDefType_Reg, mOpnd.m_base.regNum,
++            LowOpndDefUse_Use, Latency_Agen_stall, op);
++    if (mOpnd.hasScale)
++        updateDependencyGraph(UseDefType_Reg, mOpnd.m_index.regNum,
++                LowOpndDefUse_Use, Latency_Agen_stall, op);
++
++    // In order to be safe, if one of the operands has size 64, assume it is size 64
+     if (op->numOperands >= 1 && op->opndDest.size == OpndSize_64)
+         is64 = true;
+     if (op->numOperands >= 2 && op->opndSrc.size == OpndSize_64)
+         is64 = true;
+ 
++    // At this point make a decision on whether or not to do memory disambiguation.
++    // If it is not VR or SPILL access, then it may not be safe to disambiguate.
+     if (mType == MemoryAccess_VR) {
+-        updateDependencyGraph(UseDefType_MemVR, index, defuse, op);
++        // All VR accesses should be made via Java frame pointer
++        assert(mOpnd.m_base.regNum == PhysicalReg_FP);
++
++        updateDependencyGraph(UseDefType_MemVR, index, defuse, Latency_None, op);
+         if (is64)
+-            updateDependencyGraph(UseDefType_MemVR, index + 1, defuse, op);
++            updateDependencyGraph(UseDefType_MemVR, index + 1, defuse, Latency_None, op);
+     } else if (mType == MemoryAccess_SPILL) {
+-#ifndef DISABLE_DEBUG_ATOM_SCHEDULER
+-        printf("UseDef MemSpill @%d slot %d\n", index, op->slotId);
+-#endif
+-        updateDependencyGraph(UseDefType_MemSpill, index, defuse, op);
++        // All spill accesses should be made via offset from EBP
++        assert(mOpnd.m_base.regNum == PhysicalReg_EBP);
++
++        updateDependencyGraph(UseDefType_MemSpill, index, defuse, Latency_None, op);
+         if (is64) {
+-#ifndef DISABLE_DEBUG_ATOM_SCHEDULER
+-            printf("UseDef MemSpill2 @%d slot %d\n", index+4, op->slotId);
+-#endif
+-            updateDependencyGraph(UseDefType_MemSpill, index + 4, defuse, op);
++            updateDependencyGraph(UseDefType_MemSpill, index + 4, defuse, Latency_None, op);
+         }
+-    } else
+-        updateDependencyGraph(UseDefType_MemUnknown, REG_NOT_USED, defuse, op);
++    } else // No disambiguation
++        updateDependencyGraph(UseDefType_MemUnknown, REG_NOT_USED, defuse,
++                Latency_None, op);
+ }
+ 
+ //! \brief Updates dependency information for PUSH which uses then defines %esp
+ //! and also updates native stack.
+ void inline Scheduler::handlePushDependencyUpdate(LowOp* op) {
+-    if (op->opCode != Mnemonic_PUSH)
+-        return;
+-    updateDependencyGraph(UseDefType_Reg, PhysicalReg_ESP, LowOpndDefUse_UseDef, op);
+-    updateDependencyGraph(UseDefType_MemUnknown, REG_NOT_USED, LowOpndDefUse_Def, op);
++    if (op->opCode == Mnemonic_PUSH) {
++        updateDependencyGraph(UseDefType_Reg, PhysicalReg_ESP,
++                LowOpndDefUse_UseDef, Latency_Agen_stall, op);
++        updateDependencyGraph(UseDefType_MemUnknown, REG_NOT_USED,
++                LowOpndDefUse_Def, Latency_None, op);
++    }
+ }
+ 
+ //! \brief Updates dependency information for operations on floating point stack.
++//! \details This should be called for all x87 instructions. This will ensure
++//! that they are never reordered.
+ void inline Scheduler::handleFloatDependencyUpdate(LowOp* op) {
+-    updateDependencyGraph(UseDefType_Float, REG_NOT_USED, LowOpndDefUse_Def, op);
++    // UseDef dependency is used so that x87 instructions won't be reordered
++    // Whenever reordering support is added, this function should be replaced
++    // and new resources defined like FPU flags, control word, status word, etc.
++    updateDependencyGraph(UseDefType_Float, REG_NOT_USED, LowOpndDefUse_UseDef,
++            Latency_None, op);
++}
++
++//! \brief Updates dependency graph with the implicit dependencies on eax
++//! and edx for imul, mul, div, idiv, and cdq
++//! \warning Assumes that operand size is 32 bits
++void inline Scheduler::handleImplicitDependenciesEaxEdx(LowOp* op) {
++    if (isAluOpWithImplicitRegisterUsage(op->opCode)) {
++        // mul and imul with a reg operand implicitly usedef eax and def edx
++        // div and idiv with a reg operand implicitly usedef eax and usedef edx
++        // cdq implicitly usedef eax and def edx
++        if (op->opCode == Mnemonic_MUL || op->opCode == Mnemonic_IMUL
++                || op->opCode == Mnemonic_CDQ) {
++            updateDependencyGraph(UseDefType_Reg, PhysicalReg_EAX,
++                    LowOpndDefUse_UseDef, Latency_None, op);
++            updateDependencyGraph(UseDefType_Reg, PhysicalReg_EDX,
++                    LowOpndDefUse_Def, Latency_None, op);
++        } else if (op->opCode == Mnemonic_IDIV || op->opCode == Mnemonic_DIV) {
++            updateDependencyGraph(UseDefType_Reg, PhysicalReg_EAX,
++                    LowOpndDefUse_UseDef, Latency_None, op);
++            updateDependencyGraph(UseDefType_Reg, PhysicalReg_EDX,
++                    LowOpndDefUse_UseDef, Latency_None, op);
++        }
++    }
+ }
+ 
+ //! \brief Updates dependency information for LowOps with zero operands.
+ //! \param op has mnemonic RET
+ void Scheduler::updateUseDefInformation(LowOp * op) {
++    assert(op->opCode == Mnemonic_RET);
+     op->instructionLatency = getAtomMnemonicLatency(op->opCode);
+     op->portType = getAtomMnemonicPort(op->opCode);
+-#ifndef DISABLE_MACHINE_MODEL_CHECK
+-    if(op->instructionLatency == INVN || op->portType == INVP) {
+-        LOGE("ERROR: Atom Scheduler bug! Invalid Atom machine model "
+-                "entry for Mnemonic %d with zero operands.", op->opCode);
+-        dvmAbort();
+-    }
+-#endif
+-    updateDependencyGraph(UseDefType_Ctrl, REG_NOT_USED, LowOpndDefUse_Def, op);
++    assert(op->instructionLatency != INVN);
++    assert(op->portType != INVP);
++
++    updateDependencyGraph(UseDefType_Ctrl, REG_NOT_USED, LowOpndDefUse_Def,
++            Latency_None, op);
+     signalEndOfNativeBasicBlock(); // RET ends native basic block
+ }
+ 
+@@ -786,386 +884,320 @@ void Scheduler::updateUseDefInformation(LowOp * op) {
+ //! operand.
+ //! \param op has mnemonic JMP, Jcc, or CALL
+ void Scheduler::updateUseDefInformation_imm(LowOp * op) {
++    assert((op->opCode >= Mnemonic_Jcc && op->opCode <= Mnemonic_JMP)
++            || op->opCode == Mnemonic_CALL);
+     op->instructionLatency = getAtomMnemonicLatency_imm(op->opCode);
+     op->portType = getAtomMnemonicPort_imm(op->opCode);
+-#ifndef DISABLE_MACHINE_MODEL_CHECK
+-    if(op->instructionLatency == INVN || op->portType == INVP) {
+-        LOGE("ERROR: Atom Scheduler bug! Invalid Atom machine model "
+-                "entry for Mnemonic %d with imm operand.", op->opCode);
+-        dvmAbort();
+-    }
+-#endif
++    assert(op->instructionLatency != INVN);
++    assert(op->portType != INVP);
++
+     if (op->opCode == Mnemonic_CALL || op->opCode == Mnemonic_JMP)
+-        updateDependencyGraph(UseDefType_Ctrl, REG_NOT_USED, LowOpndDefUse_Def, op);
++        updateDependencyGraph(UseDefType_Ctrl, REG_NOT_USED, LowOpndDefUse_Def,
++                Latency_None, op);
+     else
+-        updateDependencyGraph(UseDefType_Ctrl, REG_NOT_USED, LowOpndDefUse_Use, op);
++        updateDependencyGraph(UseDefType_Ctrl, REG_NOT_USED, LowOpndDefUse_Use,
++                Latency_None, op);
+     if (isBasicBlockDelimiter(op->opCode))
+         signalEndOfNativeBasicBlock();
+-#ifndef ENABLE_BASIC_BLOCK_DUMP
+-    signalEndOfNativeBasicBlock();
+-#endif
+ }
+ 
+ //! \brief Updates dependency information for LowOps with a single register operand.
+-//! \param op has mnemonic JMP, CALL, alu_unary_reg, PUSH or
+-//! alu_unary: neg, not, idiv, mul 32 bits operand
++//! \param op has mnemonic JMP, CALL, PUSH or it is an ALU instruction
+ void Scheduler::updateUseDefInformation_reg(LowOpReg * op) {
++    assert(op->opCode == Mnemonic_JMP || op->opCode == Mnemonic_CALL
++            || op->opCode == Mnemonic_PUSH || op->opCode2 == ATOM_NORMAL_ALU);
+     op->instructionLatency = getAtomMnemonicLatency_reg(op->opCode);
+     op->portType = getAtomMnemonicPort_reg(op->opCode);
+-#ifndef DISABLE_MACHINE_MODEL_CHECK
+-    if(op->instructionLatency == INVN || op->portType == INVP) {
+-        LOGE("ERROR: Atom Scheduler bug! Invalid Atom machine model "
+-                "entry for Mnemonic %d with reg operand.", op->opCode);
+-        dvmAbort();
+-    }
+-#endif
++    assert(op->instructionLatency != INVN);
++    assert(op->portType != INVP);
++
+     if (op->opCode == Mnemonic_CALL || op->opCode == Mnemonic_JMP
+-            || op->opCode == Mnemonic_PUSH)
++            || op->opCode == Mnemonic_PUSH
++            || isAluOpWithImplicitRegisterUsage(op->opCode))
+         op->opndSrc.defuse = LowOpndDefUse_Use;
+-    if (op->opCode2 == ATOM_NORMAL_ALU)
++    else // ALU ops with a single operand and no implicit operands use and then define
+         op->opndSrc.defuse = LowOpndDefUse_UseDef;
++    updateDependencyGraph(UseDefType_Reg, op->regOpnd.regNum,
++            op->opndSrc.defuse, Latency_None, op);
++
+     // PUSH will not update control flag
+     if (op->opCode != Mnemonic_PUSH)
+-        updateDependencyGraph(UseDefType_Ctrl, REG_NOT_USED, LowOpndDefUse_Def, op);
+-    updateDependencyGraph(UseDefType_Reg, op->regOpnd.regNum, op->opndSrc.defuse, op);
+-    Mnemonic m = op->opCode;
+-    if (m == Mnemonic_MUL || m == Mnemonic_IMUL || m == Mnemonic_DIV
+-            || m == Mnemonic_IDIV) {
+-        updateDependencyGraph(UseDefType_Reg, PhysicalReg_EAX, LowOpndDefUse_UseDef, op);
+-        updateDependencyGraph(UseDefType_Reg, PhysicalReg_EDX, LowOpndDefUse_UseDef, op);
+-    }
++        updateDependencyGraph(UseDefType_Ctrl, REG_NOT_USED, LowOpndDefUse_Def,
++                Latency_None, op);
++
++    handleImplicitDependenciesEaxEdx(op);
+     handlePushDependencyUpdate(op);
++
+     if (isBasicBlockDelimiter(op->opCode))
+         signalEndOfNativeBasicBlock();
+-#ifndef ENABLE_BASIC_BLOCK_DUMP
+-    signalEndOfNativeBasicBlock();
+-#endif
+ }
+ 
+ //! \brief Updates dependency information for for LowOps with a single
+ //! memory operand.
+-//! \param op has mnemonic CALL, FLDCW, FNSTCW, alu_unary_mem, PUSH or
+-//! alu_unary: neg, not, idiv, mul 32 bits operand
++//! \param op has mnemonic CALL, FLDCW, FNSTCW, PUSH or it is an ALU
++//! instruction
+ void Scheduler::updateUseDefInformation_mem(LowOpMem * op) {
++    assert(op->opCode == Mnemonic_CALL || op->opCode == Mnemonic_FLDCW
++            || op->opCode == Mnemonic_FNSTCW || op->opCode == Mnemonic_PUSH
++            || op->opCode2 == ATOM_NORMAL_ALU);
+     op->instructionLatency = getAtomMnemonicLatency_mem(op->opCode);
+     op->portType = getAtomMnemonicPort_mem(op->opCode);
+-#ifndef DISABLE_MACHINE_MODEL_CHECK
+-    if(op->instructionLatency == INVN || op->portType == INVP) {
+-        LOGE("ERROR: Atom Scheduler bug! Invalid Atom machine model "
+-                "entry for Mnemonic %d with mem operand.", op->opCode);
+-        dvmAbort();
+-    }
+-#endif
+-    // FLDCW: read memory location, affects FPU flags
++    assert(op->instructionLatency != INVN);
++    assert(op->portType != INVP);
++
+     if (op->opCode == Mnemonic_CALL || op->opCode == Mnemonic_FLDCW
+-            || op->opCode == Mnemonic_PUSH)
++            || op->opCode == Mnemonic_PUSH
++            || isAluOpWithImplicitRegisterUsage(op->opCode))
+         op->opndSrc.defuse = LowOpndDefUse_Use;
+-    if (op->opCode == Mnemonic_FNSTCW)
++    else if (op->opCode == Mnemonic_FNSTCW)
+         op->opndSrc.defuse = LowOpndDefUse_Def;
+-    if (op->opCode2 == ATOM_NORMAL_ALU)
++    else // ALU ops with a single operand and no implicit operands use and then define
+         op->opndSrc.defuse = LowOpndDefUse_UseDef;
+-    // PUSH will not update control flag
+-    if (op->opCode != Mnemonic_PUSH)
+-        updateDependencyGraph(UseDefType_Ctrl, REG_NOT_USED, LowOpndDefUse_Def, op);
+     updateDependencyGraphForMem(op->memOpnd, op->opndSrc.defuse, op);
++
++    // PUSH will not update control flag
++    if (op->opCode != Mnemonic_PUSH && op->opCode != Mnemonic_FLDCW
++            && op->opCode != Mnemonic_FNSTCW)
++        updateDependencyGraph(UseDefType_Ctrl, REG_NOT_USED, LowOpndDefUse_Def,
++                Latency_None, op);
++
++    handleImplicitDependenciesEaxEdx(op);
+     handlePushDependencyUpdate(op);
++
+     if (op->opCode == Mnemonic_FLDCW || op->opCode == Mnemonic_FNSTCW)
+         handleFloatDependencyUpdate(op);
+     if (isBasicBlockDelimiter(op->opCode))
+         signalEndOfNativeBasicBlock();
+-#ifndef ENABLE_BASIC_BLOCK_DUMP
+-    signalEndOfNativeBasicBlock();
+-#endif
+ }
+ 
+ //! \brief Updates dependency information for LowOps with two operands:
+ //! immediate to register
+-//! \param op has mnemonic CMP, TEST, MOVQ, MOV, MOVSS, MOVSD, alu_binary,
+-//! COMISS, or COMISD
++//! \param op must be a MOV variant, a comparison (CMP, TEST, COMISS, COMISD),
++//! or an ALU instruction
+ void Scheduler::updateUseDefInformation_imm_to_reg(LowOpImmReg * op) {
++    assert(isMoveMnemonic(op->opCode) || isCompareMnemonic(op->opCode)
++            || op->opCode2 == ATOM_NORMAL_ALU);
+     bool isMove = isMoveMnemonic(op->opCode);
+     op->instructionLatency = getAtomMnemonicLatency_imm_to_reg(op->opCode);
+     op->portType = getAtomMnemonicPort_imm_to_reg(op->opCode);
+-#ifndef DISABLE_MACHINE_MODEL_CHECK
+-    if(op->instructionLatency == INVN || op->portType == INVP) {
+-        LOGE("ERROR: Atom Scheduler bug! Invalid Atom machine model "
+-                "entry for Mnemonic %d with imm to reg.", op->opCode);
+-        dvmAbort();
+-    }
+-#endif
++    assert(op->instructionLatency != INVN);
++    assert(op->portType != INVP);
++
+     if (usesAndDefinesFlags(op->opCode))
+         updateDependencyGraph(UseDefType_Ctrl, REG_NOT_USED, LowOpndDefUse_Use,
+-                op);
++                Latency_None, op);
+     if (!isMove)
+-        updateDependencyGraph(UseDefType_Ctrl, REG_NOT_USED, LowOpndDefUse_Def, op);
++        updateDependencyGraph(UseDefType_Ctrl, REG_NOT_USED, LowOpndDefUse_Def,
++                Latency_None, op);
+ 
+     if (isMove)
+         op->opndDest.defuse = LowOpndDefUse_Def;
+-    else if (op->opCode2 == ATOM_NORMAL_ALU)
+-        op->opndDest.defuse = LowOpndDefUse_UseDef;
+-    else
++    else if (isCompareMnemonic(op->opCode))
+         op->opndDest.defuse = LowOpndDefUse_Use;
+-    updateDependencyGraph(UseDefType_Reg, op->regDest.regNum, op->opndDest.defuse, op);
+-#ifndef ENABLE_BASIC_BLOCK_DUMP
+-    signalEndOfNativeBasicBlock();
+-#endif
++    else // ALU ops
++        op->opndDest.defuse = LowOpndDefUse_UseDef;
++    updateDependencyGraph(UseDefType_Reg, op->regDest.regNum,
++            op->opndDest.defuse, Latency_None, op);
+ }
+ 
+ //! \brief Updates dependency information for LowOps with two operands:
+ //! immediate and memory.
+-//! \param op has mnemonic MOV, MOVQ, CMP, TEST, alu_binary
++//! \param op must be a MOV variant, a comparison (CMP, TEST, COMISS, COMISD),
++//! or an ALU instruction
+ void Scheduler::updateUseDefInformation_imm_to_mem(LowOpImmMem * op) {
++    assert(isMoveMnemonic(op->opCode) || isCompareMnemonic(op->opCode)
++            || op->opCode2 == ATOM_NORMAL_ALU);
+     bool isMove = isMoveMnemonic(op->opCode);
+     op->instructionLatency = getAtomMnemonicLatency_imm_to_mem(op->opCode);
+     op->portType = getAtomMnemonicPort_imm_to_mem(op->opCode);
+-#ifndef DISABLE_MACHINE_MODEL_CHECK
+-    if(op->instructionLatency == INVN || op->portType == INVP) {
+-        LOGE("ERROR: Atom Scheduler bug! Invalid Atom machine model "
+-                "entry for Mnemonic %d with imm to mem.", op->opCode);
+-        dvmAbort();
+-    }
+-#endif
++    assert(op->instructionLatency != INVN);
++    assert(op->portType != INVP);
++
+     if (usesAndDefinesFlags(op->opCode))
+         updateDependencyGraph(UseDefType_Ctrl, REG_NOT_USED, LowOpndDefUse_Use,
+-                op);
++                Latency_None, op);
+     if (!isMove)
+-        updateDependencyGraph(UseDefType_Ctrl, REG_NOT_USED, LowOpndDefUse_Def, op);
++        updateDependencyGraph(UseDefType_Ctrl, REG_NOT_USED, LowOpndDefUse_Def,
++                Latency_None, op);
+ 
+     if (isMove)
+         op->opndDest.defuse = LowOpndDefUse_Def;
+-    else if (op->opCode2 == ATOM_NORMAL_ALU)
+-        op->opndDest.defuse = LowOpndDefUse_UseDef;
+-    else
++    else if (isCompareMnemonic(op->opCode))
+         op->opndDest.defuse = LowOpndDefUse_Use;
++    else // ALU ops
++        op->opndDest.defuse = LowOpndDefUse_UseDef;
+     updateDependencyGraphForMem(op->memDest, op->opndDest.defuse, op);
+-#ifndef ENABLE_BASIC_BLOCK_DUMP
+-    signalEndOfNativeBasicBlock();
+-#endif
+ }
+ 
+ //! \brief Updates dependency information for LowOps with two operands:
+ //! register to register.
+-//! \param op has mnemonic TEST, CDQ, CMP, COMISS, COMISD,
+-//! MOVQ, MOV, CMOVcc, MOVSS, MOVSD, FUCOM, FUCOMP, or
+-//! alu_sd_binary, alu_ss_binary, alu_binary,
++//! \param op must be a MOV variant, a comparison (CMP, TEST, COMISS, COMISD),
++//! an ALU instruction including SSE variants SD and SS, or must have mnemonic
++//! FUCOM, FUCOMP, CMOVcc, or CDQ.
+ void Scheduler::updateUseDefInformation_reg_to_reg(LowOpRegReg * op) {
+-    Mnemonic m = op->opCode;
+-    bool isMove = isMoveMnemonic(m);
++    assert(isMoveMnemonic(op->opCode) || isCompareMnemonic(op->opCode)
++            || op->opCode2 == ATOM_NORMAL_ALU || op->opCode == Mnemonic_FUCOM
++            || op->opCode == Mnemonic_FUCOMP || op->opCode == Mnemonic_CDQ
++            || (op->opCode >= Mnemonic_CMOVcc && op->opCode < Mnemonic_CMP));
++    bool isMove = isMoveMnemonic(op->opCode);
+     op->instructionLatency = getAtomMnemonicLatency_reg_to_reg(op->opCode);
+     op->portType = getAtomMnemonicPort_reg_to_reg(op->opCode);
+-#ifndef DISABLE_MACHINE_MODEL_CHECK
+-    if(op->instructionLatency == INVN || op->portType == INVP) {
+-        LOGE("ERROR: Atom Scheduler bug! Invalid Atom machine model "
+-                "entry for Mnemonic %d with reg to reg.", op->opCode);
+-        dvmAbort();
+-    }
+-#endif
+-    if ((m >= Mnemonic_CMOVcc && m < Mnemonic_CMP)
++    assert(op->instructionLatency != INVN);
++    assert(op->portType != INVP);
++
++    if ((op->opCode >= Mnemonic_CMOVcc && op->opCode < Mnemonic_CMP)
+             || usesAndDefinesFlags(op->opCode))
+         updateDependencyGraph(UseDefType_Ctrl, REG_NOT_USED, LowOpndDefUse_Use,
+-                op);
+-    else if (!isMove)
+-        updateDependencyGraph(UseDefType_Ctrl, REG_NOT_USED, LowOpndDefUse_Def, op);
++                Latency_None, op);
++    else if (!isMove && op->opCode != Mnemonic_FUCOM
++            && op->opCode != Mnemonic_FUCOMP && op->opCode != Mnemonic_CDQ)
++        updateDependencyGraph(UseDefType_Ctrl, REG_NOT_USED, LowOpndDefUse_Def,
++                Latency_None, op);
++
++    if (op->opCode == Mnemonic_CDQ) {
++        // CDQ has no explicit operands but for encoding reasons it is treated like
++        // it does and therefore comes to Scheduler via this interface function.
++        // We can handle it here.
++        assert(op->opndSrc.size == OpndSize_32
++                && op->opndDest.size == OpndSize_32);
++        handleImplicitDependenciesEaxEdx(op);
++        return;
++    }
+ 
+-    // CDQ: use & def eax, def edx
+-    if (m == Mnemonic_CDQ)
+-        op->opndSrc.defuse = LowOpndDefUse_UseDef; //use & def eax
+-    else
+-        op->opndSrc.defuse = LowOpndDefUse_Use;
+-    updateDependencyGraph(UseDefType_Reg, op->regSrc.regNum, op->opndSrc.defuse, op);
++    op->opndSrc.defuse = LowOpndDefUse_Use;
++    updateDependencyGraph(UseDefType_Reg, op->regSrc.regNum, op->opndSrc.defuse,
++            Latency_None, op);
+ 
+-    if (isMove || (m >= Mnemonic_CMOVcc && m < Mnemonic_CMP)
+-            || m == Mnemonic_CDQ)
++    if (isMove || (op->opCode >= Mnemonic_CMOVcc && op->opCode < Mnemonic_CMP))
+         op->opndDest.defuse = LowOpndDefUse_Def;
+-    else if (op->opCode2 == ATOM_NORMAL_ALU)
+-        op->opndDest.defuse = LowOpndDefUse_UseDef;
+-    else
++    else if (isCompareMnemonic(op->opCode))
+         op->opndDest.defuse = LowOpndDefUse_Use;
+-    updateDependencyGraph(UseDefType_Reg, op->regDest.regNum, op->opndDest.defuse, op);
+-    if (m == Mnemonic_FUCOM || m == Mnemonic_FUCOMP)
++    else // ALU ops
++        op->opndDest.defuse = LowOpndDefUse_UseDef;
++    updateDependencyGraph(UseDefType_Reg, op->regDest.regNum,
++            op->opndDest.defuse, Latency_None, op);
++
++    if (op->opCode == Mnemonic_FUCOM || op->opCode == Mnemonic_FUCOMP)
+         handleFloatDependencyUpdate(op);
+-#ifndef ENABLE_BASIC_BLOCK_DUMP
+-    signalEndOfNativeBasicBlock();
+-#endif
+ }
+ 
+ //! \brief Updates dependency information for LowOps with two operands:
+ //! memory to register.
+-//! \param op has mnemonic LEA, CMP, COMISS, COMISD, MOVQ, MOV, MOVSS,
+-//! MOVSD, alu_binary, or alu_sd_binary
++//! \param op must be a MOV variant, a comparison (CMP, COMISS, COMISD),
++//! an ALU instruction including SSE variants SD and SS, or must have
++//! mnemonic LEA
+ void Scheduler::updateUseDefInformation_mem_to_reg(LowOpMemReg * op) {
+-    Mnemonic m = op->opCode;
+-    bool isMove = isMoveMnemonic(m);
++    assert(isMoveMnemonic(op->opCode) || isCompareMnemonic(op->opCode)
++            || op->opCode2 == ATOM_NORMAL_ALU || op->opCode == Mnemonic_LEA);
++    bool isMove = isMoveMnemonic(op->opCode);
+     op->instructionLatency = getAtomMnemonicLatency_mem_to_reg(op->opCode);
+     op->portType = getAtomMnemonicPort_mem_to_reg(op->opCode);
+-#ifndef DISABLE_MACHINE_MODEL_CHECK
+-    if(op->instructionLatency == INVN || op->portType == INVP) {
+-        LOGE("ERROR: Atom Scheduler bug! Invalid Atom machine model "
+-                "entry for Mnemonic %d with mem to reg.", op->opCode);
+-        dvmAbort();
+-    }
+-#endif
++    assert(op->instructionLatency != INVN);
++    assert(op->portType != INVP);
+ 
+     if (usesAndDefinesFlags(op->opCode))
+         updateDependencyGraph(UseDefType_Ctrl, REG_NOT_USED, LowOpndDefUse_Use,
+-                op);
+-    if (!isMove && m != Mnemonic_LEA)
+-        updateDependencyGraph(UseDefType_Ctrl, REG_NOT_USED, LowOpndDefUse_Def, op);
++                Latency_None, op);
++    if (!isMove && op->opCode != Mnemonic_LEA)
++        updateDependencyGraph(UseDefType_Ctrl, REG_NOT_USED, LowOpndDefUse_Def,
++                Latency_None, op);
+ 
+     // Read from memory
+     // However, LEA does not load from memory, and instead it uses the register
+     op->opndSrc.defuse = LowOpndDefUse_Use;
+-    if (m != Mnemonic_LEA)
++    if (op->opCode != Mnemonic_LEA)
+         updateDependencyGraphForMem(op->memSrc, op->opndSrc.defuse, op);
+     else {
+         updateDependencyGraph(UseDefType_Reg, op->memSrc.m_base.regNum,
+-                op->opndSrc.defuse, op);
++                op->opndSrc.defuse, Latency_Agen_stall, op);
++        if(op->memSrc.hasScale)
++            updateDependencyGraph(UseDefType_Reg, op->memSrc.m_index.regNum,
++                    op->opndSrc.defuse, Latency_Agen_stall, op);
+     }
+-    if (isMove || m == Mnemonic_LEA)
++
++    if (isMove || op->opCode == Mnemonic_LEA)
+         op->opndDest.defuse = LowOpndDefUse_Def;
+-    else if (op->opCode2 == ATOM_NORMAL_ALU)
+-        op->opndDest.defuse = LowOpndDefUse_UseDef;
+-    else
++    else if (isCompareMnemonic(op->opCode))
+         op->opndDest.defuse = LowOpndDefUse_Use;
+-    updateDependencyGraph(UseDefType_Reg, op->regDest.regNum, op->opndDest.defuse, op);
+-#ifndef ENABLE_BASIC_BLOCK_DUMP
+-    signalEndOfNativeBasicBlock();
+-#endif
++    else // ALU ops
++        op->opndDest.defuse = LowOpndDefUse_UseDef;
++    updateDependencyGraph(UseDefType_Reg, op->regDest.regNum,
++            op->opndDest.defuse, Latency_None, op);
+ }
+ 
+ //! \brief Updates dependency information for LowOps with two operands:
+ //! register to memory.
+-//! \param op has mnemonic MOVQ, MOV, MOVSS, MOVSD, CMP, or alu_binary
++//! \param op must be a MOV variant, a comparison (CMP), or an ALU instruction
+ void Scheduler::updateUseDefInformation_reg_to_mem(LowOpRegMem * op) {
++    assert(isMoveMnemonic(op->opCode) || isCompareMnemonic(op->opCode)
++            || op->opCode2 == ATOM_NORMAL_ALU);
+     bool isMove = isMoveMnemonic(op->opCode);
+     op->instructionLatency = getAtomMnemonicLatency_reg_to_mem(op->opCode);
+     op->portType = getAtomMnemonicPort_reg_to_mem(op->opCode);
+-#ifndef DISABLE_MACHINE_MODEL_CHECK
+-    if(op->instructionLatency == INVN || op->portType == INVP) {
+-        LOGE("ERROR: Atom Scheduler bug! Invalid Atom machine model "
+-                "entry for Mnemonic %d with reg to mem.", op->opCode);
+-        dvmAbort();
+-    }
+-#endif
++    assert(op->instructionLatency != INVN);
++    assert(op->portType != INVP);
++
+     if (usesAndDefinesFlags(op->opCode))
+         updateDependencyGraph(UseDefType_Ctrl, REG_NOT_USED, LowOpndDefUse_Use,
+-                op);
++                Latency_None, op);
+     if (!isMove)
+-        updateDependencyGraph(UseDefType_Ctrl, REG_NOT_USED, LowOpndDefUse_Def, op);
++        updateDependencyGraph(UseDefType_Ctrl, REG_NOT_USED, LowOpndDefUse_Def,
++                Latency_None, op);
+ 
+     op->opndSrc.defuse = LowOpndDefUse_Use;
+-    updateDependencyGraph(UseDefType_Reg, op->regSrc.regNum, op->opndSrc.defuse, op);
++    updateDependencyGraph(UseDefType_Reg, op->regSrc.regNum, op->opndSrc.defuse,
++            Latency_None, op);
++
+     if (isMove)
+         op->opndDest.defuse = LowOpndDefUse_Def;
+-    else if (op->opCode2 == ATOM_NORMAL_ALU)
+-        op->opndDest.defuse = LowOpndDefUse_UseDef;
+-    else
++    else if (isCompareMnemonic(op->opCode))
+         op->opndDest.defuse = LowOpndDefUse_Use;
++    else // ALU ops
++        op->opndDest.defuse = LowOpndDefUse_UseDef;
+     updateDependencyGraphForMem(op->memDest, op->opndDest.defuse, op);
+-#ifndef ENABLE_BASIC_BLOCK_DUMP
+-    signalEndOfNativeBasicBlock();
+-#endif
+-}
+-
+-//! \brief Updates dependency information for LowOps with two operands:
+-//! memory with scale to register.
+-//! \param op has mnemonic LEA, MOVQ, MOV, MOVSX, or MOVZX
+-void Scheduler::updateUseDefInformation_mem_scale_to_reg(LowOpMemReg * op) {
+-    op->instructionLatency = getAtomMnemonicLatency_mem_to_reg(op->opCode);
+-    op->portType = getAtomMnemonicPort_mem_to_reg(op->opCode);
+-#ifndef DISABLE_MACHINE_MODEL_CHECK
+-    if(op->instructionLatency == INVN || op->portType == INVP) {
+-        LOGE("ERROR: Atom Scheduler bug! Invalid Atom machine model "
+-                "entry for Mnemonic %d with mem scale to reg.", op->opCode);
+-        dvmAbort();
+-    }
+-#endif
+-    op->opndSrc.defuse = LowOpndDefUse_Use;
+-    Mnemonic m = op->opCode;
+-    if (m != Mnemonic_LEA)
+-        updateDependencyGraphForMem(op->memSrc, op->opndSrc.defuse, op);
+-    else {
+-        updateDependencyGraph(UseDefType_Reg, op->memSrc.m_base.regNum,
+-                op->opndSrc.defuse, op);
+-    }
+-    op->opndDest.defuse = LowOpndDefUse_Def;
+-    updateDependencyGraph(UseDefType_Reg, op->regDest.regNum, op->opndDest.defuse, op);
+-#ifndef ENABLE_BASIC_BLOCK_DUMP
+-    signalEndOfNativeBasicBlock();
+-#endif
+-}
+-
+-//! \brief Updates dependency information for LowOps with two operands:
+-//! register to memory with scale.
+-//! \param op has mnemonic MOVQ or MOV
+-void Scheduler::updateUseDefInformation_reg_to_mem_scale(LowOpRegMem * op) {
+-    op->instructionLatency = getAtomMnemonicLatency_reg_to_mem(op->opCode);
+-    op->portType = getAtomMnemonicPort_reg_to_mem(op->opCode);
+-#ifndef DISABLE_MACHINE_MODEL_CHECK
+-    if(op->instructionLatency == INVN || op->portType == INVP) {
+-        LOGE("ERROR: Atom Scheduler bug! Invalid Atom machine model "
+-                "entry for Mnemonic %d with reg to mem scale.", op->opCode);
+-        dvmAbort();
+-    }
+-#endif
+-    op->opndSrc.defuse = LowOpndDefUse_Use;
+-    updateDependencyGraph(UseDefType_Reg, op->regSrc.regNum, op->opndSrc.defuse, op);
+-    op->opndDest.defuse = LowOpndDefUse_Def;
+-    updateDependencyGraphForMem(op->memDest, op->opndDest.defuse, op);
+-#ifndef ENABLE_BASIC_BLOCK_DUMP
+-    signalEndOfNativeBasicBlock();
+-#endif
+ }
+ 
+ //! \brief Updates dependency information for LowOps with two operands:
+ //! floating point stack to memory.
+-//! \param op has mnemonic FSTP, FST, FISTP, or FIST (write to memory)
++//! \param op must have mnemonic FSTP, FST, FISTP, or FIST
+ void Scheduler::updateUseDefInformation_fp_to_mem(LowOpRegMem * op) {
++    assert(op->opCode == Mnemonic_FSTP || op->opCode == Mnemonic_FST
++            || op->opCode == Mnemonic_FISTP || op->opCode == Mnemonic_FIST);
+     op->instructionLatency = getAtomMnemonicLatency_reg_to_mem(op->opCode);
+     op->portType = getAtomMnemonicPort_reg_to_mem(op->opCode);
+-#ifndef DISABLE_MACHINE_MODEL_CHECK
+-    if(op->instructionLatency == INVN || op->portType == INVP) {
+-        LOGE("ERROR: Atom Scheduler bug! Invalid Atom machine model "
+-                "entry for Mnemonic %d with fp to mem.", op->opCode);
+-        dvmAbort();
+-    }
+-#endif
+-    updateDependencyGraph(UseDefType_Ctrl, REG_NOT_USED, LowOpndDefUse_Def, op);
++    assert(op->instructionLatency != INVN);
++    assert(op->portType != INVP);
++
++    handleFloatDependencyUpdate(op);
++
+     op->opndSrc.defuse = LowOpndDefUse_Use;
+-    updateDependencyGraph(UseDefType_Reg, PhysicalReg_ST0, op->opndSrc.defuse, op);
++    updateDependencyGraph(UseDefType_Reg, PhysicalReg_ST0, op->opndSrc.defuse,
++            Latency_None, op);
+     op->opndDest.defuse = LowOpndDefUse_Def;
+     updateDependencyGraphForMem(op->memDest, op->opndDest.defuse, op);
+-    handleFloatDependencyUpdate(op);
+-#ifndef ENABLE_BASIC_BLOCK_DUMP
+-    signalEndOfNativeBasicBlock();
+-#endif
+ }
+ 
+ //! \brief Updates dependency information for LowOps with two operands:
+ //! memory to floating point stack.
+-//! \param op has mnemonic FLD or FILD
++//! \param op must have mnemonic FLD or FILD, or must be an x87 ALU op
+ void Scheduler::updateUseDefInformation_mem_to_fp(LowOpMemReg * op) {
++    assert(op->opCode == Mnemonic_FLD || op->opCode == Mnemonic_FILD
++            || op->opCode2 == ATOM_NORMAL_ALU);
+     op->instructionLatency = getAtomMnemonicLatency_mem_to_reg(op->opCode);
+     op->portType = getAtomMnemonicPort_mem_to_reg(op->opCode);
+-#ifndef DISABLE_MACHINE_MODEL_CHECK
+-    if(op->instructionLatency == INVN || op->portType == INVP) {
+-        LOGE("ERROR: Atom Scheduler bug! Invalid Atom machine model "
+-                "entry for Mnemonic %d with mem to fp.", op->opCode);
+-        dvmAbort();
+-    }
+-#endif
+-    updateDependencyGraph(UseDefType_Ctrl, REG_NOT_USED, LowOpndDefUse_Def, op);
++    assert(op->instructionLatency != INVN);
++    assert(op->portType != INVP);
++
++    handleFloatDependencyUpdate(op);
++
+     op->opndSrc.defuse = LowOpndDefUse_Use;
+     updateDependencyGraphForMem(op->memSrc, op->opndSrc.defuse, op);
+-    if (op->opCode2 == ATOM_NORMAL_ALU)
+-        op->opndDest.defuse = LowOpndDefUse_UseDef;
+-    else
++    if (op->opCode == Mnemonic_FLD || op->opCode == Mnemonic_FILD)
+         op->opndDest.defuse = LowOpndDefUse_Def;
+-    updateDependencyGraph(UseDefType_Reg, PhysicalReg_ST0, op->opndDest.defuse, op);
+-    handleFloatDependencyUpdate(op);
+-#ifndef ENABLE_BASIC_BLOCK_DUMP
+-    signalEndOfNativeBasicBlock();
+-#endif
++    else // x87 ALU ops
++        op->opndDest.defuse = LowOpndDefUse_UseDef;
++    updateDependencyGraph(UseDefType_Reg, PhysicalReg_ST0, op->opndDest.defuse,
++            Latency_None, op);
+ }
+ 
+ //! \brief Generates IA native code for given LowOp
+@@ -1340,105 +1372,111 @@ void Scheduler::generateAssembly(LowOp * op) {
+ //! \details It also updates the readyTime of every LowOp waiting to be scheduled.
+ //! \param chosenIdx is the index of the chosen instruction for scheduling
+ //! \param scheduledOps is an input list of scheduled LowOps
+-//! \param pendingOps is an input list of pending LowOps
+ //! \param readyOps is an output list of LowOps that are ready
+ void Scheduler::updateReadyOps(int chosenIdx, bool* scheduledOps,
+-        bool* pendingOps, bool* readyOps) {
++        bool* readyOps) {
+     // Go through each successor LIR that depends on selected LIR
+-    for (unsigned int k = 0; k < queuedLIREntries[chosenIdx]->successorDependencies.size(); ++k) {
+-        int dst = queuedLIREntries[chosenIdx]->successorDependencies[k].lowopSlotId;
++    for (unsigned int k = 0; k < dependencyAssociation[queuedLIREntries[chosenIdx]].successorDependencies.size(); ++k) {
++        int dst = dependencyAssociation[queuedLIREntries[chosenIdx]].successorDependencies[k].lowopSlotId;
+         bool isReady = true;
+         int readyTime = -1;
+         // If all predecessors are scheduled, insert into ready queue
+-        for (unsigned int k2 = 0; k2 < queuedLIREntries[dst]->predecessorDependencies.size(); ++k2) {
+-            int src = queuedLIREntries[dst]->predecessorDependencies[k2].lowopSlotId;
++        for (unsigned int k2 = 0; k2 < dependencyAssociation[queuedLIREntries[dst]].predecessorDependencies.size(); ++k2) {
++            int src = dependencyAssociation[queuedLIREntries[dst]].predecessorDependencies[k2].lowopSlotId;
+             if (!scheduledOps[src]) {
++                // If one of parents hasn't been scheduled, then current instruction is not ready
+                 isReady = false;
+                 break;
+             }
+-            int tmpTime = queuedLIREntries[src]->scheduledTime
+-                    + queuedLIREntries[src]->instructionLatency;
+-            if (readyTime < tmpTime)
++
++            // Candidate ready time is the sum of the scheduled time of parent,
++            // the latency of parent, and the weight of edge between parent
++            // and self
++            int candidateReadyTime = queuedLIREntries[src]->scheduledTime
++                    + queuedLIREntries[src]->instructionLatency
++                    + dependencyAssociation[queuedLIREntries[dst]].predecessorDependencies[k2].edgeLatency;
++            if (readyTime < candidateReadyTime)
+                 // This is ready after ALL predecessors have finished executing
+-                readyTime = tmpTime;
++                readyTime = candidateReadyTime;
+         }
+         if (isReady) {
+             readyOps[dst] = true; // Update entry in ready queue
+-            // All already pending instructions should commit ahead of this LowOp
+-            for (unsigned int k2 = 0; k2 < queuedLIREntries.size(); ++k2) {
+-                if (pendingOps[k2]) {
+-                    int tmpTime = queuedLIREntries[k2]->scheduledTime
+-                            + queuedLIREntries[k2]->instructionLatency
+-                            - queuedLIREntries[dst]->instructionLatency; //TODO Is this correct?
+-                    if (readyTime < tmpTime) {
+-#ifndef DISABLE_DEBUG_ATOM_SCHEDULER
+-                        printf("update readyTime from %d to %d of slot %d due to pending "
+-                                "op at slot %d\n", readyTime, tmpTime, dst, k2);
+-#endif
+-                        readyTime = tmpTime;
+-                    }
+-                }
+-            }
+             queuedLIREntries[dst]->readyTime = readyTime;
+ #ifndef DISABLE_DEBUG_ATOM_SCHEDULER
+-            printf("update readyTime of slot %d: %d\n", dst, readyTime);
++            ALOGD("update readyTime of slot %d: %d\n", dst, readyTime);
+ #endif
+         }
+     }
+ }
+ 
+-//! \brief Defines the maximum latency in the dependency graph.
+-//! \details This value should be larger than any possible valid dependency latency.
+-#define MAXIMUM_LATENCY 10000
++//! This method constructs the inverse topological sort of the
++//! dependency graph of current basic block (queuedLIREntries)
++//! \param nodeId Index of LowOp in queuedLIREntries
++//! \param visitedList List with same indexing as queuedLIREntries
++//! that keeps track of LowOps that have already been visited
++//! \param inverseTopologicalOrder A list that will eventually
++//! hold the inverse topological order of the dependency graph.
++//! Inverse order means that parent nodes come later in the list
++//! compared to its children.
++void Scheduler::visitNodeTopologicalSort(unsigned int nodeId, int * visitedList,
++        NativeBasicBlock & inverseTopologicalOrder) {
++    // If it has been visited already, there's no need to do anything
++    if (visitedList[nodeId] == 0) {
++        assert(queuedLIREntries[nodeId]->slotId == nodeId);
++        // Mark as visited
++        visitedList[nodeId]++;
++        for (unsigned int child = 0;
++                child < dependencyAssociation[queuedLIREntries[nodeId]].successorDependencies.size();
++                ++child) {
++            // visit children
++            visitNodeTopologicalSort(
++                    dependencyAssociation[queuedLIREntries[nodeId]].successorDependencies[child].lowopSlotId,
++                    visitedList, inverseTopologicalOrder);
++        }
++        // Since all children have been visited, can now add node to list
++        inverseTopologicalOrder.push_back(queuedLIREntries[nodeId]);
++    }
++}
+ 
+-//! \brief Finds longest path latency to end for every LowOp in the basic block
++//! \brief Finds longest path latency for every node in every tree in the
++//! dependency graph.
+ //! \details This updates the longest path field of every LowOp in the current
+ //! native basic block.
+ //! \see queuedLIREntries
+-//! \todo Find out what algorithm is used here.
+ void Scheduler::findLongestPath() {
+-#if 1 // Algorithm 1
+-    std::vector<int> options1, options2;
+-    for (unsigned int k = 0; k < queuedLIREntries.size() - 1; ++k)
+-        options1.push_back(MAXIMUM_LATENCY);
+-    //destination is the last LowOp
+-    options1.push_back(-queuedLIREntries.back()->instructionLatency); //from dst to dst
+-    options2.resize(options1.size());
+-
+-    bool inputIn1 = true;
+-    for (unsigned int i = 0; i < queuedLIREntries.size() - 1; ++i) { //number of arcs in shortest path
+-        for (unsigned int k = 0; k < queuedLIREntries.size(); ++k) { //for each v in V
+-            int m = inputIn1 ? options1[k] : options2[k];
+-            int m_prime = MAXIMUM_LATENCY;
+-            for (unsigned int k2 = 0; k2 < queuedLIREntries[k]->successorDependencies.size();
+-                    ++k2) { //for each edge from v
+-                int dst = queuedLIREntries[k]->successorDependencies[k2].lowopSlotId;
+-                int m_tmp = (inputIn1 ? options1[dst] : options2[dst])
+-                        + (-queuedLIREntries[k]->instructionLatency)
+-                        + queuedLIREntries[k]->successorDependencies[k2].latency;
+-                m_prime = (m_tmp < m_prime) ? m_tmp : m_prime;
++    NativeBasicBlock inverseTopologicalOrder;
++
++    // Initialize visited list to 0 (false) for all nodes
++    int visitedList[queuedLIREntries.size()];
++    memset(visitedList, 0, queuedLIREntries.size() * sizeof(int));
++
++    // Determine topological order.
++    for (unsigned int node = 0; node < queuedLIREntries.size(); ++node) {
++        visitNodeTopologicalSort(node, visitedList, inverseTopologicalOrder);
++    }
++
++    assert(queuedLIREntries.size() == inverseTopologicalOrder.size());
++
++    // for each node in inverse topological order
++    for(unsigned int vindex = 0; vindex < inverseTopologicalOrder.size(); ++vindex) {
++        int bestLongestPath = 0;
++        // Go through each child find the best longest path.
++        // Since we are doing this in inverse topological order,
++        // we know the longest path for all children has already
++        // been updated.
++        for(unsigned int windex = 0; windex < dependencyAssociation[inverseTopologicalOrder[vindex]].successorDependencies.size();
++                ++windex) {
++            int successorSlotId = dependencyAssociation[inverseTopologicalOrder[vindex]].successorDependencies[windex].lowopSlotId;
++            int edgeLatency = dependencyAssociation[inverseTopologicalOrder[vindex]].successorDependencies[windex].edgeLatency;
++            if (queuedLIREntries[successorSlotId]->longestPath > bestLongestPath) {
++                bestLongestPath = queuedLIREntries[successorSlotId]->longestPath + edgeLatency;
+             }
+-            if (inputIn1)
+-                options2[k] = (m_prime < m) ? m_prime : m;
+-            else
+-                options1[k] = (m_prime < m) ? m_prime : m;
+         }
+-        inputIn1 = !inputIn1;
++        // Longest path to self is sum of best longest path to children plus
++        // instruction latency of self
++        inverseTopologicalOrder[vindex]->longestPath = inverseTopologicalOrder[vindex]->instructionLatency
++                + bestLongestPath;
+     }
+-    for (unsigned int k = 0; k < queuedLIREntries.size(); ++k) {
+-        int m = inputIn1 ? options1[k] : options2[k];
+-        if (m == MAXIMUM_LATENCY)
+-            m = queuedLIREntries[k]->instructionLatency;
+-        else
+-            m = -m;
+-        queuedLIREntries[k]->longestPath = m;
+-#ifndef DISABLE_DEBUG_ATOM_SCHEDULER
+-        printf("longest path from %d to %d: %d\n", k, queuedLIREntries.size() - 1, m);
+-#endif
+-    }
+-#else // Algorithm 2
+-
+-#endif
+ }
+ 
+ //! \brief Reorders basic block to minimize block latency and make use of both
+@@ -1462,165 +1500,182 @@ void Scheduler::findLongestPath() {
+ //! \post If last LIR in Scheduler::queuedLIREntries is a jump, call, or return, it must
+ //! also be the last LIR in Scheduler::scheduledLIREntries
+ void Scheduler::schedule() {
+-    // Initialize data structures for scheduling
+-    bool* readyOps = (bool *) malloc(sizeof(bool) * (queuedLIREntries.size())); // ready for scheduling
+-    bool* scheduledOps = (bool *) malloc(
+-            sizeof(bool) * (queuedLIREntries.size())); // scheduled
+-    bool* pendingOps = (bool *) malloc(
+-            sizeof(bool) * (queuedLIREntries.size())); // scheduled but not yet finished executing
+-    unsigned int* candidateArray = (unsigned int *) malloc(
+-            sizeof(unsigned int) * queuedLIREntries.size());
+-    unsigned int num_candidates = 0, numScheduled = 0, k;
++    // Declare data structures for scheduling
++    bool readyOps[queuedLIREntries.size()]; // ready for scheduling
++    bool scheduledOps[queuedLIREntries.size()]; // scheduled
++    unsigned int candidateArray[queuedLIREntries.size()]; // ready candidates for scheduling
++    unsigned int num_candidates = 0 /*index for candidateArray*/, numScheduled = 0, lirID;
+     int currentTime = 0;
+ 
+     // Predecessor dependencies have already been initialized in the dependency graph building.
+     // Now, initialize successor dependencies to complete dependency graph.
+-    for (unsigned int k = 0; k < queuedLIREntries.size(); ++k) {
+-        for (unsigned int k2 = 0; k2 < queuedLIREntries[k]->predecessorDependencies.size(); ++k2) {
+-            int src = queuedLIREntries[k]->predecessorDependencies[k2].lowopSlotId;
++    for (lirID = 0; lirID < queuedLIREntries.size(); ++lirID) {
++        for (unsigned int k2 = 0; k2 < dependencyAssociation[queuedLIREntries[lirID]].predecessorDependencies.size(); ++k2) {
++            int src = dependencyAssociation[queuedLIREntries[lirID]].predecessorDependencies[k2].lowopSlotId;
+             DependencyInformation ds;
+-            ds.lowopSlotId = k;
+-            ds.latency = -queuedLIREntries[k]->predecessorDependencies[k2].latency; //negative weight
+-            queuedLIREntries[src]->successorDependencies.push_back(ds);
++            ds.lowopSlotId = lirID;
++
++            // Since edges are directional, no need to invert weight.
++            ds.edgeLatency = dependencyAssociation[queuedLIREntries[lirID]].predecessorDependencies[k2].edgeLatency;
++            dependencyAssociation[queuedLIREntries[src]].successorDependencies.push_back(ds);
+         }
+     }
+ 
+-    // Find longest path from each LIR to end of basic block
++    // Find longest path from each LIR to the leaves of the dependency trees
+     findLongestPath();
+ 
+     // When a LowOp is ready, it means all its predecessors are scheduled
+     // and the readyTime of this LowOp has been set already.
+-    for (k = 0; k < queuedLIREntries.size(); k++) {
++    for (lirID = 0; lirID < queuedLIREntries.size(); lirID++) {
+ #ifndef DISABLE_DEBUG_ATOM_SCHEDULER
+-        printf("-- slot %d: latency %d port type %d\n", k, queuedLIREntries[k]->instructionLatency,
+-                queuedLIREntries[k]->portType);
++        ALOGD("-- slot %d: latency %d port type %d\n", lirID, queuedLIREntries[lirID]->instructionLatency,
++                queuedLIREntries[lirID]->portType);
+ #endif
+-        scheduledOps[k] = false;
+-        readyOps[k] = false;
+-        pendingOps[k] = false;
+-        if (queuedLIREntries[k]->predecessorDependencies.size() == 0) {
+-            readyOps[k] = true;
++        scheduledOps[lirID] = false;
++        readyOps[lirID] = false;
++        if (dependencyAssociation[queuedLIREntries[lirID]].predecessorDependencies.size() == 0) {
++            readyOps[lirID] = true;
+ #ifndef DISABLE_DEBUG_ATOM_SCHEDULER
+-            printf("slot %d is ready\n", k);
++            ALOGD("slot %d is ready\n", lirID);
+ #endif
+-            queuedLIREntries[k]->readyTime = 0;
++            queuedLIREntries[lirID]->readyTime = 0;
+         }
+     }
+ 
+     // Schedule each of LIRs in the basic block
+     while (numScheduled < queuedLIREntries.size()) {
+-        int nextTime = currentTime;
+-        unsigned int chosenIdx1 = queuedLIREntries.size(), chosenIdx2 =
+-                queuedLIREntries.size(), idx;
++        // Set chosen indices to BB size since no LIR will have
++        // this id.
++        unsigned int chosenIdx1 = queuedLIREntries.size();
++        unsigned int chosenIdx2 = queuedLIREntries.size();
++
++        // Reset number of picked candidates
+         num_candidates = 0;
+-        // candidates: ops with readyTime <= currentTime
+-        // if no ops are ready to be issued, ops with smallest readyTime
+-        for (k = 0; k < queuedLIREntries.size(); k++) {
+-            if (readyOps[k] && queuedLIREntries[k]->readyTime <= currentTime
+-                    && (!isBasicBlockDelimiter(queuedLIREntries[k]->opCode)))
+-                candidateArray[num_candidates++] = k;
++
++        // Select candidates that are ready (readyTime <= currentTime)
++        for (lirID = 0; lirID < queuedLIREntries.size(); lirID++) {
++            if (readyOps[lirID] && queuedLIREntries[lirID]->readyTime <= currentTime
++                    && (!isBasicBlockDelimiter(queuedLIREntries[lirID]->opCode)))
++                candidateArray[num_candidates++] = lirID;
+         }
++
++        // If no candidate is ready to be issued, just pick the one with
++        // the smallest readyTime
+         if (num_candidates == 0) {
+-            for (k = 0; k < queuedLIREntries.size(); k++) {
+-                if (readyOps[k]
+-                        && (!isBasicBlockDelimiter(queuedLIREntries[k]->opCode))) {
++
++            // First, find the smallest ready time out of instructions that are
++            // ready.
++            for (lirID = 0; lirID < queuedLIREntries.size(); lirID++) {
++                if (readyOps[lirID]
++                        && (!isBasicBlockDelimiter(queuedLIREntries[lirID]->opCode))) {
+                     if (chosenIdx1 == queuedLIREntries.size()
+-                            || queuedLIREntries[k]->readyTime
++                            || queuedLIREntries[lirID]->readyTime
+                                     < queuedLIREntries[chosenIdx1]->readyTime) {
+-                        chosenIdx1 = k;
+-                        nextTime = queuedLIREntries[k]->readyTime;
++                        chosenIdx1 = lirID;
++                        // Update current time with smallest ready time
++                        currentTime = queuedLIREntries[lirID]->readyTime;
+                     }
+                 }
+             }
+-            for (k = 0; k < queuedLIREntries.size(); k++) {
+-                if (readyOps[k] && (!isBasicBlockDelimiter(queuedLIREntries[k]->opCode))
+-                        && queuedLIREntries[k]->readyTime <= nextTime) {
+-                    candidateArray[num_candidates++] = k;
++
++            // Select any other candidates that also are ready at the same time.
++            for (lirID = 0; lirID < queuedLIREntries.size(); lirID++) {
++                if (readyOps[lirID] && (!isBasicBlockDelimiter(queuedLIREntries[lirID]->opCode))
++                        && queuedLIREntries[lirID]->readyTime <= currentTime) {
++                    candidateArray[num_candidates++] = lirID;
+                 }
+             }
+         }
++
++        // This is the last gate for picking a candidate.
++        // By this point if still we don't have a candidate, it means that
++        // only the sync point instruction remains.
+         if (num_candidates == 0)
+             candidateArray[num_candidates++] = queuedLIREntries.size() - 1;
++
++        // Reinitialize chosenIdx1 since it was used earlier for
++        // finding smallest ready time
+         chosenIdx1 = queuedLIREntries.size();
+-        for (idx = 0; idx < num_candidates; idx++) {
+-            k = candidateArray[idx];
++
++        // Pick candidate that is on the critical path
++        for (unsigned int i = 0; i < num_candidates; i++) {
++            lirID = candidateArray[i];
++            // Always try to pick a candidate. Once we've picked one,
++            // then we can start looking for another with a longer
++            // critical path
+             if (chosenIdx1 == queuedLIREntries.size()
+-                    || queuedLIREntries[k]->longestPath
++                    || queuedLIREntries[lirID]->longestPath
+                             > queuedLIREntries[chosenIdx1]->longestPath) {
+-                chosenIdx1 = k;
++                chosenIdx1 = lirID;
+             }
+         }
++
++        // By the time we get to this point, we better have picked
++        // an instruction to schedule OR ELSE ...
++        assert (chosenIdx1 < queuedLIREntries.size());
++
+         // Pick 2 candidates if possible.
++        // If current candidate must issue on both ports, we cannot pick another
+         if (queuedLIREntries[chosenIdx1]->portType == BOTH_PORTS)
+             num_candidates = 0;
+-        for (idx = 0; idx < num_candidates; idx++) {
+-            k = candidateArray[idx];
+-            if (k == chosenIdx1)
+-                continue;
+-            // Check whether candidateArray[k] can be issued at the same time.
+-            // Namely, check port conflict
+-            if (queuedLIREntries[k]->portType == BOTH_PORTS)
+-                continue;
++
++        // The only way we will go through this logic is if chosen instruction
++        // doesn't issue on both ports
++        for (unsigned int i = 0; i < num_candidates; i++) {
++            lirID = candidateArray[i];
++            if (lirID == chosenIdx1)
++                continue; // Should skip the one already chosen
++
++            // Check for port conflict
++            if (queuedLIREntries[lirID]->portType == BOTH_PORTS)
++                continue; // Look for another one that doesn't issue on both ports
+             if (queuedLIREntries[chosenIdx1]->portType == EITHER_PORT
+-                    || queuedLIREntries[k]->portType == EITHER_PORT
++                    || queuedLIREntries[lirID]->portType == EITHER_PORT
+                     || (queuedLIREntries[chosenIdx1]->portType == PORT0
+-                            && queuedLIREntries[k]->portType == PORT1)
++                            && queuedLIREntries[lirID]->portType == PORT1)
+                     || (queuedLIREntries[chosenIdx1]->portType == PORT1
+-                            && queuedLIREntries[k]->portType == PORT0)) {
+-                chosenIdx2 = k;
+-                break;
++                            && queuedLIREntries[lirID]->portType == PORT0)) {
++                // Looks like we found one that doesn't conflict on ports
++                // However, still try to find one on critical path
++                if (chosenIdx2 == queuedLIREntries.size()
++                        || queuedLIREntries[lirID]->longestPath
++                                > queuedLIREntries[chosenIdx2]->longestPath) {
++                    chosenIdx2 = lirID;
++                }
+             }
+         }
+ #ifndef DISABLE_DEBUG_ATOM_SCHEDULER
+-        printf("pick ready instructions at slots %d %d\n", chosenIdx1, chosenIdx2);
+-#endif
+-        currentTime = nextTime;
+-#ifndef DISABLE_DEBUG_ATOM_SCHEDULER
+-        printf("advance time to %d\n", nextTime);
++        ALOGD("pick ready instructions at slots %d %d\n", chosenIdx1, chosenIdx2);
+ #endif
+-        for (k = 0; k < queuedLIREntries.size(); k++) {
+-            if (scheduledOps[k]
+-                    && currentTime
+-                            >= queuedLIREntries[k]->scheduledTime
+-                                    + queuedLIREntries[k]->instructionLatency)
+-                // This instruction is retired and thus no longer pending
+-                pendingOps[k] = false;
+-        }
+-        if (chosenIdx1 < queuedLIREntries.size()) {
+-            scheduledLIREntries.push_back(queuedLIREntries[chosenIdx1]);
+-            scheduledOps[chosenIdx1] = true;
+-            pendingOps[chosenIdx1] = true;
+-            readyOps[chosenIdx1] = false;
+-            queuedLIREntries[chosenIdx1]->scheduledTime = currentTime;
+-            numScheduled++;
+-        }
++
++        scheduledLIREntries.push_back(queuedLIREntries[chosenIdx1]);
++        scheduledOps[chosenIdx1] = true;
++        readyOps[chosenIdx1] = false;
++        queuedLIREntries[chosenIdx1]->scheduledTime = currentTime;
++        numScheduled++;
++
+         if (chosenIdx2 < queuedLIREntries.size()) {
+             scheduledLIREntries.push_back(queuedLIREntries[chosenIdx2]);
+             scheduledOps[chosenIdx2] = true;
+-            pendingOps[chosenIdx2] = true;
+             readyOps[chosenIdx2] = false;
+             queuedLIREntries[chosenIdx2]->scheduledTime = currentTime;
+             numScheduled++;
+         }
+ 
+-        // When an instruction is scheduled, insert ready instructions to readyQueue.
+-        // Check dependencies from chosen instructions to other instructions.
+-        if (chosenIdx1 < queuedLIREntries.size())
+-            updateReadyOps(chosenIdx1, scheduledOps, pendingOps, readyOps);
++        // Since we have scheduled instructions in this cycle, we should
++        // update the ready queue now to find new instructions whose
++        // dependencies have been satisfied
++        updateReadyOps(chosenIdx1, scheduledOps, readyOps);
+         if (chosenIdx2 < queuedLIREntries.size())
+-            updateReadyOps(chosenIdx2, scheduledOps, pendingOps, readyOps);
++            updateReadyOps(chosenIdx2, scheduledOps, readyOps);
++
++        // Advance time to next cycle
+         currentTime++;
+     }
+ 
+-    // Free temporary data structures used during scheduling
+-    free(readyOps);
+-    free(scheduledOps);
+-    free(pendingOps);
+-    free(candidateArray);
+-
+     // Make sure that original and scheduled basic blocks are same size
+     if (scheduledLIREntries.size() != queuedLIREntries.size()) {
+-        LOGE("ERROR: Atom Scheduler bug! Original basic block is not same "
++        ALOGE("ERROR: Atom Scheduler bug! Original basic block is not same "
+                 "size as the scheduled basic block");
+         dvmAbort();
+     }
+@@ -1629,7 +1684,7 @@ void Scheduler::schedule() {
+     // scheduled basic block
+     if (isBasicBlockDelimiter(queuedLIREntries.back()->opCode)
+             && !isBasicBlockDelimiter(scheduledLIREntries.back()->opCode)) {
+-        LOGE("ERROR: Atom Scheduler bug! Sync point should be the last "
++        ALOGE("ERROR: Atom Scheduler bug! Sync point should be the last "
+         "scheduled instruction.");
+         dvmAbort();
+     }
+@@ -1650,22 +1705,28 @@ void Scheduler::signalEndOfNativeBasicBlock() {
+     if(queuedLIREntries.empty())
+             return; // No need to do any work
+ 
++#ifndef DISABLE_DEPENDENGY_GRAPH_DEBUG
++    std::ostringstream dependGraphFileName;
++    char * streamStartBasicBlock = stream;
++    dependGraphFileName << "depengraph_" << gDvm.threadList[0].systemTid << "_"
++            << std::hex << (int)streamStartBasicBlock;
++#endif
++
+     printStatistics(true /*prescheduling*/);
+     schedule();
+     printStatistics(false /*prescheduling*/);
+ 
+-    unsigned int k;
+-    for(k = 0; k < scheduledLIREntries.size(); ++k) {
++    for(unsigned int k = 0; k < scheduledLIREntries.size(); ++k) {
+         generateAssembly(scheduledLIREntries[k]);
+-        delete scheduledLIREntries[k]; // LowOp is no longer needed, can deallocate
+     }
+ 
+-    // Clear all scheduler data structures:
+-    queuedLIREntries.clear();
+-    scheduledLIREntries.clear();
+-    userEntries.clear();
+-    producerEntries.clear();
+-    ctrlEntries.clear();
++#ifndef DISABLE_DEPENDENGY_GRAPH_DEBUG
++    printDependencyGraph("/data/local/tmp/", dependGraphFileName.str(),
++            streamStartBasicBlock, true, true, true, true, true);
++#endif
++
++    // Clear all scheduler data structures
++    this->reset();
+ }
+ 
+ #ifndef DISABLE_DEBUG_ATOM_SCHEDULER
+@@ -1729,21 +1790,103 @@ void Scheduler::printStatistics(bool prescheduling) {
+     else
+         lowOpList = &scheduledLIREntries;
+ 
+-    printf("%s The block size is %d\n", message_tag, lowOpList->size());
+-    for (unsigned int i = 0; i < lowOpList->size(); ++i) {
+-#ifndef DISABLE_DEBUG_ATOM_SCHEDULER
+-        printf(
+-                "   LIR with opcode %d and with %d operands which are %s and %s\n",
+-                (*lowOpList)[i]->opCode, (*lowOpList)[i]->numOperands,
+-                (*lowOpList)[i]->numOperands >= 1 ?
+-                operandTypeToString((*lowOpList)[i]->opndDest.type) : "-",
+-                (*lowOpList)[i]->numOperands >= 2 ?
+-                operandTypeToString((*lowOpList)[i]->opndSrc.type) : "-");
+-#endif
+-    }
++    ALOGD("%s The block size is %d\n", message_tag, lowOpList->size());
+     if (!prescheduling) {
+-        printf("%s Difference in basic blocks after scheduling is %5.2f%%\n",
++        ALOGD("%s Difference in basic blocks after scheduling is %5.2f%%\n",
+                 message_tag, basicBlockEditDistance(queuedLIREntries, scheduledLIREntries));
+     }
+ #endif
+ }
++
++//! \brief Prints dependency graph in dot format
++//! \details Creates dot files in /data/local/tmp with every basic block
++//! that has been scheduled.
++//! \param dgfilename Name to use for dot file created
++//! \param startStream The pointer to the start of code cache stream where
++//! the basic block has been encoded
++//! \param printScheduledTime Allow printing of scheduled time of each LIR
++//! \param printIssuePort Allow printing of issue port of each LIR
++//! \param printInstructionLatency Allow printing of latency of each LIR
++//! \param printCriticalPath Allows printing of longest path latency for each
++//! LIR.
++//! \param printOriginalOrder Appends to front of instruction the original
++//! instruction order before scheduling.
++void Scheduler::printDependencyGraph(const char * directoryPath,
++        const std::string &dgfilename, const char * startStream,
++        bool printScheduledTime, bool printIssuePort,
++        bool printInstructionLatency, bool printCriticalPath,
++        bool printOriginalOrder) {
++#ifndef DISABLE_DEPENDENGY_GRAPH_DEBUG
++    std::ofstream depengraphfile;
++    const unsigned int maxInstSize = 30;
++    char decodedInst[maxInstSize];
++
++    // Create dot file
++    std::string completeFSPath = directoryPath;
++    completeFSPath.append(dgfilename);
++    completeFSPath.append(".dot");
++    ALOGD("Dumping dependency graph to %s", completeFSPath.c_str());
++    depengraphfile.open(completeFSPath.c_str(), std::ios::out);
++
++    // A little error handling
++    if (depengraphfile.fail()) {
++        ALOGD("Encountered error when trying to open the file %s",
++                completeFSPath.c_str());
++        depengraphfile.close();
++        return;
++    }
++
++    // Print header
++    depengraphfile << "digraph BB" << dgfilename.c_str() << " {" << std::endl;
++    depengraphfile << "forcelabels = true" << std::endl;
++
++    // Print nodes
++    for (unsigned int i = 0; i < scheduledLIREntries.size(); ++i) {
++        startStream = decoder_disassemble_instr(const_cast<char *>(startStream),
++                decodedInst, maxInstSize);
++        // Add node with the x86 instruction as label
++        depengraphfile << "LIR" << scheduledLIREntries[i]->slotId
++                << " [shape=record, label=\"{";
++        if (printOriginalOrder)
++            depengraphfile << scheduledLIREntries[i]->slotId << ": ";
++        depengraphfile << decodedInst;
++        if (printScheduledTime) // Conditional print of time instruction was scheduled
++            depengraphfile << " | ScheduledTime:"
++                    << scheduledLIREntries[i]->scheduledTime;
++        if (printIssuePort) // Conditional print of issue port of instruction
++            // I promise the cast is safe
++            depengraphfile << " | IssuePort:"
++                    << getIssuePort(
++                            static_cast<IssuePort>(scheduledLIREntries[i]->portType));
++        if (printInstructionLatency) // Conditional print of instruction latency
++            depengraphfile << " | Latency:"
++                    << scheduledLIREntries[i]->instructionLatency;
++        if (printCriticalPath) // Conditional print of critical path
++            depengraphfile << " | LongestPath:"
++                    << scheduledLIREntries[i]->longestPath;
++        // Close label
++        depengraphfile << "}\"";
++        // Close node attributes
++        depengraphfile << "]" << std::endl;
++    }
++
++    // Print edge between each node and its successors
++    for (unsigned int i = 0; i < scheduledLIREntries.size(); ++i) {
++        // It is possible that successorDependencies contains duplicates
++        // So we set up a set here to avoid creating multiple edges
++        std::set<int> successors;
++        for (unsigned int j = 0;
++                j < dependencyAssociation[scheduledLIREntries[i]].successorDependencies.size(); ++j) {
++            int successorSlotId = dependencyAssociation[scheduledLIREntries[i]].successorDependencies[j].lowopSlotId;
++            if(successors.find(successorSlotId) != successors.end())
++                continue; // If we already generated edge for this successor, don't generate another
++            successors.insert(successorSlotId);
++            depengraphfile << "LIR" << scheduledLIREntries[i]->slotId << "->LIR"
++                    << dependencyAssociation[scheduledLIREntries[i]].successorDependencies[j].lowopSlotId
++                    << std::endl;
++        }
++    }
++    depengraphfile << "}" << std::endl;
++    depengraphfile.close();
++#endif
++}
+diff --git a/vm/compiler/codegen/x86/Scheduler.h b/vm/compiler/codegen/x86/Scheduler.h
+index 9b6e8fb..0332ca8 100644
+--- a/vm/compiler/codegen/x86/Scheduler.h
++++ b/vm/compiler/codegen/x86/Scheduler.h
+@@ -22,6 +22,32 @@
+ #define ATOM_SCHEDULER_H_
+ 
+ #include "Lower.h"
++#include <map>
++#include <vector>
++
++/**
++ * @class Dependencies
++ * @brief Provides vectors for the dependencies
++ */
++struct Dependencies
++{
++    //! \brief Holds information about LowOps on which current LowOp
++    //! depends on (predecessors).
++    //! \details For example, if a LowOp with slotId of 3 depends on
++    //! LowOp with slotId of 2 because of a RAW, then the LowOp with
++    //! slotId of 3 will have an entry in the predecessorDependencies
++    //! with a Dependency_RAW and slotId of 2. This field is used
++    //! only for scheduling.
++    std::vector<DependencyInformation> predecessorDependencies;
++    //! \brief Holds information about LowOps that depend on current
++    //! LowOp (successors).
++    //! \details For example, if a LowOp with slotId of 3 depends on
++    //! LowOp with slotId of 2 because of a RAW, then the LowOp with
++    //! slotId of 2 will have an entry in the successorDependencies
++    //! with a Dependency_RAW and slotId of 3. This field is used
++    //! only for scheduling.
++    std::vector<DependencyInformation> successorDependencies;
++};
+ 
+ //! \brief Interface for Atom Instruction Scheduler
+ class Scheduler {
+@@ -29,6 +55,9 @@ private:
+     //! \brief Defines implementation of a native basic block for Atom LIRs.
+     typedef std::vector<LowOp*> NativeBasicBlock;
+ 
++    //! \brief A map providing a link between LowOp and scheduling dependencies
++    std::map<LowOp *, Dependencies> dependencyAssociation;
++
+     //! \brief Holds a list of all LIRs allocated via allocateNewEmptyLIR
+     //! which are not yet in code stream.
+     //! \details The field LowOp::slotId corresponds to index into this list
+@@ -64,25 +93,41 @@ private:
+     //! used during scheduling. This list holds values from LowOp::slotId.
+     //! \see LowOp::predecessorDependencies
+     //! \see LowOp::slotId
+-    std::vector<int> ctrlEntries;
++    std::vector<unsigned int> ctrlEntries;
+ 
+     // See documentation in Schedule.cpp or in doxygen output for undocumented prototypes.
+     void updateDependencyGraph(UseDefEntryType type, int regNum,
+-            LowOpndDefUse defuse, LowOp* op);
++            LowOpndDefUse defuse,
++            LatencyBetweenNativeInstructions causeOfLatency, LowOp* op);
+     void updateDependencyGraphForMem(LowOpndMem & mOpnd, LowOpndDefUse defuse,
+             LowOp* op);
+     void handlePushDependencyUpdate(LowOp* op);
+     void handleFloatDependencyUpdate(LowOp* op);
+-    void updateReadyOps(int chosenIdx, bool* scheduledOps, bool* pendingOps,
+-            bool* readyOps);
++    void handleImplicitDependenciesEaxEdx(LowOp* op);
++
+     bool isBasicBlockDelimiter(Mnemonic m);
+     void generateAssembly(LowOp * op);
++
++    void visitNodeTopologicalSort(unsigned int nodeId, int * visitedList,
++            NativeBasicBlock & inverseTopologicalOrder);
+     void findLongestPath();
++    void updateReadyOps(int chosenIdx, bool* scheduledOps, bool* readyOps);
+     void schedule();
++
+     double basicBlockEditDistance(const NativeBasicBlock & block1,
+             const NativeBasicBlock & block2);
+     void printStatistics(bool prescheduling);
++    void printDependencyGraph(const char * directoryPath,
++            const std::string &filename, const char * startStream,
++            bool printScheduledTime, bool printIssuePort,
++            bool printInstructionLatency, bool printCriticalPath,
++            bool printOriginalOrder);
++
++    //! \brief Reset the internal structures
++    void reset(void);
+ public:
++    ~Scheduler(void);
++
+     //! \brief Called by users of scheduler to allocate an empty LIR (no mnemonic
+     //! or operands).
+     //! \details The caller of this method takes the LIR, updates the mnemonic
+@@ -91,10 +136,13 @@ public:
+     //! be called when scheduling is not enabled because the LIR will never be freed.
+     //! Internally, the scheduler will add this LIR to the native basic block it
+     //! is building and also assign it an id.
++    //! Because of specialization this method definition must stay in the header in
++    //! order to prevent linker errors.
+     //! \tparam is a LowOp or any of its specialized children.
+     //! \see LowOp
+     template<typename LowOpType> LowOpType * allocateNewEmptyLIR() {
+-        LowOpType * op = new LowOpType;
++        LowOpType * op = static_cast<LowOpType *>(dvmCompilerNew(
++                sizeof(LowOpType), true /*zero*/));
+         op->slotId = queuedLIREntries.size();
+         queuedLIREntries.push_back(op);
+         return op;
+@@ -110,11 +158,10 @@ public:
+     void updateUseDefInformation_reg_to_reg(LowOpRegReg * op);
+     void updateUseDefInformation_mem_to_reg(LowOpMemReg * op);
+     void updateUseDefInformation_reg_to_mem(LowOpRegMem * op);
+-    void updateUseDefInformation_mem_scale_to_reg(LowOpMemReg * op);
+-    void updateUseDefInformation_reg_to_mem_scale(LowOpRegMem * op);
+     void updateUseDefInformation_fp_to_mem(LowOpRegMem * op);
+     void updateUseDefInformation_mem_to_fp(LowOpMemReg * op);
+     void signalEndOfNativeBasicBlock();
++    bool isQueueEmpty() const;
+ };
+ 
+ #endif /* ATOM_SCHEDULER_H_ */
+-- 
+1.7.4.1
+

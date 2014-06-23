@@ -1,0 +1,438 @@
+From 8b5768369d2ff3f3c66850cf9697bda77c0c7eb5 Mon Sep 17 00:00:00 2001
+From: Udayan Banerji <udayan.banerji@intel.com>
+Date: Wed, 17 Jul 2013 00:04:49 -0700
+Subject: Dalvik: Flag to abort on error
+
+BZ: 85270
+
+Added flag -Xjitabortonerror which can be used to force a dvmAbort
+whenever an error in the x86 backend is encountered, or dvmCompilerAbort is
+called.
+
+The flag can be passed to dalvikvm via command line or set as a
+global property as part of dalvik.vm.extra-opts.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I76d55c8cd84f3e99374aab783a861b9e32b33a94
+Orig-MCG-Change-Id: I6329c30739d28f268b41a44c4ce5c08b985c3009
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Signed-off-by: Udayan Banerji <udayan.banerji@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/Globals.h                                 |    5 +
+ vm/Init.cpp                                  |    3 +
+ vm/compiler/Utility.cpp                      |   10 +
+ vm/compiler/codegen/x86/CodegenErrors.cpp    |  259 +++++++++++++++-----------
+ vm/compiler/codegen/x86/CodegenErrors.h      |    7 +-
+ vm/compiler/codegen/x86/CodegenInterface.cpp |   17 ++-
+ 6 files changed, 189 insertions(+), 112 deletions(-)
+
+diff --git a/vm/Globals.h b/vm/Globals.h
+index bb8a884..4c46ca2 100644
+--- a/vm/Globals.h
++++ b/vm/Globals.h
+@@ -906,6 +906,11 @@ struct DvmJitGlobals {
+     /* Jit Errors Bit-field */
+     unsigned int jitErrorFlags;
+ 
++    /* If flag is true, we abort the VM if any error happens during JIT
++     * compilation, even if we can possibly ignore it and move on
++     */
++    bool abortOnCompilerError;
++
+     /*
+      * This is used to store the base address of an in-flight compilation whose
+      * class object pointers have been calculated to populate literal pool.
+diff --git a/vm/Init.cpp b/vm/Init.cpp
+index d1ccaa8..8af9de7 100644
+--- a/vm/Init.cpp
++++ b/vm/Init.cpp
+@@ -1323,6 +1323,8 @@ static int processOptions(int argc, const char* const argv[],
+             const char *file = argv[i] + 16;
+             //Send off to handle user pass
+             dvmCompilerHandleUserPlugin (file);
++        } else if (strncmp (argv[i], "-Xjitabortonerror", 17) == 0) {
++            gDvmJit.abortOnCompilerError = true;
+         } else if (strncmp (argv[i], "-Xjitarenatrimstyle:", 20) == 0) {
+             const char *style = argv[i] + 20;
+             const char *acceptedStyles[] = {"none", "onlyOne", "average", "user"};
+@@ -1573,6 +1575,7 @@ static void setCommandLineDefaults()
+     gDvmJit.oldLoopDetection = false;
+     gDvmJit.backEndRegisterization = true;
+     gDvmJit.maximumRegisterization = UINT_MAX;
++    gDvmJit.abortOnCompilerError = false;
+ 
+     gDvmJit.ignorePasses = 0;
+ #if defined(ARCH_IA32)
+diff --git a/vm/compiler/Utility.cpp b/vm/compiler/Utility.cpp
+index 3b0cb16..737394c 100644
+--- a/vm/compiler/Utility.cpp
++++ b/vm/compiler/Utility.cpp
+@@ -509,9 +509,19 @@ void dvmDebugBitVector(char *msg, const BitVector *bv, int length)
+ 
+ void dvmCompilerAbort(CompilationUnit *cUnit)
+ {
++    /* We might want to do a full abort to help with debugging */
++    if (gDvmJit.abortOnCompilerError == true)
++    {
++        ALOGE("Forcing full system abort due to debug flag");
++        dvmAbort();
++    }
++
++    /* Otherwise, just abort trace compilation */
+     ALOGE("Jit: aborting trace compilation, reverting to interpreter");
++
+     /* Force a traceback in debug builds */
+     assert(0);
++
+     /*
+      * Abort translation and force to interpret-only for this trace
+      * Matching setjmp in compiler thread work loop in Compiler.c.
+diff --git a/vm/compiler/codegen/x86/CodegenErrors.cpp b/vm/compiler/codegen/x86/CodegenErrors.cpp
+index 9189e0e..0f82fbc 100644
+--- a/vm/compiler/codegen/x86/CodegenErrors.cpp
++++ b/vm/compiler/codegen/x86/CodegenErrors.cpp
+@@ -17,115 +17,79 @@
+ #include "CodegenErrors.h"
+ 
+ /**
+- * @brief Error messages corresponding to JitCompilationErrors
+- * IMPORTANT: This needs to get updated when JitCompilationErrors
+- * is changed
++ * @class ErrorInformation Used to keep track of information associated with an error
+  */
+-static const char* jitErrorMessages[kJitErrorMaxDefined] = {
+-    "Exceeded maximum allowed VRs in a basic block",
+-    "Jump offset greater than 8-bits",
+-    "Trace contains bytecode with no implementation",
+-    "Trace contains SGET / SPUT bytecode with unresolved field",
+-    "Cannot find BasicBlock_O1 corresponding to a BasicBlock",
+-    "Jit code cache is full while trace compilation",
+-    "Failure in register allocator or register tables",
+-    "Malloc failure while trace compilation",
+-    "Exceeded maximum number of transfer points per BB",
+-    "Exceeded number of destination regs for a source reg",
+-    "Problem with state transfer in JIT",
+-    "Problem with trace formation",
+-    "Problem while performing null or bound check",
+-    "Problem while merging live ranges (mergeLiveRange)",
+-    "Global data not defined",
+-    "Problem while scheduling instructions",
+-    "Issue registerizing the trace in the backend",
+-    "The trace provoked a spill",
+-    "The backend decided it cannot safely handle the Basic Block",
+-    "Patching of Double/Long constants failed",
+-    "An issue was encountered while generating chaining cell",
+-    "Invalid Operand Size was encountered",
+-    "Problem with the plugin system",
+-    "Constant folding failed due to unhandled case",
+-    //Add error messages here when adding error codes
++
++struct ErrorInformation
++{
++    /** @brief Type of error */
++    JitCompilationErrors type;
++
++    /** @brief Error message */
++    const char * errorMessage;
++
++    /** @brief Whether we can possibly fix the error */
++    bool canResolve;
++
++    /** @brief Whether error is fatal */
++    bool isFatal;
+ };
+ 
+ /**
+- * @brief Contains a list of errors which are considered fatal
+- * Putting an error in this list will cause a dvmAbort if the
+- * error happens
+- * @param jitError The error to check for
+- * @return whether it is fatal
++ * @brief Three macros to help error definitions
+  */
+-bool isErrorFatal(JitCompilationErrors jitError) {
+-
+-    switch(jitError) {
+-        case kJitErrorMallocFailed:
+-        case kJitErrorInsScheduling:
+-            return true;
+-        default:
+-            return false;
+-    }
+-}
+ 
+-/**
+- * @brief Checks whether a compilation should be re-attempted
+- * Fixes anything which can be fixed. At the end we
+- * either don't have an error, have fixed the error, or
+- * cannot recover from the error. For the second case, we
+- * retry the compilation.
+- * @param cUnit Compilation Unit context
+- * @param isLastAttempt whether the next compilation attempt will be the last one
+- * @return whether we can retry the trace.
+- */
+-bool dvmCanFixErrorsAndRetry(CompilationUnit *cUnit, bool isLastAttempt)
+-{
+-
+-    //Check if no error happened. No need to retry
+-    if (!IS_ANY_JIT_ERROR_SET())
+-        return false;
+ 
+-    bool isError = false;
+-    int lenErrorCodeBitVector = kJitErrorMaxDefined;
+-
+-    //Check all the errors which have been raised:
+-    for (int i = 0; i < lenErrorCodeBitVector; i++) {
+-        if (IS_JIT_ERROR_SET(i)) {
+-            //This is the first error we are seeing. Print some information
+-            //to be noticeable in the logs
+-            if (!isError) {
+-                ALOGI("++++++++++++++++++++++++++++++++++++++++++++");
+-                ALOGI("JIT_INFO: Issues in trace  %s%s, offset %d", cUnit->method->clazz->descriptor,
+-                     cUnit->method->name, cUnit->traceDesc->trace[0].info.frag.startOffset);
+-
+-                //If kJitErrorCodegen is the first error we encounter,
+-                //somebody forgot to raise an error flag somewhere.
+-                //Print a message and reject the trace:
+-                if (i == kJitErrorCodegen) {
+-                    ALOGI("Unknown issue in trace formation");
+-                    ALOGI("++++++++++++++++++++++++++++++++++++++++++++");
+-                    return false;
+-                }
++#define START_ERRORS \
++    static ErrorInformation gErrorInformation[] = {
+ 
+-                //Some other error happened with a proper flag. Remove the guard
+-                CLEAR_JIT_ERROR(kJitErrorCodegen);
++#define NEW_ERROR(TYPE, MESSAGE, CANRESOLVE, ISFATAL) \
++        { \
++            TYPE, MESSAGE, CANRESOLVE, ISFATAL \
++        }
+ 
+-                isError = true;
+-                ALOGI("The following issues were seen:");
+-            }
++#define END_ERRORS \
++    };
+ 
+-            if (jitErrorMessages[i] == '\0')
+-                ALOGI("\tIssue: (detailed description not available)");
+-            else
+-                ALOGI("\tIssue: %s", jitErrorMessages[i]);
++/**
++ * @brief Table that stores information about errors defined in
++ * JitCompilationErrors
++ */
++START_ERRORS
++    NEW_ERROR (kJitErrorMaxVR,                "Exceeded maximum allowed VRs in a basic block.",               false, false),
++    NEW_ERROR (kJitErrorShortJumpOffset,      "Jump offset greater than 8-bits.",                              true, false),
++    NEW_ERROR (kJitErrorUnsupportedBytecode,  "Trace contains bytecode with no implementation.",              false, false),
++    NEW_ERROR (kJitErrorUnresolvedField,      "Trace contains SGET / SPUT bytecode with unresolved field.",   false, false),
++    NEW_ERROR (kJitErrorInvalidBBId,          "Cannot find BasicBlock_O1 corresponding to a BasicBlock.",     false, false),
++    NEW_ERROR (kJitErrorCodeCacheFull,        "Jit code cache is full.",                                       true, false),
++    NEW_ERROR (kJitErrorRegAllocFailed,       "Failure in register allocator or register tables.",            false, false),
++    NEW_ERROR (kJitErrorMallocFailed,         "Malloc failure during trace compilation.",                      false, true),
++    NEW_ERROR (kJitErrorMaxXferPoints,        "Exceeded maximum number of transfer points per BB.",           false, false),
++    NEW_ERROR (kJitErrorMaxDestRegPerSource,  "Exceeded number of destination regs for a source reg.",        false, false),
++    NEW_ERROR (kJitErrorStateTransfer,        "Problem with state transfer in JIT.",                          false, false),
++    NEW_ERROR (kJitErrorTraceFormation,       "Problem with trace formation.",                                false, false),
++    NEW_ERROR (kJitErrorNullBoundCheckFailed, "Problem while performing null or bound check.",                false, false),
++    NEW_ERROR (kJitErrorMergeLiveRange,       "Problem while merging live ranges (mergeLiveRange).",          false, false),
++    NEW_ERROR (kJitErrorGlobalData,           "Global data not defined.",                                     false, false),
++    NEW_ERROR (kJitErrorInsScheduling,        "Problem during instruction scheduling.",                       false, false),
++    NEW_ERROR (kJitErrorBERegisterization,    "Issue registerizing the trace in the backend.",                 true, false),
++    NEW_ERROR (kJitErrorSpill,                "The trace provoked a spill.",                                   true, false),
++    NEW_ERROR (kJitErrorBBCannotBeHandled,    "The backend decided it cannot safely handle the Basic Block.", false, false),
++    NEW_ERROR (kJitErrorConstInitFail,        "Patching of Double/Long constants failed.",                     true, false),
++    NEW_ERROR (kJitErrorChainingCell,         "An issue was encountered while generating chaining cell.",     false, false),
++    NEW_ERROR (kJitErrorInvalidOperandSize,   "Invalid Operand Size was encountered.",                        false, false),
++    NEW_ERROR (kJitErrorPlugin,               "Problem with the plugin system.",                              false, false),
++    NEW_ERROR (kJitErrorConstantFolding,      "Constant folding failed due to unhandled case.",               false, false),
++    NEW_ERROR (kJitErrorCodegen,              "Undefined issues in trace formation.",                         false, false),
++END_ERRORS
+ 
+-            if (isErrorFatal((JitCompilationErrors) i)) {
+-                ALOGE("\t\t(FATAL ERROR)");
+-                ALOGE("FATAL_ERRORS in JIT. Aborting");
+-                dvmAbort();
+-            }
+-        }
+-    }
+ 
++/**
++ * @brief Tries to resolve errors from which we can recover.
++ * @param cUnit Compilation unit
++ * @param isLastAttempt whether the next compilation attempt will be the last one
++ */
++inline void resolveErrors(CompilationUnit * cUnit, bool isLastAttempt) {
+     /* Handle any errors which can be handled */
+ 
+     //Handle error due to large jump offset
+@@ -185,21 +149,102 @@ bool dvmCanFixErrorsAndRetry(CompilationUnit *cUnit, bool isLastAttempt)
+         //Clear the error:
+         CLEAR_JIT_ERROR(kJitErrorConstInitFail);
+     }
++}
++
++/**
++ * @brief Checks whether a compilation should be re-attempted
++ * Fixes anything which can be fixed. At the end we
++ * either don't have an error, have fixed the error, or
++ * cannot recover from the error. For the second case, we
++ * retry the compilation.
++ * @param cUnit Compilation Unit context
++ * @param isLastAttempt whether the next compilation attempt will be the last one
++ * @return whether we can retry the trace.
++ */
++bool dvmCanFixErrorsAndRetry(CompilationUnit *cUnit, bool isLastAttempt){
++    // Make sure that the error information table is synced up with the
++    // error enum JitCompilationErrors
++    assert (NELEM(gErrorInformation) == static_cast<int>(kJitErrorMaxDefined));
++
++    // Checks if any error has occurred. If not, we do not need to retry.
++    if (IS_ANY_JIT_ERROR_SET() == false) {
++        return false;
++    }
++
++    bool firstError = true;
++
++    //Get the maximum error number the system is aware of so far:
++    int maxError = static_cast<int>(kJitErrorCodegen);
++
++    // Check which errors have been raised
++    for (int errorIndex = 0; errorIndex <= maxError; errorIndex++) {
++
++        //Get the error from the table
++        JitCompilationErrors error = gErrorInformation[errorIndex].type;
+ 
+-    /* If at this point, we again have no errors set
+-     * we have successfully resolved the errors. We can
+-     * retry the trace now.
+-     */
+-    if (!IS_ANY_JIT_ERROR_SET()){
+-        ALOGI("Retrying trace %s%s, offset %d", cUnit->method->clazz->descriptor,
++        if (IS_JIT_ERROR_SET(error) == true) {
++
++            // If this is the first error we are seeing, print some information
++            // to be noticeable in the logs
++            if (firstError == true) {
++                ALOGD("++++++++++++++++++++++++++++++++++++++++++++");
++                ALOGD("JIT_INFO: Issues while compiling trace  %s%s, offset %d",
++                        cUnit->method->clazz->descriptor, cUnit->method->name,
++                        cUnit->traceDesc->trace[0].info.frag.startOffset);
++
++                // If kJitErrorCodegen is the first error we encounter,
++                // somebody forgot to raise an error flag somewhere.
++                // Otherwise, we should clear the flag because another
++                // non-generic message will be printed out.
++                if (error != kJitErrorCodegen) {
++                    CLEAR_JIT_ERROR(kJitErrorCodegen);
++                }
++
++                firstError = false;
++            }
++
++            // Paranoid. Make sure we actually found an entry
++            assert (errorIndex < NELEM(gErrorInformation));
++
++            // Find out if error is fatal
++            bool fatalError = gErrorInformation[errorIndex].isFatal;
++
++            // If we are set to abort on error and error cannot be resolved, then
++            // the error is fatal.
++            fatalError = (fatalError == true) ||
++                            (gDvmJit.abortOnCompilerError == true
++                                && gErrorInformation[errorIndex].canResolve == false);
++
++            // Print error message
++            if (fatalError == true) {
++                ALOGE("\t%s",
++                        gErrorInformation[errorIndex].errorMessage);
++                ALOGE("FATAL_ERRORS in JIT. Aborting compilation.");
++                dvmCompilerAbort(cUnit);
++            }
++            else {
++                ALOGD("\t%s",
++                        gErrorInformation[errorIndex].errorMessage);
++            }
++        }
++    }
++
++    // Handle any errors which can be resolved
++    resolveErrors(cUnit, isLastAttempt);
++
++    // If we have no errors set at this point, we have successfully resolved
++    // them and thus we can retry the trace now.
++    if (IS_ANY_JIT_ERROR_SET() == false){
++        ALOGD("JIT_INFO: Retrying trace %s%s, offset %d", cUnit->method->clazz->descriptor,
+                 cUnit->method->name, cUnit->traceDesc->trace[0].info.frag.startOffset);
+-        ALOGI("++++++++++++++++++++++++++++++++++++++++++++");
++        ALOGD("++++++++++++++++++++++++++++++++++++++++++++");
+         return true;
+     }
+ 
+-    //Otherwise, error cannot be handled:
+-    ALOGI("JIT_WARNING: Current trace has been rejected");
+-    ALOGI("++++++++++++++++++++++++++++++++++++++++++++");
++    // Otherwise, error cannot be handled or does not have a handler
++    ALOGD("JIT_INFO: Terminating trace due to unresolved issues");
++    ALOGD("++++++++++++++++++++++++++++++++++++++++++++");
++
+     return false;
+ }
+ 
+diff --git a/vm/compiler/codegen/x86/CodegenErrors.h b/vm/compiler/codegen/x86/CodegenErrors.h
+index 3db8c8f..4301da0 100644
+--- a/vm/compiler/codegen/x86/CodegenErrors.h
++++ b/vm/compiler/codegen/x86/CodegenErrors.h
+@@ -90,8 +90,11 @@ enum JitCompilationErrors {
+     /** @brief Unhandled case during constant folding */
+     kJitErrorConstantFolding,
+ 
+-    /* ----- Add more errors above ---------------------------*/
+-    /* ----- Don't add new errors beyond this point ----------*/
++    /* ----- Add more errors above ---------------------------
++     * ----- Don't add new errors beyond this point ----------
++     * When adding more errors, update error information table
++     * in CodegenErrors.cpp
++     */
+ 
+     /** @brief Indicates "some" error happened
+      * Specifically, the purpose is that if someone forgets
+diff --git a/vm/compiler/codegen/x86/CodegenInterface.cpp b/vm/compiler/codegen/x86/CodegenInterface.cpp
+index 49ee049..36db7e6 100644
+--- a/vm/compiler/codegen/x86/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/CodegenInterface.cpp
+@@ -2321,9 +2321,20 @@ void dvmCompilerMIR2LIR(CompilationUnit *cUnit, JitTranslationInfo *info) {
+    do {
+         //See if we have been here too many times:
+         if (numTries > MAX_RETRIES) {
+-            ALOGI("Too many retries while compiling trace  %s%s, offset %d", cUnit->method->clazz->descriptor,
+-                cUnit->method->name, cUnit->traceDesc->trace[0].info.frag.startOffset);
+-            ALOGI("Rejecting Trace");
++
++            //Abort if the flag is set.
++            if (gDvmJit.abortOnCompilerError == true) {
++                ALOGE("Too many retries for trace  %s%s, offset %d", cUnit->method->clazz->descriptor,
++                        cUnit->method->name, cUnit->traceDesc->trace[0].info.frag.startOffset);
++
++                //This will cause a full abort due to the flag
++                dvmCompilerAbort(cUnit);
++            }
++
++            ALOGD("Too many retries while compiling trace  %s%s, offset %d", cUnit->method->clazz->descriptor,
++                    cUnit->method->name, cUnit->traceDesc->trace[0].info.frag.startOffset);
++            ALOGD("Rejecting Trace");
++
+             //Restore the compilation state
+             dvmRestoreCompilationState (compilationState);
+             //Make sure 'NULL' will be returned as compilation result
+-- 
+1.7.4.1
+

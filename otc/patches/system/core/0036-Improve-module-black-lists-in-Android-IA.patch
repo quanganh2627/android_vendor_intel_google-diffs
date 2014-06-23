@@ -1,0 +1,641 @@
+From 1e2938f4f8231287f1ba1fa570b7b78c0882e891 Mon Sep 17 00:00:00 2001
+From: Jianxun Zhang <jianxun.zhang@intel.com>
+Date: Tue, 4 Dec 2012 13:46:38 -0800
+Subject: Improve module black lists in Android IA
+
+Main changes:
+
+() Switch parsing jobs of black list from internal module parser
+in ueventd to the module parser in libcutils. By doing so, we can
+centralize module loading solution into libcutils and reduce the
+foot prints in ueventd.
+
+() Change the role of modules.blacklist. It works as the black list
+at a lower level for insmod_by_dep API now. Every module in the dep.
+chain will be checked with this file and an optional black list from
+caller. The whole chain will be scanned BEFORE any loading happens.
+No module will be loaded if any in the dep. chain failed checking.
+This brings a stronger security for module loading, and provides an
+alternative approach to disable a module, beside kernel config.
+
+() Add new extra black list file in insmod_by_dep()'s arguments. Any
+caller now can pass their own black list file to insmod_by_dep(). For
+example, ueventd can add its own black list when calling to block
+iwlwifi module, but this will not prevent wifi HAL to load that module.
+
+() The existing ueventd can not prevent modules in the black list if
+they are not top modules in uevents but in a module dep. chain.
+(ueventd doesn't know dep. chain which is constructed later in the lower
+levels.). The new extra black list passed to insmod_by_dep() will resolve
+this issue.
+
+() Other misc fixes of this commit's parents.
+
+() To do:
+Support pthread mutex in insmod_by_dep() so a process calling it only needs
+to setup lists of dep, base black list and alias at the first time.
+
+() Ueventd is still parsing alias, though we switch it to the parser in
+libcutils in tis commit. We will move parsing job to insmod_by_dep() later.
+
+For: AXIA-653
+Change-Id: I113915d19958ea4378716b866e98ac5dffc8f0b3
+Depends-Change-Id: I4dc060b3dc540284d8063826b221717902094f91
+Depends-Change-Id: Ifaec8e535f6647912f76256c7f77aef450c66949
+Signed-off-by: Jianxun Zhang <jianxun.zhang@intel.com>
+---
+ include/cutils/module_parsers.h |    5 +-
+ include/cutils/probe_module.h   |   14 +++-
+ init/builtins.c                 |    2 +-
+ init/devices.c                  |  226 +++-----------------------------------
+ libcutils/module_parsers.c      |   13 ++-
+ libcutils/probe_module.c        |  106 +++++++++++++++++--
+ 6 files changed, 141 insertions(+), 225 deletions(-)
+
+diff --git a/include/cutils/module_parsers.h b/include/cutils/module_parsers.h
+index db14dfb..4814ff0 100644
+--- a/include/cutils/module_parsers.h
++++ b/include/cutils/module_parsers.h
+@@ -14,13 +14,10 @@
+  * limitations under the License.
+  */
+ 
+-/* parsers for module alias and blacklists */
++/* parsers for module loading */
+ 
+ #include <cutils/list.h>
+ 
+-#define READ_MODULES_ALIAS  1
+-#define READ_MODULES_BLKLST 2
+-
+ struct module_alias_node {
+     char *name;
+     char *pattern;
+diff --git a/include/cutils/probe_module.h b/include/cutils/probe_module.h
+index dfa814d..834e094 100644
+--- a/include/cutils/probe_module.h
++++ b/include/cutils/probe_module.h
+@@ -48,6 +48,17 @@ extern "C" {
+  *              must be a '/'. If it is NULL, we will take
+  *              /system/lib/modules/modules.dep by default.
+  *
++ * blacklist  : A file of modules you don't want to loaded. It is optional.
++ *              If the file name is provided, modules in it will be parsed
++ *              and appended to the system's module black list which is from
++ *              the base /etc/modules.blacklist. The base black list will
++ *              always be appiled in insmod_by_dep(). This parameter provides
++ *              a chance to callers to prevent more modules in a one-shot
++ *              style. The typical format of a module in the black list file
++ *              is like the below. Note, specify module's name instead of alias.
++ *
++ *              blacklist your_module_name
++ *
+  * return     : 0 for success; non-zero for any errors.
+  *
+  * Note:
+@@ -60,7 +71,8 @@ extern int insmod_by_dep(
+         const char *args,
+         const char *dep_name,
+         int strip,
+-        const char * base);
++        const char *base,
++        const char *blacklist);
+ 
+ /* rmmod_by_dep() - remove a module (target) from kernel with its dependency
+  * The module's dependency must be described in the provided dependency file.
+diff --git a/init/builtins.c b/init/builtins.c
+index ea64e22..ea35198 100644
+--- a/init/builtins.c
++++ b/init/builtins.c
+@@ -426,7 +426,7 @@ static int do_probemod_inner(int nargs, char **args, int opt_len)
+         }
+     }
+ 
+-    ret = insmod_by_dep(args[1], options, NULL, 1, NULL);
++    ret = insmod_by_dep(args[1], options, NULL, 1, NULL, NULL);
+     if (ret)
+         ERROR("Couldn't probe module '%s'\n", args[1]);
+     return ret;
+diff --git a/init/devices.c b/init/devices.c
+index c4334c1..c3e8857 100644
+--- a/init/devices.c
++++ b/init/devices.c
+@@ -49,15 +49,14 @@
+ #include "log.h"
+ #include "parser.h"
+ 
++#include <cutils/module_parsers.h>
++
+ #define SYSFS_PREFIX    "/sys"
+ #define FIRMWARE_DIR1   "/etc/firmware"
+ #define FIRMWARE_DIR2   "/vendor/firmware"
+ #define FIRMWARE_DIR3   "/firmware/image"
+-
+ #define MODULES_ALIAS   "/system/lib/modules/modules.alias"
+-#define MODULES_BLKLST  "/system/etc/modules.blacklist"
+-#define READ_MODULES_ALIAS	1
+-#define READ_MODULES_BLKLST	2
++#define MODULES_BLKLST  "/system/etc/ueventd.modules.blacklist"
+ 
+ extern struct selabel_handle *sehandle;
+ 
+@@ -97,27 +96,12 @@ struct platform_node {
+     struct listnode list;
+ };
+ 
+-struct module_alias_node {
+-    char *name;
+-    char *pattern;
+-    struct listnode list;
+-};
+-
+-struct module_blacklist_node {
+-    char *name;
+-    struct listnode list;
+-};
+-
+ static list_declare(sys_perms);
+ static list_declare(dev_perms);
+ static list_declare(platform_names);
+ static list_declare(modules_aliases_map);
+-static list_declare(modules_blacklist);
+ static list_declare(deferred_module_loading_list);
+ 
+-static int read_modules_aliases();
+-static int read_modules_blacklist();
+-
+ int add_dev_perms(const char *name, const char *attr,
+                   mode_t perm, unsigned int uid, unsigned int gid,
+                   unsigned short wildcard) {
+@@ -690,30 +674,6 @@ static void handle_generic_device_event(struct uevent *uevent)
+              uevent->major, uevent->minor, links);
+ }
+ 
+-static int is_module_blacklisted(const char *name)
+-{
+-    struct listnode *blklst_node;
+-    struct module_blacklist_node *blacklist;
+-    int ret = 0;
+-
+-    if (!name) goto out;
+-
+-    /* See if module is blacklisted, skip if it is */
+-    list_for_each(blklst_node, &modules_blacklist) {
+-        blacklist = node_to_item(blklst_node,
+-                                 struct module_blacklist_node,
+-                                 list);
+-        if (!strcmp(name, blacklist->name)) {
+-            INFO("modules %s is blacklisted\n", name);
+-            ret = 1;
+-            goto out;
+-        }
+-    }
+-
+-out:
+-    return ret;
+-}
+-
+ static int load_module_by_device_modalias(const char *id)
+ {
+     struct listnode *alias_node;
+@@ -728,21 +688,19 @@ static int load_module_by_device_modalias(const char *id)
+         if (alias && alias->name && alias->pattern) {
+             if (fnmatch(alias->pattern, id, 0) == 0) {
+                 INFO("trying to load module %s due to uevents\n", alias->name);
+-
+-                if (!is_module_blacklisted(alias->name)) {
+-                    if (insmod_by_dep(alias->name, "", NULL, 1, NULL)) {
+-                        /* cannot load module. try another one since
+-                         * there may be another match.
+-                         */
+-                        INFO("cannot load module %s due to uevents\n",
+-                             alias->name);
+-                    } else {
+-                        /* loading was successful */
+-                        INFO("loaded module %s due to uevents\n", alias->name);
+-                        ret = 0;
+-                        goto out;
+-                    }
++                if (insmod_by_dep(alias->name, "", NULL, 1, NULL, MODULES_BLKLST)) {
++                    /* cannot load module. try another one since
++                     * there may be another match.
++                     */
++                    INFO("cannot load module %s due to uevents\n",
++                            alias->name);
++                } else {
++                    /* loading was successful */
++                    INFO("loaded module %s due to uevents\n", alias->name);
++                    ret = 0;
++                    goto out;
+                 }
++
+             }
+         }
+     }
+@@ -777,12 +735,9 @@ static void handle_deferred_module_loading()
+ 
+ int module_probe(const char *modalias)
+ {
+-    if (list_empty(&modules_aliases_map)) {
+-        if (read_modules_aliases() == 0)
+-            read_modules_blacklist();
+-        else
++    if (list_empty(&modules_aliases_map))
++        if (parse_alias_to_list(MODULES_ALIAS, &modules_aliases_map) != 0)
+             return -1;
+-    }
+ 
+     return load_module_by_device_modalias(modalias);
+ }
+@@ -796,8 +751,7 @@ static void handle_module_loading(const char *modalias)
+      * we load all the deferred ones
+      */
+     if (list_empty(&modules_aliases_map)) {
+-        if (read_modules_aliases() == 0) {
+-            read_modules_blacklist();
++        if (parse_alias_to_list(MODULES_ALIAS, &modules_aliases_map) == 0) {
+             handle_deferred_module_loading();
+         }
+     }
+@@ -999,150 +953,6 @@ static void handle_firmware_event(struct uevent *uevent)
+     }
+ }
+ 
+-static void parse_line_module_alias(struct parse_state *state, int nargs, char **args)
+-{
+-    struct module_alias_node *node;
+-
+-    if (!args ||
+-        (nargs != 3) ||
+-        !args[0] || !args[1] || !args[2]) {
+-        /* empty line or not enough arguments */
+-        return;
+-    }
+-
+-    node = calloc(1, sizeof(*node));
+-    if (!node) return;
+-
+-    node->name = strdup(args[2]);
+-    if (!node->name) {
+-        free(node);
+-        return;
+-    }
+-
+-    node->pattern = strdup(args[1]);
+-    if (!node->pattern) {
+-        free(node->name);
+-        free(node);
+-        return;
+-    }
+-
+-    list_add_tail(&modules_aliases_map, &node->list);
+-}
+-
+-static void parse_line_module_blacklist(struct parse_state *state, int nargs, char **args)
+-{
+-    struct module_blacklist_node *node;
+-
+-    if (!args ||
+-        (nargs != 2) ||
+-        !args[0] || !args[1]) {
+-        /* empty line or not enough arguments */
+-        return;
+-    }
+-
+-    /* this line does not being with "blacklist" */
+-    if (strncmp(args[0], "blacklist", 9)) return;
+-
+-    node = calloc(1, sizeof(*node));
+-    if (!node) return;
+-
+-    node->name = strdup(args[1]);
+-    if (!node->name) {
+-        free(node);
+-        return;
+-    }
+-
+-    list_add_tail(&modules_blacklist, &node->list);
+-}
+-
+-static int __read_modules_desc_file(int mode)
+-{
+-    struct parse_state state;
+-    char *args[3];
+-    int nargs;
+-    char *data = NULL;
+-    char *fn;
+-    int fd = -1;
+-    int ret = -1;
+-    int args_to_read = 0;
+-
+-    if (mode == READ_MODULES_ALIAS) {
+-        /* read modules.alias */
+-        if (asprintf(&fn, "%s", MODULES_ALIAS) <= 0) {
+-            goto out;
+-        }
+-    } else if (mode == READ_MODULES_BLKLST) {
+-        /* read modules.blacklist */
+-        if (asprintf(&fn, "%s", MODULES_BLKLST) <= 0) {
+-            goto out;
+-        }
+-    } else {
+-        /* unknown mode */
+-        goto out;
+-    }
+-
+-    fd = open(fn, O_RDONLY);
+-    if (fd == -1) {
+-        goto out;
+-    }
+-
+-    /* read the whole file */
+-    data = read_file(fn, 0);
+-    if (!data) {
+-        goto out;
+-    }
+-
+-    /* invoke tokenizer */
+-    nargs = 0;
+-    state.filename = fn;
+-    state.line = 1;
+-    state.ptr = data;
+-    state.nexttoken = 0;
+-    if (mode == READ_MODULES_ALIAS) {
+-        state.parse_line = parse_line_module_alias;
+-        args_to_read = 3;
+-    } else if (mode == READ_MODULES_BLKLST) {
+-        state.parse_line = parse_line_module_blacklist;
+-        args_to_read = 2;
+-    }
+-    for (;;) {
+-        int token = next_token(&state);
+-        switch (token) {
+-        case T_EOF:
+-            state.parse_line(&state, 0, 0);
+-            ret = 0;
+-            goto out;
+-        case T_NEWLINE:
+-            if (nargs) {
+-                state.parse_line(&state, nargs, args);
+-                nargs = 0;
+-            }
+-            break;
+-        case T_TEXT:
+-            if (nargs < args_to_read) {
+-                args[nargs++] = state.text;
+-            }
+-            break;
+-        }
+-    }
+-    ret = 0;
+-
+-out:
+-    if (fd != -1) {
+-        close(fd);
+-    }
+-    free(data);
+-    return ret;
+-}
+-
+-static int read_modules_aliases() {
+-    return __read_modules_desc_file(READ_MODULES_ALIAS);
+-}
+-
+-static int read_modules_blacklist() {
+-    return __read_modules_desc_file(READ_MODULES_BLKLST);
+-}
+-
+ #define UEVENT_MSG_LEN  1024
+ void handle_device_fd()
+ {
+diff --git a/libcutils/module_parsers.c b/libcutils/module_parsers.c
+index 5371146..4fc4041 100644
+--- a/libcutils/module_parsers.c
++++ b/libcutils/module_parsers.c
+@@ -25,10 +25,14 @@
+ #include <string.h>
+ #include <cutils/list.h>
+ #include <stdlib.h>
++
++#define LOG_TAG "ModuleParsers"
+ #include <cutils/log.h>
++
+ #include <cutils/misc.h>
+ #include <cutils/module_parsers.h>
+ 
++
+ #define READ_MODULES_ALIAS  1
+ #define READ_MODULES_BLKLST 2
+ 
+@@ -51,7 +55,7 @@ struct parse_state
+     void *priv;
+ };
+ 
+-int next_token(struct parse_state *state)
++static int next_token(struct parse_state *state)
+ {
+     char *x = state->ptr;
+     char *s;
+@@ -189,6 +193,7 @@ void free_alias_list(struct listnode *head)
+ 
+ void free_black_list(struct listnode *head)
+ {
++
+     struct listnode *node = NULL;
+     struct listnode *next = NULL;
+     struct module_blacklist_node *black = NULL;
+@@ -197,7 +202,6 @@ void free_black_list(struct listnode *head)
+     {
+         black = node_to_item(node, struct module_blacklist_node, list);
+         if (black) {
+-            ALOGI("free black list name [%s]\n", black->name);
+             free(black->name);
+             list_remove(node);
+             free(black);
+@@ -252,7 +256,7 @@ static void parse_line_module_blacklist(struct parse_state *state, int nargs, ch
+         free(node);
+         return;
+     }
+-    /* caller must get mutex first. */
++
+     list_add_tail(head, &node->list);
+ }
+ 
+@@ -282,8 +286,9 @@ static void parse_line_module_alias(struct parse_state *state, int nargs, char *
+         free(node);
+         return;
+     }
+-    /* Caller must get mutex first. */
++
+     list_add_tail(head, &node->list);
++
+ }
+ 
+ int module_parser(const char *file_name, int mode, struct listnode *head)
+diff --git a/libcutils/probe_module.c b/libcutils/probe_module.c
+index e043c66..1758b12 100644
+--- a/libcutils/probe_module.c
++++ b/libcutils/probe_module.c
+@@ -14,12 +14,15 @@
+  * limitations under the License.
+  */
+ 
++#define _GNU_SOURCE
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <cutils/misc.h>
++#include <cutils/list.h>
++#include <cutils/module_parsers.h>
+ 
+ #define LOG_TAG "ProbeModule"
+ #include <cutils/log.h>
+@@ -371,6 +374,67 @@ static void *load_dep_file(const char *file_name)
+     return load_file(dep_file_name, &len);
+ }
+ 
++/* is_dep_in_blacklist() checks if any module in dependency
++ * is in a blacklilst
++ * dep:         dependency array
++ * blacklist :  head of a black list.
++ * return:      1 if any module in dep is in black list.
++ *              -1 when any error happens
++ *              0 none of modules in dep is in black list.
++ * */
++static int is_dep_in_blacklist(char *dep[], struct listnode *blacklist)
++{
++    int i;
++    char *tmp;
++    int ret = 0;
++    size_t len;
++
++    for (i = 0; dep[i]; i++) {
++        tmp = dep[i];
++        len = strlen(tmp);
++
++        if (!(len > strlen(".ko")
++                && tmp[len - 1] == 'o'
++                        && tmp[len - 2] == 'k'
++                                && tmp[len - 3] == '.')) {
++            ret = -1;
++
++            break;
++        }
++
++        if (asprintf(&tmp, "%s", dep[i]) <= 0) {
++            ret = -1;
++
++            break;
++        }
++
++        tmp[len - 3] = '\0';
++        if (is_module_blacklisted(strip_path(tmp), blacklist)) {
++            ALOGE("found module [%s] is in black list\n", tmp);
++            free(tmp);
++            ret = 1;
++
++            break;
++        }
++        free(tmp);
++    }
++
++    return ret;
++}
++static void dump_black_list(struct listnode *black_list_head)
++{
++    struct listnode *blklst_node;
++    struct module_blacklist_node *blacklist;
++
++    list_for_each(blklst_node, black_list_head) {
++        blacklist = node_to_item(blklst_node,
++                                 struct module_blacklist_node,
++                                 list);
++
++            ALOGE("DUMP BLACK: [%s]\n", blacklist->name);
++
++    }
++}
+ /* insmod_by_dep() interface to outside,
+  * refer to its description in probe_module.h
+  */
+@@ -378,40 +442,68 @@ int insmod_by_dep(const char *module_name,
+         const char *args,
+         const char *dep_name,
+         int strip,
+-        const char *base)
++        const char *base,
++        const char *blacklist)
+ {
+-    void *dep_file;
++    void *dep_file = NULL;
+     char **dep = NULL;
+     int ret = -1;
++    list_declare(base_blacklist);
++    list_declare(extra_blacklist);
+ 
+     if (!module_name || *module_name == '\0') {
+         ALOGE("need valid module name\n");
+         return ret;
+     }
+ 
++    ret = parse_blacklist_to_list("/system/etc/modules.blacklist", &base_blacklist);
++
++    if (ret)
++        ALOGI("%s: parse base black list error %d\n", __FUNCTION__, ret);
++
++    if (blacklist && *blacklist != '\0') {
++        ret = parse_blacklist_to_list(blacklist, &extra_blacklist);
++        if (ret) {
++            ALOGI("%s: parse extra black list error %d\n", __FUNCTION__, ret);
++
++            /* Extra black list from caller is optional, but when caller does
++             * give us an extra file and something's wrong with it, we will stop going further*/
++            goto free_file;
++        }
++    }
+     dep_file = load_dep_file(dep_name);
+ 
+     if (!dep_file) {
+         ALOGE("cannot load dep file : %s\n", dep_name);
+-        return ret;
++        goto free_file;
+     }
+ 
+     dep = look_up_dep(module_name, dep_file);
+ 
+     if (!dep) {
+-        ALOGE("%s: cannot load module: [%s]\n", __FUNCTION__, module_name);
++        ALOGE("%s: cannot find module's dependency info: [%s]\n", __FUNCTION__, module_name);
+         goto free_file;
+     }
+ 
+-    ret = insmod_s(dep, args, strip, base);
++    if (is_dep_in_blacklist(dep, &extra_blacklist)) {
++        ALOGE("%s: a module is in caller's black list, stop further loading\n", __FUNCTION__);
++        goto free_file;
++    }
+ 
+-    free(dep);
++    if (is_dep_in_blacklist(dep, &base_blacklist)) {
++        ALOGE("%s: a module is in system black list, stop further loading\n", __FUNCTION__);
++        goto free_file;
++    }
++
++    ret = insmod_s(dep, args, strip, base);
+ 
+ free_file:
++    free(dep);
+     free(dep_file);
++    free_black_list(&base_blacklist);
++    free_black_list(&extra_blacklist);
+ 
+     return ret;
+-
+ }
+ 
+ /* rmmod_by_dep() interface to outside,
+-- 
+1.7.4.1
+

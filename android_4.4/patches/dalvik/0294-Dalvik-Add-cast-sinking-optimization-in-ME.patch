@@ -1,0 +1,898 @@
+From 46224174d690c50f2d97dd7c78a64c689fd69235 Mon Sep 17 00:00:00 2001
+From: Yixin Shou <yixin.shou@intel.com>
+Date: Thu, 15 Aug 2013 20:33:31 -0700
+Subject: Dalvik: Add cast sinking optimization in ME
+
+BZ: 132499
+
+A new optimization pass has been added to the pass framework that does
+cast sinking. The gate for this pass is testing if we have a loop with the
+new loop system and is only applied if we have a very simple loop.
+The worker function for the pass is dvmCompilerSinkCasts.
+
+The pass goes through the single basic block looking for int-to-short and
+int-to-byte casts. Once it finds those it tests whether sinking them to
+the loop exit is safe and only does the sink for count up loops. The only
+casts sunk are those that are same VR to same VR casts.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I5ecbab448632edc1dfde8c19358cd5d6e2146e5c
+Orig-MCG-Change-Id: Ie18c605fe75cd21aa690da43ad3df42e770f4017
+Signed-off-by: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Signed-off-by: Yixin Shou <yixin.shou@intel.com>
+Signed-off-by: Udayan Banerji <udayan.banerji@intel.com>
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Reviewed-on: http://android.intel.com:8080/125066
+Reviewed-by: Provodin, Vitaly A <vitaly.a.provodin@intel.com>
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/Dvm.mk                       |    4 +-
+ vm/compiler/Compiler.h          |    8 +
+ vm/compiler/Dataflow.cpp        |  270 ++++++++++++++++++++++++++++++--
+ vm/compiler/Loop.cpp            |    1 +
+ vm/compiler/LoopInformation.cpp |   33 ++++-
+ vm/compiler/LoopInformation.h   |   23 +++
+ vm/compiler/LoopOpt.cpp         |    3 +
+ vm/compiler/SinkCastOpt.cpp     |  327 +++++++++++++++++++++++++++++++++++++++
+ vm/compiler/SinkCastOpt.h       |   27 ++++
+ vm/compiler/Utility.cpp         |   11 ++
+ 10 files changed, 689 insertions(+), 18 deletions(-)
+ create mode 100644 vm/compiler/SinkCastOpt.cpp
+ create mode 100644 vm/compiler/SinkCastOpt.h
+
+diff --git a/vm/Dvm.mk b/vm/Dvm.mk
+index 807b35c..b6237c3 100644
+--- a/vm/Dvm.mk
++++ b/vm/Dvm.mk
+@@ -378,7 +378,9 @@ ifeq ($(dvm_arch),x86)
+               compiler/SSAWalkData.cpp \
+               compiler/RegisterizationME.cpp \
+               compiler/Expression.cpp \
+-              compiler/AccumulationSinking.cpp
++              compiler/AccumulationSinking.cpp \
++              compiler/SinkCastOpt.cpp
++
+        # need apache harmony x86 encoder/decoder
+        LOCAL_C_INCLUDES += \
+               dalvik/vm/compiler \
+diff --git a/vm/compiler/Compiler.h b/vm/compiler/Compiler.h
+index 6e22b36..3c3456b 100644
+--- a/vm/compiler/Compiler.h
++++ b/vm/compiler/Compiler.h
+@@ -354,4 +354,12 @@ BasicBlock *dvmCompilerGetNextBasicBlockViaBitVector (BitVectorIterator &bvItera
+ 
+ /* Build the def use chains */
+ bool dvmCompilerBuildDefUseChain (CompilationUnit *cUnit, BasicBlock *bb);
++
++/**
++ * @brief Return true if the mir is a conditional bytecode
++ * @param mir The MIR to check
++ * @return whether the mir is conditional
++ */
++bool dvmCompilerIsMIRConditional (MIR *mir);
++
+ #endif  // DALVIK_VM_COMPILER_H_
+diff --git a/vm/compiler/Dataflow.cpp b/vm/compiler/Dataflow.cpp
+index fc2ab22..222bace 100644
+--- a/vm/compiler/Dataflow.cpp
++++ b/vm/compiler/Dataflow.cpp
+@@ -2283,6 +2283,237 @@ bool dvmCompilerFindInductionVariables(struct CompilationUnit *cUnit,
+ #else
+ 
+ /**
++ * @brief check if mir is a supported type conversion bytecode during IV detection
++ * @param mir mir instruction need to be checked
++ * @return whether bytecode type of mir is support for IV detection
++ */
++static bool isSupportedCastBytecodeForIV(MIR* mir)
++{
++    switch (mir->dalvikInsn.opcode)
++    {
++        case OP_INT_TO_BYTE:
++        case OP_INT_TO_SHORT:
++            return true;
++        default:
++            return false;
++    }
++}
++
++/**
++ * @brief Find the upper bound
++ * @details Find the upper bound of a count up loop by looking
++ * at the CONSTs defining the if-VR
++ * Currently works only with a single BasicBlock loop
++ * @param cUnit the CompilationUnit
++ * @param info the LoopInformation
++ * @param[out] upperBound reference to where to store the upperBound
++ * @return whether or not the function found the upper bound
++ */
++static bool findLoopUpperBound (CompilationUnit *cUnit, LoopInformation *const info, int &upperBound)
++{
++    //Loop should exist and should be a count up loop
++    if (info == 0)
++    {
++        return false;
++    }
++
++    //Get the bitvector of BWCC
++    BitVector *bv = info->getBackwardBranches ();
++
++    if (bv == 0)
++    {
++        return false;
++    }
++
++    //Check if we have only one BWCC
++    unsigned int count = dvmCountSetBits (bv);
++
++    if (count != 1)
++    {
++        return false;
++    }
++
++    //Get BWCC
++    unsigned int idx = dvmHighestBitSet (bv);
++    BasicBlock *bb = (BasicBlock *) dvmGrowableListGetElement(&cUnit->blockList, idx);
++
++    //Paranoid
++    if (bb == 0)
++    {
++        return false;
++    }
++
++    //Now get its predecessor
++    BitVector *predecessors = bb->predecessors;
++    count = dvmCountSetBits (predecessors);
++
++    //If we have more one predecessors, bail
++    if (count != 1)
++    {
++        return false;
++    }
++
++    //Get index
++    idx = dvmHighestBitSet (predecessors);
++
++    //Get the bb
++    bb = (BasicBlock *) dvmGrowableListGetElement(&cUnit->blockList, idx);
++
++    //Make sure we have an "if" at the end
++    const MIR *const lastMIR = bb->lastMIRInsn;
++    if (lastMIR == 0)
++    {
++        return false;
++    }
++
++    const Opcode opcode = lastMIR->dalvikInsn.opcode;
++    if (opcode < OP_IF_EQ || opcode > OP_IF_LEZ)
++    {
++        return false;
++    }
++
++    //Get the SSA etc
++    SSARepresentation *ssaRep = lastMIR->ssaRep;
++
++    //Make sure we have only two uses
++    if (ssaRep == 0 || ssaRep->numUses != 2)
++    {
++        return false;
++    }
++
++    //Check the MIR defining the first use
++    MIR *mirUseFirst = ssaRep->defWhere[0];
++    MIR *mirUseSecond = ssaRep->defWhere[1];
++
++
++    //Paranoid
++    if (mirUseFirst == 0 || mirUseSecond == 0)
++    {
++        return false;
++    }
++
++    //This will hold the const value if found
++    int constValue = 0;
++
++    //We don't care about wide constants
++    int constValueIgnored = 0;
++
++    bool isWideConst = false;
++
++    bool setsConst = dexGetConstant (mirUseFirst->dalvikInsn, constValue,
++            constValueIgnored, isWideConst);
++
++    if (setsConst == true && isWideConst == false)
++    {
++        upperBound = constValue;
++        return true;
++    }
++
++    //Otherwise check the MIR defining the second use
++    setsConst = dexGetConstant (mirUseSecond->dalvikInsn, constValue,
++            constValueIgnored, isWideConst);
++
++    if (setsConst == true && isWideConst == false)
++    {
++        upperBound = constValue;
++        return true;
++    }
++
++    return false;
++}
++
++
++/**
++ * @brief Check if whether this is a valid cast operation on an IV
++ * @details Assuming the MIR defines an IV, is the operation a cast,
++ * and if so, is it a valid cast? A valid cast on an IV will keep the
++ * type of IV compatible with the loop bound.
++ * @param cUnit the CompilationUnit
++ * @param info loop information
++ * @param defMir mir that is a bytecode need to be checked
++ * @return whether we need and can go see the next def for IV detection
++ */
++static bool isAValidCastForIV (CompilationUnit *cUnit, LoopInformation *info, MIR* defMir)
++{
++    // check if the defMIR is the type conversion bytecode we supported for IV detection
++    if (isSupportedCastBytecodeForIV(defMir) == true)
++    {
++        int upperBound = 0;
++
++        //Find the upper bound and put it in upperBound
++        if (findLoopUpperBound(cUnit, info, upperBound) == false)
++        {
++            return false;
++        }
++
++        // Check the constant to see if it's within the range of the cast type
++        switch (defMir->dalvikInsn.opcode)
++        {
++            case OP_INT_TO_BYTE:
++                if (upperBound > 127 || upperBound < -128)
++                {
++                    return false;
++                }
++                break;
++            case OP_INT_TO_SHORT:
++                if (upperBound > 32767 || upperBound < -32768)
++                {
++                    return false;
++                }
++                break;
++            default:
++                return false;
++        }
++        return true;
++    }
++    else
++    {
++        return false;
++    }
++}
++
++/**
++ * @brief Can the parser go through the instruction when looking for a definition of an induction variable?
++ * @param cUnit the CompilationUnit
++ * @param info the LoopInformation
++ * @param mir the MIR instruction
++ * @param wentThrgouh did the function go across an instruction?
++ * @return the MIR to consider
++ */
++static MIR *tryToGoThroughMIR (CompilationUnit *cUnit, LoopInformation *info, MIR *mir, bool &wentThrough)
++{
++    //Reset went through
++    wentThrough = false;
++
++    while (true)
++    {
++        // null check
++        if (mir == 0)
++        {
++            break;
++        }
++
++        /* If this is a cast operation, and is valid even if the
++         * candidate is an IV, ignore it
++         */
++        if (isAValidCastForIV (cUnit, info, mir) == true)
++        {
++            //Go to the previous define
++            mir = mir->ssaRep->defWhere[0];
++
++            //Update wentThrough
++            wentThrough = true;
++            continue;
++        }
++
++        //We are done then
++        break;
++    }
++
++    return mir;
++}
++
++/**
+  * @brief Detects whether the phi node is a basic IV. If it is, then it
+  * augments the loop with that information.
+  * @param cUnit The compilation unit
+@@ -2320,6 +2551,7 @@ bool detectAndInitializeBasicIV(CompilationUnit *cUnit,
+ 
+     //Keep track of MIR that is candidate for identifying simple IV
+     MIR *candidate = 0;
++    bool wentThrough = false;
+ 
+     //Go through each of the PHI's uses
+     for (int use = 0; use < ssaRep->numUses; use++)
+@@ -2327,9 +2559,13 @@ bool detectAndInitializeBasicIV(CompilationUnit *cUnit,
+         //Get MIR that defines the use
+         MIR *defMIR = defWhere[use];
+ 
++        //A cast operation doesn't automatically disqualify a PHI node
++        //as an IV. If it acceptable, move to the next define
++        defMIR = tryToGoThroughMIR (cUnit, info, defMIR, wentThrough);
++
+         //If we cannot find the definition nor any uses, then just continue
+-        if (defMIR == 0 || defMIR->ssaRep == 0
+-                || defMIR->ssaRep->uses == 0) {
++        if (defMIR == 0 || defMIR->ssaRep == 0 || defMIR->ssaRep->uses == 0)
++        {
+             continue;
+         }
+ 
+@@ -2408,19 +2644,23 @@ bool detectAndInitializeBasicIV(CompilationUnit *cUnit,
+ 
+         if (deltaIsConstant == true)
+         {
+-            GrowableList & ivList = info->getInductionVariableList();
+-            InductionVariableInfo *ivInfo = static_cast<InductionVariableInfo *> (
+-                    dvmCompilerNew (sizeof (*ivInfo), false));
+-
+-            ivInfo->ssaReg = candidate->ssaRep->uses[0];
+-            ivInfo->basicSSAReg = candidate->ssaRep->uses[0];
+-            ivInfo->m = 1;         // always 1 to basic iv
+-            ivInfo->c = 0;         // N/A to basic iv
+-            ivInfo->inc = deltaValue;
+-            dvmInsertGrowableList (&ivList, (intptr_t) ivInfo);
+-            info->setSSABIV(candidate->ssaRep->defs[0]);
+-
+-            foundBasicIV = true;
++            //Only accept this IV if the deltaValue is positive OR it's negative and we did not go through a cast
++            if (deltaValue >= 0 || wentThrough == false)
++            {
++                GrowableList & ivList = info->getInductionVariableList();
++                InductionVariableInfo *ivInfo = static_cast<InductionVariableInfo *> (
++                        dvmCompilerNew (sizeof (*ivInfo), false));
++
++                ivInfo->ssaReg = candidate->ssaRep->uses[0];
++                ivInfo->basicSSAReg = candidate->ssaRep->uses[0];
++                ivInfo->m = 1;         // always 1 to basic iv
++                ivInfo->c = 0;         // N/A to basic iv
++                ivInfo->inc = deltaValue;
++                dvmInsertGrowableList (&ivList, (intptr_t) ivInfo);
++                info->setSSABIV(candidate->ssaRep->defs[0]);
++
++                foundBasicIV = true;
++            }
+         }
+     }
+ 
+diff --git a/vm/compiler/Loop.cpp b/vm/compiler/Loop.cpp
+index b22e97b..bfc724a 100644
+--- a/vm/compiler/Loop.cpp
++++ b/vm/compiler/Loop.cpp
+@@ -618,6 +618,7 @@ static bool negateOpcode(Opcode opcode, Opcode & negatedOpcode)
+   * @param pass the Pass
+   * @return false for loops that fail the above tests.
+   */
++//TODO: this should take a LoopInformation to be tested for inner loops
+ static bool isSimpleCountedLoop(CompilationUnit *cUnit)
+ {
+     unsigned int i;
+diff --git a/vm/compiler/LoopInformation.cpp b/vm/compiler/LoopInformation.cpp
+index c9cb11f..2e9928a 100644
+--- a/vm/compiler/LoopInformation.cpp
++++ b/vm/compiler/LoopInformation.cpp
+@@ -878,7 +878,7 @@ static bool containsUnsupportedOpcodes (const CompilationUnit *cUnit, BitVector
+     return false;
+ }
+ 
+-bool dvmCompilerVerySimpleLoopGateHelper (const CompilationUnit *cUnit, LoopInformation *info, void *data)
++bool dvmCompilerVerySimpleLoopGate (const CompilationUnit *cUnit, LoopInformation *info, void *data)
+ {
+     if (info->getNested () != 0)
+     {
+@@ -913,7 +913,7 @@ bool dvmCompilerVerySimpleLoopGate (const CompilationUnit *cUnit, const Pass *cu
+ 
+     if (info != 0)
+     {
+-        if (info->iterateWithConst (cUnit, dvmCompilerVerySimpleLoopGateHelper) == true)
++        if (info->iterateWithConst (cUnit, dvmCompilerVerySimpleLoopGate) == true)
+         {
+             return true;
+         }
+@@ -1439,3 +1439,32 @@ bool LoopInformation::isUniqueIVIncrementingBy1 (void)
+     //Result is: we did get only one right?
+     return (number == 1);
+ }
++
++void LoopInformation::addInstructionsToExits (CompilationUnit *cUnit, const std::vector<MIR *> &insns)
++{
++    //We need to sink to the exit loops and the backward chaining cell
++
++    //First, handle the exit loops
++    BitVector *bv = getExitLoops ();
++
++    //Add the instructions to the basic blocks defined by the vector
++    dvmCompilerPrependInstructionsToBasicBlocks (cUnit, bv, insns);
++
++    //Now get the backward chaining cells
++    bv = getBackwardBranches ();
++
++    //Add the instructions to the basic blocks defined by the vector
++   dvmCompilerPrependInstructionsToBasicBlocks (cUnit, bv, insns);
++}
++
++void LoopInformation::addInstructionToExits (CompilationUnit *cUnit, MIR *mir)
++{
++    //Create a vector
++    std::vector<MIR *> insns;
++
++    //Push the unique one
++    insns.push_back (mir);
++
++    //Call generic function
++    addInstructionsToExits (cUnit, insns);
++}
+diff --git a/vm/compiler/LoopInformation.h b/vm/compiler/LoopInformation.h
+index 359aaab..ea1247f 100644
+--- a/vm/compiler/LoopInformation.h
++++ b/vm/compiler/LoopInformation.h
+@@ -533,9 +533,32 @@ class LoopInformation
+           * @return whether it does or does not
+           */
+          bool isUniqueIVIncrementingBy1 (void);
++
++         /**
++          * @brief Add the instructions to every loop exit
++          * @param cUnit the CompilationUnit
++          * @param insns the vector of MIR to add
++          */
++         void addInstructionsToExits (CompilationUnit *cUnit, const std::vector<MIR *> &insns);
++
++         /**
++          * @brief Add a single instruction to every loop exit
++          * @param cUnit the CompilationUnit
++          * @param mir the MIR to add
++          */
++        void addInstructionToExits (CompilationUnit *cUnit, MIR *mir);
+ };
+ 
+ /**
++ * @brief Gate to determine if the loop is a very simple one: not nested, one basic block, no unsupported instructions
++ * @param cUnit the Compilation Unit
++ * @param info The loop to test
++ * @param data Data to pass to the testing function (unused)
++ * @return Returns whether the loop is very simple
++ */
++bool dvmCompilerVerySimpleLoopGate (const CompilationUnit *cUnit, LoopInformation *info, void *data);
++
++/**
+  * @brief Gate to determine if the CompilationUnit only contains a very simple loop: not nested, one BasicBlock
+  * @param cUnit the CompilationUnit
+  * @param curPass the Pass structure
+diff --git a/vm/compiler/LoopOpt.cpp b/vm/compiler/LoopOpt.cpp
+index 0341146..513cfa0 100644
+--- a/vm/compiler/LoopOpt.cpp
++++ b/vm/compiler/LoopOpt.cpp
+@@ -24,6 +24,7 @@
+ #include "InvariantRemoval.h"
+ #include "Loop.h"
+ #include "LoopOpt.h"
++#include "SinkCastOpt.h"
+ #include "LoopRegisterUsage.h"
+ #include "Pass.h"
+ #include "RegisterizationME.h"
+@@ -86,6 +87,8 @@ START_PASSES
+               dvmCompilerIgetIputRemoval, 0, 0, 0, kOptimizationBasicBlockChange),
+     NEW_PASS ("Hoisted_checks", kAllNodes, 0, dvmCompilerHoistedChecksGate,
+                              dvmCompilerBodyCodeMotion, dvmCompilerGenHoistedChecks, 0, 0, 0),
++    NEW_PASS ("Sink_Casts", kAllNodes, 0, dvmCompilerTraceIsLoopNewSystem,
++               dvmCompilerSinkCasts, 0, 0, 0, kOptimizationBasicBlockChange),
+     NEW_PASS ("Accumulation_Sinking", kAllNodes, 0, dvmCompilerSinkAccumulationsGate,
+             0, dvmCompilerAccumulationSinking, 0, 0, kOptimizationBasicBlockChange),
+     //This should be after the last optimization that changes instruction sequence or BB logic
+diff --git a/vm/compiler/SinkCastOpt.cpp b/vm/compiler/SinkCastOpt.cpp
+new file mode 100644
+index 0000000..7f89a79
+--- /dev/null
++++ b/vm/compiler/SinkCastOpt.cpp
+@@ -0,0 +1,327 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "Dalvik.h"
++#include "Dataflow.h"
++#include "Loop.h"
++#include "LoopInformation.h"
++#include "LoopOpt.h"
++#include "BBOptimization.h"
++#include "Pass.h"
++
++/**
++ * @brief Check if the cast operation on an IV is valid
++ * @details Verify that the loop bounds being compared to the
++ * IV are consistent with the cast operation applied to it.
++ * For example an IV casted to byte should be compared to values < 127
++ * @param cUnit the CompilationUnit
++ * @param info the LoopInformation
++ * @param ifMir the MIR instruction which contains one use need to be checked
++ * @param castMir the MIR instruction which contains cast bytecode
++ * @return whether mir passed the check for the cast sinking
++ */
++static bool checkValidCastingForIV(CompilationUnit *cUnit, LoopInformation *info,
++        MIR *ifMir, const MIR *const castMir)
++{
++    // check if induction variable is a count-up
++    if (info->isCountUpLoop () == false)
++    {
++        return false;
++    }
++
++    DecodedInstruction &ifInsn = ifMir->dalvikInsn;
++
++    //Get the SSA
++    SSARepresentation *ssaRep = ifMir->ssaRep;
++
++    // null check
++    if (ssaRep == 0)
++    {
++        return false;
++    }
++
++    // vA tracks the virtual register defined in castMir and used in ifMir
++    int vA = 0;
++
++    // constValue record the constant for one of ifMir's operand.
++    int constValue = 0;
++
++    // Check if "if" bytecode has one operand
++    if (ifMir->dalvikInsn.opcode >= OP_IF_EQZ && ifMir->dalvikInsn.opcode <= OP_IF_LEZ)
++    {
++        if (ifInsn.vA == castMir->dalvikInsn.vA)
++        {
++            vA = ifInsn.vA;
++        }
++
++        // did not found the corresponding use in ifMir
++        else
++        {
++            return false;
++        }
++        constValue = 0;
++    }
++    else
++    {
++        // Check if "if" bytecode has two operands
++        if (ifMir->dalvikInsn.opcode >= OP_IF_EQ && ifMir->dalvikInsn.opcode <= OP_IF_LE)
++        {
++            //This should hold the define for the non IV VR of the IF, which should be a const
++            MIR * mirConst = 0;
++
++            // vA tracks the virtual register defined in castMir and used in ifMir
++            if (ifInsn.vA == castMir->dalvikInsn.vA)
++            {
++                vA = ifInsn.vA;
++                assert(ssaRep->numUses > 1);
++
++                //Check the MIR defining the vB use
++                mirConst = ssaRep->defWhere[1];
++            }
++            else
++            {
++                if (ifInsn.vB == castMir->dalvikInsn.vA)
++                {
++                    vA = ifInsn.vB;
++                    assert(ssaRep->numUses > 0);
++
++                    //Check the MIR defining the vA use
++                    mirConst = ssaRep->defWhere[0];
++                }
++
++                // did not found the corresponding use in ifMir
++                else
++                {
++                    return false;
++                }
++            }
++
++            //Paranoid
++            if (mirConst == 0)
++            {
++                return false;
++            }
++
++            int highConst = 0;
++            bool isWide = false;
++
++            // start to find if the other operand is coming from a const bytecode
++            bool isConst = dexGetConstant (mirConst->dalvikInsn, constValue, highConst, isWide);
++
++            // if the mirConst is not a const bytecode or it set a wide constant, return false
++            if (isConst == false || isWide == true)
++            {
++                return false;
++            }
++        }
++    }
++
++    // return false if vA is not an induction variable
++    if (info->isAnInductionVariable(cUnit, vA) == false)
++    {
++        return false;
++    }
++
++    // Check the constant to see if it's within the range of the cast type
++    switch (castMir->dalvikInsn.opcode)
++    {
++        case OP_INT_TO_BYTE:
++            if (constValue > 127 || constValue < -128)
++            {
++                return false;
++            }
++            break;
++        case OP_INT_TO_SHORT:
++            if (constValue > 32767 || constValue < -32768)
++            {
++                return false;
++            }
++            break;
++        default:
++            return false;
++    }
++
++    //We got here so we are happy
++    return true;
++}
++
++/**
++ * @brief check if the cast byte is supported for sinking
++ * @param mir current mir instruction
++ * @return whether bytecode type of mir is support for cast sinking
++ */
++static bool isCastSinkable(MIR *mir)
++{
++    switch (mir->dalvikInsn.opcode)
++    {
++        case OP_INT_TO_BYTE:
++        case OP_INT_TO_SHORT:
++            break;
++        default:
++            return false;
++    }
++
++    //Get instruction
++    DecodedInstruction &insn = mir->dalvikInsn;
++
++    //Get dataflow flags
++    int flags = dvmCompilerDataFlowAttributes[insn.opcode];
++
++    //First off, we only sink casts that aren't wide associated
++    if ( (flags & DF_DA_WIDE) != 0 || ( (flags & DF_UB_WIDE) != 0))
++    {
++        return false;
++    }
++
++    //Second, we only sink same vr to same vr casts
++    if (insn.vA != insn.vB)
++    {
++        return false;
++    }
++
++    return true;
++}
++
++/**
++ * @brief Handle sinking of a cast
++ * @param cUnit the CompilationUnit
++ * @param info the LoopInformation
++ * @param mir the MIR instruction
++ */
++static void sinkCastByteCodes (CompilationUnit *cUnit, LoopInformation *info, MIR *mir)
++{
++    // if current mir is not supported for cast sinking optimization
++    if (isCastSinkable(mir) == false)
++    {
++        return;
++    }
++
++    //Ok, now is it the last use of this VR in the loop?
++    SSARepresentation *ssaRep = mir->ssaRep;
++
++    if (ssaRep == 0)
++    {
++        return;
++    }
++
++    //Get def-use chain for the single def
++    const SUsedChain *usedChain = ssaRep->usedNext[0];
++
++    //If the casted VR is used, we have work to do
++    if (usedChain != 0)
++    {
++        // Get basic block of current mir
++        const BasicBlock *const currentBB = mir->bb;
++
++        //Walk the def-use chain
++        for (; usedChain != 0; usedChain = usedChain->nextUse)
++        {
++
++            //Get the MIR
++            MIR *next = usedChain->mir;
++
++            // Get the basic block of the use mir
++            const BasicBlock *const nextBB = next->bb;
++
++            //It must the PHI node or an IF
++            if (next->dalvikInsn.opcode != static_cast<Opcode> (kMirOpPhi) && (dvmCompilerIsMIRConditional (next) == false))
++            {
++                return;
++            }
++
++            //If next use mir within current block is a if
++            if (dvmCompilerIsMIRConditional (next) == true)
++            {
++               //Check if the nextUse allows a valid cast sinking
++               if (checkValidCastingForIV(cUnit, info, next, mir) == false)
++               {
++                   return;
++               }
++            }
++        }
++    }
++
++    //Check if we can peel the loop
++    bool result = info->peelLoop (cUnit);
++
++    //Always peel first for the moment because peeling isn't that smart
++    if (result == false)
++    {
++        return;
++    }
++
++    //Ok we definitely can sink this MIR
++    //First step, remove it
++    bool removed = dvmCompilerRemoveMIR (mir);
++
++    if (removed == true)
++    {
++        //Now add it to exits
++        info->addInstructionToExits (cUnit, mir);
++    }
++}
++
++/**
++ * @brief Tries to sink casts to the loop exit
++ * @param cUnit The compilation unit
++ * @param info The loop to try for cast sinking
++ * @param data pass data
++ * @return Always returns true to signify that cast sinking was tried for all loops (even if it doesn't actually do it)
++ */
++static bool tryCastSinking (CompilationUnit *cUnit, LoopInformation *info, void *data)
++{
++    if (dvmCompilerVerySimpleLoopGate (cUnit, info, data) == false)
++    {
++        //We only return so we continue looking through the rest of the loops
++        return true;
++    }
++
++    //Get the entry basic block
++    BasicBlock *bb = info->getEntryBlock ();
++
++    //Paranoid
++    assert (bb != 0);
++
++    for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        //Get the opcode
++        Opcode opcode = mir->dalvikInsn.opcode;
++
++        //Check if it is a cast
++        if (opcode >= OP_INT_TO_LONG && opcode <= OP_INT_TO_SHORT)
++        {
++            sinkCastByteCodes (cUnit, info, mir);
++        }
++    }
++
++    //We have successfully attempted to sink casts
++    return true;
++}
++
++/**
++ * Sink Loop Casts
++ */
++void dvmCompilerSinkCasts (CompilationUnit *cUnit, Pass *pass)
++{
++    //Find the loop information
++    LoopInformation *info = cUnit->loopInformation;
++
++    //The gate should have checked this, let's be paranoid
++    assert (info != 0);
++
++    //Now go through the loops and try sinking the casts
++    info->iterate (cUnit, tryCastSinking, pass->getData ());
++}
+diff --git a/vm/compiler/SinkCastOpt.h b/vm/compiler/SinkCastOpt.h
+new file mode 100644
+index 0000000..089ba01
+--- /dev/null
++++ b/vm/compiler/SinkCastOpt.h
+@@ -0,0 +1,27 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef DALVIK_VM_SINKCASTOP_H_
++#define DALVIK_VM_SINKCASTOP_H_
++
++/**
++ * @brief Sink loop casts
++ * @param cUnit the CompilationUnit
++ * @param pass the current Pass
++ * @return returns whether we changed anything in the BasicBlock
++ */
++void dvmCompilerSinkCasts (CompilationUnit *cUnit, Pass *pass);
++#endif
+diff --git a/vm/compiler/Utility.cpp b/vm/compiler/Utility.cpp
+index 737394c..783c4a6 100644
+--- a/vm/compiler/Utility.cpp
++++ b/vm/compiler/Utility.cpp
+@@ -617,3 +617,14 @@ BasicBlock *dvmCompilerGetNextBasicBlockViaBitVector (BitVectorIterator &bvItera
+     //Return the element
+     return bb;
+ }
++
++bool dvmCompilerIsMIRConditional (MIR *mir)
++{
++    //Get dex flags
++    int dexFlags = dvmCompilerGetOpcodeFlags (mir->dalvikInsn.opcode);
++
++    //Can it continue and can it branch?
++    bool result = (dexFlags == (kInstrCanContinue|kInstrCanBranch));
++
++    return result;
++}
+-- 
+1.7.4.1
+

@@ -1,0 +1,169 @@
+From 76a6722e358e59c82360dd6aa132e286d9a5b6d9 Mon Sep 17 00:00:00 2001
+From: ywan171 <yi.a.wang@intel.com>
+Date: Mon, 30 Jul 2012 18:53:32 +0800
+Subject: libstagefright: release the socket in ARTPConnection
+
+BZ: 49305
+
+RTP packet polling and Myhandle is in different thread, after close the
+socket in myhandle, there may occur assertion failure in ARTPConnection
+if onRemove function is not called, release the socket after remove RTP
+Connection
+
+orig-patch:
+43057 (BZ: 22477) unregister the socket before socket close for RTP
+30070 (BZ:18533, part) patch porting from R2 to R3 for RTSP
+
+Category: aosp improvement
+Domain: Video.Media-streaming
+Origin: internal
+Upstream-Candidate: yes
+
+Change-Id: I4c1deee5a08a693f675f7502a504c339316fed3b
+Orig-Change-Id: I85ea7926d5dfbb8a9a56fb051a0ab0d8a1d75866
+Signed-off-by: ywan171 <yi.a.wang@intel.com>
+Signed-off-by: chuzhoux <chux.zhou@intel.com>
+---
+ media/libstagefright/rtsp/ARTPConnection.cpp |   15 ++++++++-
+ media/libstagefright/rtsp/ARTPConnection.h   |    3 +-
+ media/libstagefright/rtsp/MyHandler.h        |   43 ++++++++++---------------
+ 3 files changed, 33 insertions(+), 28 deletions(-)
+
+diff --git a/media/libstagefright/rtsp/ARTPConnection.cpp b/media/libstagefright/rtsp/ARTPConnection.cpp
+index af369b5..3b8b3c7 100644
+--- a/media/libstagefright/rtsp/ARTPConnection.cpp
++++ b/media/libstagefright/rtsp/ARTPConnection.cpp
+@@ -32,6 +32,7 @@
+ 
+ #include <arpa/inet.h>
+ #include <sys/socket.h>
++#include "HTTPBase.h"
+ 
+ namespace android {
+ 
+@@ -69,6 +70,7 @@ struct ARTPConnection::StreamInfo {
+ 
+ ARTPConnection::ARTPConnection(uint32_t flags)
+     : mFlags(flags),
++      mUIDValid(false),
+       mPollEventPending(false),
+       mLastReceiverReportTimeUs(-1) {
+ }
+@@ -92,7 +94,8 @@ void ARTPConnection::addStream(
+     msg->post();
+ }
+ 
+-void ARTPConnection::removeStream(int rtpSocket, int rtcpSocket) {
++void ARTPConnection::removeStream(int rtpSocket, int rtcpSocket, bool uidvalid) {
++    mUIDValid = uidvalid;
+     sp<AMessage> msg = new AMessage(kWhatRemoveStream, id());
+     msg->setInt32("rtp-socket", rtpSocket);
+     msg->setInt32("rtcp-socket", rtcpSocket);
+@@ -225,6 +228,16 @@ void ARTPConnection::onRemoveStream(const sp<AMessage> &msg) {
+         return;
+     }
+ 
++    if (mUIDValid) {
++        HTTPBase::UnRegisterSocketUserTag(it->mRTPSocket);
++        HTTPBase::UnRegisterSocketUserTag(it->mRTCPSocket);
++    }
++    // close the socket here
++    close(it->mRTPSocket);
++    close(it->mRTCPSocket);
++    it->mRTPSocket = -1;
++    it->mRTCPSocket = -1;
++
+     mStreams.erase(it);
+ }
+ 
+diff --git a/media/libstagefright/rtsp/ARTPConnection.h b/media/libstagefright/rtsp/ARTPConnection.h
+index edbcc35..231a2f8 100644
+--- a/media/libstagefright/rtsp/ARTPConnection.h
++++ b/media/libstagefright/rtsp/ARTPConnection.h
+@@ -40,7 +40,7 @@ struct ARTPConnection : public AHandler {
+             const sp<AMessage> &notify,
+             bool injected);
+ 
+-    void removeStream(int rtpSocket, int rtcpSocket);
++    void removeStream(int rtpSocket, int rtcpSocket, bool uidvalid = false);
+ 
+     void injectPacket(int index, const sp<ABuffer> &buffer);
+ 
+@@ -65,6 +65,7 @@ private:
+     static const int64_t kSelectTimeoutUs;
+ 
+     uint32_t mFlags;
++    bool mUIDValid;
+ 
+     struct StreamInfo;
+     List<StreamInfo> mStreams;
+diff --git a/media/libstagefright/rtsp/MyHandler.h b/media/libstagefright/rtsp/MyHandler.h
+index fd569de..ccb6788 100644
+--- a/media/libstagefright/rtsp/MyHandler.h
++++ b/media/libstagefright/rtsp/MyHandler.h
+@@ -707,26 +707,28 @@ struct MyHandler : public AHandler {
+                 }
+ 
+                 if (result != OK) {
+-                    if (track) {
+-                        if (!track->mUsingInterleavedTCP) {
+-                            // Clear the tag
+-                            if (mUIDValid) {
+-                                HTTPBase::UnRegisterSocketUserTag(track->mRTPSocket);
+-                                HTTPBase::UnRegisterSocketUserMark(track->mRTPSocket);
+-                                HTTPBase::UnRegisterSocketUserTag(track->mRTCPSocket);
+-                                HTTPBase::UnRegisterSocketUserMark(track->mRTCPSocket);
++                    for (size_t i = 0; i < mTracks.size(); ++i) {
++                        TrackInfo *info = &mTracks.editItemAt(i);
++                        if (info) {
++                            if (!info->mUsingInterleavedTCP) {
++                                // Clear the tag
++                                if (mUIDValid) {
++                                    HTTPBase::UnRegisterSocketUserTag(info->mRTPSocket);
++                                    HTTPBase::UnRegisterSocketUserMark(info->mRTPSocket);
++                                    HTTPBase::UnRegisterSocketUserTag(info->mRTCPSocket);
++                                    HTTPBase::UnRegisterSocketUserMark(info->mRTCPSocket);
++                                }
++                                close(info->mRTPSocket);
++                                close(info->mRTCPSocket);
+                             }
+-
+-                            close(track->mRTPSocket);
+-                            close(track->mRTCPSocket);
++                            mTracks.removeItemsAt(i);
+                         }
+-
+-                        mTracks.removeItemsAt(trackIndex);
+                     }
++                    mSetupTracksSuccessful = false;
+                 }
+ 
+                 ++index;
+-                if (index < mSessionDesc->countTracks()) {
++                if (index < mSessionDesc->countTracks() && mSetupTracksSuccessful) {
+                     setupTrack(index);
+                 } else if (mSetupTracksSuccessful) {
+                     ++mKeepAliveGeneration;
+@@ -840,18 +842,7 @@ struct MyHandler : public AHandler {
+                     }
+ 
+                     if (!info->mUsingInterleavedTCP) {
+-                        mRTPConn->removeStream(info->mRTPSocket, info->mRTCPSocket);
+-
+-                        // Clear the tag
+-                        if (mUIDValid) {
+-                            HTTPBase::UnRegisterSocketUserTag(info->mRTPSocket);
+-                            HTTPBase::UnRegisterSocketUserMark(info->mRTPSocket);
+-                            HTTPBase::UnRegisterSocketUserTag(info->mRTCPSocket);
+-                            HTTPBase::UnRegisterSocketUserMark(info->mRTCPSocket);
+-                        }
+-
+-                        close(info->mRTPSocket);
+-                        close(info->mRTCPSocket);
++                        mRTPConn->removeStream(info->mRTPSocket, info->mRTCPSocket, mUIDValid);
+                     }
+                 }
+                 mTracks.clear();
+-- 
+1.7.4.1
+

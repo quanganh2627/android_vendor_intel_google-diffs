@@ -1,0 +1,330 @@
+From c9aaea9acf4830afc865cd38c0992a860f671d43 Mon Sep 17 00:00:00 2001
+From: Brian Harring <brian.harring@intel.com>
+Date: Sun, 8 May 2011 00:03:11 -0700
+Subject: refactor private->prebuilt machinery
+
+Author: Brian Harring <brian.harring@intel.com>
+Author: Alin Dobre <alin.m.dobre@intel.com>
+
+New form basically extracts all relevant ABS metadata so that
+the prebuilt form can use it; intention is to make the prebuilt
+form basically a full drop in for the private form without any
+manual intervention required.
+
+Adds two templates; $(BUILD_PREBUILT_BUNDLE_CREATE) and
+$(BUILD_PREBUILT_BUNDLE).
+
+For creation, three vars influence it; PREBUILT_PROJECT
+(grouping of modules), PREBUILT_MODULES (list of modules to scan
+and convert to prebuilts), and PREBUILT_INSTALL_DIR (optional
+subdirectory where prebuilt outputs should be placed); output is
+written to for each PREBUILT_MODULES word, the module is written to
+$(OUT_DIR)/prebuilt/$(PREBUILT_PROJECT)/$(CUSTOM_BOARD)/$(THE-MODULE).
+W/in PREBUILT/$(PREBUILT_PROJECT), a usable Android.mk is generated that
+uses the bundle machinery; basically is intended to handle it all.
+
+For the bundle usage side, it's basically automatic; needs LOCAL_PATH to
+know where to scan for bundles; it honors BUNDLE_TARGETS if specified-
+this is the list of bundles to expose to ABS.  If unspecified, it scans
+the directory and autoidentifies the bundles available.
+
+Current limitations:
+- doesn't handle modules that have multiple INSTALLED files; there is only
+one the author is aware of that is valid.
+- machinery on bundle side is ready for host, but creation side doesn't
+yet fully identify if it's a host target or not, thus can't yet handle host.
+- can handle LOCAL_COPY_HEADERS but not individual headers set
+specified by BUILD_COPY_HEADERS
+
+Issue: ADEV-21
+Category: AOSP Improvement
+Domain: AOSP-build
+Upstream-candidate: Yes
+Change-Id: Id85660dada7d7ca218221f536515d8ac3e9729bc
+---
+ core/config.mk                 |    2 +
+ core/multi_prebuilt.mk         |   13 ++++-
+ core/prebuilt_bundle.mk        |   73 ++++++++++++++++++++
+ core/prebuilt_bundle_create.mk |  144 ++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 231 insertions(+), 1 deletions(-)
+ create mode 100644 core/prebuilt_bundle.mk
+ create mode 100644 core/prebuilt_bundle_create.mk
+
+diff --git a/core/config.mk b/core/config.mk
+index 19e2745..66e3b71 100644
+--- a/core/config.mk
++++ b/core/config.mk
+@@ -79,6 +79,8 @@ BUILD_COPY_HEADERS := $(BUILD_SYSTEM)/copy_headers.mk
+ BUILD_NATIVE_TEST := $(BUILD_SYSTEM)/native_test.mk
+ BUILD_HOST_NATIVE_TEST := $(BUILD_SYSTEM)/host_native_test.mk
+ BUILD_NOTICE_FILE := $(BUILD_SYSTEM)/notice_files.mk
++BUILD_PREBUILT_BUNDLE_CREATE := $(BUILD_SYSTEM)/prebuilt_bundle_create.mk
++BUILD_PREBUILT_BUNDLE := $(BUILD_SYSTEM)/prebuilt_bundle.mk
+ 
+ -include cts/build/config.mk
+ 
+diff --git a/core/multi_prebuilt.mk b/core/multi_prebuilt.mk
+index be60e2f..94fe4bd 100644
+--- a/core/multi_prebuilt.mk
++++ b/core/multi_prebuilt.mk
+@@ -41,6 +41,8 @@ multi_prebuilt_once := true
+ # $(6): UNINSTALLABLE_MODULE
+ # $(7): BUILT_MODULE_STEM
+ # $(8): LOCAL_STRIP_MODULE
++# $(9): LOCAL_MODULE_PATH
++# $(10): LOCAL_CERTIFICATE
+ #
+ # Elements in the file list may be bare filenames,
+ # or of the form "<modulename>:<filename>".
+@@ -71,9 +73,18 @@ $(foreach t,$(1), \
+    , \
+     $(eval LOCAL_BUILT_MODULE_STEM := $(notdir $(LOCAL_SRC_FILES))) \
+    ) \
+-  $(eval LOCAL_MODULE_SUFFIX := $(suffix $(LOCAL_SRC_FILES))) \
++  $(if $(strip $(filter ETC,$(module_class))), \
++    , \
++    $(eval LOCAL_MODULE_SUFFIX := $(suffix $(LOCAL_SRC_FILES))) \
++   ) \
+   $(if $(filter user,$(TARGET_BUILD_VARIANT)), \
+     $(eval LOCAL_STRIP_MODULE := $(8))) \
++  $(if $(9), \
++    $(eval LOCAL_MODULE_PATH := $(9)) \
++   ) \
++  $(if $(10), \
++    $(eval LOCAL_CERTIFICATE := $(strip $(10))) \
++   ) \
+   $(eval include $(BUILD_PREBUILT)) \
+  )
+ endef
+diff --git a/core/prebuilt_bundle.mk b/core/prebuilt_bundle.mk
+new file mode 100644
+index 0000000..ea7a3d2
+--- /dev/null
++++ b/core/prebuilt_bundle.mk
+@@ -0,0 +1,73 @@
++
++ifndef prebuilt_bundle_once
++prebuilt_bundle_once := true
++
++include $(BUILD_MULTI_PREBUILT)
++
++#
++# $(1): filepath to read, stripping it upon return
++#
++define _read_metadata
++  $(strip $(shell cat $(1) 2> /dev/null))
++endef
++
++#
++# $(1): $(LOCAL_PATH)
++# $(3): module/bundle
++#
++define auto-prebuilt-bundle-boilerplate
++  $(eval base := $(1)/$(2))
++  $(eval is_host := $(call _read_metadata,$(base)/is_host))
++  $(eval module_class := $(call _read_metadata,$(base)/class))
++  $(eval module_tags := $(call _read_metadata,$(base)/tags))
++  $(eval path_override := $(call _read_metadata,$(base)/override_path))
++  $(eval module_suffix := $(call _read_metadata,$(base)/suffix))
++  $(if $(ifeq $(path_override),), \
++    $(if $(ifeq $(module_class,SHARED_LIBRARIES)), \
++      $(eval path_override := $($(if $(prebuilt_is_host),HOST,TARGET)_OUT_INTERMEDIATE_LIBRARIES))) \
++    )
++  $(if $(ifeq $(module_class),STATIC), \
++    $(eval uninstallable := true), \
++    $(eval uninstallable := ) \
++  )
++  $(if $(ifeq $(module_class,JAVA_LIBRARIES)), \
++    $(eval stem := javalib.jar),\
++    $(eval stem := ) \
++  )
++
++  $(call auto-prebuilt-boilerplate, \
++    $(notdir $(2)):$(2)/payload$(module_suffix), \
++    $(is_host), \
++    $(module_class), \
++    $(module_tags), \
++    $(path_override), \
++    $(uninstallable), \
++    $(stem), \
++    , \
++    $(PREBUILT.$(2).LOCAL_PATH), \
++    $(PREBUILT.$(2).LOCAL_CERTIFICATE) \
++  )
++endef
++
++endif
++
++ifeq ($(BUNDLE_TARGETS),)
++  BUNDLE_TARGETS := $(shell find $(LOCAL_PATH)/ -maxdepth 1 -mindepth 1 -type d -exec basename {} \;)
++endif
++ifneq ($(TARGET_BOARD_PLATFORM),)
++  $(foreach t,$(BUNDLE_TARGETS), \
++    $(eval $(call auto-prebuilt-bundle-boilerplate,$(LOCAL_PATH),$(t))) \
++  )
++else
++  $(warning ** Prebuilt machinery relies on TARGET_BOARD_PLATFORM being non-null)
++  $(warning *  Since its value is null, will disable prebuilts installation for:)
++  $(warning *  module(s): $(BUNDLE_TARGETS))
++  $(warning *  path: $(LOCAL_PATH))
++  $(warning * )
++  $(warning *  A quick fix might be enclosing the parent Android.mk inclusion between)
++  $(warning *   ifneq ($$(TARGET_BOARD_PLATFORM),))
++  $(warning *   ...)
++  $(warning *   endif)
++  $(warning ** )
++endif
++BUNDLE_TARGETS :=
+diff --git a/core/prebuilt_bundle_create.mk b/core/prebuilt_bundle_create.mk
+new file mode 100644
+index 0000000..e70d30b
+--- /dev/null
++++ b/core/prebuilt_bundle_create.mk
+@@ -0,0 +1,144 @@
++#
++# Copyright (C) 2011 The Android Open Source Project
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++
++ifeq ($(PREBUILT_MODULES),)
++ifeq ($(LOCAL_MODULE),)
++$(error PREBUILT_MODULES must be specified; LOCAL_PATH=$(LOCAL_PATH))
++endif
++PREBUILT_MODULES := $(LOCAL_MODULE)
++endif
++
++ifeq ($(PREBUILT_PROJECT),)
++$(error PREBUILT_PROJECT must be specified; LOCAL_PATH=$(LOCAL_PATH))
++endif
++
++ifndef prebuilt_create_once
++prebuilt_create_once := true
++
++PREBUILT_OUT_DIR := $(OUT_DIR)/prebuilt
++
++define convert_installed_to_relative
++  $(if $(strip $(TARGET_OUT_$(strip $(2)))), \
++    $(subst $(TARGET_OUT_$(strip $(2)))/,,$(1)) \
++   , \
++    $(subst $(PRODUCT_OUT)/,,$(1)) \
++  )
++endef
++
++define transfer_content
++  $(info prebuilt transfer_content: $(1) => $(2))
++  $(hide) $(ACP) -fp $(1) $(2)
++endef
++
++define _write_metadata
++  $(eval data := $(strip $(1)))
++  $(if $(data),\
++    $(shell echo $(data) > $(2)) \
++  )
++endef
++
++#
++# translate ABS module data into a prebuilt bundle.
++# $(1): pathway to the binary base
++# $(2): pathway to the headers base
++# $(3): module to translate.
++#
++define install_prebuilt
++  $(eval prebuilt_out := $(1)/$(TARGET_BOARD_PLATFORM)/$(3))
++  $(eval prebuilt_headers_out := $(2)/$(TARGET_BOARD_PLATFORM)/$(PREBUILT-HEADERS-TO-$(3)))
++  $(shell mkdir -p $(prebuilt_out))
++  $(if $(word 1,$(PREBUILT-HEADERS-$(3))),
++    $(shell mkdir -p $(prebuilt_headers_out))
++  )
++  $(info creating prebuilt: $(3))
++  $(call _write_metadata,$(ALL_MODULES.$(3).CLASS),$(prebuilt_out)/class)
++  $(call _write_metadata,$(ALL_MODULES.$(3).TAGS),$(prebuilt_out)/tags)
++  $(call _write_metadata,$(ALL_MODULES.$(3).REQUIRED),$(prebuilt_out)/required)
++  $(eval files = $(call module-installed-files,$(3)))
++  $(if $(word 2,$(files)), \
++    $(error installing $(3), multiple files encountered- we cannot handle that) \
++  )
++
++  $(eval suf := $(suffix $(files)))
++  $(call _write_metadata,$(suf),$(prebuilt_out)/suffix)
++  $(foreach x,$(files),\
++    $(call transfer_content,$(x),$(prebuilt_out)/payload$(suf)) \
++  )
++  $(foreach x,$(PREBUILT-HEADERS-$(3)),\
++    $(call transfer_content,$(PREBUILT-HEADERS-FROM-$(3))/$(x),$(prebuilt_headers_out)) \
++  )
++  $(info Headers list for $(3) from $(PREBUILT-HEADERS-FROM-$(3)): $(PREBUILT-HEADERS-$(3)))
++endef
++
++#
++# create a project android.mk
++# $(1): path to the Android.mk to create for this project
++#
++define install_prebuilt_project
++  $(shell mkdir -p $(dir $(1)))
++  $(shell echo # autogenerated template for prebuilts > $(1))
++  $(shell echo 'ifneq ($$(TARGET_BOARD_PLATFORM),)' >> $(1))
++  $(shell echo LOCAL_PATH := $$\(call my-dir\)/$$\(TARGET_BOARD_PLATFORM\) >> $(1))
++  $(shell echo include $$\(BUILD_PREBUILT_BUNDLE\) >> $(1))
++  $(shell echo endif >> $(1))
++endef
++
++#
++# create a module bundle
++# $(1): directory to create the prebuilt projects bundles in.
++# $(2): directory to create the prebuilt headers bundles in.
++# $(3): project/grouping for the module bundling.
++# $(4): module to translate
++#
++define prebuilt_bundle_create_boilerplate
++  $(eval PREBUILT-HEADERS-FROM-$(4) := $(LOCAL_PATH))
++  $(eval PREBUILT-HEADERS-TO-$(4) := $(LOCAL_COPY_HEADERS_TO))
++  $(eval PREBUILT-HEADERS-$(4) := $(LOCAL_COPY_HEADERS))
++  $(eval .PHONY: PREBUILT-$(4))
++  $(eval PREBUILT-$(4): $(1)/Android.mk $(4) ; $$(call install_prebuilt,$(1),$(2),$(4)))
++  $(eval PREBUILT-PROJECT-$(3): PREBUILT-$(4))
++endef
++endif
++
++prebuilt_base := $(PREBUILT_OUT_DIR)/$(PREBUILT_PROJECT)
++
++prebuilt_bin := $(prebuilt_base)/proprietary
++ifneq ($(PREBUILT_INSTALL_DIR),)
++prebuilt_bin := $(prebuilt_base)/$(PREBUILT_INSTALL_DIR)
++endif
++
++prebuilt_hdr := $(prebuilt_base)/include
++ifneq ($(PREBUILT_INSTALL_HEADERS_DIR),)
++prebuilt_hdr := $(prebuilt_base)/$(PREBUILT_INSTALL_HEADERS_DIR)
++endif
++
++$(prebuilt_bin)/Android.mk:
++	$(call install_prebuilt_project,$@)
++
++.PHONY: PREBUILT-PROJECT-$(PREBUILT_PROJECT)
++
++PREBUILT-PROJECT-$(PREBUILT_PROJECT): $(prebuilt_bin)/Android.mk
++
++$(foreach x,$(PREBUILT_MODULES), \
++  $(eval $(call prebuilt_bundle_create_boilerplate,$(prebuilt_bin),$(prebuilt_hdr),$(PREBUILT_PROJECT),$(x))) \
++)
++
++prebuilt_base :=
++prebuilt_bin :=
++prebuilt_hdr :=
++PREBUILT_MODULES :=
++PREBUILT_PROJECT :=
++PREBUILT_INSTALL_DIR :=
+-- 
+1.7.4.1
+

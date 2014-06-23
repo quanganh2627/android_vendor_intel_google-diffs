@@ -1,0 +1,337 @@
+From 15563a3c9f46299792124b1e8616ef31a4601046 Mon Sep 17 00:00:00 2001
+From: Udayan Banerji <udayan.banerji@intel.com>
+Date: Thu, 19 Dec 2013 18:31:01 -0800
+Subject: Dalvik: Add information of VRs dying at basic block end to method context
+
+BZ: 148488
+
+Collect information about all the VRs whose last use it at the last MIR
+of a basic block, so that they are not treated as live outs at the trace
+level.
+
+Change-Id: Ib8de65ce860007257b394926a5f5f8f28bab4c88
+Category: device enablement
+Domain: AOSP.Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, need rework
+Signed-off-by: Udayan Banerji <udayan.banerji@intel.com>
+---
+ vm/compiler/Dataflow.cpp             |   60 ++++++++++++++++++++++++++++++
+ vm/compiler/Dataflow.h               |    8 ++++
+ vm/compiler/MethodContext.cpp        |   66 ++++++++++++++++++++++++++++++++-
+ vm/compiler/MethodContext.h          |   25 ++++++++++++-
+ vm/compiler/MethodContextHandler.cpp |   46 +++++++++++++++++++++++
+ vm/compiler/MethodContextHandler.h   |   10 +++++
+ 6 files changed, 212 insertions(+), 3 deletions(-)
+
+diff --git a/vm/compiler/Dataflow.cpp b/vm/compiler/Dataflow.cpp
+index 84d8a2a..de7cb30 100644
+--- a/vm/compiler/Dataflow.cpp
++++ b/vm/compiler/Dataflow.cpp
+@@ -2107,6 +2107,66 @@ static void dataFlowSSAFormatExtendedOp(CompilationUnit *cUnit, MIR *mir)
+     }
+ }
+ 
++SUsedChain *dvmCompilerGetUseChainForUse (MIR *mir, int useIndex)
++{
++    //Get the SSA representation
++    SSARepresentation *useSsaRep = mir->ssaRep;
++
++    if (useSsaRep == 0)
++    {
++        assert (false);
++        return 0;
++    }
++
++    //The useIndex should be within bounds
++    if (useIndex >= useSsaRep->numUses || useIndex < 0)
++    {
++        assert (false);
++        return 0;
++    }
++
++    //Get the defining MIR
++    MIR *defMIR = useSsaRep->defWhere[useIndex];
++
++    //If defMIR is null, there is no use chain
++    if (defMIR == 0)
++    {
++        return 0;
++    }
++
++    //Get the index of the define
++    int defIndex = 0;
++
++    while (defMIR->ssaRep->defs[defIndex] != useSsaRep->uses[useIndex])
++    {
++        //Check the next define
++        defIndex++;
++
++        //Paranoid
++        if (defIndex >= defMIR->ssaRep->numDefs)
++        {
++            assert (false);
++            return 0;
++        }
++    }
++
++    //Paranoid
++    if (defMIR->ssaRep->usedNext == 0)
++    {
++        return 0;
++    }
++
++    SUsedChain *useChain = defMIR->ssaRep->usedNext[defIndex];
++
++    //Now advance the use chain to the requested MIR
++    while (useChain != 0 && useChain->mir != mir)
++    {
++        useChain = useChain->nextUse;
++    }
++
++    return useChain;
++}
++
+ /* Entry function to convert a block into SSA representation */
+ bool dvmCompilerDoSSAConversion(CompilationUnit *cUnit, BasicBlock *bb)
+ {
+diff --git a/vm/compiler/Dataflow.h b/vm/compiler/Dataflow.h
+index 59af26b..35365e1 100644
+--- a/vm/compiler/Dataflow.h
++++ b/vm/compiler/Dataflow.h
+@@ -208,6 +208,14 @@ typedef struct ArrayAccessInfo {
+ int dvmCompilerGetStartUseIndex (Opcode opcode);
+ 
+ /**
++ * @brief Given a use of an MIR, return the SUsedChain to which it belongs
++ * @param mir The MIR which contains the use
++ * @param useIndex The index of the use for which we need the chain
++ * @return The useChain if available, 0 otherwise
++ */
++SUsedChain *dvmCompilerGetUseChainForUse (MIR *mir, int useIndex);
++
++/**
+  * @brief Check whether opcode is volatile
+  * @param opcode the considered opcode
+  * @return true if opcode represents a volatile instruction
+diff --git a/vm/compiler/MethodContext.cpp b/vm/compiler/MethodContext.cpp
+index 232a981..95f6997 100644
+--- a/vm/compiler/MethodContext.cpp
++++ b/vm/compiler/MethodContext.cpp
+@@ -521,6 +521,52 @@ bool MethodContext::handleConstants (CompilationUnit *cUnit)
+     return true;
+ }
+ 
++static bool markLastUsesAtEndOfBB (CompilationUnit *cUnit, BasicBlock *bb)
++{
++    std::map<unsigned int, std::set<unsigned int> > *mapVR =
++            static_cast<std::map<unsigned int, std::set<unsigned int> > *>(cUnit->walkData);
++
++    /*
++     * For now, we only look at the last MIR of the basic block. This
++     * is faster, and also uses lot less space. Also it covers specific cases
++     * like VRs used only for comparisons in if statements.
++     */
++
++    //Get the last MIR
++    MIR *lastMir = bb->lastMIRInsn;
++
++    //Paranoid
++    if (lastMir == 0 || lastMir->ssaRep == 0)
++    {
++        return false;
++    }
++
++    //Now go through all the uses, and see if they are the last use
++    int useIndex = 0;
++
++    while (useIndex < lastMir->ssaRep->numUses)
++    {
++        SUsedChain *useChain = dvmCompilerGetUseChainForUse (lastMir, useIndex);
++
++        //If this is the end of the use chain, mark this offset
++        if (useChain != 0 && useChain->nextUse == 0)
++        {
++            (*mapVR)[lastMir->offset].insert (dvmExtractSSARegister (cUnit, lastMir->ssaRep->uses [useIndex]));
++        }
++
++        useIndex++;
++    }
++
++    return false;
++}
++
++void MethodContext::handleEndOfUDChains (CompilationUnit *cUnit)
++{
++    void *walkData = static_cast<void *>(&lastOffsetOfBBToLastUseVRMap);
++    dvmCompilerDataFlowAnalysisDispatcher (cUnit,
++            markLastUsesAtEndOfBB, kReachableNodes, false, walkData);
++}
++
+ const MethodContext *MethodContext::createNewInstance (const Method * method)
+ {
+ 
+@@ -582,6 +628,8 @@ const MethodContext *MethodContext::createNewInstance (const Method * method)
+         context->methodWideConstVRs.clear();
+     }
+ 
++    context->handleEndOfUDChains (&cUnit);
++
+     return context;
+ }
+ 
+@@ -736,6 +784,20 @@ void MethodContext::printStatistics (void) const
+     }
+ 
+     //Print out all the statistics in one line
+-    ALOGE ("JIT_INFO: For %s%s - Const VRs: %d, Max Offset Ranges: %d for VR %d, Uniq Const: %d",
+-            method->clazz->descriptor, method->name, vRConstMap.size (), maxOffsetRanges, maxOffsetVR, constants.size ());
++    ALOGE ("JIT_INFO: For %s%s - Const VRs: %d, Max Offset Ranges: %d for VR %d, Uniq Const: %d, Const-If pairs recorded: %d",
++            method->clazz->descriptor, method->name, vRConstMap.size (), maxOffsetRanges, maxOffsetVR, constants.size (), lastOffsetOfBBToLastUseVRMap.size());
++}
++
++bool MethodContext::isOffsetEndOfUDChain (unsigned int offset, u4 VR) const
++{
++    std::map<unsigned int, std::set<unsigned int> >::const_iterator it = lastOffsetOfBBToLastUseVRMap.find (offset);
++
++    //See if we have an entry for this offset
++    if (it != lastOffsetOfBBToLastUseVRMap.end())
++    {
++        //Check if the VR is the same as the one with the last use at this offset
++        return (it->second.find (VR) != it->second.end ());
++    }
++
++    return false;
+ }
+diff --git a/vm/compiler/MethodContext.h b/vm/compiler/MethodContext.h
+index f5f2db3..cdc853b 100644
+--- a/vm/compiler/MethodContext.h
++++ b/vm/compiler/MethodContext.h
+@@ -21,6 +21,8 @@
+ #include "CompilerIR.h"
+ #include "Dalvik.h"
+ 
++#include <set>
++
+ //Forward declarations
+ struct BasicBlock;
+ struct BitVector;
+@@ -116,13 +118,26 @@ private:
+     std::vector<unsigned int> constants;
+ 
+     /**
+-     * @brief Given a context and a cUnit, collect information about the constants in the method
++     * @brief Given a cUnit, collect information about the constants in the method
+      * @param cUnit The CompilationUnit for the method
+      * @return true if everything was fine
+      */
+     bool handleConstants (CompilationUnit *cUnit);
+ 
+     /**
++     * @brief Given a cUnit, collect the bytecodes which are the last defines of a VR
++     * @details For now, we only look at the last MIR of the basic block and see if
++     * that is the last use of a VR. This takes much less space and is faster to
++     * collect. TODO: Generalize.
++     * @param cUnit The CompilationUnit for the method
++     */
++    void handleEndOfUDChains (CompilationUnit *cUnit);
++
++    /** @brief A map of the offset of last MIR of basic block to the VRs having last use there */
++    std::map<unsigned int, std::set<unsigned int> > lastOffsetOfBBToLastUseVRMap;
++
++
++    /**
+      * @brief Get the index for a constant value
+      * @details If the value is not found in the table,
+      * and we have not exceeded the maxConstants limit, the value will
+@@ -181,6 +196,14 @@ public:
+      */
+     static bool setMaxConstants (unsigned long numConstants);
+ 
++    /**
++     * @brief Check if the offset matches the end of any live range for the VR
++     * @param offset The offset to check as the end of live range
++     * @param VR The VR to check
++     * @return true if the offset is the end offset of a live range
++     */
++    bool isOffsetEndOfUDChain (unsigned int offset, u4 VR) const;
++
+     /** @brief Print statistics about the MethodContext */
+     void printStatistics (void) const;
+ };
+diff --git a/vm/compiler/MethodContextHandler.cpp b/vm/compiler/MethodContextHandler.cpp
+index 8523fb9..a8b136b 100644
+--- a/vm/compiler/MethodContextHandler.cpp
++++ b/vm/compiler/MethodContextHandler.cpp
+@@ -257,3 +257,49 @@ ConstVRType dvmCompilerGetConstValueOfVR (const MIR *mirForVR, u4 vR, u8 &value)
+ 
+     return kVRNotConst;
+ }
++
++bool dvmCompilerIsMirEndOfUDChain (const MIR *mir, u4 VR)
++{
++    //Get the method associated with the MIR
++    const Method *method = mir->nesting.sourceMethod;
++
++    //If the MIR has no associated method, we cannot have any context information
++    if (method == 0)
++    {
++        return false;
++    }
++
++    DecodedInstruction insn = mir->dalvikInsn;
++
++    //See if the VR is actually present in the MIR
++    if (VR != mir->dalvikInsn.vA && VR != mir->dalvikInsn.vB && VR != mir->dalvikInsn.vC)
++    {
++        return false;
++    }
++
++    int dfAttributes = dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
++
++    //Make sure the MIR actually uses this VR
++    if (((dfAttributes & DF_UA) == 0 || insn.vA != VR) &&
++            ((dfAttributes & DF_UB) == 0 || insn.vB != VR) &&
++            ((dfAttributes & DF_UC) == 0 || insn.vC != VR))
++    {
++        return false;
++    }
++
++    //Get the context for the method to which the mir belongs to
++    const MethodContext *metCon = MethodContextHandler::getMethodContext (method);
++
++    //If there is not context, we cannot determine if it is a constant
++    if (metCon == 0)
++    {
++        return false;
++    }
++
++    //Take method inlining into account
++    u4 actualVR = VR - mir->virtualRegRenameOffset;
++
++    bool success = metCon->isOffsetEndOfUDChain(mir->offset, actualVR);
++
++    return success;
++}
+diff --git a/vm/compiler/MethodContextHandler.h b/vm/compiler/MethodContextHandler.h
+index e8db732..db1b9ba 100644
+--- a/vm/compiler/MethodContextHandler.h
++++ b/vm/compiler/MethodContextHandler.h
+@@ -109,4 +109,14 @@ public:
+  */
+ ConstVRType dvmCompilerGetConstValueOfVR (const MIR *mirForVR, u4 vR, u8 &value);
+ 
++/**
++ * @brief See if the MIR is the last use of the current define of the VR
++ * @details This is not the last use of the VR, but this still returns true
++ * if the VR is redefined after this MIR
++ * @param mir The MIR to check
++ * @param VR The VR we are interested in
++ * @return true if the VR is redefined / not used after this MIR
++ */
++bool dvmCompilerIsMirEndOfUDChain (const MIR *mir, u4 *VR);
++
+ #endif
+-- 
+1.7.4.1
+

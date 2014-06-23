@@ -1,0 +1,473 @@
+From 7457c5f0a284bdd08bbdcf44180330cea18e2080 Mon Sep 17 00:00:00 2001
+From: Udayan Banerji <udayan.banerji@intel.com>
+Date: Mon, 14 Jan 2013 13:42:29 -0800
+Subject: Dalvik: Use MOVSX to perform int-to-byte and int-to-short
+
+BZ: 73316
+
+This change replaces shl-sar pair with a movsx to perform int conversions.
+This also adds helper code to facilitate register to register moves,
+with source and destination operands having different sizes.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I77a53e0ac2b4ddc5566a09af9e98cb1d26a3c0bd
+Orig-MCG-Change-Id: I1ef1e40e04a4d12267a3f109cc3e058b53238a45
+Signed-off-by: Udayan Banerji <udayan.banerji@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ tests/intel-002-int-conversion/expected.txt    |    2 +
+ tests/intel-002-int-conversion/info.txt        |    2 +
+ tests/intel-002-int-conversion/src/Main.java   |   55 +++++++++++++++++++
+ vm/compiler/codegen/x86/BytecodeVisitor.cpp    |    2 +
+ vm/compiler/codegen/x86/Lower.h                |   13 +++++
+ vm/compiler/codegen/x86/LowerAlu.cpp           |    6 +--
+ vm/compiler/codegen/x86/LowerHelper.cpp        |   67 +++++++++++++++++++----
+ vm/compiler/codegen/x86/Schedule.cpp           |    7 ++-
+ vm/compiler/codegen/x86/libenc/enc_wrapper.cpp |   24 +++++---
+ vm/compiler/codegen/x86/libenc/enc_wrapper.h   |    8 +++-
+ 10 files changed, 157 insertions(+), 29 deletions(-)
+ create mode 100644 tests/intel-002-int-conversion/expected.txt
+ create mode 100644 tests/intel-002-int-conversion/info.txt
+ create mode 100644 tests/intel-002-int-conversion/src/Main.java
+
+diff --git a/tests/intel-002-int-conversion/expected.txt b/tests/intel-002-int-conversion/expected.txt
+new file mode 100644
+index 0000000..fd0e1c2
+--- /dev/null
++++ b/tests/intel-002-int-conversion/expected.txt
+@@ -0,0 +1,2 @@
++Byte: Sum over entire range is 0
++Short: Sum over entire range is 0
+diff --git a/tests/intel-002-int-conversion/info.txt b/tests/intel-002-int-conversion/info.txt
+new file mode 100644
+index 0000000..9a3e815
+--- /dev/null
++++ b/tests/intel-002-int-conversion/info.txt
+@@ -0,0 +1,2 @@
++This check ensures that conversions of Integer to Short and Byte values happen
++correctly. Larger values should get truncated properly.
+diff --git a/tests/intel-002-int-conversion/src/Main.java b/tests/intel-002-int-conversion/src/Main.java
+new file mode 100644
+index 0000000..36fdef2
+--- /dev/null
++++ b/tests/intel-002-int-conversion/src/Main.java
+@@ -0,0 +1,55 @@
++public class Main {
++    static int iterations = 1000;
++
++    // Using these constants instead of e.g. Byte.MIN_VALUE
++    // to keep all values as integers, except when wanting to convert
++    final static int BYTE_MIN = -128;
++    final static int BYTE_MAX = 127;
++    final static int SHORT_MIN = -32768;
++    final static int SHORT_MAX = 32767;
++
++    public static void main(String args[]) {
++        int result = 0;
++
++        result = loopByte();
++        System.out.println("Byte: Sum over entire range is " + result);
++        result = 0;
++        result = loopShort();
++        System.out.println("Short: Sum over entire range is " + result);
++    }
++
++    // Loop through the entire range of Byte and add all the values
++    static int loopByte() {
++        int sum = 0;
++
++        for (int counter = 0; counter < (iterations * 256); counter++) {
++            for (int step = BYTE_MIN; step <= BYTE_MAX; step++) {
++                //insert randon bits, which should go away on conversion
++                int scratch = 0xF00BA400 | step;
++                // generates the int-to-byte bytecode
++                sum += (byte) scratch;
++            }
++            // There are more numbers on the negative side. Return to 0.
++            sum -= BYTE_MIN;
++        }
++        return sum;
++    }
++
++    // Loop through the entire range of Byte and add all the values
++    static int loopShort() {
++        int sum = 0;
++
++        for (int counter = 0; counter < iterations; counter++) {
++            for (int step = SHORT_MIN; step <= SHORT_MAX; step++) {
++                //insert randon bits, which should go away on conversion
++                int scratch = 0xBADD0000 | step;
++                // generates the int-to-short bytecode
++                sum += (short) scratch;
++            }
++            // There are more numbers on the negative side. Return to 0
++            sum -= SHORT_MIN;
++        }
++        return sum;
++    }
++
++}
+diff --git a/vm/compiler/codegen/x86/BytecodeVisitor.cpp b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+index 20ca56d..f06b8bc 100644
+--- a/vm/compiler/codegen/x86/BytecodeVisitor.cpp
++++ b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+@@ -4652,6 +4652,8 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+         infoArray[0].physicalType = LowOpndRegType_gp;
+         if (vA != vB)
+             infoArray[0].shareWithVR = false;
++        if (inst_op == OP_INT_TO_BYTE)
++            infoArray[0].is8Bit = true;
+         return 1;
+ 
+     case OP_ADD_INT:
+diff --git a/vm/compiler/codegen/x86/Lower.h b/vm/compiler/codegen/x86/Lower.h
+index a6bb65a..8be895f 100644
+--- a/vm/compiler/codegen/x86/Lower.h
++++ b/vm/compiler/codegen/x86/Lower.h
+@@ -869,6 +869,19 @@ void moves_mem_disp_scale_to_reg(OpndSize size,
+                       int base_reg, bool isBasePhysical,
+                       int disp, int index_reg, bool isIndexPhysical, int scale,
+                       int reg, bool isPhysical);
++
++//! \brief Performs MOVSX reg, reg2
++//!
++//! \details Sign extends reg and moves to reg2
++//! Size of destination register is fixed at 32-bits
++//! \param size of the source operand
++//! \param reg source operand
++//! \param isPhysical if reg is a physical register
++//! \param reg2 destination register
++//! \param isPhysical2 if reg2 is a physical register
++void moves_reg_to_reg(OpndSize size,
++                      int reg, bool isPhysical,
++                      int reg2, bool isPhysical2);
+ void move_reg_to_reg(OpndSize size,
+                       int reg, bool isPhysical,
+                       int reg2, bool isPhysical2);
+diff --git a/vm/compiler/codegen/x86/LowerAlu.cpp b/vm/compiler/codegen/x86/LowerAlu.cpp
+index 43f3249..deb8a73 100644
+--- a/vm/compiler/codegen/x86/LowerAlu.cpp
++++ b/vm/compiler/codegen/x86/LowerAlu.cpp
+@@ -459,8 +459,7 @@ int op_int_to_byte(const MIR * mir) {
+     u2 vA = mir->dalvikInsn.vA; //destination
+     u2 vB = mir->dalvikInsn.vB;
+     get_virtual_reg(vB, OpndSize_32, 1, false);
+-    alu_binary_imm_reg(OpndSize_32, sal_opc, 24, 1, false);
+-    alu_binary_imm_reg(OpndSize_32, sar_opc, 24, 1, false);
++    moves_reg_to_reg(OpndSize_8, 1, false, 1, false);
+     set_virtual_reg(vA, OpndSize_32, 1, false);
+     return 0;
+ }
+@@ -493,8 +492,7 @@ int op_int_to_short(const MIR * mir) {
+     u2 vA = mir->dalvikInsn.vA; //destination
+     u2 vB = mir->dalvikInsn.vB;
+     get_virtual_reg(vB, OpndSize_32, 1, false);
+-    alu_binary_imm_reg(OpndSize_32, sal_opc, 16, 1, false);
+-    alu_binary_imm_reg(OpndSize_32, sar_opc, 16, 1, false);
++    moves_reg_to_reg(OpndSize_16, 1, false, 1, false);
+     set_virtual_reg(vA, OpndSize_32, 1, false);
+     return 0;
+ }
+diff --git a/vm/compiler/codegen/x86/LowerHelper.cpp b/vm/compiler/codegen/x86/LowerHelper.cpp
+index 7ccd3ba..939dad8 100644
+--- a/vm/compiler/codegen/x86/LowerHelper.cpp
++++ b/vm/compiler/codegen/x86/LowerHelper.cpp
+@@ -335,31 +335,57 @@ LowOpReg* dump_reg_noalloc(Mnemonic m, OpndSize size, int reg, bool isPhysical,
+     return lower_reg(m, ATOM_NORMAL, size, reg, type, true /*isPhysical*/);
+ }
+ 
++//! \brief Update fields of LowOp to generate an instruction with
++//! two register operands
++//!
++//! \details For MOVZX and MOVSX, allows source and destination
++//! operand sizes to be different, and fixes type to general purpose.
++//! \param m x86 mnemonic
++//! \param m2 Atom pseudo-mnemonic
++//! \param size operand size
++//! \param regSrc source register
++//! \param isPhysical if regSrc is a physical register
++//! \param regDest destination register
++//! \param isPhysical2 if regDest is a physical register
++//! \param type the register type. For MOVSX and MOVZX, type is fixed
++//! as general purpose
++//! \return a LowOp corresponding to the reg-reg operation
+ LowOpRegReg* lower_reg_to_reg(Mnemonic m, AtomOpCode m2, OpndSize size, int regSrc,
+         bool isPhysical, int regDest, bool isPhysical2, LowOpndRegType type) {
++    bool isMovzs = (m == Mnemonic_MOVZX || m == Mnemonic_MOVSX);
++
++    //If we are sign extending / zero extending, the destination becomes a fixed size
++    //container of 32-bits. The size and type apply to the source. Note that this is
++    //a rigid requirement, and for now won't allow, for example, MOVSX Sz8, Sz16
++    OpndSize overridden_size = isMovzs ? OpndSize_32 : size;
++    LowOpndRegType overridden_type = isMovzs ? LowOpndRegType_gp : type;
++
+     if (!gDvmJit.scheduling) {
+         if (m == Mnemonic_FUCOMP || m == Mnemonic_FUCOM) {
+             stream = encoder_compare_fp_stack(m == Mnemonic_FUCOMP, regSrc - regDest,
+                     size == OpndSize_64, stream);
+         } else {
+-            stream = encoder_reg_reg(m, size, regSrc, isPhysical, regDest,
+-                    isPhysical2, type, stream);
++            stream = encoder_reg_reg_diff_sizes(m, size, regSrc, isPhysical, overridden_size,
++                    regDest, isPhysical2, overridden_type, stream);
+         }
+         return NULL;
+     }
++
+     if (!isPhysical && !isPhysical2)
+         dvmAbort();
++
+     LowOpRegReg* op = g_SchedulerInstance.allocateNewEmptyLIR<LowOpRegReg>();
+     op->opCode = m;
+     op->opCode2 = m2;
+-    op->opndDest.size = size;
++    op->opndDest.size = overridden_size;
+     op->opndDest.type = LowOpndType_Reg;
+     op->opndSrc.size = size;
+     op->opndSrc.type = LowOpndType_Reg;
+     op->numOperands = 2;
+-    set_reg_opnd(&(op->regDest), regDest, isPhysical2, type);
++    set_reg_opnd(&(op->regDest), regDest, isPhysical2, overridden_type);
+     set_reg_opnd(&(op->regSrc), regSrc, isPhysical, type);
+     g_SchedulerInstance.updateUseDefInformation_reg_to_reg(op);
++
+     return op;
+ }
+ 
+@@ -372,7 +398,14 @@ LowOpRegReg* dump_reg_reg_noalloc(Mnemonic m, OpndSize size, int reg,
+             true /*isPhysical2*/, type);
+ }
+ 
+-inline bool isMnemonicMove(Mnemonic m) {
++//! \brief Check if we have a MOV instruction which can be redundant
++//!
++//! \details Checks if the Mnemonic is a MOV which can possibly be
++//! optimized. For example, MOVSX %ax, %eax cannot be optimized, while
++//! MOV %eax, %eax is a NOP, and can be treated as such.
++//! \param m Mnemonic to check for
++//! \return whether the move can possibly be optimized away
++inline bool isMoveOptimizable(Mnemonic m) {
+     return (m == Mnemonic_MOV || m == Mnemonic_MOVQ || m == Mnemonic_MOVSS
+             || m == Mnemonic_MOVSD);
+ }
+@@ -386,7 +419,7 @@ LowOpRegReg* dump_reg_reg_noalloc_dst(Mnemonic m, OpndSize size, int reg,
+     if (gDvm.executionMode == kExecutionModeNcgO1) {
+         int regAll = registerAlloc(type, reg, isPhysical, true);
+         /* remove move from one register to the same register */
+-        if (isMnemonicMove(m) && regAll == reg2)
++        if (isMoveOptimizable(m) && regAll == reg2)
+             return NULL;
+         return lower_reg_to_reg(m, ATOM_NORMAL, size, regAll, true /*isPhysical*/,
+                 reg2, true /*isPhysical2*/, type);
+@@ -404,7 +437,7 @@ LowOpRegReg* dump_reg_reg_noalloc_src(Mnemonic m, AtomOpCode m2, OpndSize size,
+         LowOpndRegType type) {
+     if (gDvm.executionMode == kExecutionModeNcgO1) {
+         int regAll2;
+-        if(isMnemonicMove(m) && checkTempReg2(reg2, type, isPhysical2, reg, -1)) { //dst reg is logical
++        if(isMoveOptimizable(m) && checkTempReg2(reg2, type, isPhysical2, reg, -1)) { //dst reg is logical
+             //only from get_virtual_reg_all
+             regAll2 = registerAllocMove(reg2, type, isPhysical2, reg);
+         } else {
+@@ -432,7 +465,7 @@ LowOpRegReg* dump_reg_reg(Mnemonic m, AtomOpCode m2, OpndSize size, int reg,
+         int regAll2;
+         LowOpRegReg* op = NULL;
+ #ifdef MOVE_OPT2
+-        if(isMnemonicMove(m) &&
++        if(isMoveOptimizable(m) &&
+                 ((reg != PhysicalReg_EDI && reg != PhysicalReg_ESP && reg != PhysicalReg_EBP) || (!isPhysical)) &&
+                 isPhysical2 == false) { //dst reg is logical
+             //called from move_reg_to_reg
+@@ -462,7 +495,7 @@ LowOpMemReg* lower_mem_to_reg(Mnemonic m, AtomOpCode m2, OpndSize size, int disp
+     OpndSize overridden_size = isMovzs ? OpndSize_32 : size;
+     LowOpndRegType overridden_type = isMovzs ? LowOpndRegType_gp : type;
+     if (!gDvmJit.scheduling) {
+-        stream = encoder_mem_to_reg_2(m, size, disp, base_reg, isBasePhysical,
++        stream = encoder_mem_to_reg_diff_sizes(m, size, disp, base_reg, isBasePhysical,
+                 overridden_size, reg, isPhysical, overridden_type, stream);
+         return NULL;
+     }
+@@ -525,7 +558,7 @@ LowOpMemReg* dump_mem_reg(Mnemonic m, AtomOpCode m2, OpndSize size, int disp,
+         int baseAll = registerAlloc(LowOpndRegType_gp, base_reg, isBasePhysical,
+                 true);
+         //it is okay to use the same physical register
+-        if (isMnemonicMove(m)) {
++        if (isMoveOptimizable(m)) {
+             freeReg(true);
+         } else {
+             donotSpillReg(baseAll);
+@@ -637,7 +670,7 @@ LowOpMemReg* lower_mem_scale_to_reg(Mnemonic m, OpndSize size, int base_reg,
+     OpndSize overridden_size = isMovzs ? OpndSize_32 : size;
+     LowOpndRegType overridden_type = isMovzs ? LowOpndRegType_gp : type;
+     if (!gDvmJit.scheduling) {
+-        stream = encoder_mem_disp_scale_to_reg_2(m, size, base_reg, isBasePhysical,
++        stream = encoder_mem_disp_scale_to_reg_diff_sizes(m, size, base_reg, isBasePhysical,
+                 disp, index_reg, isIndexPhysical, scale, overridden_size, reg,
+                 isPhysical, overridden_type, stream);
+         return NULL;
+@@ -672,7 +705,7 @@ LowOpMemReg* dump_mem_scale_reg(Mnemonic m, OpndSize size, int base_reg,
+         donotSpillReg(baseAll); //make sure index will not use the same physical reg
+         int indexAll = registerAlloc(LowOpndRegType_gp, index_reg,
+                 isIndexPhysical, true);
+-        if (isMnemonicMove(m)) {
++        if (isMoveOptimizable(m)) {
+             freeReg(true);
+             doSpillReg(baseAll); //base can be used now
+         } else {
+@@ -1766,6 +1799,16 @@ void move_reg_to_reg(OpndSize size,
+ }
+ //!mov from one reg to another reg
+ 
++//!Sign extends the value. Only 32-bit support.
++void moves_reg_to_reg(OpndSize size,
++                      int reg, bool isPhysical,
++                      int reg2, bool isPhysical2) {
++    Mnemonic m = Mnemonic_MOVSX;
++    dump_reg_reg(m, ATOM_NORMAL, size, reg, isPhysical, reg2, isPhysical2, getTypeFromIntSize(size));
++}
++
++//!mov from one reg to another reg
++
+ //!Operands are already allocated
+ void move_reg_to_reg_noalloc(OpndSize size,
+                   int reg, bool isPhysical,
+diff --git a/vm/compiler/codegen/x86/Schedule.cpp b/vm/compiler/codegen/x86/Schedule.cpp
+index 94d0b6b..168822f 100644
+--- a/vm/compiler/codegen/x86/Schedule.cpp
++++ b/vm/compiler/codegen/x86/Schedule.cpp
+@@ -1267,9 +1267,10 @@ void Scheduler::generateAssembly(LowOp * op) {
+                             - ((LowOpRegReg*) op)->regDest.regNum,
+                     op->opndDest.size == OpndSize_64, stream);
+         } else {
+-            stream = encoder_reg_reg(op->opCode, op->opndDest.size,
++            stream = encoder_reg_reg_diff_sizes(op->opCode, op->opndSrc.size,
+                     ((LowOpRegReg*) op)->regSrc.regNum,
+                     ((LowOpRegReg*) op)->regSrc.isPhysical,
++                    op->opndDest.size,
+                     ((LowOpRegReg*) op)->regDest.regNum,
+                     ((LowOpRegReg*) op)->regDest.isPhysical,
+                     ((LowOpRegReg*) op)->regDest.regType, stream);
+@@ -1286,7 +1287,7 @@ void Scheduler::generateAssembly(LowOp * op) {
+                     regmem_op->memSrc.m_base.isPhysical,
+                     regmem_op->regDest.regNum - PhysicalReg_ST0, stream);
+         else if (regmem_op->memSrc.hasScale)
+-            stream = encoder_mem_disp_scale_to_reg_2(regmem_op->opCode,
++            stream = encoder_mem_disp_scale_to_reg_diff_sizes(regmem_op->opCode,
+                     regmem_op->opndSrc.size, regmem_op->memSrc.m_base.regNum,
+                     regmem_op->memSrc.m_base.isPhysical,
+                     regmem_op->memSrc.m_disp.value,
+@@ -1296,7 +1297,7 @@ void Scheduler::generateAssembly(LowOp * op) {
+                     regmem_op->regDest.regNum, regmem_op->regDest.isPhysical,
+                     regmem_op->regDest.regType, stream);
+         else
+-            stream = encoder_mem_to_reg_2(regmem_op->opCode,
++            stream = encoder_mem_to_reg_diff_sizes(regmem_op->opCode,
+                     regmem_op->opndSrc.size, regmem_op->memSrc.m_disp.value,
+                     regmem_op->memSrc.m_base.regNum,
+                     regmem_op->memSrc.m_base.isPhysical,
+diff --git a/vm/compiler/codegen/x86/libenc/enc_wrapper.cpp b/vm/compiler/codegen/x86/libenc/enc_wrapper.cpp
+index 3c34b29..0a1cca4 100644
+--- a/vm/compiler/codegen/x86/libenc/enc_wrapper.cpp
++++ b/vm/compiler/codegen/x86/libenc/enc_wrapper.cpp
+@@ -220,17 +220,17 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_reg(Mnemonic m, OpndSize size,
+ #endif
+     return stream;
+ }
+-//both operands have same size
+-extern "C" ENCODER_DECLARE_EXPORT char * encoder_reg_reg(Mnemonic m, OpndSize size,
+-                   int reg, bool isPhysical,
++//! \brief Allows for different operand sizes
++extern "C" ENCODER_DECLARE_EXPORT char * encoder_reg_reg_diff_sizes(Mnemonic m, OpndSize srcOpndSize,
++                   int reg, bool isPhysical, OpndSize destOpndSize,
+                    int reg2, bool isPhysical2, LowOpndRegType type, char * stream) {
+     if((m == Mnemonic_MOV || m == Mnemonic_MOVQ) && reg == reg2) return stream;
+     EncoderBase::Operands args;
+-    add_r(args, reg2, size); //destination
++    add_r(args, reg2, destOpndSize); //destination
+     if(m == Mnemonic_SAL || m == Mnemonic_SHR || m == Mnemonic_SHL || m == Mnemonic_SAR)
+       add_r(args, reg, OpndSize_8);
+     else
+-      add_r(args, reg, size);
++      add_r(args, reg, srcOpndSize);
+     char* stream_start = stream;
+     stream = (char *)EncoderBase::encode(stream, m, args);
+ #ifdef PRINT_ENCODER_STREAM
+@@ -239,8 +239,14 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_reg_reg(Mnemonic m, OpndSize si
+ #endif
+     return stream;
+ }
++//both operands have same size
++extern "C" ENCODER_DECLARE_EXPORT char * encoder_reg_reg(Mnemonic m, OpndSize size,
++                   int reg, bool isPhysical,
++                   int reg2, bool isPhysical2, LowOpndRegType type, char * stream) {
++    return encoder_reg_reg_diff_sizes(m, size, reg, isPhysical, size, reg2, isPhysical2, type, stream);
++}
+ //! \brief Allows for different operand sizes
+-extern "C" ENCODER_DECLARE_EXPORT char * encoder_mem_to_reg_2(Mnemonic m, OpndSize memOpndSize,
++extern "C" ENCODER_DECLARE_EXPORT char * encoder_mem_to_reg_diff_sizes(Mnemonic m, OpndSize memOpndSize,
+                    int disp, int base_reg, bool isBasePhysical, OpndSize regOpndSize,
+                    int reg, bool isPhysical, LowOpndRegType type, char * stream) {
+     EncoderBase::Operands args;
+@@ -257,7 +263,7 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_mem_to_reg_2(Mnemonic m, OpndSi
+ extern "C" ENCODER_DECLARE_EXPORT char * encoder_mem_reg(Mnemonic m, OpndSize size,
+                    int disp, int base_reg, bool isBasePhysical,
+                    int reg, bool isPhysical, LowOpndRegType type, char * stream) {
+-    return encoder_mem_to_reg_2(m, size, disp, base_reg, isBasePhysical, size, reg, isPhysical, type, stream);
++    return encoder_mem_to_reg_diff_sizes(m, size, disp, base_reg, isBasePhysical, size, reg, isPhysical, type, stream);
+ }
+ extern "C" ENCODER_DECLARE_EXPORT char * encoder_mem_scale_reg(Mnemonic m, OpndSize size,
+                          int base_reg, bool isBasePhysical, int index_reg, bool isIndexPhysical, int scale,
+@@ -289,7 +295,7 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_reg_mem_scale(Mnemonic m, OpndS
+     return stream;
+ }
+ //! \brief Allows for different operand sizes
+-extern "C" ENCODER_DECLARE_EXPORT char * encoder_mem_disp_scale_to_reg_2(Mnemonic m, OpndSize memOpndSize,
++extern "C" ENCODER_DECLARE_EXPORT char * encoder_mem_disp_scale_to_reg_diff_sizes(Mnemonic m, OpndSize memOpndSize,
+                          int base_reg, bool isBasePhysical, int disp, int index_reg, bool isIndexPhysical, int scale,
+                          OpndSize regOpndSize, int reg, bool isPhysical, LowOpndRegType type, char * stream) {
+     EncoderBase::Operands args;
+@@ -306,7 +312,7 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_mem_disp_scale_to_reg_2(Mnemoni
+ extern "C" ENCODER_DECLARE_EXPORT char * encoder_mem_disp_scale_reg(Mnemonic m, OpndSize size,
+                          int base_reg, bool isBasePhysical, int disp, int index_reg, bool isIndexPhysical, int scale,
+                          int reg, bool isPhysical, LowOpndRegType type, char * stream) {
+-    return encoder_mem_disp_scale_to_reg_2(m, size, base_reg, isBasePhysical,
++    return encoder_mem_disp_scale_to_reg_diff_sizes(m, size, base_reg, isBasePhysical,
+             disp, index_reg, isIndexPhysical, scale, size, reg, isPhysical,
+             type, stream);
+ }
+diff --git a/vm/compiler/codegen/x86/libenc/enc_wrapper.h b/vm/compiler/codegen/x86/libenc/enc_wrapper.h
+index 093fe69..b5d52b3 100644
+--- a/vm/compiler/codegen/x86/libenc/enc_wrapper.h
++++ b/vm/compiler/codegen/x86/libenc/enc_wrapper.h
+@@ -184,10 +184,13 @@ ENCODER_DECLARE_EXPORT char* encoder_reg(Mnemonic m, OpndSize size,
+ ENCODER_DECLARE_EXPORT char* encoder_reg_reg(Mnemonic m, OpndSize size,
+                    int reg, bool isPhysical,
+                    int reg2, bool isPhysical2, LowOpndRegType type, char* stream);
++ENCODER_DECLARE_EXPORT char* encoder_reg_reg_diff_sizes(Mnemonic m, OpndSize srcOpndSize,
++                   int reg, bool isPhysical, OpndSize destOpndSize,
++                   int reg2, bool isPhysical2, LowOpndRegType type, char* stream);
+ ENCODER_DECLARE_EXPORT char* encoder_mem_reg(Mnemonic m, OpndSize size,
+                    int disp, int base_reg, bool isBasePhysical,
+                    int reg, bool isPhysical, LowOpndRegType type, char* stream);
+-ENCODER_DECLARE_EXPORT char* encoder_mem_to_reg_2(Mnemonic m, OpndSize memOpndSize,
++ENCODER_DECLARE_EXPORT char* encoder_mem_to_reg_diff_sizes(Mnemonic m, OpndSize memOpndSize,
+                    int disp, int base_reg, bool isBasePhysical, OpndSize regOpndSize,
+                    int reg, bool isPhysical, LowOpndRegType type, char* stream);
+ ENCODER_DECLARE_EXPORT char* encoder_mem_scale_reg(Mnemonic m, OpndSize size,
+@@ -200,6 +203,9 @@ ENCODER_DECLARE_EXPORT char* encoder_reg_mem_scale(Mnemonic m, OpndSize size,
+ ENCODER_DECLARE_EXPORT char * encoder_mem_disp_scale_reg(Mnemonic m, OpndSize size,
+                          int base_reg, bool isBasePhysical, int disp, int index_reg, bool isIndexPhysical, int scale,
+                          int reg, bool isPhysical, LowOpndRegType type, char * stream);
++ENCODER_DECLARE_EXPORT char * encoder_mem_disp_scale_to_reg_diff_sizes(Mnemonic m, OpndSize memOpndSize,
++                         int base_reg, bool isBasePhysical, int disp, int index_reg, bool isIndexPhysical, int scale,
++                         OpndSize regOpndSize, int reg, bool isPhysical, LowOpndRegType type, char * stream);
+ ENCODER_DECLARE_EXPORT char * encoder_movzs_mem_disp_scale_reg(Mnemonic m, OpndSize size,
+                          int base_reg, bool isBasePhysical, int disp, int index_reg, bool isIndexPhysical, int scale,
+                          int reg, bool isPhysical, LowOpndRegType type, char * stream);
+-- 
+1.7.4.1
+

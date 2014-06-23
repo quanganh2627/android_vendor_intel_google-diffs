@@ -1,0 +1,230 @@
+From 665517fa6d9551c4334e8e427c23d7fde04dd93c Mon Sep 17 00:00:00 2001
+From: samaga Prasanna Krishna <samaga.krishna@intel.com>
+Date: Fri, 5 Oct 2012 09:55:54 +0530
+Subject: [PATCH 075/196] [PORT FROM MAIN]DUT reboot on pause/resume for 5.1 channel audio file
+
+BZ: 60020
+
+This patch will fix the DUT reboot and TOMSTONE issue while pause/
+resume 5.1 channel audio file during playback via HDMI.
+
+Both 5.1 channel audio file playback via HDMI and codec offload
+uses Direct Output thread and hence added a check to identify the
+offload track and route its calls to offload device.
+
+Change-Id: I85356b1e3247d4580ee8276e13b1d1064e9f27bd
+origChange-Id: Ieecff0d08826b8bf1336be552e47556c419031e2
+Signed-off-by: samaga Prasanna Krishna <samaga.krishna@intel.com>
+Reviewed-on: http://android.intel.com:8080/78713
+Reviewed-by: Yao, Yong <yong.yao@intel.com>
+Reviewed-by: M, Arulselvan <arulselvan.m@intel.com>
+Tested-by: M, Arulselvan <arulselvan.m@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+---
+ include/media/IAudioFlinger.h          |    3 +-
+ media/libmedia/AudioTrack.cpp          |    6 +++
+ services/audioflinger/AudioFlinger.cpp |   66 ++++++++++++++++++-------------
+ services/audioflinger/AudioFlinger.h   |    3 +-
+ 4 files changed, 48 insertions(+), 30 deletions(-)
+
+diff --git a/include/media/IAudioFlinger.h b/include/media/IAudioFlinger.h
+index 578624d..2daf6ea 100644
+--- a/include/media/IAudioFlinger.h
++++ b/include/media/IAudioFlinger.h
+@@ -48,7 +48,8 @@ public:
+     enum {
+         TRACK_DEFAULT = 0,  // client requests a default AudioTrack
+         TRACK_TIMED   = 1,  // client requests a TimedAudioTrack
+-        TRACK_FAST    = 2,  // client requests a fast AudioTrack or AudioRecord
++        TRACK_FAST    = 2,  // client requests a fast AudioTrack
++        TRACK_OFFLOAD = 4,  // client requests a offload AudioTrack
+     };
+     typedef uint32_t track_flags_t;
+ 
+diff --git a/media/libmedia/AudioTrack.cpp b/media/libmedia/AudioTrack.cpp
+index 0348043..f3352dd 100644
+--- a/media/libmedia/AudioTrack.cpp
++++ b/media/libmedia/AudioTrack.cpp
+@@ -995,6 +995,12 @@ status_t AudioTrack::createTrack_l(
+         }
+     }
+ 
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    if (mFlags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD) {
++        trackFlags |= IAudioFlinger::TRACK_OFFLOAD;
++    }
++#endif
++
+     sp<IAudioTrack> track = audioFlinger->createTrack(getpid(),
+                                                       streamType,
+                                                       sampleRate,
+diff --git a/services/audioflinger/AudioFlinger.cpp b/services/audioflinger/AudioFlinger.cpp
+index 5878bd3..cc1673d 100644
+--- a/services/audioflinger/AudioFlinger.cpp
++++ b/services/audioflinger/AudioFlinger.cpp
+@@ -1984,6 +1984,22 @@ Exit:
+     return track;
+ }
+ 
++bool AudioFlinger::PlaybackThread::isOffloadTrack() const
++{
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    bool offloadTrack = false;
++    for (size_t i = 0; i < mTracks.size(); ++i) {
++        sp<Track> t = mTracks[i];
++        if (t != 0 && t->isOffloadTrack()) {
++            offloadTrack = true;
++        }
++    }
++    return offloadTrack;
++#else
++    return false;
++#endif
++}
++
+ uint32_t AudioFlinger::MixerThread::correctLatency(uint32_t latency) const
+ {
+     if (mFastMixer != NULL) {
+@@ -2042,7 +2058,8 @@ void AudioFlinger::PlaybackThread::setStreamVolume(audio_stream_type_t stream, f
+     // Check if MusicOffload Track is running, if so, instanly apply volume
+     // AudioTrack.
+     ALOGV("setStreamVolume of thread");
+-    if (stream == AUDIO_STREAM_MUSIC && mType == DIRECT && getOutput_l()) {
++    if ( (stream == AUDIO_STREAM_MUSIC) && (isOffloadTrack()) &&
++         (getOutput_l()) ) {
+         ALOGV("DIRECT thread calling set_volume");
+         getOutput_l()->stream->set_volume(getOutput_l()->stream, value, value);
+     }
+@@ -3926,15 +3943,19 @@ AudioFlinger::PlaybackThread::mixer_state AudioFlinger::DirectOutputThread::prep
+         }
+ 
+ #ifdef INTEL_MUSIC_OFFLOAD_FEATURE
+-        if (track->isPausing()) {
+-             track->setPaused();
++        bool offloadTrack = track->isOffloadTrack();
++        if (offloadTrack) {
++            if (track->isPausing()) {
++                track->setPaused();
++            }
+         }
+ 
+-        if ((track->framesReady() >= minFrames) && track->isReady() &&  track->isActive())
+-//                !track->isPaused() && !track->isTerminated())
++        if ((track->framesReady() >= minFrames) && track->isReady() &&
++                (offloadTrack ? (track->isActive()) :
++                               (!track->isPaused() && !track->isTerminated())))
+         {
+ #else
+-         if ((track->framesReady() >= minFrames) && track->isReady() &&
++        if ((track->framesReady() >= minFrames) && track->isReady() &&
+                 !track->isPaused() && !track->isTerminated())
+         {
+ #endif
+@@ -4851,8 +4872,8 @@ status_t AudioFlinger::PlaybackThread::Track::start(AudioSystem::sync_event_t ev
+         // In case of Music Offload write, it could be blocked on pause-event
+         // make sure we restart the output
+         PlaybackThread* playbackThread = static_cast<PlaybackThread*>(thread.get());
+-        if (playbackThread->type() == DIRECT && (state==PAUSING || state==PAUSED)) {
+-            ALOGV("calling resume directly");
++        if ( (isOffloadTrack()) && (state==PAUSING || state==PAUSED) ) {
++            ALOGV("start: offload resume");
+             status_t status = playbackThread->getOutput_l()->stream->resume(
+                                             playbackThread->getOutput_l()->stream);
+             if (NO_ERROR != status) {
+@@ -4902,9 +4923,9 @@ void AudioFlinger::PlaybackThread::Track::stop()
+         }
+ #ifdef INTEL_MUSIC_OFFLOAD_FEATURE
+         PlaybackThread* playbackThread = static_cast<PlaybackThread*>(thread.get());
+-        if ((playbackThread->type() == DIRECT) ) {
++        if (isOffloadTrack()) {
+             if (state!=ACTIVE && state!=RESUMING) {
+-                ALOGV("Track:stop: state!=ACTIVE && state!=RESUMING");
++                ALOGV("Track:stop: offload state!=ACTIVE && state!=RESUMING");
+                 status_t status = playbackThread->getOutput_l()->stream->flush(
+                                            playbackThread->getOutput_l()->stream);
+                 if (NO_ERROR != status) {
+@@ -4930,7 +4951,8 @@ void AudioFlinger::PlaybackThread::Track::pause()
+ #ifdef INTEL_MUSIC_OFFLOAD_FEATURE
+                 // Call direct pause for offload mechanism
+                 PlaybackThread* pPBThread = static_cast<PlaybackThread*>(thread.get());
+-                if (pPBThread->type() == DIRECT) {
++                if (isOffloadTrack()) {
++                    ALOGV("pause: offload pause");
+                     status_t status = pPBThread->getOutput_l()->stream->pause(
+                                                pPBThread->getOutput_l()->stream);
+                     if (NO_ERROR != status) {
+@@ -4962,8 +4984,8 @@ void AudioFlinger::PlaybackThread::Track::flush()
+         Mutex::Autolock _l(thread->mLock);
+         PlaybackThread *playbackThread = (PlaybackThread *)thread.get();
+ #ifdef INTEL_MUSIC_OFFLOAD_FEATURE
+-        if (playbackThread->type() == DIRECT) {
+-            ALOGV("Calling flush directly");
++        if (isOffloadTrack()) {
++            ALOGV("flush: offload flush");
+             mCblk->lock.lock();
+             reset();
+             mCblk->lock.unlock();
+@@ -5002,19 +5024,7 @@ void AudioFlinger::PlaybackThread::Track::reset()
+     // For MusicOffload: Flush the data if requested anytime
+     // Check if Music Offload playback is running
+ #ifdef INTEL_MUSIC_OFFLOAD_FEATURE
+-    bool offload = false;
+-    sp<ThreadBase> baseThread = mThread.promote();
+-    if (baseThread != 0) {
+-        PlaybackThread *playbackThread = (PlaybackThread *)baseThread.get();
+-
+-        if (playbackThread->type() == DIRECT) {
+-            offload = true;
+-        }
+-    }
+-#endif
+-
+-#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
+-    if (!mResetDone || offload) {
++    if ( (!mResetDone) || (isOffloadTrack()) ) {
+ #else
+     if (!mResetDone) {
+ #endif
+@@ -7425,7 +7435,7 @@ status_t AudioFlinger::closeOutput_nonvirtual(audio_io_handle_t output)
+             }
+         }
+ #ifdef INTEL_MUSIC_OFFLOAD_FEATURE
+-        if (thread->type() == ThreadBase::DIRECT) {
++        if (thread->isOffloadTrack()) {
+             Vector<int> sessionIds;
+ 
+             thread->getEffectSessionIds(sessionIds);
+@@ -9067,7 +9077,7 @@ status_t AudioFlinger::EffectModule::setEnabled_l(bool enabled)
+         PlaybackThread *p = (PlaybackThread *)thread.get();
+ 
+         if (enabled) {
+-            if (p->type() == ThreadBase::DIRECT ) {
++            if (p->isOffloadTrack()) {
+                 ALOGV("setEnabled: Offload, invalidate tracks");
+                 DirectOutputThread *srcThread = (DirectOutputThread *)p;
+                 srcThread->invalidateTracks(AUDIO_STREAM_MUSIC);
+diff --git a/services/audioflinger/AudioFlinger.h b/services/audioflinger/AudioFlinger.h
+index bf9dbee..b62c311 100644
+--- a/services/audioflinger/AudioFlinger.h
++++ b/services/audioflinger/AudioFlinger.h
+@@ -865,7 +865,7 @@ private:
+             void triggerEvents(AudioSystem::sync_event_t type);
+             virtual bool isTimedTrack() const { return false; }
+             bool isFastTrack() const { return (mFlags & IAudioFlinger::TRACK_FAST) != 0; }
+-
++            bool isOffloadTrack() const { return (mFlags & IAudioFlinger::TRACK_OFFLOAD) != 0; }
+         protected:
+ 
+             // written by Track::mute() called by binder thread(s), without a mutex or barrier.
+@@ -1259,6 +1259,7 @@ public:
+     protected:
+                     // accessed by both binder threads and within threadLoop(), lock on mutex needed
+                     unsigned    mFastTrackAvailMask;    // bit i set if fast track [i] is available
++                    bool        isOffloadTrack() const;
+ 
+     };
+ 
+-- 
+1.7.4.1
+

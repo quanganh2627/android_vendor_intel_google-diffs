@@ -1,0 +1,202 @@
+From dbffd34a9a47d27d8a0a2e1bddd6ce782da97579 Mon Sep 17 00:00:00 2001
+From: Pavan Kumar S <pavan.kumar.s@intel.com>
+Date: Tue, 22 Oct 2013 17:16:37 +0530
+Subject: [PORT FROM MAIN] ANDROID-COS: Add a thermal fail-safe
+
+BZ: 59728
+
+At high temperatures, device should be shut down to avoid potential
+harm to the device.
+
+This patch adds a thermal threshold check to Android-COS.
+If any of front-skin, back-skin or battery temperatures exceed their
+respective thresholds, the platform will be shutdown.
+
+Orig-Change-Id: Id1227b448f742244f44f01d30bcbfef801bc8932
+Category: device enablement
+Domain: EM.ThermalManagement-Common
+Origin: internal
+Upstream-Candidate: no, proprietary
+Orig-Change-Id: I7da37076ede73f082c3b8a2e6b31d747223e219d
+
+Change-Id: Ic0fdf30016134b9322412923e2ed899bde386890
+Signed-off-by: Pavan Kumar S <pavan.kumar.s@intel.com>
+---
+ charger/charger.c |  133 ++++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 files changed, 132 insertions(+), 1 deletions(-)
+
+diff --git a/charger/charger.c b/charger/charger.c
+index 64144c9..1c1269a 100644
+--- a/charger/charger.c
++++ b/charger/charger.c
+@@ -64,6 +64,7 @@
+ #define BATTERY_UNKNOWN_TIME    (2 * MSEC_PER_SEC)
+ #define POWER_ON_KEY_TIME       (2 * MSEC_PER_SEC)
+ #define UNPLUGGED_SHUTDOWN_TIME (10 * MSEC_PER_SEC)
++#define THERMAL_POLL_TIME       (5 * MSEC_PER_SEC)
+ 
+ #define BATTERY_FULL_THRESH     95
+ #define BOOT_BATT_MIN_CAP_THRS  3
+@@ -75,6 +76,18 @@
+ #define LOGI(x...) do { KLOG_INFO("charger", x); } while (0)
+ #define LOGV(x...) do { KLOG_DEBUG("charger", x); } while (0)
+ 
++#define TEMP_BASE_PATH               "/sys/class/thermal/thermal_zone"
++#define TEMP_SENS_TYPE               "/type"
++#define TEMP_SENS_VAL                "/temp"
++#define TEMP_MON_TYPE_FRONT_SKIN     "skin0"
++#define TEMP_MON_TYPE_BACK_SKIN      "skin1"
++#define TEMP_MON_TYPE_BATTERY        "battery"
++
++/* temperature is in mC */
++#define CRIT_TEMP_THRESH_FRONT_SKIN  64000
++#define CRIT_TEMP_THRESH_BACK_SKIN   74000
++#define CRIT_TEMP_THRESH_BATTERY     60000
++
+ #define INVALID_BATT_MODEL "UNKNOWN"
+ 
+ struct key_state {
+@@ -973,6 +986,123 @@ static void handle_power_supply_state(struct charger *charger, int64_t now)
+     }
+ }
+ 
++static int get_temp_interface(char *sensor_name)
++{
++    int sensor_count = 0;
++    char path[PATH_MAX], buf[PATH_MAX];
++    int ret = -1;
++    static int index_skin0 = -1;
++    static int index_skin1 = -1;
++    static int index_battery = -1;
++
++    if (!sensor_name)
++        return ret;
++
++    /* if the sysfs path is found already, just return with value */
++    if ((!strcmp(sensor_name, "skin0") || !strcmp(sensor_name, "SYSTHERM0")) && index_skin0 != -1)
++        return index_skin0;
++    else if ((!strcmp(sensor_name, "skin1") || !strcmp(sensor_name, "SYSTHERM1")) && index_skin1 != -1)
++        return index_skin1;
++    else if (strstr(sensor_name, "battery") && index_battery != -1)
++        return index_battery;
++
++    snprintf(path, sizeof(path), "%s%d%s", TEMP_BASE_PATH, sensor_count, TEMP_SENS_TYPE);
++    memset(buf, 0, sizeof(buf));
++    /* loop through all the sysfs files. Exit when file doesnt exist.
++     * Assumption is if file doesnt exist for a given sensor_count,
++     * no file exist for a higher sensor_count */
++    while (read_file(path, buf, sizeof(buf)) >= 0) {
++         if (strstr(buf, sensor_name)){
++             ret = sensor_count;
++             break;
++         }
++
++         sensor_count++;
++         snprintf(path, sizeof(path), "%s%d%s", TEMP_BASE_PATH, sensor_count, TEMP_SENS_TYPE);
++         memset(buf, 0, sizeof(buf));
++    }
++
++    if (ret == -1)
++        return ret;
++
++    if (!strcmp(sensor_name, "skin0") || !strcmp(sensor_name, "SYSTHERM0"))
++        index_skin0 = ret;
++    else if (!strcmp(sensor_name, "skin1") || !strcmp(sensor_name, "SYSTHERM1"))
++        index_skin1 = ret;
++    else if (strstr(sensor_name, "battery"))
++        index_battery = ret;
++
++    return ret;
++}
++
++static void handle_temperature_state(struct charger *charger)
++{
++    int temp_front, temp_back, temp_battery;
++    int sensor_type_front, sensor_type_back, sensor_type_battery;
++    int ret;
++    char path_front[PATH_MAX], path_back[PATH_MAX], path_battery[PATH_MAX];
++
++    sensor_type_front = get_temp_interface(TEMP_MON_TYPE_FRONT_SKIN);
++    if (sensor_type_front < 0) {
++        sensor_type_front = get_temp_interface("SYSTHERM1");
++        if (sensor_type_front < 0)
++           return;
++    }
++
++    sensor_type_back = get_temp_interface(TEMP_MON_TYPE_BACK_SKIN);
++    if (sensor_type_back < 0) {
++        sensor_type_back = get_temp_interface("SYSTHERM0");
++        if (sensor_type_back < 0)
++           return;
++    }
++
++    sensor_type_battery = get_temp_interface(TEMP_MON_TYPE_BATTERY);
++    if (sensor_type_battery < 0)
++        return;
++
++    snprintf(path_front, sizeof(path_front), "%s%d%s", TEMP_BASE_PATH,
++             sensor_type_front, TEMP_SENS_VAL);
++
++
++    ret = read_file_int(path_front, &temp_front);
++    if (ret < 0) {
++        LOGE("Unable to open/read file %s\n", path_front);
++        return;
++    }
++
++    snprintf(path_back, sizeof(path_back), "%s%d%s", TEMP_BASE_PATH,
++             sensor_type_back, TEMP_SENS_VAL);
++
++    ret = read_file_int(path_back, &temp_back);
++    if (ret < 0) {
++        LOGE("Unable to open/read file %s\n", path_back);
++        return;
++    }
++
++    snprintf(path_battery, sizeof(path_battery), "%s%d%s", TEMP_BASE_PATH,
++             sensor_type_battery, TEMP_SENS_VAL);
++
++    ret = read_file_int(path_battery, &temp_battery);
++    if (ret < 0) {
++        LOGE("Unable to open/read file %s\n", path_battery);
++        return;
++    }
++
++    if (temp_front >= CRIT_TEMP_THRESH_FRONT_SKIN ||
++        temp_back >= CRIT_TEMP_THRESH_BACK_SKIN ||
++        temp_battery >= CRIT_TEMP_THRESH_BATTERY) {
++        kick_animation(charger->batt_anim);
++        request_suspend(false);
++
++        LOGI("Temperature threshold breached: Front_skin_temp:%d, Back_skin_temp:%d, Battery_temp:%d\n"
++             "Thresholds: Front:%d, Back:%d, Battery:%d\nShutting down system\n", temp_front, temp_back,
++             temp_battery, CRIT_TEMP_THRESH_FRONT_SKIN, CRIT_TEMP_THRESH_BACK_SKIN, CRIT_TEMP_THRESH_BATTERY);
++
++        system("echo 1 > /sys/module/intel_mid_osip/parameters/force_shutdown_occured");
++        android_reboot(ANDROID_RB_POWEROFF, 0, 0);
++    }
++}
++
+ static void wait_next_event(struct charger *charger, int64_t now)
+ {
+     int64_t next_event = INT64_MAX;
+@@ -994,7 +1124,7 @@ static void wait_next_event(struct charger *charger, int64_t now)
+     if (next_event != -1 && next_event != INT64_MAX)
+         timeout = max(0, next_event - now);
+     else
+-        timeout = -1;
++        timeout = THERMAL_POLL_TIME;
+     LOGV("[%lld] blocking (%lld)\n", now, timeout);
+     ret = ev_wait((int)timeout);
+     if (!ret)
+@@ -1024,6 +1154,7 @@ static void event_loop(struct charger *charger)
+         LOGV("[%lld] event_loop()\n", now);
+         handle_input_state(charger, now);
+         handle_power_supply_state(charger, now);
++        handle_temperature_state(charger);
+ 
+         /* do screen update last in case any of the above want to start
+          * screen transitions (animations, etc)
+-- 
+1.7.4.1
+

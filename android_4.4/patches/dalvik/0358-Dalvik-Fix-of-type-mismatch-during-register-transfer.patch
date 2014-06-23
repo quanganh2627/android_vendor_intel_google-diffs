@@ -1,0 +1,154 @@
+From 023c4cb4e18e5cd7e9ee67a6f121a8e2cc608b6d Mon Sep 17 00:00:00 2001
+From: aleksey.v.ignatenko <avignate@lab-dyn-116-248.ins.intel.com>
+Date: Mon, 23 Sep 2013 13:10:59 +0700
+Subject: Dalvik: Fix of type mismatch during register transfer in LCG RA
+
+BZ: 135434
+
+CheckVirtualReg in certain cases cannot find physical register. In the bug
+bb input reg has SS type (XMM physical reg is used), later it
+is to be converted to GP type. But due to RA specifics (it considers type GP
+or XMM only, see getTypeFromIntSize) it happens that we can update VR in
+memory and don't mark this happened while the value is also stored on XMM.
+Later when XMM is used we get incorrect calculation. The fix contains 3 parts:
+1. check if a VR has physical reg in CompileTable and spill it; 2. fix for
+the same problem reported in bug 135322 for handleStartOfBBXferPoints method; 3.
+warning removed related to unused regAll
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: If0c680aea3eabec0d487b75020c863fdd67c6911
+Orig-MCG-Change-Id: Ibae6c463263b4046837ea61a2ad5f7b87fd93d89
+Signed-off-by: aleksey.v.ignatenko <avignate@lab-dyn-116-248.ins.intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+Reviewed-on: http://android.intel.com:8080/136472
+Reviewed-by: Ignatenko, Aleksey V <aleksey.v.ignatenko@intel.com>
+Reviewed-by: Beyler, Jean Christophe <jean.christophe.beyler@intel.com>
+Reviewed-by: lab_aqa <lab_aqa@intel.com>
+Reviewed-by: Provodin, Vitaly A <vitaly.a.provodin@intel.com>
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: Banerji, Udayan <udayan.banerji@intel.com>
+Reviewed-by: Lupusoru, Razvan A <razvan.a.lupusoru@intel.com>
+Reviewed-by: Hartley, Timothy D <timothy.d.hartley@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+---
+ vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp  |   33 +++++++++++++++++++++-
+ vm/compiler/codegen/x86/lightcg/AnalysisO1.h    |    4 +++
+ vm/compiler/codegen/x86/lightcg/LowerHelper.cpp |    9 ++++++
+ 3 files changed, 44 insertions(+), 2 deletions(-)
+
+diff --git a/vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp b/vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp
+index 0b78e9c..8915f38 100644
+--- a/vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp
++++ b/vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp
+@@ -2528,7 +2528,13 @@ void handleStartOfBBXferPoints (BasicBlock_O1 *bb)
+                         && compileEntry.inPhysicalRegister( ) == true)
+                 {
+                     //Write back the VR to memory
+-                    writeBackVR (vR, compileEntry.getPhysicalType (), compileEntry.getPhysicalReg ());
++                    int index = searchCompileTable(compileEntry.getPhysicalType () | LowOpndRegType_virtual, vR);
++                    if(index < 0) {
++                        ALOGI("JIT_INFO: Cannot find VR %d %d in spillVirtualReg", vR, compileEntry.getPhysicalType ());
++                        SET_JIT_ERROR(kJitErrorRegAllocFailed);
++                        return;
++                    }
++                    spillLogicalReg(index, true);
+                 }
+             }
+         }
+@@ -2896,6 +2902,30 @@ inline void saveToSpillRegion(OpndSize size, int reg, int offset) {
+ #endif
+ 
+ /**
++ * @brief reset physical reg for a VR in CompileTable
++ * @details The method is used when there is a need to
++ * operate on VR in memory directly. In that case we
++ * want to be sure all physical registers are spilled
++ * @param vR Virtual Register to reset in CompileTable
++ */
++
++void resetVRInCompileTable(int vR)
++{
++    int k;
++    for(k = 0; k < compileTable.size (); k++)
++    {
++        if(compileTable[k].regNum == vR && compileTable[k].physicalReg != PhysicalReg_Null)
++        {
++            if (compileTable[k].isVirtualReg ()) {
++                spillLogicalReg(k, true);
++            }
++        }
++
++    }
++
++}
++
++/**
+  * @brief If VR is dirty, it writes the constant value to the VR on stack
+  * @details If VR is wide, this function should be called separately twice,
+  * once with the low bits and once with the high bits.
+@@ -3204,7 +3234,6 @@ int updateVirtualReg(int reg, LowOpndRegType pType) {
+            currentBB->xferPoints[k].physicalType == pType &&
+            currentBB->xferPoints[k].xtype != XFER_MEM_TO_XMM) {
+             //perform the corresponding action for the def
+-            PhysicalReg regAll;
+             if(currentBB->xferPoints[k].xtype == XFER_DEF_IS_XMM) {
+                 //def at fs: content of xmm is out-dated
+                 //def at xmm: content of misaligned xmm is out-dated
+diff --git a/vm/compiler/codegen/x86/lightcg/AnalysisO1.h b/vm/compiler/codegen/x86/lightcg/AnalysisO1.h
+index 7a35399..85fc2a1 100644
+--- a/vm/compiler/codegen/x86/lightcg/AnalysisO1.h
++++ b/vm/compiler/codegen/x86/lightcg/AnalysisO1.h
+@@ -463,6 +463,10 @@ bool isVirtualReg(int type);
+ //Spill a logical register using a index in the compileTable
+ int spillLogicalReg(int spill_index, bool updateTable);
+ 
++//Reset all entries of vR in CompileTable to
++//PhysicalReg_Null
++void resetVRInCompileTable(int vR);
++
+ //Search in the memory table for a register
+ int searchMemTable(int regNum);
+ 
+diff --git a/vm/compiler/codegen/x86/lightcg/LowerHelper.cpp b/vm/compiler/codegen/x86/lightcg/LowerHelper.cpp
+index 25df8fc..0ffe3b1 100644
+--- a/vm/compiler/codegen/x86/lightcg/LowerHelper.cpp
++++ b/vm/compiler/codegen/x86/lightcg/LowerHelper.cpp
+@@ -2076,6 +2076,9 @@ bool alu_imm_to_VR(OpndSize size, ALU_Opcode opc, int srcVR, int destVR, int imm
+                     return setVRToConst(destVR, size, constValue);
+                 }
+                 else if (caseDest == DEST_IN_MEMORY) {
++                    // reset any physical regs for vR because
++                    // we operate in memory directly
++                    resetVRInCompileTable(destVR);
+                     const int vrOffset = getVirtualRegOffsetRelativeToFP (destVR);
+                     dump_imm_mem_noalloc(Mnemonic_MOV, size, finalSum, vrOffset, PhysicalReg_FP, true, MemoryAccess_VR, destVR, NULL);
+                     return true; //Successfully updated
+@@ -2132,6 +2135,9 @@ bool alu_imm_to_VR(OpndSize size, ALU_Opcode opc, int srcVR, int destVR, int imm
+ 
+                         // when we reach here, we can use add/sub on memory directly based
+                         // on the fact that no uses of the mir's def in adjacent mirs window
++                        // reset any physical regs for vR because
++                        // we operate in memory directly
++                        resetVRInCompileTable(destVR);
+                         const int vrOffset = getVirtualRegOffsetRelativeToFP (destVR);
+                         dump_imm_mem_noalloc_alu(alu_mn, size, imm, vrOffset, PhysicalReg_FP, true, MemoryAccess_VR, destVR);
+ 
+@@ -2141,6 +2147,9 @@ bool alu_imm_to_VR(OpndSize size, ALU_Opcode opc, int srcVR, int destVR, int imm
+ 
+                     // for other platforms
+                     else {
++                        // reset any physical regs for vR because
++                        // we operate in memory directly
++                        resetVRInCompileTable(destVR);
+                         const int vrOffset = getVirtualRegOffsetRelativeToFP (destVR);
+                         dump_imm_mem_noalloc_alu(alu_mn, size, imm, vrOffset, PhysicalReg_FP, true, MemoryAccess_VR, destVR);
+ 
+-- 
+1.7.4.1
+

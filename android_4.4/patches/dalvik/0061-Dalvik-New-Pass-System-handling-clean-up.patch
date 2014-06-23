@@ -1,0 +1,1513 @@
+From b6f938c52774f9499af3c906e19bf4a7e16b529f Mon Sep 17 00:00:00 2001
+From: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Date: Fri, 1 Feb 2013 14:50:46 -0800
+Subject: Dalvik: New Pass System: handling clean up
+
+BZ: 75659
+
+New Pass System: handling clean up
+
+The Pass structure has become a Pass class with a better handling of inner data.
+The framework now correctly cleans up after a pass and can recalculate PHI nodes
+  and basic block predecessor information.
+Certain parts of the code base have been reworked to only allocate once if
+  possible.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I4289dffbeb40623088f7e0f89ada323795dfb5b1
+Orig-MCG-Change-Id: I81be6d5a1c602aaf51cc435d729025e469479396
+Signed-off-by: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/Dvm.mk                         |    3 +-
+ vm/compiler/Checks.cpp            |   19 ++-
+ vm/compiler/Checks.h              |   10 +-
+ vm/compiler/Compiler.h            |    2 +-
+ vm/compiler/CompilerIR.h          |   12 ++-
+ vm/compiler/CompilerUtility.h     |    5 +
+ vm/compiler/Dataflow.cpp          |  131 ++++++++++++-----
+ vm/compiler/Frontend.cpp          |   15 +-
+ vm/compiler/LoopOpt.cpp           |  294 ++++++++++++++++++++++++++++---------
+ vm/compiler/LoopOpt.h             |   49 ++-----
+ vm/compiler/Pass.cpp              |  139 +++++++++++++++++
+ vm/compiler/Pass.h                |  172 ++++++++++++++++++++++
+ vm/compiler/SSATransformation.cpp |  110 ++++++++++----
+ vm/compiler/Utility.cpp           |    7 +
+ 14 files changed, 772 insertions(+), 196 deletions(-)
+ create mode 100644 vm/compiler/Pass.cpp
+ create mode 100644 vm/compiler/Pass.h
+
+diff --git a/vm/Dvm.mk b/vm/Dvm.mk
+index 1ddbd59..ab59348 100644
+--- a/vm/Dvm.mk
++++ b/vm/Dvm.mk
+@@ -354,7 +354,8 @@ ifeq ($(dvm_arch),x86)
+               compiler/codegen/$(dvm_arch_variant)/ExceptionHandling.cpp \
+               compiler/codegen/$(dvm_arch_variant)/CodegenErrors.cpp \
+               compiler/LoopOpt.cpp \
+-              compiler/Checks.cpp
++              compiler/Checks.cpp \
++              compiler/Pass.cpp
+        # need apache harmony x86 encoder/decoder
+        LOCAL_C_INCLUDES += \
+ 	      dalvik/vm/compiler/codegen/x86/libenc
+diff --git a/vm/compiler/Checks.cpp b/vm/compiler/Checks.cpp
+index 08e6b47..b4e645d 100644
+--- a/vm/compiler/Checks.cpp
++++ b/vm/compiler/Checks.cpp
+@@ -14,11 +14,12 @@
+  * limitations under the License.
+  */
+ 
++#include "Checks.h"
+ #include "Dalvik.h"
+ #include "Dataflow.h"
+ #include "Loop.h"
+ #include "LoopOpt.h"
+-#include "Checks.h"
++#include "Pass.h"
+ 
+ #include <map>
+ 
+@@ -219,9 +220,9 @@ static bool usesEqual (const MIR *mir, const MIR *other, std::map<int, std::vect
+ /**
+  * @brief Start the removal pass, allocate the map
+  * @param cUnit the CompilationUnit
+- * @param curPass the SPass
++ * @param curPass the Pass
+  */
+-void dvmCompilerStartCheckRemoval (CompilationUnit *cUnit, SPass *curPass)
++void dvmCompilerStartCheckRemoval (CompilationUnit *cUnit, Pass *curPass)
+ {
+     //We only care about this, if it is a loop
+     if (dvmCompilerTraceIsLoop (cUnit, curPass) == false)
+@@ -231,7 +232,7 @@ void dvmCompilerStartCheckRemoval (CompilationUnit *cUnit, SPass *curPass)
+ 
+     //STEP 1: Initialize any thing for the pass data here
+     SRemoveData *data = new SRemoveData;
+-    curPass->data = static_cast<void *> (data);
++    curPass->setData (static_cast<void *> (data));
+ 
+     //By default, we don't hoist the checks yet because the entry is not really the entry of the loop
+     data->hoistChecks = false;
+@@ -242,11 +243,11 @@ void dvmCompilerStartCheckRemoval (CompilationUnit *cUnit, SPass *curPass)
+ /**
+  * @brief End the removal pass, free the map
+  * @param cUnit the CompilationUnit
+- * @param curPass the SPass
++ * @param curPass the Pass
+  */
+-void dvmCompilerEndCheckRemoval (CompilationUnit *cUnit, SPass *curPass)
++void dvmCompilerEndCheckRemoval (CompilationUnit *cUnit, Pass *curPass)
+ {
+-    SRemoveData *data = static_cast<SRemoveData *> (curPass->data);
++    SRemoveData *data = static_cast<SRemoveData *> (curPass->getData ());
+ 
+     //STEP 2: Add any free code here
+ 
+@@ -274,8 +275,8 @@ void dvmCompilerEndCheckRemoval (CompilationUnit *cUnit, SPass *curPass)
+         data->hoistedArrayToIndexChecks.clear ();
+ 
+         //Now delete data and clear up curPass->data
+-        delete data, data = NULL;
+-        curPass->data = NULL;
++        delete data, data = 0;
++        curPass->setData (0);
+     }
+ }
+ 
+diff --git a/vm/compiler/Checks.h b/vm/compiler/Checks.h
+index 90d4b06..47bf119 100644
+--- a/vm/compiler/Checks.h
++++ b/vm/compiler/Checks.h
+@@ -20,21 +20,21 @@
+ #include "Dalvik.h"
+ 
+ //Forward declaration
+-struct sPass;
++class Pass;
+ 
+ /**
+  * @brief Remove redundant checks start function
+  * @param cUnit the CompilationUnit
+- * @param curPass the current pass SPass
++ * @param curPass the current pass Pass
+  */
+-void dvmCompilerStartCheckRemoval (CompilationUnit *cUnit, struct sPass *curPass);
++void dvmCompilerStartCheckRemoval (CompilationUnit *cUnit, Pass *curPass);
+ 
+ /**
+  * @brief Remove redundant checks end function
+  * @param cUnit the CompilationUnit
+- * @param curPass the current pass struct sPass
++ * @param curPass the current pass Pass
+  */
+-void dvmCompilerEndCheckRemoval (CompilationUnit *cUnit, struct sPass *curPass);
++void dvmCompilerEndCheckRemoval (CompilationUnit *cUnit, Pass *curPass);
+ 
+ /**
+  * @brief Remove redundant checks
+diff --git a/vm/compiler/Compiler.h b/vm/compiler/Compiler.h
+index ba3bd9b..28bcf3d 100644
+--- a/vm/compiler/Compiler.h
++++ b/vm/compiler/Compiler.h
+@@ -259,7 +259,7 @@ void dvmCompilerDataFlowAnalysisDispatcher(struct CompilationUnit *cUnit,
+                 DataFlowAnalysisMode dfaMode,
+                 bool isIterative);
+ void dvmCompilerMethodSSATransformation(struct CompilationUnit *cUnit);
+-bool dvmCompilerBuildLoop(struct CompilationUnit *cUnit);
++bool dvmCompilerBuildLoop(struct CompilationUnit *cUnit, bool filter = true);
+ void dvmCompilerUpdateGlobalState(void);
+ JitTraceDescription *dvmCopyTraceDescriptor(const u2 *pc,
+                                             const struct JitEntry *desc);
+diff --git a/vm/compiler/CompilerIR.h b/vm/compiler/CompilerIR.h
+index 03a9ab3..e6c034d 100644
+--- a/vm/compiler/CompilerIR.h
++++ b/vm/compiler/CompilerIR.h
+@@ -224,6 +224,14 @@ typedef enum AssemblerStatus {
+     kRetryHalve
+ } AssemblerStatus;
+ 
++typedef struct sPhiVectors {
++    BitVector *phiBlocks;
++    BitVector *tmpBlocks;
++    BitVector *inputBlocks;
++    int size;
++}SPhiVectors;
++
++
+ typedef struct CompilationUnit {
+     int numInsts;
+     int numBlocks;
+@@ -231,7 +239,6 @@ typedef struct CompilationUnit {
+     const Method *method;
+ #ifdef ARCH_IA32
+     int exceptionBlockId;               /**< @brief The block corresponding to exception handling */
+-    bool traceIsALoop;                  /**< @brief The trace is a loop */
+ #endif
+     const JitTraceDescription *traceDesc;
+     LIR *firstLIRInsn;
+@@ -303,6 +310,9 @@ typedef struct CompilationUnit {
+     BitVector *tempBlockV;
+     BitVector *tempDalvikRegisterV;
+     BitVector *tempSSARegisterV;        // numSSARegs
++
++    SPhiVectors phi;
++
+     bool printSSANames;
+     void *blockLabelList;
+     bool quitLoopMode;                  // cold path/complex bytecode
+diff --git a/vm/compiler/CompilerUtility.h b/vm/compiler/CompilerUtility.h
+index 532b550..8b637cc 100644
+--- a/vm/compiler/CompilerUtility.h
++++ b/vm/compiler/CompilerUtility.h
+@@ -57,6 +57,11 @@ struct LIR;
+ struct BasicBlock;
+ 
+ void dvmInitGrowableList(GrowableList *gList, size_t initLength);
++/**
++ * @brief Empty Growable List
++ * @param gList the GrowableList to empty
++ */
++void dvmClearGrowableList (GrowableList *gList);
+ void dvmInsertGrowableList(GrowableList *gList, intptr_t elem);
+ void dvmGrowableListIteratorInit(GrowableList *gList,
+                                  GrowableListIterator *iterator);
+diff --git a/vm/compiler/Dataflow.cpp b/vm/compiler/Dataflow.cpp
+index 2c246a4..d42b8b5 100644
+--- a/vm/compiler/Dataflow.cpp
++++ b/vm/compiler/Dataflow.cpp
+@@ -1290,12 +1290,32 @@ bool dvmCompilerFindLocalLiveIn(CompilationUnit *cUnit, BasicBlock *bb)
+ 
+     if (bb->dataFlowInfo == NULL) return false;
+ 
+-    useV = bb->dataFlowInfo->useV =
+-        dvmCompilerAllocBitVector(cUnit->numDalvikRegisters, false);
+-    defV = bb->dataFlowInfo->defV =
+-        dvmCompilerAllocBitVector(cUnit->numDalvikRegisters, false);
+-    liveInV = bb->dataFlowInfo->liveInV =
+-        dvmCompilerAllocBitVector(cUnit->numDalvikRegisters, false);
++    //If not allocated yet
++    if (bb->dataFlowInfo->useV == 0)
++    {
++        bb->dataFlowInfo->useV =
++            dvmCompilerAllocBitVector(cUnit->numDalvikRegisters, false);
++    }
++    //Get local version
++    useV = bb->dataFlowInfo->useV;
++
++    //If not allocated yet
++    if (bb->dataFlowInfo->defV == 0)
++    {
++        bb->dataFlowInfo->defV =
++            dvmCompilerAllocBitVector(cUnit->numDalvikRegisters, false);
++    }
++    //Get local version
++    defV = bb->dataFlowInfo->defV;
++
++    //If not allocated yet
++    if (bb->dataFlowInfo->liveInV == 0)
++    {
++        bb->dataFlowInfo->liveInV =
++            dvmCompilerAllocBitVector(cUnit->numDalvikRegisters, false);
++    }
++    //Get local version
++    liveInV = bb->dataFlowInfo->liveInV;
+ 
+     for (mir = bb->firstMIRInsn; mir; mir = mir->next) {
+         int dfAttributes =
+@@ -1366,8 +1386,12 @@ static void dataFlowSSAFormat35C(CompilationUnit *cUnit, MIR *mir)
+     int numUses = dInsn->vA;
+     int i;
+ 
+-    mir->ssaRep->numUses = numUses;
+-    mir->ssaRep->uses = (int *)dvmCompilerNew(sizeof(int) * numUses, false);
++    //Do we need more space ?
++    if (numUses > mir->ssaRep->numUses)
++    {
++        mir->ssaRep->numUses = numUses;
++        mir->ssaRep->uses = static_cast <int *> (dvmCompilerNew (sizeof (* (mir->ssaRep->uses)) * numUses, false));
++    }
+ 
+     for (i = 0; i < numUses; i++) {
+         handleSSAUse(cUnit, mir->ssaRep->uses, dInsn->arg[i], i);
+@@ -1381,8 +1405,12 @@ static void dataFlowSSAFormat3RC(CompilationUnit *cUnit, MIR *mir)
+     int numUses = dInsn->vA;
+     int i;
+ 
+-    mir->ssaRep->numUses = numUses;
+-    mir->ssaRep->uses = (int *)dvmCompilerNew(sizeof(int) * numUses, false);
++    //Do we need more space ?
++    if (numUses > mir->ssaRep->numUses)
++    {
++        mir->ssaRep->numUses = numUses;
++        mir->ssaRep->uses = static_cast <int *> (dvmCompilerNew (sizeof (* (mir->ssaRep->uses)) * numUses, false));
++    }
+ 
+     for (i = 0; i < numUses; i++) {
+         handleSSAUse(cUnit, mir->ssaRep->uses, dInsn->vC+i, i);
+@@ -1397,8 +1425,11 @@ bool dvmCompilerDoSSAConversion(CompilationUnit *cUnit, BasicBlock *bb)
+     if (bb->dataFlowInfo == NULL) return false;
+ 
+     for (mir = bb->firstMIRInsn; mir; mir = mir->next) {
+-        mir->ssaRep = (struct SSARepresentation *)
+-            dvmCompilerNew(sizeof(SSARepresentation), true);
++        //If not yet generated
++        if (mir->ssaRep == NULL)
++        {
++            mir->ssaRep = static_cast<struct SSARepresentation *> (dvmCompilerNew (sizeof (* (mir->ssaRep)), true));
++        }
+ 
+         int dfAttributes =
+             dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
+@@ -1433,12 +1464,10 @@ bool dvmCompilerDoSSAConversion(CompilationUnit *cUnit, BasicBlock *bb)
+             }
+         }
+ 
+-        if (numUses) {
++        if (numUses > mir->ssaRep->numUses) {
+             mir->ssaRep->numUses = numUses;
+-            mir->ssaRep->uses = (int *)dvmCompilerNew(sizeof(int) * numUses,
+-                                                      false);
+-            mir->ssaRep->fpUse = (bool *)dvmCompilerNew(sizeof(bool) * numUses,
+-                                                false);
++            mir->ssaRep->uses = static_cast<int *> (dvmCompilerNew (sizeof (* (mir->ssaRep->uses)) * numUses, false));
++            mir->ssaRep->fpUse = static_cast<bool *> (dvmCompilerNew (sizeof (* (mir->ssaRep->fpUse)) * numUses, false));
+         }
+ 
+         int numDefs = 0;
+@@ -1450,12 +1479,10 @@ bool dvmCompilerDoSSAConversion(CompilationUnit *cUnit, BasicBlock *bb)
+             }
+         }
+ 
+-        if (numDefs) {
++        if (numDefs > mir->ssaRep->numDefs) {
+             mir->ssaRep->numDefs = numDefs;
+-            mir->ssaRep->defs = (int *)dvmCompilerNew(sizeof(int) * numDefs,
+-                                                      false);
+-            mir->ssaRep->fpDef = (bool *)dvmCompilerNew(sizeof(bool) * numDefs,
+-                                                        false);
++            mir->ssaRep->defs = static_cast<int *> (dvmCompilerNew (sizeof (* (mir->ssaRep->defs)) * numDefs, false));
++            mir->ssaRep->fpDef = static_cast<bool *> (dvmCompilerNew (sizeof (* (mir->ssaRep->fpDef)) * numDefs, false));
+         }
+ 
+         DecodedInstruction *dInsn = &mir->dalvikInsn;
+@@ -1505,12 +1532,13 @@ bool dvmCompilerDoSSAConversion(CompilationUnit *cUnit, BasicBlock *bb)
+      * input to PHI nodes can be derived from the snapshot of all predecessor
+      * blocks.
+      */
+-    bb->dataFlowInfo->dalvikToSSAMap =
+-        (int *)dvmCompilerNew(sizeof(int) * cUnit->method->registersSize,
+-                              false);
++    if (bb->dataFlowInfo->dalvikToSSAMap == 0)
++    {
++        bb->dataFlowInfo->dalvikToSSAMap = static_cast<int *> (dvmCompilerNew (sizeof (* (bb->dataFlowInfo->dalvikToSSAMap)) * cUnit->method->registersSize, false));
++    }
+ 
+     memcpy(bb->dataFlowInfo->dalvikToSSAMap, cUnit->dalvikToSSAMap,
+-           sizeof(int) * cUnit->method->registersSize);
++           sizeof (* (bb->dataFlowInfo->dalvikToSSAMap)) * cUnit->method->registersSize);
+     return true;
+ }
+ 
+@@ -1764,15 +1792,30 @@ void dvmInitializeSSAConversion(CompilationUnit *cUnit)
+     int i;
+     int numDalvikReg = cUnit->method->registersSize;
+ 
+-    cUnit->ssaToDalvikMap = (GrowableList *)dvmCompilerNew(sizeof(GrowableList),
+-                                                           false);
+-    dvmInitGrowableList(cUnit->ssaToDalvikMap, numDalvikReg);
++    //If ever the new number is not the same as before, invalidate all dataflow and ssa structures
++    if (numDalvikReg > cUnit->numSSARegs)
++    {
++        cUnit->ssaToDalvikMap = 0;
++        cUnit->dalvikToSSAMap = 0;
++        cUnit->defBlockMatrix = 0;
+ 
+-    /*
+-     * Initial number of SSA registers is equal to the number of Dalvik
+-     * registers.
+-     */
+-    cUnit->numSSARegs = numDalvikReg;
++        //For tempDalvikRegisterV, we don't have to set it to 0, we can just expand it
++        if (cUnit->tempDalvikRegisterV != 0)
++        {
++            dvmSetBit (cUnit->tempDalvikRegisterV, numDalvikReg - 1);
++        }
++    }
++
++    if (cUnit->ssaToDalvikMap == 0)
++    {
++        cUnit->ssaToDalvikMap = static_cast<GrowableList *> (dvmCompilerNew (sizeof (* (cUnit->ssaToDalvikMap)), false));
++        dvmInitGrowableList (cUnit->ssaToDalvikMap, numDalvikReg);
++    }
++    else
++    {
++        //Otherwise it's big enough to hold a bit, just reset its usage
++        dvmClearGrowableList (cUnit->ssaToDalvikMap);
++    }
+ 
+     /*
+      * Initialize the SSA2Dalvik map list. For the first numDalvikReg elements,
+@@ -1788,8 +1831,17 @@ void dvmInitializeSSAConversion(CompilationUnit *cUnit)
+      * while the high 16 bit is the current subscript. The original Dalvik
+      * register N is mapped to SSA register N with subscript 0.
+      */
+-    cUnit->dalvikToSSAMap = (int *)dvmCompilerNew(sizeof(int) * numDalvikReg,
+-                                                  false);
++    if (cUnit->dalvikToSSAMap == 0)
++    {
++        cUnit->dalvikToSSAMap = static_cast<int *> (dvmCompilerNew (sizeof (* (cUnit->dalvikToSSAMap)) * numDalvikReg, false));
++    }
++
++    /*
++     * Initial number of SSA registers is equal to the number of Dalvik
++     * registers.
++     */
++    cUnit->numSSARegs = numDalvikReg;
++
+     for (i = 0; i < numDalvikReg; i++) {
+         cUnit->dalvikToSSAMap[i] = i;
+     }
+@@ -1805,6 +1857,13 @@ void dvmInitializeSSAConversion(CompilationUnit *cUnit)
+         BasicBlock *bb = (BasicBlock *) dvmGrowableListIteratorNext(&iterator);
+         if (bb == NULL) break;
+         if (bb->hidden == true) continue;
++
++        //If already allocated, skip it
++        if (bb->dataFlowInfo != 0)
++        {
++            continue;
++        }
++
+         if (bb->blockType == kDalvikByteCode ||
+             bb->blockType == kEntryBlock ||
+             bb->blockType == kExitBlock) {
+diff --git a/vm/compiler/Frontend.cpp b/vm/compiler/Frontend.cpp
+index f05bbe9..2f32e4a 100644
+--- a/vm/compiler/Frontend.cpp
++++ b/vm/compiler/Frontend.cpp
+@@ -1771,13 +1771,16 @@ static bool compileLoop(CompilationUnit *cUnit, unsigned int startOffset,
+                                           kAllNodes,
+                                           false /* isIterative */);
+ 
+-
++#ifndef ARCH_IA32
+     /* Try to identify a loop */
+     if (!dvmCompilerBuildLoop(cUnit))
+         goto bail;
++#else
++    if (dvmCalculateBasicBlockInformation (cUnit) == false)
++        goto bail;
++#endif
+ 
+     //Set that the CompilationUnit is a loop
+-    cUnit->traceIsALoop = true;
+     dvmCompilerLoopOpt(cUnit);
+ 
+     /*
+@@ -2405,13 +2408,16 @@ bool dvmCompileTrace(JitTraceDescription *desc, int numMaxInsts,
+ 
+     cUnit.numDalvikRegisters = cUnit.method->registersSize;
+ 
++#ifndef ARCH_IA32
+     /* Preparation for SSA conversion */
+     dvmInitializeSSAConversion(&cUnit);
+ 
+     dvmCompilerNonLoopAnalysis(&cUnit);
+ 
+-#ifndef ARCH_IA32
+     dvmCompilerInitializeRegAlloc(&cUnit);  // Needs to happen after SSA naming
++#else
++    //set that the CompilationUnit is not a loop
++    dvmCalculateBasicBlockInformation (&cUnit);
+ #endif
+ 
+     if (cUnit.printMe) {
+@@ -2421,12 +2427,9 @@ bool dvmCompileTrace(JitTraceDescription *desc, int numMaxInsts,
+ #ifndef ARCH_IA32
+     /* Allocate Registers using simple local allocation scheme */
+     dvmCompilerLocalRegAlloc(&cUnit);
+-
+     /* Convert MIR to LIR, etc. */
+     dvmCompilerMIR2LIR(&cUnit);
+ #else /* ARCH_IA32 */
+-    //Set that the CompilationUnit is not a loop
+-    cUnit.traceIsALoop = false;
+     //The loop optimization framework can work for traces as well
+     dvmCompilerLoopOpt(&cUnit);
+ 
+diff --git a/vm/compiler/LoopOpt.cpp b/vm/compiler/LoopOpt.cpp
+index 8c74a12..d26083a 100644
+--- a/vm/compiler/LoopOpt.cpp
++++ b/vm/compiler/LoopOpt.cpp
+@@ -19,117 +19,144 @@
+ #include "Dataflow.h"
+ #include "Loop.h"
+ #include "LoopOpt.h"
++#include "Pass.h"
+ 
+ /**
+  * @brief Static functions defined below
+  */
+-static void startConstant (CompilationUnit *cUnit, SPass *curPass);
+-static void endConstant (CompilationUnit *cUnit, SPass *curPass);
+-static void startInductionVariable (CompilationUnit *cUnit, SPass *curPass);
+-static void endInductionVariable (CompilationUnit *cUnit, SPass *curPass);
+-static void startInductionAccessDetection (CompilationUnit *cUnit, SPass *curPass);
+-static void endInductionAccessDetection (CompilationUnit *cUnit, SPass *curPass);
+-static void simpleCountedLoopHandler (CompilationUnit *cUnit, SPass *curPass);
+-static void endHoisting (CompilationUnit *cUnit, SPass *curPass);
+-static bool simpleCountedGate (const CompilationUnit *cUnit, const SPass *curPass);
++static void startConstant (CompilationUnit *cUnit, Pass *curPass);
++static void endConstant (CompilationUnit *cUnit, Pass *curPass);
++static void startInductionVariable (CompilationUnit *cUnit, Pass *curPass);
++static void endInductionVariable (CompilationUnit *cUnit, Pass *curPass);
++static void startInductionAccessDetection (CompilationUnit *cUnit, Pass *curPass);
++static void endInductionAccessDetection (CompilationUnit *cUnit, Pass *curPass);
++static void simpleCountedLoopHandler (CompilationUnit *cUnit, Pass *curPass);
++static void endHoisting (CompilationUnit *cUnit, Pass *curPass);
++static bool simpleCountedGate (const CompilationUnit *cUnit, const Pass *curPass);
++static void handlePassFlag (CompilationUnit *cUnit, Pass *pass);
++static void calculatePredecessors (CompilationUnit *cUnit);
++static bool clearPHIInformationHelper (CompilationUnit *cUnit, BasicBlock *bb);
++static void clearPHIInformation (CompilationUnit *cUnit);
++static bool clearPredecessors (CompilationUnit *cUnit, BasicBlock *bb);
++static bool calculatePredecessorsHelper (CompilationUnit *cUnit, BasicBlock *bb);
++static void calculatePredecessors (CompilationUnit *cUnit);
+ 
+ /**
+  * @brief Three macros to help pass definitions
+  */
+ 
+ #define START_PASSES \
+-    static SPass gPasses[] = {
++    static Pass gPasses[] = {
+ 
+-#define NEW_PASS(NAME,TYPE,DATA,GATE,START,END,WORK,FLAG) \
+-        { \
+-            NAME, TYPE, DATA, GATE, START, END, WORK, FLAG \
+-        }
++#define NEW_PASS(NAME,TYPE,DATA,GATE,START,END,WORK,FREE,FLAG) \
++        Pass ( \
++            NAME, TYPE, DATA, GATE, START, END, WORK, FREE, FLAG \
++        )
+ 
+ #define END_PASSES \
+     };
+ 
+ START_PASSES
+     NEW_PASS ("Constant values detection", kAllNodes, NULL, dvmCompilerTraceIsLoop,
+-            startConstant, endConstant, dvmCompilerDoConstantPropagation,0),
++            startConstant, endConstant, dvmCompilerDoConstantPropagation,0, 0),
+     NEW_PASS ("Induction variable detection", kAllNodes, NULL, dvmCompilerTraceIsLoop,
+-                 startInductionVariable, endInductionVariable, dvmCompilerFindInductionVariables,0),
++                 startInductionVariable, endInductionVariable, dvmCompilerFindInductionVariables,0, 0),
+     NEW_PASS ("Simple Counted Loop Detection", kAllNodes, NULL, dvmCompilerTraceIsLoop,
+-                 NULL, simpleCountedLoopHandler, NULL, 0),
++                 NULL, simpleCountedLoopHandler, NULL, 0, 0),
+     NEW_PASS ("Induction variable detection", kAllNodes, NULL, simpleCountedGate,
+-                 startInductionVariable, endInductionVariable, dvmCompilerFindInductionVariables, 0),
++                 startInductionVariable, endInductionVariable, dvmCompilerFindInductionVariables, 0, 0),
+     NEW_PASS ("Induction array based checks", kAllNodes, NULL, simpleCountedGate,
+-                 startInductionAccessDetection, endInductionAccessDetection, NULL, 0),
++                 startInductionAccessDetection, endInductionAccessDetection, NULL, 0, 0),
+     NEW_PASS ("Generate the hoisted code from induction array", kAllNodes, NULL, simpleCountedGate,
+-                 NULL, endHoisting, NULL, 0),
++                 NULL, endHoisting, NULL, 0, 0),
+     NEW_PASS ("Check Removal", kAllNodes, NULL, NULL,
+-                dvmCompilerStartCheckRemoval, dvmCompilerEndCheckRemoval, dvmCompilerCheckRemoval, 0),
++                dvmCompilerStartCheckRemoval, dvmCompilerEndCheckRemoval, dvmCompilerCheckRemoval, 0, 0),
+ 
+-    /* Last element must have and be the only one to have a NULL name, it's our ending check */
+-    NEW_PASS (NULL,         /** Pass name */
++    /* Last element must have and be the only one to have a "" as name, it's our ending check */
++    NEW_PASS ("",       /** Pass name */
+          kAllNodes,     /** Type of traversal */
+          NULL,          /** Data */
+          NULL,          /** Gate function */
+          NULL,          /** Start function */
+          NULL,          /** End function */
+          NULL,          /** Work function */
++         NULL,          /** Free function */
+          0              /** Flags */
+          ),
+ END_PASSES
+ 
++bool dvmCalculateBasicBlockInformation (CompilationUnit *cUnit, bool filter)
++{
++    //Clear SSA information
++    clearPHIInformation (cUnit);
++
++    //Calculate Predecessors
++    calculatePredecessors (cUnit);
++
++    //Now it depends if cUnit is a loop
++    if (cUnit->jitMode == kJitLoop)
++    {
++        //Call build loop it does the work for us
++        return dvmCompilerBuildLoop (cUnit, filter);
++    }
++    else
++    {
++        //Do the initialization
++        dvmInitializeSSAConversion (cUnit);
++
++        //Non loop analysis
++        dvmCompilerNonLoopAnalysis (cUnit);
++    }
++
++    return true;
++}
++
+ /**
+-  * @brief Handle pass flag, for the moment the function is empty
++  * @brief Handle pass flag, if it is kOptimizationBasicBlockChange, call back dvmCalculateBasicBlockInformation
+   * @param cUnit the CompilationUnit
+-  * @param curPass the SPass
++  * @param pass the Pass
+   */
+-static void handlePassFlag (CompilationUnit *cUnit, SPass *pass)
++void handlePassFlag (CompilationUnit *cUnit, Pass *pass)
+ {
+-    /** Todo when needed */
+-    (void) cUnit;
+-    (void) pass;
++    //For the moment we only check for BasicBlock change requests
++    if (pass->getFlag (kOptimizationBasicBlockChange) == true)
++    {
++        dvmCalculateBasicBlockInformation (cUnit, false);
++    }
+ }
+ 
+  /**
+-  * @brief The loop pass driver
++  * @brief The loop
+   * @param cUnit the CompilationUnit
+   */
+ void dvmCompilerLoopOptimizationDriver (CompilationUnit *cUnit)
+ {
+     //Go through the different elements
+-    SPass *curPass = gPasses;
++    Pass *curPass = gPasses;
+ 
+-    while (curPass->passName != NULL)
++    while (curPass->getName () != "")
+     {
+         //We have a pass: do we apply it? By default yes
+-        bool applyPass = true;
+-
+-        //But if a gate is defined, we call that
+-        if (curPass->gate != NULL)
+-        {
+-            applyPass = curPass->gate (cUnit, curPass);
+-        }
++        bool applyPass = curPass->gate (cUnit, curPass);
+ 
+         if (applyPass == true)
+         {
+             //Applying the pass: first start, doWork, and end calls
+-            //Each function might not be defined
+-            if (curPass->start != NULL)
+-            {
+-                curPass->start (cUnit, curPass);
+-            }
++            curPass->start (cUnit, curPass);
++
++            //Get work function
++            bool (*doWork) (CompilationUnit *, BasicBlock *) = curPass->getWork ();
+ 
+-            if (curPass->doWork != NULL)
++            if (doWork != 0)
+             {
+                 //Set the data in cUnit
+                 LoopAnalysis *loopAnalysis = cUnit->loopAnalysis;
+-                loopAnalysis->passData = curPass->data;
+-                dvmCompilerDataFlowAnalysisDispatcher (cUnit, curPass->doWork, curPass->traversalType, false /* isIterative */);
+-                loopAnalysis->passData = NULL;
++                loopAnalysis->passData = curPass->getData ();
++                dvmCompilerDataFlowAnalysisDispatcher (cUnit, doWork, curPass->getTraversal (), false /* isIterative */);
++                loopAnalysis->passData = 0;
+             }
+ 
+-            if (curPass->end != NULL)
+-            {
+-                curPass->end (cUnit, curPass);
+-            }
++            curPass->end (cUnit, curPass);
+ 
+             //Do we need any clean up?
+             handlePassFlag (cUnit, curPass);
+@@ -145,9 +172,9 @@ void dvmCompilerLoopOptimizationDriver (CompilationUnit *cUnit)
+ /**
+   * @brief Initializes the constant detection data structures
+   * @param cUnit the CompilationUnit
+-  * @param curPass the SPass
++  * @param curPass the Pass
+   */
+-void startConstant (CompilationUnit *cUnit, SPass *curPass)
++void startConstant (CompilationUnit *cUnit, Pass *curPass)
+ {
+     /* Constant propagation */
+     cUnit->isConstantV = dvmCompilerAllocBitVector(cUnit->numSSARegs, false);
+@@ -160,9 +187,9 @@ void startConstant (CompilationUnit *cUnit, SPass *curPass)
+ /**
+   * @brief Dumps the loop constants
+   * @param cUnit the CompilationUnit
+-  * @param curPass the SPass
++  * @param curPass the Pass
+   */
+-void endConstant (CompilationUnit *cUnit, SPass *curPass)
++void endConstant (CompilationUnit *cUnit, Pass *curPass)
+ {
+     dvmCompilerDumpConstants (cUnit);
+ 
+@@ -174,9 +201,9 @@ void endConstant (CompilationUnit *cUnit, SPass *curPass)
+ /**
+   * @brief Initializes the data for the induction detection pass
+   * @param cUnit the CompilationUnit
+-  * @param curPass the SPass
++  * @param curPass the Pass
+   */
+-void startInductionVariable (CompilationUnit *cUnit, SPass *curPass)
++void startInductionVariable (CompilationUnit *cUnit, Pass *curPass)
+ {
+     LoopAnalysis *loopAnalysis = cUnit->loopAnalysis;
+ 
+@@ -192,9 +219,9 @@ void startInductionVariable (CompilationUnit *cUnit, SPass *curPass)
+ /**
+   * @brief Dumps the Induction variable list
+   * @param cUnit the CompilationUnit
+-  * @param curPass the SPass
++  * @param curPass the Pass
+   */
+-void endInductionVariable (CompilationUnit *cUnit, SPass *curPass)
++void endInductionVariable (CompilationUnit *cUnit, Pass *curPass)
+ {
+     dvmCompilerDumpIVList (cUnit);
+ 
+@@ -206,9 +233,9 @@ void endInductionVariable (CompilationUnit *cUnit, SPass *curPass)
+ /**
+   * @brief Initializes data for the induction access pass
+   * @param cUnit the CompilationUnit
+-  * @param curPass the SPass
++  * @param curPass the Pass
+   */
+-void startInductionAccessDetection (CompilationUnit *cUnit, SPass *curPass)
++void startInductionAccessDetection (CompilationUnit *cUnit, Pass *curPass)
+ {
+     LoopAnalysis *loopAnalysis = cUnit->loopAnalysis;
+     loopAnalysis->arrayAccessInfo = (GrowableList *)dvmCompilerNew(sizeof(GrowableList), true);
+@@ -221,9 +248,9 @@ void startInductionAccessDetection (CompilationUnit *cUnit, SPass *curPass)
+ /**
+   * @brief Perform the body code motion function: handles induction access detection
+   * @param cUnit the CompilationUnit
+-  * @param curPass the SPass
++  * @param curPass the Pass
+   */
+-void endInductionAccessDetection (CompilationUnit *cUnit, SPass *curPass)
++void endInductionAccessDetection (CompilationUnit *cUnit, Pass *curPass)
+ {
+     LoopAnalysis *loopAnalysis = cUnit->loopAnalysis;
+     loopAnalysis->bodyIsClean = dvmCompilerIVArrayAccess (cUnit);
+@@ -239,8 +266,9 @@ void endInductionAccessDetection (CompilationUnit *cUnit, SPass *curPass)
+         - Only one induction variable, knowing the lower/upper bounds
+     Function also fills in the loopAnalysis->isSimpleCountedLoop variable
+   * @param cUnit the CompilationUnit
++  * @param curPass the Pass
+   */
+-void simpleCountedLoopHandler (CompilationUnit *cUnit, SPass *curPass)
++void simpleCountedLoopHandler (CompilationUnit *cUnit, Pass *curPass)
+ {
+     bool res = dvmCompilerSimpleCountedLoop(cUnit);
+ 
+@@ -255,9 +283,9 @@ void simpleCountedLoopHandler (CompilationUnit *cUnit, SPass *curPass)
+ /**
+   * @brief Generates the hoisting of the checks
+   * @param cUnit the CompilationUnit
+-  * @param curPass the SPass
++  * @param curPass the Pass
+   */
+-void endHoisting (CompilationUnit *cUnit, SPass *curPass)
++void endHoisting (CompilationUnit *cUnit, Pass *curPass)
+ {
+     /*
+      * Convert the array access information into extended MIR code in the loop header.
+@@ -272,10 +300,10 @@ void endHoisting (CompilationUnit *cUnit, SPass *curPass)
+   * @brief The simple counted gate, checks the simple counted loop boolean in the LoopAnalysis data structure.
+     It is filled up by the Simple Counted Loop Detection pass
+   * @param cUnit the CompilationUnit
+-  * @param curPass the SPass
++  * @param curPass the Pass
+   * @return whether or not the isSimpleCountedLoop variable is set
+   */
+-bool simpleCountedGate (const CompilationUnit *cUnit, const SPass *curPass)
++bool simpleCountedGate (const CompilationUnit *cUnit, const Pass *curPass)
+ {
+     //First is it a loop ?
+     bool res = dvmCompilerTraceIsLoop (cUnit, curPass);
+@@ -294,8 +322,132 @@ bool simpleCountedGate (const CompilationUnit *cUnit, const SPass *curPass)
+     return loopAnalysis->isSimpleCountedLoop;
+ }
+ 
+-bool dvmCompilerTraceIsLoop (const CompilationUnit *cUnit, const SPass *curPass)
++bool dvmCompilerTraceIsLoop (const CompilationUnit *cUnit, const Pass *curPass)
+ {
+-    return cUnit->traceIsALoop;
++    return cUnit->jitMode == kJitLoop;
+ }
+ 
++/**
++ * @brief Helper to remove all PHI nodes from BasicBlocks
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock
++ * @return whether we changed something to the BasicBlock
++ */
++bool clearPHIInformationHelper (CompilationUnit *cUnit, BasicBlock *bb)
++{
++    bool res = false;
++
++    //Go through each MIR
++    MIR *mir = bb->firstMIRInsn;
++
++    while (mir != 0)
++    {
++        int opcode = mir->dalvikInsn.opcode;
++
++        if (opcode == kMirOpPhi)
++        {
++            //Going to change something
++            res = true;
++
++            //First thing is to detach it
++            MIR *prev = mir->prev;
++            MIR *next = mir->next;
++
++            //Attach previous to next if it exists
++            if (prev != 0)
++            {
++                prev->next = next;
++            }
++
++            //Same for next
++            if (next != 0)
++            {
++                next->prev = prev;
++            }
++
++            //Instruction is now removed but we must handle first and last for the basic block
++            if (mir == bb->firstMIRInsn)
++            {
++                bb->firstMIRInsn = next;
++            }
++
++            //Remove the instruction for last
++            if (mir == bb->lastMIRInsn)
++            {
++                bb->lastMIRInsn = prev;
++            }
++        }
++
++        //Go to the next instruction
++        mir = mir->next;
++    }
++
++    return res;
++}
++
++/**
++ * @brief Clear the PHI nodes
++ * @param cUnit the CompilationUnit
++ */
++void clearPHIInformation (CompilationUnit *cUnit)
++{
++    dvmCompilerDataFlowAnalysisDispatcher (cUnit, clearPHIInformationHelper, kAllNodes, false);
++}
++
++/**
++ * @brief Clear predecessor information
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock
++ */
++bool clearPredecessors (CompilationUnit *cUnit, BasicBlock *bb)
++{
++    //We only need to set it if there is a bit set,
++    //normally we wouldn't care about this test but the dispatcher might care
++    if (dvmCountSetBits (bb->predecessors) != 0)
++    {
++        dvmClearAllBits (bb->predecessors);
++        return true;
++    }
++    return false;
++}
++
++/**
++ * @brief Calculate Predecessor Information Helper
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock
++ */
++bool calculatePredecessorsHelper (CompilationUnit *cUnit, BasicBlock *bb)
++{
++    //We only care about non hidden blocks
++    if (bb->hidden == true)
++    {
++        return false;
++    }
++
++    //Go through taken and fallthrough
++    if (bb->taken != 0)
++    {
++        dvmCompilerSetBit (bb->taken->predecessors, bb->id);
++    }
++
++    if (bb->fallThrough != 0)
++    {
++        dvmCompilerSetBit (bb->fallThrough->predecessors, bb->id);
++    }
++
++    //We did change something but not our own basic block
++    return false;
++}
++
++/**
++ * @brief Calculate Predecessor Information
++ * @param cUnit the CompilationUnit
++ */
++void calculatePredecessors (CompilationUnit *cUnit)
++{
++    //First job is to clear the predecessors
++    dvmCompilerDataFlowAnalysisDispatcher (cUnit, clearPredecessors, kAllNodes, false);
++
++    //Second part is to calculate them again
++    dvmCompilerDataFlowAnalysisDispatcher (cUnit, calculatePredecessorsHelper, kAllNodes, false);
++}
+diff --git a/vm/compiler/LoopOpt.h b/vm/compiler/LoopOpt.h
+index 7554198..5475b50 100644
+--- a/vm/compiler/LoopOpt.h
++++ b/vm/compiler/LoopOpt.h
+@@ -17,42 +17,11 @@
+ #ifndef DALVIK_VM_LOOPOPT_H_
+ #define DALVIK_VM_LOOPOPT_H_
+ 
+-#include "Dalvik.h"
+ #include "CompilerInternals.h"
+ 
+-/**
+-  * @class SPass
+-  * @brief SPass is the Pass structure for the optimizations
+-  * The following structure has the different optimization passes that we are going to do
+-  */
+-typedef struct sPass
+-{
+-    /** @brief Pass name */
+-    const char *passName;
+-
+-    /** @brief Type of traversal */
+-    DataFlowAnalysisMode traversalType;
+-
+-    /** @brief Specific data for the pass */
+-    void *data;
+-
+-    /** @brief Gate for the pass, taking the CompilationUnit and the pass information */
+-    bool (*gate) (const CompilationUnit *cUnit, const struct sPass *curPass);
+-
+-    /** @brief Start of the pass function */
+-    void (*start) (CompilationUnit *cUnit, struct sPass *curPass);
+-
+-    /** @brief End of the pass function */
+-    void (*end) (CompilationUnit *cUnit, struct sPass *curPass);
+-
+-    /** @brief Per basic block work
+-     *  @return returns whether the BasicBlock has been changed
+-     */
+-    bool (*doWork) (CompilationUnit *, BasicBlock *bb);
+-
+-    /** @brief Flags for clean-up */
+-    unsigned int flags;
+-}SPass;
++//Forwad Declaration
++struct CompilationUnit;
++class Pass;
+ 
+ /**
+   * @brief The loop optimization driver: calls each pass from the gPasses array
+@@ -63,9 +32,17 @@ void dvmCompilerLoopOptimizationDriver (CompilationUnit *cUnit);
+ /**
+   * @brief The is a trace a loop gate, checks if the CompilationUnit is a loop
+   * @param cUnit the CompilationUnit
+-  * @param curPass the SPass
++  * @param curPass the Pass
+   * @return whether or not the cUnit represents a loop
+   */
+-bool dvmCompilerTraceIsLoop (const CompilationUnit *cUnit, const SPass *curPass);
++bool dvmCompilerTraceIsLoop (const CompilationUnit *cUnit, const Pass *curPass);
++
++/**
++ * @brief Calculate the BasicBlock information
++ * @param cUnit the CompilationUnit
++ * @param filter do we wish to filter the loop? (default: true)
++ * @return whether the calculation succeeded or not
++ */
++bool dvmCalculateBasicBlockInformation (CompilationUnit *cUnit, bool filter = true);
+ 
+ #endif
+diff --git a/vm/compiler/Pass.cpp b/vm/compiler/Pass.cpp
+new file mode 100644
+index 0000000..63dac27
+--- /dev/null
++++ b/vm/compiler/Pass.cpp
+@@ -0,0 +1,139 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "Dalvik.h"
++#include "Pass.h"
++
++//Constructor and Destructor
++Pass::Pass (const std::string &name,
++        DataFlowAnalysisMode traversalType,
++        void *data,
++        bool (*gatePtr) (const CompilationUnit *, const Pass *),
++        void (*startPtr) (CompilationUnit *, Pass *),
++        void (*endPtr) (CompilationUnit *, Pass *),
++        bool (*doWorkPtr) (CompilationUnit *, BasicBlock *),
++        void (*freeDataPtr) (void *),
++        unsigned int flags)
++{
++    this->passName = name;
++    this->traversalType = traversalType;
++    this->data = data;
++    this->gatePtr = gatePtr;
++    this->startPtr = startPtr;
++    this->endPtr = endPtr;
++    this->doWorkPtr = doWorkPtr;
++    this->freeDataPtr = freeDataPtr;
++    this->flags = flags;
++}
++
++
++Pass::~Pass (void)
++{
++    //Do we have to free anything ?
++    if (freeDataPtr != 0)
++    {
++        freeDataPtr (data), data = 0;
++    }
++}
++
++const std::string &Pass::getName (void) const
++{
++    return passName;
++}
++
++DataFlowAnalysisMode Pass::getTraversal (void) const
++{
++    return traversalType;
++}
++
++void *Pass::getData (void) const
++{
++    return data;
++}
++
++void Pass::setData (void *data)
++{
++    this->data = data;
++}
++
++bool Pass::getFlag (OptimizationFlag flag) const
++{
++    unsigned int max = ~0;
++
++    //Paranoid: trying to get something too high
++    if (flag >= max)
++        return false;
++
++    return (flags & flag);
++}
++
++void Pass::setFlag (OptimizationFlag flag, bool value)
++{
++    unsigned int max = ~0;
++
++    //Paranoid: trying to set something too high
++    if (flag >= max)
++        return;
++
++    //Are we setting it or clearing it?
++    if (value == true)
++    {
++        flags |= flag;
++    }
++    else
++    {
++        //Reverse mask
++        unsigned int mask = ~flag;
++
++        flags &= mask;
++    }
++}
++
++bool Pass::gate (const CompilationUnit *cUnit, Pass *curPass) const
++{
++    //Do we have the pointer?
++    if (gatePtr != 0)
++    {
++        return gatePtr (cUnit, curPass);
++    }
++
++    //Otherwise, say yes
++    return true;
++}
++
++void Pass::start (CompilationUnit *cUnit, Pass *curPass) const
++{
++    //Do we have the pointer?
++    if (startPtr != 0)
++    {
++        return startPtr (cUnit, curPass);
++    }
++
++}
++
++void Pass::end (CompilationUnit *cUnit, Pass *curPass) const
++{
++    //Do we have the pointer?
++    if (endPtr != 0)
++    {
++        return endPtr (cUnit, curPass);
++    }
++}
++
++fctWorkPtr Pass::getWork (void) const
++{
++    return doWorkPtr;
++}
+diff --git a/vm/compiler/Pass.h b/vm/compiler/Pass.h
+new file mode 100644
+index 0000000..47bf741
+--- /dev/null
++++ b/vm/compiler/Pass.h
+@@ -0,0 +1,172 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef DALVIK_VM_PASS
++#define DALVIK_VM_PASS
++
++#include <string>
++
++//Forward declarations
++struct CompilationUnit;
++struct BasicBlock;
++
++//We need a typedef for returning a pointer function
++typedef bool (*fctWorkPtr) (CompilationUnit *, BasicBlock *);
++
++/**
++ * @brief OptimizationFlag is an enumeration to perform certain tasks after a given pass using the flags field of Pass, each enum should be a power of 2 to be correctly used
++ */
++enum OptimizationFlag
++{
++    kOptimizationBasicBlockChange = 1,   /**< @brief Recalculate BasicBlock information */
++};
++
++/**
++  * @class Pass
++  * @brief Pass is the Pass structure for the optimizations
++  * The following structure has the different optimization passes that we are going to do
++  */
++class Pass
++{
++    protected:
++        /** @brief Pass name */
++        std::string passName;
++
++        /** @brief Type of traversal */
++        DataFlowAnalysisMode traversalType;
++
++        /** @brief Specific data for the pass */
++        void *data;
++
++        /** @brief Gate for the pass, taking the CompilationUnit and the pass information */
++        bool (*gatePtr) (const CompilationUnit *cUnit, const Pass *curPass);
++
++        /** @brief Start of the pass function */
++        void (*startPtr) (CompilationUnit *cUnit, Pass *curPass);
++
++        /** @brief End of the pass function */
++        void (*endPtr) (CompilationUnit *cUnit, Pass *curPass);
++
++        /**
++         * @brief Per basic block work
++         * @return returns whether the BasicBlock has been changed
++         */
++        bool (*doWorkPtr) (CompilationUnit *, BasicBlock *bb);
++
++        /**
++         * @brief Free the data
++         * @param data the data to be freed
++         */
++        void (*freeDataPtr) (void *data);
++
++        /** @brief Flags for clean-up */
++        unsigned int flags;
++
++    public:
++        /**
++         * @brief Constructor
++         * @param name the Pass' name
++         * @param traversalType the traversal type
++         * @param data the data
++         * @param gatePtr the gate function pointer
++         * @param startPtr the start function pointer
++         * @param endPtr the end function pointer
++         * @param doWorkPtr the doWork function pointer
++         * @param freeDataPtr the freeData function pointer
++         * @param flag the post-pass requests using the OptimizationFlag enum bit-ored
++         */
++         Pass (const std::string &name,
++               DataFlowAnalysisMode traversalType,
++               void *data,
++               bool (*gatePtr) (const CompilationUnit *, const Pass *),
++               void (*startPtr) (CompilationUnit *, Pass *),
++               void (*endPtr) (CompilationUnit *, Pass *),
++               bool (*doWorkPtr) (CompilationUnit *, BasicBlock *),
++               void (*freeDataPtr) (void *),
++               unsigned int flag);
++
++         /**
++          * @brief Destructor
++          */
++         ~Pass (void);
++
++        /**
++          * @brief Get the Pass name
++          * @return the name
++          */
++        const std::string &getName (void) const;
++
++        /**
++         * @brief Get the traversal type
++         * @return the traversal type
++         */
++        DataFlowAnalysisMode getTraversal (void) const;
++
++        /**
++         * @brief Get the data for the Pass
++         * @return the data
++         */
++        void *getData (void) const;
++
++        /**
++         * @brief Set the data
++         * @param the new data
++         */
++        void setData (void *data);
++
++        /**
++         * @brief Get the Pass' flags
++         * @param flag the flag we want to test
++         * @return whether the flag is set
++         */
++        bool getFlag (OptimizationFlag flag) const;
++
++        /**
++         * @brief Set a given flag
++         * @param flag the new flag
++         * @param value to set the flag (default: true)
++         */
++       void setFlag (OptimizationFlag flag, bool value = true);
++
++        /**
++         * @brief Gate for the pass, taking the CompilationUnit and the pass information
++         * @param cUnit the CompilationUnit
++         * @param curPass the current Pass
++         */
++        bool gate (const CompilationUnit *cUnit, Pass *curPass) const;
++
++        /**
++         * @brief Start of the pass function
++         * @param cUnit the CompilationUnit
++         * @param curPass the current Pass
++         */
++        void start (CompilationUnit *cUnit, Pass *curPass) const;
++
++        /**
++         * @brief End of the pass function
++         * @param cUnit the CompilationUnit
++         * @param curPass the current Pass
++         */
++        void end (CompilationUnit *cUnit, Pass *curPass) const;
++
++        /**
++         * @brief Get the work function
++         * @return returns the work function pointer (can be NULL)
++         */
++        fctWorkPtr getWork (void) const;
++};
++
++#endif
+diff --git a/vm/compiler/SSATransformation.cpp b/vm/compiler/SSATransformation.cpp
+index 7dde594..ca0f823 100644
+--- a/vm/compiler/SSATransformation.cpp
++++ b/vm/compiler/SSATransformation.cpp
+@@ -88,13 +88,15 @@ static bool fillDefBlockMatrix(CompilationUnit *cUnit, BasicBlock *bb)
+ static void computeDefBlockMatrix(CompilationUnit *cUnit)
+ {
+     int numRegisters = cUnit->numDalvikRegisters;
++
+     /* Allocate numDalvikRegisters bit vector pointers */
+-    cUnit->defBlockMatrix = (BitVector **)
+-        dvmCompilerNew(sizeof(BitVector *) * numRegisters, true);
+-    int i;
++    if (cUnit->defBlockMatrix == 0)
++    {
++        cUnit->defBlockMatrix = static_cast<BitVector **> (dvmCompilerNew(sizeof(BitVector *) * numRegisters, true));
++    }
+ 
+     /* Initialize numRegister vectors with numBlocks bits each */
+-    for (i = 0; i < numRegisters; i++) {
++    for (int i = 0; i < numRegisters; i++) {
+         cUnit->defBlockMatrix[i] = dvmCompilerAllocBitVector(cUnit->numBlocks,
+                                                              false);
+     }
+@@ -211,12 +213,16 @@ static bool initializeDominationInfo(CompilationUnit *cUnit, BasicBlock *bb)
+ 
+     if (bb->dominators == NULL ) {
+         bb->dominators = dvmCompilerAllocBitVector(numTotalBlocks,
+-                                                   false /* expandable */);
++                                                   true /* expandable */);
+         bb->iDominated = dvmCompilerAllocBitVector(numTotalBlocks,
+-                                                   false /* expandable */);
++                                                   true /* expandable */);
+         bb->domFrontier = dvmCompilerAllocBitVector(numTotalBlocks,
+-                                                   false /* expandable */);
++                                                   true /* expandable */);
+     } else {
++        //Set the highest value to make sure it gets expanded
++        dvmSetBit (bb->dominators, numTotalBlocks - 1);
++        dvmSetBit (bb->iDominated, numTotalBlocks - 1);
++        dvmSetBit (bb->domFrontier, numTotalBlocks - 1);
+         dvmClearAllBits(bb->dominators);
+         dvmClearAllBits(bb->iDominated);
+         dvmClearAllBits(bb->domFrontier);
+@@ -321,8 +327,10 @@ static void computeDominators(CompilationUnit *cUnit)
+ 
+     if (cUnit->tempBlockV == NULL) {
+         cUnit->tempBlockV = dvmCompilerAllocBitVector(numTotalBlocks,
+-                                                  false /* expandable */);
++                                                  true /* expandable */);
+     } else {
++        //Set higehst bit to expand it
++        dvmSetBit (cUnit->tempBlockV, numTotalBlocks - 1);
+         dvmClearAllBits(cUnit->tempBlockV);
+     }
+     dvmCompilerDataFlowAnalysisDispatcher(cUnit, computeBlockDominators,
+@@ -422,15 +430,41 @@ static void insertPhiNodes(CompilationUnit *cUnit)
+ {
+     int dalvikReg;
+     const GrowableList *blockList = &cUnit->blockList;
+-    BitVector *phiBlocks =
+-        dvmCompilerAllocBitVector(cUnit->numBlocks, false);
+-    BitVector *tmpBlocks =
+-        dvmCompilerAllocBitVector(cUnit->numBlocks, false);
+-    BitVector *inputBlocks =
+-        dvmCompilerAllocBitVector(cUnit->numBlocks, false);
+ 
+-    cUnit->tempDalvikRegisterV =
+-        dvmCompilerAllocBitVector(cUnit->numDalvikRegisters, false);
++    //Do we need to allocate the bit vectors again ?
++    if (cUnit->numBlocks > cUnit->phi.size)
++    {
++        //Have we ever allocated them?
++        if (cUnit->phi.phiBlocks != 0)
++        {
++            int max = cUnit->numBlocks - 1;
++            //They are expandable, so just set a bit for the last block
++            dvmSetBit (cUnit->phi.phiBlocks, max);
++            dvmSetBit (cUnit->phi.tmpBlocks, max);
++            dvmSetBit (cUnit->phi.inputBlocks, max);
++
++            //They all get cleared/set below before any use
++        }
++        else
++        {
++            cUnit->phi.phiBlocks = dvmCompilerAllocBitVector(cUnit->numBlocks, true);
++            cUnit->phi.tmpBlocks = dvmCompilerAllocBitVector(cUnit->numBlocks, true);
++            cUnit->phi.inputBlocks = dvmCompilerAllocBitVector(cUnit->numBlocks, true);
++        }
++        cUnit->phi.size = cUnit->numBlocks;
++    }
++
++    //Get local versions of the bitvectors
++    BitVector *phiBlocks = cUnit->phi.phiBlocks;
++    BitVector *tmpBlocks = cUnit->phi.tmpBlocks;
++    BitVector *inputBlocks = cUnit->phi.inputBlocks;
++
++    if (cUnit->tempDalvikRegisterV == 0)
++    {
++        cUnit->tempDalvikRegisterV =
++            dvmCompilerAllocBitVector(cUnit->numDalvikRegisters, false);
++    }
++    dvmClearAllBits (cUnit->tempDalvikRegisterV);
+ 
+     dvmCompilerDataFlowAnalysisDispatcher(cUnit, computeBlockLiveIns,
+                                           kPostOrderDFSTraversal,
+@@ -589,18 +623,27 @@ void dvmCompilerMethodSSATransformation(CompilationUnit *cUnit)
+                                           false /* isIterative */);
+ }
+ 
+-/* Build a loop. Return true if a loop structure is successfully identified. */
+-bool dvmCompilerBuildLoop(CompilationUnit *cUnit)
++/*
++ * @brief Build a loop. Return true if a loop structure is successfully identified.
++ * @param cUnit the CompilationUnit
++ * @param filter do we filter the loop or not (default: true)
++ * @return wheterh or not the loop should be accepted
++ */
++bool dvmCompilerBuildLoop(CompilationUnit *cUnit, bool filter)
+ {
+-    /* Compute the DFS order */
+-    computeDFSOrder(cUnit);
+-
+-    /* Compute the dominator info */
+-    computeDominators(cUnit);
+-
+-    /* Loop structure not recognized/supported - return false */
+-    if (dvmCompilerFilterLoopBlocks(cUnit) == false)
+-        return false;
++    //If we want to filter the loop
++    if (filter == true)
++    {
++        /* Compute the DFS order */
++        computeDFSOrder(cUnit);
++
++        /* Compute the dominator info */
++        computeDominators(cUnit);
++
++        /* Loop structure not recognized/supported - return false */
++        if (dvmCompilerFilterLoopBlocks(cUnit) == false)
++            return false;
++    }
+ 
+     /* Re-compute the DFS order just for the loop */
+     computeDFSOrder(cUnit);
+@@ -619,15 +662,22 @@ bool dvmCompilerBuildLoop(CompilationUnit *cUnit)
+ 
+     /* Rename register names by local defs and phi nodes */
+     dvmCompilerDataFlowAnalysisDispatcher(cUnit, dvmCompilerDoSSAConversion,
+-                                          kPreOrderDFSTraversal,
++                                          kAllNodes,
+                                           false /* isIterative */);
+ 
+     /*
+      * Shared temp bit vector used by each block to count the number of defs
+      * from all the predecessor blocks.
+      */
+-    cUnit->tempSSARegisterV = dvmCompilerAllocBitVector(cUnit->numSSARegs,
+-                                                        false);
++    if (cUnit->tempSSARegisterV == 0)
++    {
++        cUnit->tempSSARegisterV = dvmCompilerAllocBitVector(cUnit->numSSARegs,
++                false);
++    }
++    else
++    {
++        dvmClearAllBits (cUnit->tempSSARegisterV);
++    }
+ 
+     /* Insert phi-operands with latest SSA names from predecessor blocks */
+     dvmCompilerDataFlowAnalysisDispatcher(cUnit, insertPhiNodeOperands,
+diff --git a/vm/compiler/Utility.cpp b/vm/compiler/Utility.cpp
+index 70260d9..ecfb85d 100644
+--- a/vm/compiler/Utility.cpp
++++ b/vm/compiler/Utility.cpp
+@@ -216,6 +216,13 @@ void dvmInitGrowableList(GrowableList *gList, size_t initLength)
+                                                   true);
+ }
+ 
++/* Clear List */
++void dvmClearGrowableList (GrowableList *gList)
++{
++    assert (gList != 0);
++    gList->numUsed = 0;
++}
++
+ /* Expand the capacity of a growable list */
+ static void expandGrowableList(GrowableList *gList)
+ {
+-- 
+1.7.4.1
+

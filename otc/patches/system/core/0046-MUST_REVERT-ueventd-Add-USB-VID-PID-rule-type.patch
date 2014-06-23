@@ -1,0 +1,178 @@
+From adbb4c6e1b2c016224d6b0c2cf9bcb46abec1b10 Mon Sep 17 00:00:00 2001
+From: ravindranath <ravindranathx.doddi@intel.com>
+Date: Tue, 2 Apr 2013 10:53:11 -0400
+Subject: MUST_REVERT ueventd: Add USB VID/PID rule type
+
+Add a new type of rule in ueventd.rc files to intercept 'Add' uevents
+for specific USB devices, as identified by vendor ID and product ID,
+and set permissions on the device nodes as requested by the user.
+
+This is a MUST_REVERT patch at Andrew's request because the implementation
+is not as general as we'd eventually like. See AXIA-2364 for tracking
+the reversion of this patch.
+
+Issue: AXIA-2229
+Change-Id: Ie8e4feaee87175f3c97899dd94f7cc1432dd2de3
+Signed-off-by: Ravindranath Doddi <ravindranathx.doddi@wipro.com>
+Signed-off-by: Krishnan V <krishnanx.vaidyanathan.venkitakrishnan@intel.com>
+Signed-off-by: Matt Gumbel <matthew.k.gumbel@intel.com>
+---
+ init/devices.c |   39 ++++++++++++++++++++++++++++++++++++++-
+ init/devices.h |   14 ++++++++++++++
+ init/ueventd.c |   23 +++++++++++++++++++++++
+ 3 files changed, 75 insertions(+), 1 deletions(-)
+
+diff --git a/init/devices.c b/init/devices.c
+index fd55c81..5486a1f 100644
+--- a/init/devices.c
++++ b/init/devices.c
+@@ -68,6 +68,7 @@ struct uevent {
+     const char *partition_name;
+     const char *device_name;
+     const char *modalias;
++    const char *product;
+     int partition_num;
+     int major;
+     int minor;
+@@ -323,7 +324,7 @@ static void parse_event(const char *msg, struct uevent *uevent)
+     uevent->partition_num = -1;
+     uevent->device_name = NULL;
+     uevent->modalias = NULL;
+-
++    uevent->product = NULL;
+         /* currently ignoring SEQNUM */
+     while(*msg) {
+         if(!strncmp(msg, "ACTION=", 7)) {
+@@ -353,6 +354,9 @@ static void parse_event(const char *msg, struct uevent *uevent)
+         } else if(!strncmp(msg, "DEVNAME=", 8)) {
+             msg += 8;
+             uevent->device_name = msg;
++        } else if(!strncmp(msg, "PRODUCT=", 8)) {
++            msg += 8;
++            uevent->product = msg;
+         } else if(!strncmp(msg, "MODALIAS=", 9)) {
+             msg += 9;
+             uevent->modalias = msg;
+@@ -732,6 +736,35 @@ static void handle_module_loading(const char *modalias)
+     }
+ }
+ 
++static void fixup_device_perms(struct uevent *uevent)
++{
++    int i, retval;
++    /* O(n) search to set the permission of device */
++    if((dev_index) && (uevent->product!=NULL)) {
++        for (i = 0; i < dev_index; i++) {
++            if(!strncmp(uevent->product,dev_id[i].dev_name,strlen(dev_id[i].dev_name))) {
++                if (uevent->device_name != NULL) {
++                    char *dev_path = malloc((6+strlen(uevent->device_name)));
++                    if (dev_path == NULL) {
++                        ERROR("Memory allocation failed for Dev path \n");
++                    }
++                    strcpy(dev_path, "/dev/");
++                    strcat(dev_path, uevent->device_name);
++                    retval = chown(dev_path, dev_id[i].user_config,
++                          dev_id[i].grp_config);
++                    if (retval != 0)
++                        ERROR("chown: %s\n", strerror(errno));
++                    retval = chmod(dev_path, dev_id[i].perm);
++                    if (retval != 0)
++                        ERROR("chmod: %s\n", strerror(errno));
++                    free(dev_path);
++                }
++                break;
++            }
++        }
++    }
++}
++
+ static void handle_device_event(struct uevent *uevent)
+ {
+     if (!strcmp(uevent->action,"add")) {
+@@ -748,6 +781,10 @@ static void handle_device_event(struct uevent *uevent)
+     } else {
+         handle_generic_device_event(uevent);
+     }
++
++    if (!strcmp(uevent->action,"add")) {
++        fixup_device_perms(uevent);
++    }
+ }
+ 
+ static int load_firmware(int fw_fd, int loading_fd, int data_fd)
+diff --git a/init/devices.h b/init/devices.h
+index 96b2ef4..bffe0d1 100644
+--- a/init/devices.h
++++ b/init/devices.h
+@@ -19,6 +19,9 @@
+ 
+ #include <sys/stat.h>
+ 
++#define DEV_NAME_LEN       12
++#define MAX_DEV            16
++
+ extern void handle_device_fd();
+ extern void device_init(void);
+ extern int module_probe(const char *alias);
+@@ -27,4 +30,15 @@ extern int add_dev_perms(const char *name, const char *attr,
+                          unsigned int gid, unsigned short wildcard);
+ int get_device_fd();
+ void coldboot(const char *path);
++
++struct dev_prop
++{
++   char dev_name[DEV_NAME_LEN];
++   unsigned int perm;
++   int grp_config;
++   int user_config;
++};
++extern struct dev_prop dev_id[MAX_DEV];
++extern int dev_index;
++
+ #endif	/* _INIT_DEVICES_H */
+diff --git a/init/ueventd.c b/init/ueventd.c
+index 61fa324..f4eade0 100644
+--- a/init/ueventd.c
++++ b/init/ueventd.c
+@@ -31,8 +31,12 @@
+ #include "devices.h"
+ #include "ueventd_parser.h"
+ 
++#define UEV_VPID "__uevent_add_VID_PID__"
++
+ static char hardware[32];
+ static unsigned revision = 0;
++int dev_index = 0;
++struct dev_prop dev_id[MAX_DEV];
+ 
+ static void import_kernel_nv(char *name, int in_qemu)
+ {
+@@ -153,6 +157,25 @@ void set_device_permission(int nargs, char **args)
+ 
+     name = args[0];
+ 
++    if (!strncmp(name, UEV_VPID, strlen(UEV_VPID))) {
++        if (dev_index < MAX_DEV) {
++            if (strlen(args[1]) < DEV_NAME_LEN) {
++                strcpy(dev_id[dev_index].dev_name, args[1]);
++            } else {
++                 ERROR("String too long in ueventd.rc line for '%s'\n", args[1]);
++                 return;
++            }
++            dev_id[dev_index].grp_config = get_android_id(args[3]);
++            dev_id[dev_index].user_config = get_android_id(args[4]);
++            dev_id[dev_index].perm = strtol(args[2], &endptr, 8);
++            dev_index++;
++        } else {
++            NOTICE("%s entry %d is ignored as it exceeds MAX dev supported (%d)\n",
++                 UEV_VPID, dev_index , MAX_DEV);
++        }
++        return;
++    }
++
+     if (!strncmp(name,"/sys/", 5) && (nargs == 5)) {
+         INFO("/sys/ rule %s %s\n",args[0],args[1]);
+         attr = args[1];
+-- 
+1.7.4.1
+

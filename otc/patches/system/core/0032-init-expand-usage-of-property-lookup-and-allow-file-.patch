@@ -1,0 +1,461 @@
+From 89d74a846722e39cdacf62e75264f9e266dca449 Mon Sep 17 00:00:00 2001
+From: Andrew Boie <andrew.p.boie@intel.com>
+Date: Thu, 25 Oct 2012 14:10:07 -0700
+Subject: init: expand usage of property lookup and allow file lookup
+
+Currently, the init.rc syntax ${prop.name} to substitute a value
+looked up from the property service is only supported for the
+setprop, write, and import commands. Here we generalize it so that
+the arguments for all commands and services allow for references like
+this.
+
+We also introduce the syntax $[/path/to/file] to substitute the
+contents of a file (typically a sysfs node), pruning any trailing
+newlines from the file first.
+
+Substitutions are always done at the last possible moment; right
+when the command is executed or the service is started. If a service
+is started/stopped multiple times, the substitutions will always be
+re-done each time it starts.
+
+If any substitition fails, the command will not run/service will not
+start.
+
+The deprecated syntax $prop.name is no longer supported.
+
+Change-Id: I8560b70f48c0396832d9a7fadc546441e8e81ff9
+Signed-off-by: Andrew Boie <andrew.p.boie@intel.com>
+---
+ init/builtins.c    |   18 +----
+ init/init.c        |   50 ++++++++----
+ init/init_parser.c |  222 +++++++++++++++++++++++++++++++++-------------------
+ init/init_parser.h |    3 +-
+ 4 files changed, 178 insertions(+), 115 deletions(-)
+
+diff --git a/init/builtins.c b/init/builtins.c
+index 08b33c7..ea64e22 100644
+--- a/init/builtins.c
++++ b/init/builtins.c
+@@ -712,15 +712,8 @@ int do_setprop(int nargs, char **args)
+ {
+     const char *name = args[1];
+     const char *value = args[2];
+-    char prop_val[PROP_VALUE_MAX];
+-    int ret;
+ 
+-    ret = expand_props(prop_val, value, sizeof(prop_val));
+-    if (ret) {
+-        ERROR("cannot expand '%s' while assigning to '%s'\n", value, name);
+-        return -EINVAL;
+-    }
+-    property_set(name, prop_val);
++    property_set(name, value);
+     return 0;
+ }
+ 
+@@ -804,15 +797,8 @@ int do_write(int nargs, char **args)
+ {
+     const char *path = args[1];
+     const char *value = args[2];
+-    char prop_val[PROP_VALUE_MAX];
+-    int ret;
+ 
+-    ret = expand_props(prop_val, value, sizeof(prop_val));
+-    if (ret) {
+-        ERROR("cannot expand '%s' while writing to '%s'\n", value, path);
+-        return -EINVAL;
+-    }
+-    return write_file(path, prop_val);
++    return write_file(path, value);
+ }
+ 
+ int do_copy(int nargs, char **args)
+diff --git a/init/init.c b/init/init.c
+index 4eeec8e..43b2b9e 100755
+--- a/init/init.c
++++ b/init/init.c
+@@ -320,28 +320,33 @@ void service_start(struct service *svc, const char *dynamic_args)
+             }
+         }
+ 
+-        if (!dynamic_args) {
+-            if (execve(svc->args[0], (char**) svc->args, (char**) ENV) < 0) {
+-                ERROR("cannot execve('%s'): %s\n", svc->args[0], strerror(errno));
+-            }
+-        } else {
+-            char *arg_ptrs[INIT_PARSER_MAXARGS+1];
+-            int arg_idx = svc->nargs;
++        char *arg_ptrs[INIT_PARSER_MAXARGS+1];
++        int arg_idx = svc->nargs;
++        int i;
++        for (i = 0; i < svc->nargs; i++) {
++            arg_ptrs[i] = expand_references(svc->args[i]);
++            if (!arg_ptrs[i])
++                _exit(127);
++        }
++        if (dynamic_args) {
+             char *tmp = strdup(dynamic_args);
+             char *next = tmp;
+             char *bword;
+ 
+-            /* Copy the static arguments */
+-            memcpy(arg_ptrs, svc->args, (svc->nargs * sizeof(char *)));
+-
+-            while((bword = strsep(&next, " "))) {
+-                arg_ptrs[arg_idx++] = bword;
+-                if (arg_idx == INIT_PARSER_MAXARGS)
+-                    break;
++            if (!tmp) {
++                ERROR("strdup: %s\n", strerror(errno));
++                _exit(127);
++            }
++            while((bword = strsep(&next, " ")) && arg_idx < INIT_PARSER_MAXARGS) {
++                arg_ptrs[arg_idx] = expand_references(bword);
++                if (!arg_ptrs[arg_idx])
++                    _exit(127);
++                arg_idx++;
+             }
+-            arg_ptrs[arg_idx] = '\0';
+-            execve(svc->args[0], (char**) arg_ptrs, (char**) ENV);
+         }
++        arg_ptrs[arg_idx] = NULL;
++        execve(svc->args[0], (char**) arg_ptrs, (char**) ENV);
++        ERROR("cannot execve('%s'): %s\n", svc->args[0], strerror(errno));
+         _exit(127);
+     }
+ 
+@@ -525,6 +530,8 @@ static int is_last_command(struct action *act, struct command *cmd)
+ void execute_one_command(void)
+ {
+     int ret;
++    char *args[INIT_PARSER_MAXARGS];
++    int i;
+ 
+     if (!cur_action || !cur_command || is_last_command(cur_action, cur_command)) {
+         cur_action = action_remove_queue_head();
+@@ -540,8 +547,17 @@ void execute_one_command(void)
+     if (!cur_command)
+         return;
+ 
+-    ret = cur_command->func(cur_command->nargs, cur_command->args);
++    args[0] = cur_command->args[0];
++    for (i = 1; i < cur_command->nargs; i++) {
++        args[i] = expand_references(cur_command->args[i]);
++        if (!args[i])
++            goto out;
++    }
++    ret = cur_command->func(cur_command->nargs, args);
+     INFO("command '%s' r=%d\n", cur_command->args[0], ret);
++out:
++    for (i--; i > 0; i--)
++        free(args[i]);
+ }
+ 
+ static int wait_for_coldboot_done_action(int nargs, char **args)
+diff --git a/init/init_parser.c b/init/init_parser.c
+index 0bd5947..4cc1ac5 100644
+--- a/init/init_parser.c
++++ b/init/init_parser.c
+@@ -177,129 +177,190 @@ void parse_line_no_op(struct parse_state *state, int nargs, char **args)
+ {
+ }
+ 
+-static int push_chars(char **dst, int *len, const char *chars, int cnt)
++static void push_chars(char *dst, int *dst_idx, const char *chars,
++        int cnt)
+ {
+-    if (cnt > *len)
+-        return -1;
+-
+-    memcpy(*dst, chars, cnt);
+-    *dst += cnt;
+-    *len -= cnt;
++    memcpy(dst + *dst_idx, chars, cnt);
++    *dst_idx += cnt;
++}
+ 
++/* Advance a pointer through a string looking for a closing brace, copying all
++ * characters up to the brace into a buffer.
++ *
++ * src - Pointer to original source string, used to print helpful error messages
++ * token - Closing brace character to search for
++ * c - Pointer to a memory location within src string, we start the search one
++ * additional character from here. When the search is complete it will point to
++ * the next character after the token.
++ * dst - Destination buffer to copy all the characters inside the braces.
++ * limit - Max size of the destination buffer.
++ *
++ * Returns 0 on success, or -1 on error.
++ */
++static int find_closing_brace(const char *src, const char token, char **c,
++        char *dst, size_t limit)
++{
++    (*c)++;
++    unsigned int i = 0;
++    while (**c && **c != token && i < limit) {
++        dst[i++] = **c;
++        (*c)++;
++    }
++    if (**c != token) {
++        if (i == limit)
++            ERROR("prop name too long during expansion of '%s'", src);
++        else
++            ERROR("unable to find closing '%c' in %s", token, src);
++        return -1;
++    }
++    if (i == 0) {
++        ERROR("invalid zero-length prop name in '%s'\n", src);
++        return -1;
++    }
++    dst[i] = '\0';
++    (*c)++;
+     return 0;
+ }
+ 
+-int expand_props(char *dst, const char *src, int dst_size)
++/* Expand the destination array to hold sz additional characters
++ *
++ * dst - Array to expand
++ * dst_sz - Pointer to size of dst, which is updated
++ * sz - Additional bytes to expand dst
++ *
++ * Returns NULL on memory errors
++ */
++static void *realloc_dst(void *dst, size_t *dst_sz,
++        size_t sz)
++{
++    void *dst_new;
++    *dst_sz += sz;
++    dst_new = realloc(dst, *dst_sz);
++    if (!dst_new) {
++        free(dst);
++        ERROR("out of memory for re-allocation %zu", *dst_sz);
++    }
++    return dst_new;
++}
++
++/* Accepts a source string and expands property and file dereferences.
++ * The returned string must be freed; the original is unmodified.
++ * Returns NULL if there are errors.
++ *
++ * no nested property expansion, i.e. ${foo.${bar}} is not supported,
++ */
++char *expand_references(const char *src)
+ {
+     int cnt = 0;
+-    char *dst_ptr = dst;
++    int dst_idx = 0;
+     const char *src_ptr = src;
+-    int src_len;
+-    int idx = 0;
+-    int ret = 0;
+-    int left = dst_size - 1;
++    size_t dst_sz;
++    char *dst = NULL;
+ 
+-    if (!src || !dst || dst_size == 0)
+-        return -1;
++    if (!src)
++        return NULL;
+ 
+-    src_len = strlen(src);
++    dst_sz = strlen(src) + 1;
++    dst = malloc(dst_sz);
++    if (!dst) {
++        ERROR("out of memory");
++        return NULL;
++    }
+ 
+-    /* - variables can either be $x.y or ${x.y}, in case they are only part
+-     *   of the string.
+-     * - will accept $$ as a literal $.
+-     * - no nested property expansion, i.e. ${foo.${bar}} is not supported,
+-     *   bad things will happen
+-     */
+-    while (*src_ptr && left > 0) {
++    while (*src_ptr) {
+         char *c;
+-        char prop[PROP_NAME_MAX + 1];
+-        const char *prop_val;
+-        int prop_len = 0;
+ 
+         c = strchr(src_ptr, '$');
+         if (!c) {
+-            while (left-- > 0 && *src_ptr)
+-                *(dst_ptr++) = *(src_ptr++);
++            while (*src_ptr)
++                dst[dst_idx++] = *(src_ptr++);
+             break;
+         }
+ 
+-        memset(prop, 0, sizeof(prop));
+-
+-        ret = push_chars(&dst_ptr, &left, src_ptr, c - src_ptr);
+-        if (ret < 0)
+-            goto err_nospace;
++        /* Copy everything up to the '$', then decide what to do with
++         * what comes next */
++        push_chars(dst, &dst_idx, src_ptr, c - src_ptr);
+         c++;
+ 
+-        if (*c == '$') {
+-            *(dst_ptr++) = *(c++);
++        switch (*c) {
++        case '$':
++            /* $$ is a literal $ */
++            dst[dst_idx++] = *(c++);
+             src_ptr = c;
+-            left--;
+             continue;
+-        } else if (*c == '\0') {
++        case '{': {
++            char prop[PROP_NAME_MAX + 1];
++            const char *prop_val;
++            size_t prop_len = 0;
++
++            /* ${property} = dereference a property */
++            if (find_closing_brace(src, '}', &c, prop, PROP_NAME_MAX))
++                goto err;
++            prop_val = property_get(prop);
++            if (!prop_val) {
++                ERROR("property '%s' doesn't exist while expanding '%s'\n",
++                    prop, src);
++                goto err;
++            }
++            prop_len = strlen(prop_val);
++            dst = realloc_dst(dst, &dst_sz, prop_len);
++            if (!dst)
++                goto err;
++            push_chars(dst, &dst_idx, prop_val, prop_len);
+             break;
+         }
++        case '[': {
++            char *file_data;
++            size_t file_len;
++            char file_name[PATH_MAX + 1];
+ 
+-        if (*c == '{') {
+-            c++;
+-            while (*c && *c != '}' && prop_len < PROP_NAME_MAX)
+-                prop[prop_len++] = *(c++);
+-            if (*c != '}') {
+-                /* failed to find closing brace, abort. */
+-                if (prop_len == PROP_NAME_MAX)
+-                    ERROR("prop name too long during expansion of '%s'\n",
+-                          src);
+-                else if (*c == '\0')
+-                    ERROR("unexpected end of string in '%s', looking for }\n",
+-                          src);
++            /* $(file) = dereference file contents */
++            if (find_closing_brace(src, ']', &c, file_name, PATH_MAX))
+                 goto err;
++            file_data = read_file(file_name, NULL);
++            if (!file_data) {
++                ERROR("file %s cannot be opened for reading\n", src_ptr);
++                goto err;
++            }
++            file_len = strlen(file_data);
++            /* remove all trailing newlines              */
++            /* including the one imposed by read_file() */
++            while (file_len > 0 && file_data[file_len - 1] == '\n') {
++                file_data[file_len - 1] = '\0';
++                file_len--;
+             }
+-            prop[prop_len] = '\0';
+-            c++;
+-        } else if (*c) {
+-            while (*c && prop_len < PROP_NAME_MAX)
+-                prop[prop_len++] = *(c++);
+-            if (prop_len == PROP_NAME_MAX && *c != '\0') {
+-                ERROR("prop name too long in '%s'\n", src);
++            dst = realloc_dst(dst, &dst_sz, file_len);
++            if (!dst) {
++                free(file_data);
+                 goto err;
+             }
+-            prop[prop_len] = '\0';
+-            ERROR("using deprecated syntax for specifying property '%s', use ${name} instead\n",
+-                  prop);
+-        }
+-
+-        if (prop_len == 0) {
+-            ERROR("invalid zero-length prop name in '%s'\n", src);
+-            goto err;
++            push_chars(dst, &dst_idx, file_data, file_len);
++            free(file_data);
++            break;
+         }
+-
+-        prop_val = property_get(prop);
+-        if (!prop_val) {
+-            ERROR("property '%s' doesn't exist while expanding '%s'\n",
+-                  prop, src);
++        default:
++            ERROR("expected '{', '[', or '$' after '$' in '%s'",
++                src);
+             goto err;
+         }
+ 
+-        ret = push_chars(&dst_ptr, &left, prop_val, strlen(prop_val));
+-        if (ret < 0)
+-            goto err_nospace;
+         src_ptr = c;
+         continue;
+     }
+ 
+-    *dst_ptr = '\0';
+-    return 0;
++    dst[dst_idx] = '\0';
++    return dst;
+ 
+-err_nospace:
+-    ERROR("destination buffer overflow while expanding '%s'\n", src);
+ err:
+-    return -1;
++    free(dst);
++    return NULL;
+ }
+ 
+ void parse_import(struct parse_state *state, int nargs, char **args)
+ {
+     struct listnode *import_list = state->priv;
+     struct import *import;
+-    char conf_file[PATH_MAX];
++    char *conf_file;
+     int ret;
+ 
+     if (nargs != 2) {
+@@ -307,8 +368,8 @@ void parse_import(struct parse_state *state, int nargs, char **args)
+         return;
+     }
+ 
+-    ret = expand_props(conf_file, args[1], sizeof(conf_file));
+-    if (ret) {
++    conf_file = expand_references(args[1]);
++    if (!conf_file) {
+         ERROR("error while handling import on line '%d' in '%s'\n",
+               state->line, state->filename);
+         return;
+@@ -317,6 +378,7 @@ void parse_import(struct parse_state *state, int nargs, char **args)
+     import = calloc(1, sizeof(struct import));
+     import->filename = strdup(conf_file);
+     list_add_tail(import_list, &import->list);
++    free(conf_file);
+     INFO("found import '%s', adding to import list", import->filename);
+ }
+ 
+diff --git a/init/init_parser.h b/init/init_parser.h
+index 8fdee29..d978ee6 100644
+--- a/init/init_parser.h
++++ b/init/init_parser.h
+@@ -34,6 +34,5 @@ void queue_builtin_action(int (*func)(int nargs, char **args), char *name);
+ void queue_device_added_removed_triggers(const char *name, bool dev_added);
+ void queue_all_device_triggers();
+ int init_parse_config_file(const char *fn);
+-int expand_props(char *dst, const char *src, int len);
+-
++char *expand_references(const char *src);
+ #endif
+-- 
+1.7.4.1
+

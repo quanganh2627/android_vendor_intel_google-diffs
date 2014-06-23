@@ -1,0 +1,1263 @@
+From b4b58898a8497fb3e7d80d6fddc69f3fe2e090de Mon Sep 17 00:00:00 2001
+From: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Date: Wed, 21 Aug 2013 18:22:56 -0700
+Subject: Dalvik: Addressing vectorization, cast sinking, and invariant sinking issues
+
+BZ: 132521
+
+This patch addresses known issues with the cast sinking and invariant
+sinking passes:
+-Fixed doxygen and compiler warnings
+-SSA representation doesn't reset numUses and numDefs fields so it is possible
+they have invalid values
+-Invariant sinking should only sink if the instructions remaining in loop are
+guaranteed to not throw exceptions
+-Invariant sinking should take conservative approach that method call will
+clobber memory
+-Constant information should be cleared when ssa is redone
+-Cast sinking must check that the result of cast is not used in an operation
+that will affect semantic behavior
+-Vectorization may wrongly reuse vectorization info for inner sibling loops
+
+Debugging messages have been added to the cast sinking and vectorization
+optimizations. This is done so that it is easier to reason about how
+the optimizations are applied and in what cases they reject to optimize.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I246433631b5a95e7c1f06a5e945eed86f90a7e43
+Orig-MCG-Change-Id: I3b8636acfebcdc29e6c368154b8dc4c055df8cae
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Signed-off-by: Udayan Banerji <udayan.banerji@intel.com>
+Reviewed-on: http://android.intel.com:8080/126892
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: Beyler, Jean Christophe <jean.christophe.beyler@intel.com>
+Reviewed-by: Popov, Ivan G <ivan.g.popov@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/Dataflow.cpp                      |   28 +++-
+ vm/compiler/InvariantRemoval.cpp              |   98 ++++++++++---
+ vm/compiler/LoopInformation.cpp               |   67 +++++----
+ vm/compiler/LoopInformation.h                 |    9 -
+ vm/compiler/LoopOpt.cpp                       |    7 +-
+ vm/compiler/Pass.cpp                          |    9 +-
+ vm/compiler/Pass.h                            |    9 +-
+ vm/compiler/SSATransformation.cpp             |    1 +
+ vm/compiler/SinkCastOpt.cpp                   |   51 ++++++-
+ vm/compiler/Vectorization.cpp                 |  205 ++++++++++++++-----------
+ vm/compiler/Vectorization.h                   |   14 +--
+ vm/compiler/codegen/x86/lightcg/Scheduler.cpp |    2 +-
+ 12 files changed, 328 insertions(+), 172 deletions(-)
+
+diff --git a/vm/compiler/Dataflow.cpp b/vm/compiler/Dataflow.cpp
+index 89499d3..14a00d7 100644
+--- a/vm/compiler/Dataflow.cpp
++++ b/vm/compiler/Dataflow.cpp
+@@ -1830,15 +1830,22 @@ static void dataFlowSSAFormat35C(CompilationUnit *cUnit, MIR *mir)
+     if (numUses > mir->ssaRep->numUses)
+     {
+         mir->ssaRep->uses = static_cast <int *> (dvmCompilerNew (sizeof (* (mir->ssaRep->uses)) * numUses, false));
++        mir->ssaRep->fpUse = static_cast<bool *> (dvmCompilerNew (sizeof (* (mir->ssaRep->fpUse)) * numUses, false));
+         mir->ssaRep->defWhere = static_cast<MIR **> (dvmCompilerNew (sizeof (* (mir->ssaRep->defWhere)) * numUses, true));
+     }
+ 
+-    //Set size of ssaRep to new size
++    //All structures should have enough room to hold information about uses. So update the number of uses now.
+     mir->ssaRep->numUses = numUses;
+ 
+     for (i = 0; i < numUses; i++) {
+         handleSSAUse(cUnit, mir->ssaRep->uses, dInsn->arg[i], i);
+     }
++
++    //We have no defines so update that now
++    mir->ssaRep->numDefs = 0;
++    mir->ssaRep->defs = 0;
++    mir->ssaRep->usedNext = 0;
++    mir->ssaRep->fpDef = 0;
+ }
+ 
+ /* Look up new SSA names for format_3rc instructions */
+@@ -1852,15 +1859,22 @@ static void dataFlowSSAFormat3RC(CompilationUnit *cUnit, MIR *mir)
+     if (numUses > mir->ssaRep->numUses)
+     {
+         mir->ssaRep->uses = static_cast <int *> (dvmCompilerNew (sizeof (* (mir->ssaRep->uses)) * numUses, false));
++        mir->ssaRep->fpUse = static_cast<bool *> (dvmCompilerNew (sizeof (* (mir->ssaRep->fpUse)) * numUses, false));
+         mir->ssaRep->defWhere = static_cast<MIR **> (dvmCompilerNew (sizeof (* (mir->ssaRep->defWhere)) * numUses, true));
+     }
+ 
+-    //Set size of ssaRep to new size
++    //All structures should have enough room to hold information about uses. So update the number of uses now.
+     mir->ssaRep->numUses = numUses;
+ 
+     for (i = 0; i < numUses; i++) {
+         handleSSAUse(cUnit, mir->ssaRep->uses, dInsn->vC+i, i);
+     }
++
++    //We have no defines so update that now
++    mir->ssaRep->numDefs = 0;
++    mir->ssaRep->defs = 0;
++    mir->ssaRep->usedNext = 0;
++    mir->ssaRep->fpDef = 0;
+ }
+ 
+ /**
+@@ -2053,12 +2067,14 @@ bool dvmCompilerDoSSAConversion(CompilationUnit *cUnit, BasicBlock *bb)
+         }
+ 
+         if (numUses > mir->ssaRep->numUses) {
+-            mir->ssaRep->numUses = numUses;
+             mir->ssaRep->uses = static_cast<int *> (dvmCompilerNew (sizeof (* (mir->ssaRep->uses)) * numUses, false));
+             mir->ssaRep->fpUse = static_cast<bool *> (dvmCompilerNew (sizeof (* (mir->ssaRep->fpUse)) * numUses, false));
+             mir->ssaRep->defWhere = static_cast<MIR **> (dvmCompilerNew (sizeof (* (mir->ssaRep->defWhere)) * numUses, true));
+         }
+ 
++        //All structures should have enough room to hold information about uses. So update the number of uses now.
++        mir->ssaRep->numUses = numUses;
++
+         int numDefs = 0;
+ 
+         if (dfAttributes & DF_HAS_DEFS) {
+@@ -2069,12 +2085,14 @@ bool dvmCompilerDoSSAConversion(CompilationUnit *cUnit, BasicBlock *bb)
+         }
+ 
+         if (numDefs > mir->ssaRep->numDefs) {
+-            mir->ssaRep->numDefs = numDefs;
+             mir->ssaRep->defs = static_cast<int *> (dvmCompilerNew (sizeof (* (mir->ssaRep->defs)) * numDefs, false));
+             mir->ssaRep->fpDef = static_cast<bool *> (dvmCompilerNew (sizeof (* (mir->ssaRep->fpDef)) * numDefs, false));
+             mir->ssaRep->usedNext = static_cast<SUsedChain **> (dvmCompilerNew (sizeof (* (mir->ssaRep->usedNext)) * numDefs, true));
+         }
+ 
++        //All structures should have enough room to hold information about defs. So update the number of defs now.
++        mir->ssaRep->numDefs = numDefs;
++
+         DecodedInstruction *dInsn = &mir->dalvikInsn;
+ 
+         if (dfAttributes & DF_HAS_USES) {
+@@ -2569,7 +2587,7 @@ static bool isAValidCastForIV (CompilationUnit *cUnit, LoopInformation *info, MI
+  * @param cUnit the CompilationUnit
+  * @param info the LoopInformation
+  * @param mir the MIR instruction
+- * @param wentThrgouh did the function go across an instruction?
++ * @param wentThrough did the function go across an instruction?
+  * @return the MIR to consider
+  */
+ static MIR *tryToGoThroughMIR (CompilationUnit *cUnit, LoopInformation *info, MIR *mir, bool &wentThrough)
+diff --git a/vm/compiler/InvariantRemoval.cpp b/vm/compiler/InvariantRemoval.cpp
+index f6cf3ea..4194140 100644
+--- a/vm/compiler/InvariantRemoval.cpp
++++ b/vm/compiler/InvariantRemoval.cpp
+@@ -24,6 +24,7 @@
+ #include "BBOptimization.h"
+ #include "LoopOpt.h"
+ #include "Checks.h"
++#include <set>
+ #include <vector>
+ #include "Utility.h"
+ 
+@@ -935,6 +936,7 @@ bool dvmCompilerInvariantRemovalGate (const CompilationUnit *cUnit, Pass *curPas
+  * and find all getters and setters basing on DataFlow attributes and whether
+  * the instruction is volatile. This set covers all getters and setters.
+  * Found instructions are places in STL vector of MIRs coming by data parameter.
++ * @param cUnit The compilation unit
+  * @param bb The basic block to check
+  * @param data A vector of MIR pointers where to store the getters and setters.
+  * Runtime type of this parameter should be (std::vector<MIR *> *).
+@@ -945,12 +947,12 @@ static bool findGettersSetters (CompilationUnit *cUnit, BasicBlock *bb, void *da
+ {
+     if (data == 0)
+     {
+-        //We don't have a place to put our findings
++        //No place to put the findings
+         return false;
+     }
+ 
+-    //We should have been passed a set where we can store getters and setters
+-    std::vector<MIR *> &gettersSetters = *(reinterpret_cast<std::vector<MIR *> *> (data));
++    //We should have been given a set where we can store getters and setters
++    std::set<MIR *> &gettersSetters = *(reinterpret_cast<std::set<MIR *> *> (data));
+ 
+     for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
+     {
+@@ -958,11 +960,46 @@ static bool findGettersSetters (CompilationUnit *cUnit, BasicBlock *bb, void *da
+ 
+         if (((dfFlags & DF_IS_SETTER) != 0) || ((dfFlags & DF_IS_GETTER) != 0) || dvmCompilerIsOpcodeVolatile (mir->dalvikInsn.opcode) == true)
+         {
+-            gettersSetters.push_back (mir);
++            gettersSetters.insert (mir);
+         }
+     }
+ 
+-    //We have successfully looked
++    //Successfully looked
++    return true;
++}
++
++/**
++ * @brief Checks that no MIRs in basic block throw exceptions. Skips the MIRs passed in data.
++ * @param cUnit The compilation unit
++ * @param bb The basic block whose MIRs to examine
++ * @param data The set of mirs to skip when looking at exceptions
++ * @return Returns true if it can promise no exceptions are thrown
++ */
++static bool promiseNoExceptions (CompilationUnit *cUnit, BasicBlock *bb, void *data)
++{
++    if (data == 0)
++    {
++        //Cannot promise no exceptions
++        return false;
++    }
++
++    //We should have been given a set of MIRs to skip
++    std::set<MIR *> &mirsToSkip = *(reinterpret_cast<std::set<MIR *> *> (data));
++
++    for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        //If the MIR cannot be skipped, then check it cannot bail
++        if (mirsToSkip.find (mir) == mirsToSkip.end ())
++        {
++            if (backendCanBailOut (cUnit, mir) == true)
++            {
++                //Exception may be thrown
++                return false;
++            }
++        }
++    }
++
++    //No exceptions will be thrown
+     return true;
+ }
+ 
+@@ -1001,12 +1038,16 @@ bool isObjectGetterSetter (int opcode)
+  * DataFlow attribute for clobbering instructions.
+  * Limitation: due to no enough information about setting/getting objects we consider
+  * such instructions as clobbering ones.
++ * @param cUnit The compilation unit
+  * @param bb The basic block whose MIRs to check
+  * @param data Unused argument
+  * @return Returns true if no memory is clobbered
+  */
+ static bool checkIfNoClobberMemory (CompilationUnit *cUnit, BasicBlock *bb, void *data)
+ {
++    //Unused
++    (void) cUnit;
++
+     for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
+     {
+         int dfFlags = dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
+@@ -1023,6 +1064,13 @@ static bool checkIfNoClobberMemory (CompilationUnit *cUnit, BasicBlock *bb, void
+             //We don't know much about memory once we update an object
+             return false;
+         }
++
++        //We may also have memory clobbering if we do an invoke because we don't
++        //really know what happens in the callee.
++        if ((dvmCompilerGetOpcodeFlags (mir->dalvikInsn.opcode) & kInstrInvoke) != 0)
++        {
++            return false;
++        }
+     }
+ 
+     //We don't actually clobber memory
+@@ -1092,18 +1140,18 @@ static bool whetherDominatesBasicBlock (CompilationUnit *cUnit, BasicBlock *bb,
+  * 3) Instruction should not have null or bound check - to avoid dealing with potential exception
+  * @param cUnit The compilation unit
+  * @param info The loop information
+- * @param gettersSetters The vector of all getters and setters in the loop
++ * @param gettersSetters The set of all getters and setters in the loop
+  * @return Returns the MIRs selected for possible sinking
+  */
+-static std::vector<MIR *> selectInvariants (CompilationUnit *cUnit, LoopInformation *info, std::vector<MIR *> &gettersSetters)
++static std::set<MIR *> selectInvariants (CompilationUnit *cUnit, LoopInformation *info, std::set<MIR *> &gettersSetters)
+ {
+     //Keep track of selections
+-    std::vector<MIR *> selections;
++    std::set<MIR *> selections;
+ 
+     //We only sink if we find only one memory operation because otherwise we have a hard time disambiguating without coloring
+     if (gettersSetters.size () == 1)
+     {
+-        for (std::vector<MIR *>::const_iterator iter = gettersSetters.begin (); iter != gettersSetters.end (); iter++)
++        for (std::set<MIR *>::const_iterator iter = gettersSetters.begin (); iter != gettersSetters.end (); iter++)
+         {
+             MIR *mir = *iter;
+ 
+@@ -1207,7 +1255,7 @@ static std::vector<MIR *> selectInvariants (CompilationUnit *cUnit, LoopInformat
+             if (dvmCompilerRemoveMIR (mir) == true)
+             {
+                 //We succeeded removing it so lets add it to our selections
+-                selections.push_back (mir);
++                selections.insert (mir);
+             }
+         }
+     }
+@@ -1222,14 +1270,14 @@ static std::vector<MIR *> selectInvariants (CompilationUnit *cUnit, LoopInformat
+  * of the final selections.
+  * @param cUnit The compilation unit
+  * @param info The loop information
+- * @param selections[in] The MIRs we are trying to sink
+- * @param selections[out] The MIRs that can be safely sunk because they received hoisted null check
++ * @param selections Input: The MIRs we are trying to sink.
++ * Output: The MIRs that can be safely sunk because they received hoisted null check.
+  */
+-static void handleNullCheckHoisting (CompilationUnit *cUnit, LoopInformation *info, std::vector<MIR *> &selections)
++static void handleNullCheckHoisting (CompilationUnit *cUnit, LoopInformation *info, std::set<MIR *> &selections)
+ {
+-    std::vector<MIR *> finalSelections;
++    std::set<MIR *> finalSelections;
+ 
+-    for (std::vector<MIR *>::const_iterator iter = selections.begin (); iter != selections.end (); iter++)
++    for (std::set<MIR *>::const_iterator iter = selections.begin (); iter != selections.end (); iter++)
+     {
+         MIR *mir = *iter;
+ 
+@@ -1270,14 +1318,14 @@ static void handleNullCheckHoisting (CompilationUnit *cUnit, LoopInformation *in
+                     //If we successfully generated the check then we mark this mir as having been checked
+                     mir->OptimizationFlags |= MIR_IGNORE_NULL_CHECK;
+ 
+-                    finalSelections.push_back (mir);
++                    finalSelections.insert (mir);
+                 }
+             }
+         }
+         else
+         {
+             //We do not need a null check and thus we can safely sink it
+-            finalSelections.push_back (mir);
++            finalSelections.insert (mir);
+         }
+     }
+ 
+@@ -1324,7 +1372,7 @@ static bool sinkInvariants (CompilationUnit *cUnit, LoopInformation *info, void
+         return true;
+     }
+ 
+-    std::vector<MIR *> gettersSetters, selections;
++    std::set<MIR *> gettersSetters, selections;
+ 
+     //Third find all getters and setters
+     if (info->iterateThroughLoopBasicBlocks (cUnit, findGettersSetters,
+@@ -1349,11 +1397,21 @@ static bool sinkInvariants (CompilationUnit *cUnit, LoopInformation *info, void
+         return true;
+     }
+ 
+-    //Fifth generate any needed null checks
++    //Fifth check if excluding our selections we can still throw exception.
++    if (info->iterateThroughLoopBasicBlocks (cUnit, promiseNoExceptions,
++            reinterpret_cast<void *> (&selections)) == false)
++    {
++        //Apparently we cannot be promised no exceptions so we bail before sinking
++        return true;
++    }
++
++    //Sixth generate any needed null checks
+     handleNullCheckHoisting (cUnit, info, selections);
+ 
+     //Finally move the final selections to the exit
+-    info->addInstructionsToExits (cUnit, selections);
++    std::vector<MIR *> instructionsToSink;
++    instructionsToSink.insert (instructionsToSink.begin (), selections.begin (), selections.end ());
++    info->addInstructionsToExits (cUnit, instructionsToSink);
+ 
+     return true;
+ }
+diff --git a/vm/compiler/LoopInformation.cpp b/vm/compiler/LoopInformation.cpp
+index 8d16b78..9ac52cf 100644
+--- a/vm/compiler/LoopInformation.cpp
++++ b/vm/compiler/LoopInformation.cpp
+@@ -1138,7 +1138,14 @@ static bool containsUnsupportedOpcodes (const CompilationUnit *cUnit, BitVector
+     return false;
+ }
+ 
+-bool dvmCompilerVerySimpleLoopGate (const CompilationUnit *cUnit, LoopInformation *info, void *data)
++/**
++ * @brief Used to determine if the loop is a very simple one: not nested, one basic block, no unsupported instructions
++ * @param cUnit the Compilation Unit
++ * @param info The loop to test
++ * @param data Data to pass to the testing function (unused)
++ * @return Returns whether the loop is very simple
++ */
++static bool isVerySimpleLoop (const CompilationUnit *cUnit, LoopInformation *info, void *data)
+ {
+     if (info->getNested () != 0)
+     {
+@@ -1166,26 +1173,14 @@ bool dvmCompilerVerySimpleLoopGate (const CompilationUnit *cUnit, LoopInformatio
+ //The following gate accepts only very simple loops: one basicblock, no nesting
+ bool dvmCompilerVerySimpleLoopGateWithLoopInfo (const CompilationUnit *cUnit, LoopInformation * loopInfo)
+ {
+-    LoopInformation *info = 0;
+-
+-    //Only do something if we have the loop information
+-    if (loopInfo != 0)
+-    {
+-        info = loopInfo;
+-    }
+-    else
++    //We don't have enough information to determine if we have a simple loop
++    if (loopInfo == 0)
+     {
+-        info = cUnit->loopInformation;
++        return false;
+     }
+ 
+-    if (info != 0)
+-    {
+-        if (info->iterateWithConst (cUnit, dvmCompilerVerySimpleLoopGate) == true)
+-        {
+-            return true;
+-        }
+-    }
+-    return false;
++    //Check solely if the given loop is very simple
++    return isVerySimpleLoop (cUnit, loopInfo, 0);
+ }
+ 
+ //The following gate accepts only very simple loops: one basicblock, no nesting
+@@ -1199,7 +1194,7 @@ bool dvmCompilerVerySimpleLoopGate (const CompilationUnit *cUnit, Pass *curPass)
+ 
+     if (info != 0)
+     {
+-        if (info->iterateWithConst (cUnit, dvmCompilerVerySimpleLoopGate) == true)
++        if (info->iterateWithConst (cUnit, isVerySimpleLoop) == true)
+         {
+             return true;
+         }
+@@ -1451,34 +1446,48 @@ int LoopInformation::getNumBasicIV(CompilationUnit* cUnit)
+   */
+ bool LoopInformation::getCountUpLoop(void)
+ {
+-    GrowableList* ivList = &inductionVariableList;
+     unsigned int number = 0;
+ 
+-   for (unsigned int i = 0; i < ivList->numUsed; i++)
+-   {
+-        InductionVariableInfo *ivInfo;
++    GrowableListIterator ivIter;
++    dvmGrowableListIteratorInit (&inductionVariableList, &ivIter);
+ 
+-        ivInfo = GET_ELEM_N(ivList, InductionVariableInfo*, i);
++    while (true)
++    {
++        InductionVariableInfo *ivInfo =
++                reinterpret_cast<InductionVariableInfo *> (dvmGrowableListIteratorNext (&ivIter));
++
++        //Break when we reach the end
++        if (ivInfo == 0)
++        {
++            break;
++        }
+ 
+-        /* Count up or down loop? */
++        //Only look at basic induction variables
+         if (ivInfo->ssaReg == ivInfo->basicSSAReg)
+         {
+             number++;
+ 
+-            /* Infinite loop */
++            //If we have a BIV with 0 increment, then assume we don't have a count up loop.
++            //We possibly have an infinite loop.
+             if (ivInfo->inc == 0)
+             {
+-               return false;
++               countUpLoop = false;
++               break;
+             }
+ 
+-            /* as of now only accept one BIV */
++            //If this is the second BIV we found, then we need to do more work to figure
++            //what kind of loop we have. Until this is extended, return false for now.
+             if (number > 1)
+             {
+-                return false;
++                countUpLoop = false;
++                break;
+             }
++
++            //We have a count up loop if the increment is greater than 0
+             countUpLoop = (ivInfo->inc > 0);
+         }
+     }
++
+     return countUpLoop;
+ }
+ 
+diff --git a/vm/compiler/LoopInformation.h b/vm/compiler/LoopInformation.h
+index c7380f3..f99dc87 100644
+--- a/vm/compiler/LoopInformation.h
++++ b/vm/compiler/LoopInformation.h
+@@ -634,15 +634,6 @@ class LoopInformation
+ };
+ 
+ /**
+- * @brief Gate to determine if the loop is a very simple one: not nested, one basic block, no unsupported instructions
+- * @param cUnit the Compilation Unit
+- * @param info The loop to test
+- * @param data Data to pass to the testing function (unused)
+- * @return Returns whether the loop is very simple
+- */
+-bool dvmCompilerVerySimpleLoopGate (const CompilationUnit *cUnit, LoopInformation *info, void *data);
+-
+-/**
+  * @brief Gate to determine if the CompilationUnit only contains a very simple loop: not nested, one BasicBlock
+  * @param cUnit the CompilationUnit
+  * @param curPass the Pass structure
+diff --git a/vm/compiler/LoopOpt.cpp b/vm/compiler/LoopOpt.cpp
+index 2f8c300..c5d6c06 100644
+--- a/vm/compiler/LoopOpt.cpp
++++ b/vm/compiler/LoopOpt.cpp
+@@ -92,8 +92,8 @@ START_PASSES
+                dvmCompilerSinkCasts, 0, 0, 0, kOptimizationBasicBlockChange),
+     NEW_PASS ("Accumulation_Sinking", kAllNodes, 0, dvmCompilerSinkAccumulationsGate,
+             0, dvmCompilerAccumulationSinking, 0, 0, kOptimizationBasicBlockChange),
+-    NEW_PASS ("Vectorization", kAllNodes, 0, dvmCompilerVectorizationGate,
+-            dvmCompilerVectorize, 0, 0, dvmCompilerFreeVectorization, kOptimizationBasicBlockChange | kLoopStructureChange),
++    NEW_PASS ("Vectorization", kAllNodes, 0, dvmCompilerTraceIsLoopNewSystem,
++            dvmCompilerVectorize, 0, 0, 0, kOptimizationBasicBlockChange | kLoopStructureChange),
+     NEW_PASS ("Invariant_sinking", kAllNodes, 0, dvmCompilerInvariantSinkingGate,
+             dvmCompilerInvariantSinking, 0, 0, 0, kOptimizationBasicBlockChange),
+     //This should be after the last optimization that changes instruction sequence or BB logic
+@@ -206,6 +206,9 @@ bool dvmCompilerRunPass (CompilationUnit *cUnit, Pass *curPass)
+ 
+         //Do we need any clean up?
+         handlePassFlag (cUnit, curPass);
++
++        //Let's clean up any data we used during the pass
++        curPass->freePassData ();
+     }
+ 
+     //If the pass gate passed, we can declare success
+diff --git a/vm/compiler/Pass.cpp b/vm/compiler/Pass.cpp
+index af100df..4aebde8 100644
+--- a/vm/compiler/Pass.cpp
++++ b/vm/compiler/Pass.cpp
+@@ -41,14 +41,19 @@ Pass::Pass (const std::string &name,
+     this->previous = 0;
+ }
+ 
+-
+-Pass::~Pass (void)
++void Pass::freePassData (void)
+ {
+     //Do we have to free anything ?
+     if (freeDataPtr != 0)
+     {
+         freeDataPtr (data), data = 0;
+     }
++
++    /* We set data again to 0, it might have been done, but
++     * let's be paranoid and let us not remove the set 0 in the
++     * if to keep us from making subsequent post free mistakes
++     */
++    data = 0;
+ }
+ 
+ const std::string &Pass::getName (void) const
+diff --git a/vm/compiler/Pass.h b/vm/compiler/Pass.h
+index 039c1e2..d1f5924 100644
+--- a/vm/compiler/Pass.h
++++ b/vm/compiler/Pass.h
+@@ -114,9 +114,9 @@ class Pass
+          /**
+           * @brief Destructor
+           */
+-         ~Pass (void);
++         ~Pass (void) {}
+ 
+-        /**
++         /**
+           * @brief Get the Pass name
+           * @return the name
+           */
+@@ -141,6 +141,11 @@ class Pass
+         void setData (void *data);
+ 
+         /**
++         * @brief Free the memory of the data pointer
++         */
++        void freePassData (void);
++
++        /**
+          * @brief Get the Pass' flags
+          * @param flag the flag we want to test
+          * @return whether the flag is set
+diff --git a/vm/compiler/SSATransformation.cpp b/vm/compiler/SSATransformation.cpp
+index e9b4834..f82abf3 100644
+--- a/vm/compiler/SSATransformation.cpp
++++ b/vm/compiler/SSATransformation.cpp
+@@ -1097,6 +1097,7 @@ bool dvmCompilerCalculateBasicBlockInformation (CompilationUnit *cUnit, bool fil
+ 
+     //Clear the constants
+     cUnit->constantValues->clear ();
++    dvmClearAllBits (cUnit->isConstantV);
+ 
+     //Finally, get the constant information and set the cUnit correctly
+     dvmCompilerDataFlowAnalysisDispatcher(cUnit,
+diff --git a/vm/compiler/SinkCastOpt.cpp b/vm/compiler/SinkCastOpt.cpp
+index 9181197..51c632e 100644
+--- a/vm/compiler/SinkCastOpt.cpp
++++ b/vm/compiler/SinkCastOpt.cpp
+@@ -25,6 +25,36 @@
+ #include "BBOptimization.h"
+ #include "Pass.h"
+ #include "Utility.h"
++#include <set>
++
++#define SINK_CAST_LOG(cUnit,data,function) \
++    do { \
++        if (cUnit->printPass == true) { \
++            function (cUnit, data); \
++        } \
++    } while (false)
++
++/**
++ * @brief Used to report failure of applying cast sinking optimization pass
++ * @param cUnit The compilation unit
++ * @param message The message to display with failure
++ */
++static void reportSinkCastFailure (const CompilationUnit *cUnit, const char *message)
++{
++    ALOGI("JIT_INFO: Sink cast failure for %s%s@0x%02x: %s", cUnit->method->clazz->descriptor,
++            cUnit->method->name, cUnit->entryBlock->startOffset, message);
++}
++
++/**
++ * @brief Used to report success of sunk cast
++ * @param cUnit The compilation unit
++ * @param opcode The opcode of sunk cast
++ */
++static void reportSunkCast (const CompilationUnit *cUnit, Opcode opcode)
++{
++    ALOGI ("JIT_INFO: Sinking %s for %s%s@0x%02x", dexGetOpcodeName(opcode), cUnit->method->clazz->descriptor,
++            cUnit->method->name, cUnit->entryBlock->startOffset);
++}
+ 
+ /**
+  * @brief Check if the cast operation on an IV is valid
+@@ -43,6 +73,7 @@ static bool checkValidCastingForIV(CompilationUnit *cUnit, LoopInformation *info
+     // check if induction variable is a count-up
+     if (info->getCountUpLoop () == false)
+     {
++        SINK_CAST_LOG (cUnit, "Loop is not count up", reportSinkCastFailure);
+         return false;
+     }
+ 
+@@ -54,6 +85,7 @@ static bool checkValidCastingForIV(CompilationUnit *cUnit, LoopInformation *info
+     // null check
+     if (ssaRep == 0)
+     {
++        SINK_CAST_LOG (cUnit, "Missing ssa representation for if mir", reportSinkCastFailure);
+         return false;
+     }
+ 
+@@ -74,6 +106,7 @@ static bool checkValidCastingForIV(CompilationUnit *cUnit, LoopInformation *info
+         // did not found the corresponding use in ifMir
+         else
+         {
++            SINK_CAST_LOG (cUnit, "Did not find corresponding use in if mir", reportSinkCastFailure);
+             return false;
+         }
+         constValue = 0;
+@@ -109,6 +142,7 @@ static bool checkValidCastingForIV(CompilationUnit *cUnit, LoopInformation *info
+                 // did not found the corresponding use in ifMir
+                 else
+                 {
++                    SINK_CAST_LOG (cUnit, "Did not find corresponding use in if mir", reportSinkCastFailure);
+                     return false;
+                 }
+             }
+@@ -116,6 +150,7 @@ static bool checkValidCastingForIV(CompilationUnit *cUnit, LoopInformation *info
+             //Paranoid
+             if (mirConst == 0)
+             {
++                SINK_CAST_LOG (cUnit, "Could not find const bytecode for loop bound", reportSinkCastFailure);
+                 return false;
+             }
+ 
+@@ -128,6 +163,7 @@ static bool checkValidCastingForIV(CompilationUnit *cUnit, LoopInformation *info
+             // if the mirConst is not a const bytecode or it set a wide constant, return false
+             if (isConst == false || isWide == true)
+             {
++                SINK_CAST_LOG (cUnit, "The loop bound is not constant or is wide", reportSinkCastFailure);
+                 return false;
+             }
+         }
+@@ -136,6 +172,7 @@ static bool checkValidCastingForIV(CompilationUnit *cUnit, LoopInformation *info
+     // return false if vA is not an induction variable
+     if (info->isAnInductionVariable(cUnit, vA) == false)
+     {
++        SINK_CAST_LOG (cUnit, "The VR we are considering must be an induction variable", reportSinkCastFailure);
+         return false;
+     }
+ 
+@@ -145,16 +182,19 @@ static bool checkValidCastingForIV(CompilationUnit *cUnit, LoopInformation *info
+         case OP_INT_TO_BYTE:
+             if (constValue > 127 || constValue < -128)
+             {
++                SINK_CAST_LOG (cUnit, "Loop bound incompatible with the cast to byte", reportSinkCastFailure);
+                 return false;
+             }
+             break;
+         case OP_INT_TO_SHORT:
+             if (constValue > 32767 || constValue < -32768)
+             {
++                SINK_CAST_LOG (cUnit, "Loop bound incompatible with the cast to short", reportSinkCastFailure);
+                 return false;
+             }
+             break;
+         default:
++            SINK_CAST_LOG (cUnit, "No logic to handle unexpected cast type", reportSinkCastFailure);
+             return false;
+     }
+ 
+@@ -421,7 +461,7 @@ static bool fillDependencyFromOthers (CompilationUnit *cUnit, LoopInformation *i
+  * @param potentialOkToSink cast MIR will be added to this map if it is potentially can be sunk
+  * @param vrOkToSinkDependsOn the map represents dependancy - VR can be sunk only if corresponding VR are sunk
+  */
+-static void sinkCastByteCodes (CompilationUnit *cUnit, LoopInformation *info, MIR *mir, bool &isPeelingRequired,
++static void considerCastsForSinking (CompilationUnit *cUnit, LoopInformation *info, MIR *mir, bool &isPeelingRequired,
+         std::set<MIR*> &okToSink, std::set<MIR*> &potentialOkToSink, std::multimap<int, int> &vrOkToSinkDependsOn)
+ {
+     // if current cast mir is not supported for cast sinking optimization
+@@ -536,8 +576,10 @@ static void sinkCastByteCodes (CompilationUnit *cUnit, LoopInformation *info, MI
+  */
+ static bool tryCastSinking (CompilationUnit *cUnit, LoopInformation *info, void *data)
+ {
+-    if (dvmCompilerVerySimpleLoopGate (cUnit, info, data) == false)
++    if (dvmCompilerVerySimpleLoopGateWithLoopInfo (cUnit, info) == false)
+     {
++        SINK_CAST_LOG (cUnit, "The loop we have analyzed is not very simple", reportSinkCastFailure);
++
+         //We only return so we continue looking through the rest of the loops
+         return true;
+     }
+@@ -550,6 +592,8 @@ static bool tryCastSinking (CompilationUnit *cUnit, LoopInformation *info, void
+         isPeelingRequired  = info->guaranteedToThrowFirstIteration (cUnit);
+         if (isPeelingRequired == false)
+         {
++            SINK_CAST_LOG (cUnit, "Loop may throw", reportSinkCastFailure);
++
+             //We can throw, so reject optimization for this loop but consider others
+             return true;
+         }
+@@ -579,7 +623,7 @@ static bool tryCastSinking (CompilationUnit *cUnit, LoopInformation *info, void
+             //Check if it is a cast
+             if (opcode >= OP_INT_TO_LONG && opcode <= OP_INT_TO_SHORT)
+             {
+-                sinkCastByteCodes (cUnit, info, mir, isPeelingRequired, okToSink, potentialOkToSink, vrOkToSinkDependsOn);
++                considerCastsForSinking (cUnit, info, mir, isPeelingRequired, okToSink, potentialOkToSink, vrOkToSinkDependsOn);
+             }
+         }
+     }
+@@ -590,6 +634,7 @@ static bool tryCastSinking (CompilationUnit *cUnit, LoopInformation *info, void
+         bool result = dvmCompilerPeel (cUnit, info);
+         if (result == false)
+         {
++            SINK_CAST_LOG (cUnit, "We needed to peel but failed to do so", reportSinkCastFailure);
+             return true;
+         }
+     }
+diff --git a/vm/compiler/Vectorization.cpp b/vm/compiler/Vectorization.cpp
+index 2448a7d..1414620 100644
+--- a/vm/compiler/Vectorization.cpp
++++ b/vm/compiler/Vectorization.cpp
+@@ -1,5 +1,5 @@
+ /*
+-* Copyright (C) 2012 Intel Corporation
++* Copyright (C) 2013 Intel Corporation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+@@ -27,9 +27,16 @@
+ #include "Vectorization.h"
+ #include "Utility.h"
+ 
++#define VECTORIZATION_LOG(cUnit,data,function) \
++    do { \
++        if (cUnit->printPass == true) { \
++            function (cUnit, data); \
++        } \
++    } while (false)
++
+ enum VectorizedType
+ {
+-    kVectorizedNoType,
++    kVectorizedNoType = 0,
+     kVectorizedByte,
+     kVectorizedShort,
+     kVectorizedInt,
+@@ -57,6 +64,25 @@ struct RegisterAssociation
+  */
+ struct VectorizationInfo
+ {
++    /**
++     * @brief Constructor
++     */
++    VectorizationInfo (void) :
++            type (kVectorizedNoType), upperBound (0), scratchVrForTest (0)
++    {
++        registers.clear ();
++        constants.clear ();
++    }
++
++    /**
++     * @brief Destructor: ensures all memory is freed
++     */
++    ~VectorizationInfo (void)
++    {
++        registers.clear ();
++        constants.clear ();
++    }
++
+     /** @brief Register Map of VRs requiring vectorization */
+     std::map <int, RegisterAssociation> registers;
+ 
+@@ -78,7 +104,60 @@ struct VectorizationInfo
+ };
+ 
+ /**
++ * @brief Report any failure in the vectorization pass/gate
++ * @param cUnit The CompilationUnit for the loop
++ * @param message The message to report as a reason for failure
++ */
++static void reportFailure (const CompilationUnit *cUnit, const char *message)
++{
++    ALOGI("JIT_INFO: Vectorization gate failed at %s%s@0x%02x: %s", cUnit->method->clazz->descriptor,
++            cUnit->method->name, cUnit->entryBlock->startOffset, message);
++}
++
++/**
++ * @brief Dump information about the XMM / VR / constants of vectorization
++ * @param cUnit The CompilationUnit of the loop
++ * @param info The VectorizationInfo containing the information
++ */
++static void dumpVectorRegisterUsage (const CompilationUnit *cUnit, VectorizationInfo *info)
++{
++    ALOGI("\nVectorized loop info for %s%s@0x%02x:", cUnit->method->clazz->descriptor,
++            cUnit->method->name, cUnit->entryBlock->startOffset);
++    ALOGI("\t___Inputs___");
++
++    for (std::map<int, RegisterAssociation>::iterator it = info->registers.begin();
++            it != info->registers.end(); it++)
++    {
++        if (it->second.input == true)
++        {
++            ALOGI("\tv%d (XMM%d)", it->first, it->second.vectorized);
++        }
++    }
++
++    ALOGI("\t___Outputs___");
++
++    for (std::map<int, RegisterAssociation>::iterator it = info->registers.begin();
++            it != info->registers.end(); it++)
++    {
++        if (it->second.output == true)
++        {
++            ALOGI("\tv%d (XMM%d)", it->first, it->second.vectorized);
++        }
++    }
++
++    ALOGI("\t___Constants___");
++
++    for (std::map<int, int>::iterator it = info->constants.begin();
++            it != info->constants.end(); it++)
++    {
++            ALOGI("\tvalue %d (XMM%d)", it->first, it->second);
++    }
++}
++
++/**
+  * @brief Check whether this MIR can remain in vectorized loop
++ * @details The acception process is a whitelist and only allows a few select bytecodes.
++ * No memory operations are accepted.
+  * @param mir The MIR to check for
+  * @return Whether this MIR can remain in the loop
+  */
+@@ -454,7 +533,7 @@ static bool fillVectorizationInformation (const CompilationUnit *cUnit, LoopInfo
+         //Get the SSA
+         SSARepresentation *ssaRep = mir->ssaRep;
+ 
+-        //We cannot continue of there is no SSA information
++        //We cannot continue if there is no SSA information
+         if (ssaRep == 0)
+         {
+             return false;
+@@ -469,12 +548,13 @@ static bool fillVectorizationInformation (const CompilationUnit *cUnit, LoopInfo
+         }
+ 
+         //Now let's bail if we have any other bytecode which cannot be in a vectorized loop
++        //We count on isVectorizable not allowing any memory operations.
+         if (isVectorizable (mir) == false)
+         {
+             return false;
+         }
+ 
+-        //If this the IV bytecode, ignore it (we handle it later
++        //If this the IV bytecode, ignore it (we handle it later)
+         if (mir->dalvikInsn.vA == vrIV && dvmCompilerIsOpcodeConditionalBranch (mir->dalvikInsn.opcode) == false)
+         {
+             continue;
+@@ -505,7 +585,7 @@ static bool fillVectorizationInformation (const CompilationUnit *cUnit, LoopInfo
+             int defDalvikReg = dvmExtractSSARegister (cUnit, ssaRep->defs[0]);
+             setOutputRegister (info, defDalvikReg, false);
+ 
+-            //Get its used
++            //Get its used chain
+             SUsedChain *next = ssaRep->usedNext[0];
+ 
+             //Skip it if no use
+@@ -576,7 +656,7 @@ static bool fillVectorizationInformation (const CompilationUnit *cUnit, LoopInfo
+             }
+             else
+             {
+-                //Finally, if the define is a CONST bytecode, remove it as an output, and remove the constant
++                //Otherwise, set it as output, except if the VR is a constant
+                 bool isNotAConst = (dvmCompilerDataFlowAttributes[defMir->dalvikInsn.opcode] & DF_SETS_CONST) == 0;
+                 setOutputRegister (info, vrUsed, isNotAConst);
+             }
+@@ -1006,6 +1086,7 @@ static bool haveSafeAccumulation (CompilationUnit *cUnit, LoopInformation *loopI
+     if (chain->nextUse != 0)
+     {
+         //We cannot have more than one use
++        VECTORIZATION_LOG (cUnit, "Multiple uses of the accumulation VR", reportFailure);
+         return false;
+     }
+ 
+@@ -1017,6 +1098,7 @@ static bool haveSafeAccumulation (CompilationUnit *cUnit, LoopInformation *loopI
+     if ((dvmCompilerDataFlowAttributes[opcode] & DF_ADD_EXPRESSION) == 0)
+     {
+         //We don't have accumulation, we cannot vectorize
++        VECTORIZATION_LOG (cUnit, "We cannot vectorize if there is no accumulation", reportFailure);
+         return false;
+     }
+ 
+@@ -1051,6 +1133,7 @@ static bool haveSafeAccumulation (CompilationUnit *cUnit, LoopInformation *loopI
+         {
+             if (chain->mir != phi)
+             {
++                VECTORIZATION_LOG (cUnit, "Next use of accumulation is not a Phi", reportFailure);
+                 return false;
+             }
+         }
+@@ -1062,42 +1145,22 @@ static bool haveSafeAccumulation (CompilationUnit *cUnit, LoopInformation *loopI
+     return true;
+ }
+ 
+-static bool vectorizationGateHelper (const CompilationUnit *cUnit, LoopInformation *loopInfo, void *data)
++static bool vectorizationGate (const CompilationUnit *cUnit, LoopInformation *loopInfo, VectorizationInfo *info)
+ {
+-    Pass *pass = (Pass *) (data);
+-
+-    if (loopInfo == 0)
+-    {
+-        return false;
+-    }
+-
+-    //We only care about the inner loop here
+-    if (loopInfo->getNested () != 0)
+-    {
+-        return true;
+-    }
+-
++    //Check if we are looking at simple loop
+     if (dvmCompilerVerySimpleLoopGateWithLoopInfo (cUnit, loopInfo) == false)
+     {
++        VECTORIZATION_LOG (cUnit, "The loop we have analyzed is not very simple.", reportFailure);
+         return false;
+     }
+ 
+     //We can only handle loops with an increment of 1 to the IV
+     if (loopInfo->isUniqueIVIncrementingBy1() == false)
+     {
++        VECTORIZATION_LOG (cUnit, "Not an increment by 1 loop", reportFailure);
+         return false;
+     }
+ 
+-    //Create a vectorization system
+-    VectorizationInfo *info = 0;
+-    //Create space
+-    void *space = dvmCompilerNew (sizeof (*info), true);
+-    //Create the information for the vectorization information
+-    info = new (space) VectorizationInfo ();
+-
+-    //Set the pass data
+-    pass->setData (info);
+-
+     //Get entry block
+     BasicBlock *bb = loopInfo->getEntryBlock ();
+ 
+@@ -1110,6 +1173,7 @@ static bool vectorizationGateHelper (const CompilationUnit *cUnit, LoopInformati
+     // bail if no free scratch to use
+     if (scratchVrForTest == -1)
+     {
++        VECTORIZATION_LOG (cUnit, "No scratch VR left to generate test", reportFailure);
+         return false;
+     }
+ 
+@@ -1122,18 +1186,21 @@ static bool vectorizationGateHelper (const CompilationUnit *cUnit, LoopInformati
+     //If no type, we are done
+     if (info->type == kVectorizedNoType)
+     {
++        VECTORIZATION_LOG (cUnit, "Could not determine vectorization type", reportFailure);
+         return false;
+     }
+ 
+     //Does the vectorization in the BE support the size
+     if (dvmCompilerArchSupportsVectorizedPackedSize (convertTypeToSize (info->type)) == false )
+     {
++        VECTORIZATION_LOG (cUnit, "No architecture support for Vectorization type", reportFailure);
+         return false;
+     }
+ 
+     //For the moment we only handle count-up loops
+     if (loopInfo->getCountUpLoop () == false)
+     {
++        VECTORIZATION_LOG (cUnit, "Is not a count up loop", reportFailure);
+         return false;
+     }
+ 
+@@ -1143,6 +1210,7 @@ static bool vectorizationGateHelper (const CompilationUnit *cUnit, LoopInformati
+     //If problem, bail
+     if (foundUpperBound == false)
+     {
++        VECTORIZATION_LOG (cUnit, "Cannot find loop upper bound", reportFailure);
+         return false;
+     }
+ 
+@@ -1160,12 +1228,14 @@ static bool vectorizationGateHelper (const CompilationUnit *cUnit, LoopInformati
+ 
+     if (info->upperBound < gDvmJit.minVectorizedIterations)
+     {
++        VECTORIZATION_LOG (cUnit, "Not enough iterations in the vectorized loop", reportFailure);
+         return false;
+     }
+ 
+     //Last check: interdependency
+     if (checkLoopDependency (cUnit, loopInfo) == true)
+     {
++        VECTORIZATION_LOG (cUnit, "Inter loop dependency", reportFailure);
+         return false;
+     }
+ 
+@@ -1173,6 +1243,7 @@ static bool vectorizationGateHelper (const CompilationUnit *cUnit, LoopInformati
+     //First job: gather input, output, constants
+     if (fillVectorizationInformation (cUnit, loopInfo, bb, info) == false)
+     {
++        VECTORIZATION_LOG (cUnit, "Could not fill vectorization info", reportFailure);
+         return false;
+     }
+ 
+@@ -1180,6 +1251,7 @@ static bool vectorizationGateHelper (const CompilationUnit *cUnit, LoopInformati
+     unsigned int count = info->registers.size () + info->constants.size ();
+     if (count >= gDvmJit.vectorRegisters)
+     {
++        VECTORIZATION_LOG (cUnit, "Not enough vector registers", reportFailure);
+         return false;
+     }
+ 
+@@ -1192,6 +1264,7 @@ static bool vectorizationGateHelper (const CompilationUnit *cUnit, LoopInformati
+         {
+             if (haveSafeAccumulation ((CompilationUnit *) cUnit, loopInfo, static_cast<unsigned int>(it->first)) == false)
+             {
++                VECTORIZATION_LOG (cUnit, "Unsafe accumulation for vectorization", reportFailure);
+                 return false;
+             }
+         }
+@@ -1200,47 +1273,12 @@ static bool vectorizationGateHelper (const CompilationUnit *cUnit, LoopInformati
+     return true;
+ }
+ 
+-bool dvmCompilerVectorizationGate (const CompilationUnit *cUnit, Pass *pass)
+-{
+-    //First, make sure we are in the new loop detection system
+-    if (dvmCompilerTraceIsLoopNewSystem(cUnit, pass) == false)
+-    {
+-        return false;
+-    }
+-
+-    LoopInformation *info = cUnit->loopInformation;
+-
+-    //Find the innermost loop and test it
+-    if (info != 0)
+-    {
+-        if (info->iterateWithConst (cUnit, vectorizationGateHelper, pass) == true)
+-        {
+-            // Optimization can be applicable
+-            return true;
+-        }
+-    }
+-
+-    return false;
+-}
+-
+-void dvmCompilerFreeVectorization (void *data)
+-{
+-    //Get the VectorizationInfo from data
+-    VectorizationInfo *info = static_cast<VectorizationInfo *> (data);
+-
+-    if (info != 0)
+-    {
+-        //info->registers.clear();
+-       // info->constants.clear();
+-    }
+-}
+-
+ /**
+  * @brief Create the main test: the test performed before entering the non vectorized loop
+  * @param cUnit The CompilationUnit
+  * @param loopInfo the LoopInformation
+  * @param info the VectorizationInfo
+- * @param return a BasicBlock containing the test to know if the code should enter the non vectorized loop
++ * @return Returns a BasicBlock containing the test to know if the code should enter the non vectorized loop
+  */
+ static BasicBlock *createMainTest (CompilationUnit *cUnit, LoopInformation *loopInfo, VectorizationInfo *info)
+ {
+@@ -1316,7 +1354,7 @@ static BasicBlock *createMainTest (CompilationUnit *cUnit, LoopInformation *loop
+  * @param cUnit The CompilationUnit
+  * @param loopInfo the LoopInformation
+  * @param info the VectorizationInfo
+- * @param return a BasicBlock containing the test to know if the code should enter the vectorized loop
++ * @return Returns a BasicBlock containing the test to know if the code should enter the vectorized loop
+  */
+ static BasicBlock *createVectorizedTest (CompilationUnit *cUnit, LoopInformation *loopInfo, VectorizationInfo *info)
+ {
+@@ -1332,7 +1370,7 @@ static BasicBlock *createVectorizedTest (CompilationUnit *cUnit, LoopInformation
+     MIR *first = bb->firstMIRInsn;
+ 
+     //Paranoid
+-    assert (first != 0 && first->dalvikInsn.opcode == OP_CONST);
++    assert (first != 0 && (dvmCompilerDataFlowAttributes[first->dalvikInsn.opcode] & DF_SETS_CONST) != 0);
+ 
+     //Now just get the vectorized upper bound
+     unsigned int howManyPerIteration = convertTypeToHowManyPerIteration (info->type);
+@@ -1644,7 +1682,7 @@ static void handleConstant (CompilationUnit *cUnit, LoopInformation *loopInforma
+ 
+         if (ssaRep == 0)
+         {
+-            ALOGE("Returning");
++            VECTORIZATION_LOG (cUnit, "Cannot find ssa representation", reportFailure);
+             return;
+         }
+     }
+@@ -1809,11 +1847,13 @@ static void updatePredecessors (CompilationUnit *cUnit, BasicBlock *orig, BasicB
+ 
+ static bool vectorizeHelper (CompilationUnit *cUnit, LoopInformation *loopInformation, void *data)
+ {
+-    Pass *pass = (Pass *) data;
++    //The gate will be filling vectorization info so we set it up on stack
++    VectorizationInfo info;
+ 
+-    // Only apply pass to innermost loop
+-    if (loopInformation->getNested () != 0)
++    //Now check with the gate if we can actually vectorize this loop
++    if (vectorizationGate (cUnit, loopInformation, &info) == false)
+     {
++        //We cannot vectorize but we return true so we can continue looking through rest of loops
+         return true;
+     }
+ 
+@@ -1835,16 +1875,6 @@ static bool vectorizeHelper (CompilationUnit *cUnit, LoopInformation *loopInform
+         return true;
+     }
+ 
+-    //Get info for the vectorization
+-    VectorizationInfo *info = static_cast<VectorizationInfo *> (pass->getData ());
+-
+-    //If info is 0, we are done, it should never happen
+-    if (info == 0)
+-    {
+-        //We let it continue to the next loop
+-        return true;
+-    }
+-
+     //We want a copy of all of these
+     BasicBlock *copyBasicBlock = dvmCompilerCopyBasicBlock (cUnit, bb);
+     BasicBlock *copyPreHeader = dvmCompilerCopyBasicBlock (cUnit, preheader);
+@@ -1852,10 +1882,10 @@ static bool vectorizeHelper (CompilationUnit *cUnit, LoopInformation *loopInform
+     BasicBlock *copyBWCC = dvmCompilerCopyBasicBlock (cUnit, bwcc);
+ 
+     //We want two test blocks: main block test and vectorized version
+-    BasicBlock *mainTest = createMainTest (cUnit, loopInformation, info);
++    BasicBlock *mainTest = createMainTest (cUnit, loopInformation, &info);
+ 
+     //We want the vectorized test
+-    BasicBlock *vectorizedTest = createVectorizedTest (cUnit, loopInformation, info);
++    BasicBlock *vectorizedTest = createVectorizedTest (cUnit, loopInformation, &info);
+ 
+     //Be sure the basic blocks have been created
+     if (copyBasicBlock == 0 || copyPreHeader == 0 || copyExit == 0 || copyBWCC == 0 || vectorizedTest == 0 || mainTest == 0)
+@@ -1865,7 +1895,10 @@ static bool vectorizeHelper (CompilationUnit *cUnit, LoopInformation *loopInform
+     }
+ 
+     //Now assign the vectorized registers
+-    assignVectorizedRegisters (info);
++    assignVectorizedRegisters (&info);
++
++    //Now log information about the vector registers
++    VECTORIZATION_LOG (cUnit, &info, dumpVectorRegisterUsage);
+ 
+     //Update all predecessors of the preheader to now go to the vectorized test
+     updatePredecessors (cUnit, preheader, vectorizedTest);
+@@ -1881,7 +1914,7 @@ static bool vectorizeHelper (CompilationUnit *cUnit, LoopInformation *loopInform
+     linkBlocks (vectorizedTest, copyExit, mainTest, postExit);
+ 
+     //We have the CFG up now, what we want to do is now transform the vectorized loop into... a vectorized loop
+-    transformVectorized (cUnit, loopInformation, info, copyPreHeader, copyBasicBlock, copyExit, copyBWCC);
++    transformVectorized (cUnit, loopInformation, &info, copyPreHeader, copyBasicBlock, copyExit, copyBWCC);
+ 
+     return true;
+ }
+diff --git a/vm/compiler/Vectorization.h b/vm/compiler/Vectorization.h
+index 6d8a674..715d943 100644
+--- a/vm/compiler/Vectorization.h
++++ b/vm/compiler/Vectorization.h
+@@ -1,5 +1,5 @@
+ /*
+-* Copyright (C) 2012 Intel Corporation
++* Copyright (C) 2013 Intel Corporation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+@@ -22,22 +22,10 @@ struct CompilationUnit;
+ class Pass;
+ 
+ /**
+- * @brief The gate to the vectorization pass
+- * @param cUnit the CompilationUnit
+- * @param pass the Pass to the vectorization pass
+- */
+-bool dvmCompilerVectorizationGate (const CompilationUnit *cUnit, Pass *pass);
+-
+-/**
+  * @brief The vectorization pass entry point
+  * @param cUnit the CompilationUnit
+  * @param pass the Pass to the vectorization pass
+  */
+ void dvmCompilerVectorize (CompilationUnit *cUnit, Pass *pass);
+ 
+-/**
+- * @brief The data for the vectorization pass
+- */
+-void dvmCompilerFreeVectorization (void *data);
+-
+ #endif
+diff --git a/vm/compiler/codegen/x86/lightcg/Scheduler.cpp b/vm/compiler/codegen/x86/lightcg/Scheduler.cpp
+index bf2e008..31c3d70 100644
+--- a/vm/compiler/codegen/x86/lightcg/Scheduler.cpp
++++ b/vm/compiler/codegen/x86/lightcg/Scheduler.cpp
+@@ -509,7 +509,7 @@ inline const char * getUseDefEntryType(UseDefEntryType type) {
+ //! \brief Returns true if mnemonic is a variant of MOV.
+ inline bool isMoveMnemonic(Mnemonic m) {
+     return (m == Mnemonic_MOV || m == Mnemonic_MOVQ || m == Mnemonic_MOVSD || m == Mnemonic_MOVSS || m == Mnemonic_MOVZX
+-            || m == Mnemonic_MOVSX || m == Mnemonic_MOVAPD || m == Mnemonic_MOVDQA);
++            || m == Mnemonic_MOVSX || m == Mnemonic_MOVAPD || m == Mnemonic_MOVDQA || m == Mnemonic_MOVD);
+ }
+ 
+ //! \brief Returns true if mnemonic is used for comparisons.
+-- 
+1.7.4.1
+

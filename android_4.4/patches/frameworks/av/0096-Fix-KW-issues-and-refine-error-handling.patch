@@ -1,0 +1,224 @@
+From 5df32e50be88d19836a53c4939b707881461e848 Mon Sep 17 00:00:00 2001
+From: wanglili <lili.a.wang@intel.com>
+Date: Tue, 16 Jul 2013 00:26:06 +0800
+Subject: Fix KW issues and refine error handling
+
+BZ: 123464 122111 125565
+
+Orignal patches:
+122525, BZ: 123464, Fix KW issues.
+122527, BZ: 122111, Refine VPP error handling in AwesomePlayer.
+124700, BZ: 125565, Use getInstance method to create VPPProcessor.
+124704, BZ: 127276, Reset mVPPInit flag when creating VPPProcessor.
+
+1. Fix KW issues.
+https://android-kw2.jf.intel.com:8090/review/insight-review.html#goto:project=mainline_merr_vv,pid=109923
+https://android-kw2.jf.intel.com:8090/review/insight-review.html#goto:project=mainline_baylake,pid=97445
+
+2. Refine VPP error handling in AwesomePlayer.
+Invoke VPPProcessor->updateVideoInfo() and VPPProcessor->init()
+explicitly, in order to handle error in a proper way.
+
+3. Since VPPProcessor works in single instance mode, and player should
+use getInstance API to create/query VPPProcessor.
+
+4. Reset mVPPInit flag when creating VPPProcessor.
+mVPPInit flag is not reset, which will cause mediaserver crash
+if replay.
+
+Category: feature differentiation
+Domain: Video.Media-VPP
+Origin:  internal
+Upstream-Candidate: No
+
+Change-Id: I217778c2514378a6347e42d32b5b642894809aa5
+Orig-Change-Id: Ia1f1a9ac61377d1c256bef1c43e35962f8e1c5b2
+Orig-Change-Id: I322116c912cc87dec800bc9c9bf925933526935e
+Orig-Change-Id: I8eff014fe52ebdb05084d0f9370628d2bc230476
+Orig-Change-Id: Ia09ff57b43695ced8756d8225e6b3273cc375309
+Signed-off-by: wanglili <lili.a.wang@intel.com>
+Signed-off-by: Yu, Linda <linda.yu@intel.com>
+Signed-off-by: Xigui Wang <xigui.wang@intel.com>
+---
+ .../nuplayer/NuPlayerRenderer.cpp                  |    9 ++-
+ media/libstagefright/ACodec.cpp                    |    4 +-
+ media/libstagefright/AwesomePlayer.cpp             |   59 +++++++++++++-------
+ media/libstagefright/OMXCodec.cpp                  |    2 +-
+ media/libstagefright/include/AwesomePlayer.h       |    1 +
+ 5 files changed, 49 insertions(+), 26 deletions(-)
+
+diff --git a/media/libmediaplayerservice/nuplayer/NuPlayerRenderer.cpp b/media/libmediaplayerservice/nuplayer/NuPlayerRenderer.cpp
+index 242c7bf..d2e9179 100644
+--- a/media/libmediaplayerservice/nuplayer/NuPlayerRenderer.cpp
++++ b/media/libmediaplayerservice/nuplayer/NuPlayerRenderer.cpp
+@@ -357,7 +357,7 @@ void NuPlayer::Renderer::postDrainVideoQueue() {
+         mVPPProcessor->invokeThreads();
+         List<QueueEntry>::iterator it;
+         for(it = mVideoQueue.begin(); it != mVideoQueue.end(); it++) {
+-            if ((*it).mBuffer == NULL) break;
++            if ((*it).mBuffer == NULL || (*it).mNotifyConsumed == NULL) break;
+             sp<AMessage> notifyConsumed = (*it).mNotifyConsumed;
+             int32_t input, output, notInput;
+             if (notifyConsumed->findInt32("vppInput", &input)
+@@ -577,7 +577,12 @@ sp<NuPlayerVPPProcessor> NuPlayer::Renderer::createVppProcessor(VPPVideoInfo *in
+ 
+     if (NuPlayerVPPProcessor::isVppOn()) {
+         if (mVPPProcessor == NULL) {
+-            mVPPProcessor = new NuPlayerVPPProcessor(new AMessage(kWhatVPPNotify, id()), info, nativeWindow);
++            mVPPProcessor = NuPlayerVPPProcessor::getInstance(new AMessage(kWhatVPPNotify, id()), nativeWindow);
++            if (mVPPProcessor != NULL) {
++                if (mVPPProcessor->validateVideoInfo(info) != VPP_OK) {
++                    releaseVppProcessor();
++                }
++            }
+         }
+         return mVPPProcessor;
+     }
+diff --git a/media/libstagefright/ACodec.cpp b/media/libstagefright/ACodec.cpp
+index 53999d8..75b3607 100644
+--- a/media/libstagefright/ACodec.cpp
++++ b/media/libstagefright/ACodec.cpp
+@@ -892,7 +892,7 @@ ACodec::BufferInfo *ACodec::dequeueBufferFromNativeWindow() {
+         }
+ 
+         size_t i;
+-        BufferInfo *info;
++        BufferInfo *info = NULL;
+         for (i = mBuffers[kPortIndexOutput].size(); i-- > 0;) {
+             info = &mBuffers[kPortIndexOutput].editItemAt(i);
+ 
+@@ -900,7 +900,7 @@ ACodec::BufferInfo *ACodec::dequeueBufferFromNativeWindow() {
+                 break;
+             }
+         }
+-        if (i < 0) return NULL;
++        if (i < 0 || info == NULL) return NULL;
+         /*
+          * The buffer is still used as reference by VPP,
+          * go on dequeue next buffer, until we get a free one.
+diff --git a/media/libstagefright/AwesomePlayer.cpp b/media/libstagefright/AwesomePlayer.cpp
+index 4073a1a..0ef2e12 100644
+--- a/media/libstagefright/AwesomePlayer.cpp
++++ b/media/libstagefright/AwesomePlayer.cpp
+@@ -210,6 +210,7 @@ AwesomePlayer::AwesomePlayer()
+       mDecryptHandle(NULL),
+ #ifdef TARGET_HAS_VPP
+       mVPPProcessor(NULL),
++      mVPPInit(false),
+ #endif
+       mLastVideoTimeUs(-1),
+       mTextDriver(NULL),
+@@ -1624,34 +1625,40 @@ void AwesomePlayer::setVideoSource(sp<MediaSource> source) {
+ #ifdef TARGET_HAS_VPP
+ VPPProcessor* AwesomePlayer::createVppProcessor_l(OMXCodec *omxCodec) {
+     VPPProcessor* processor = NULL;
++    mVPPInit = false;
+ 
+     if (mNativeWindow == NULL)
+         return processor;
+ 
+     if (VPPProcessor::isVppOn()) {
+-        VPPVideoInfo info;
+-        sp<MetaData> meta = NULL;
+-        int32_t width, height, fps;
+-        width = height = fps = 0;
+-        memset(&info, 0, sizeof(VPPVideoInfo));
+-        if (mVideoTrack != NULL)
+-            meta = mVideoTrack->getFormat();
+-        if (meta != NULL && !meta->findInt32(kKeyFrameRate, &fps)) {
+-            ALOGW("No frame rate info found");
+-            fps = 0;
+-        }
+-        if (mVideoSource != NULL) {
+-            meta = mVideoSource->getFormat();
+-            if (meta != NULL) {
+-                CHECK(meta->findInt32(kKeyWidth, &width));
+-                CHECK(meta->findInt32(kKeyHeight, &height));
++        processor = VPPProcessor::getInstance(mNativeWindow, omxCodec);
++        if (processor != NULL) {
++            VPPVideoInfo info;
++            sp<MetaData> meta = NULL;
++            int32_t width, height, fps;
++            width = height = fps = 0;
++            memset(&info, 0, sizeof(VPPVideoInfo));
++            if (mVideoTrack != NULL)
++                meta = mVideoTrack->getFormat();
++            if (meta != NULL && !meta->findInt32(kKeyFrameRate, &fps)) {
++                ALOGW("No frame rate info found");
++                fps = 0;
++            }
++            if (mVideoSource != NULL) {
++                meta = mVideoSource->getFormat();
++                if (meta != NULL) {
++                    CHECK(meta->findInt32(kKeyWidth, &width));
++                    CHECK(meta->findInt32(kKeyHeight, &height));
++                }
++            }
++            info.fps = fps;
++            info.width = width;
++            info.height = height;
++            if (processor->validateVideoInfo(&info) != VPP_OK) {
++                delete processor;
++                processor = NULL;
+             }
+         }
+-        info.fps = fps;
+-        info.width = width;
+-        info.height = height;
+-
+-        processor = new VPPProcessor(mNativeWindow, omxCodec, &info);
+     }
+     return processor;
+ }
+@@ -2068,6 +2075,16 @@ void AwesomePlayer::onVideoEvent() {
+             break;
+         }
+ 
++        if (!mVPPInit) {
++            if (mVPPProcessor->init() == VPP_OK)
++                mVPPInit = true;
++            else {
++                delete mVPPProcessor;
++                mVPPProcessor = NULL;
++                postVideoEvent_l(100);
++                return;
++             }
++        }
+         ALOGV("SET DATA %p\n", mVideoBuffer);
+         if (mVPPProcessor->setDecoderBufferToVPP(mVideoBuffer) == VPP_OK) {
+             mVideoBuffer = NULL;
+diff --git a/media/libstagefright/OMXCodec.cpp b/media/libstagefright/OMXCodec.cpp
+index 96b263e..e54db65 100644
+--- a/media/libstagefright/OMXCodec.cpp
++++ b/media/libstagefright/OMXCodec.cpp
+@@ -2145,6 +2145,7 @@ OMXCodec::BufferInfo* OMXCodec::dequeueBufferFromNativeWindow() {
+     // Dequeue the next buffer from the native window.
+     ANativeWindowBuffer* buf;
+     int fenceFd = -1;
++    BufferInfo *bufInfo = 0;
+ #ifdef TARGET_HAS_VPP
+     while (1) {
+ #endif
+@@ -2158,7 +2159,6 @@ OMXCodec::BufferInfo* OMXCodec::dequeueBufferFromNativeWindow() {
+ 
+     // Determine which buffer we just dequeued.
+     Vector<BufferInfo> *buffers = &mPortBuffers[kPortIndexOutput];
+-    BufferInfo *bufInfo = 0;
+     for (size_t i = 0; i < buffers->size(); i++) {
+       sp<GraphicBuffer> graphicBuffer = buffers->itemAt(i).
+           mMediaBuffer->graphicBuffer();
+diff --git a/media/libstagefright/include/AwesomePlayer.h b/media/libstagefright/include/AwesomePlayer.h
+index a4e159c..3f1c966 100644
+--- a/media/libstagefright/include/AwesomePlayer.h
++++ b/media/libstagefright/include/AwesomePlayer.h
+@@ -247,6 +247,7 @@ private:
+ 
+ #ifdef TARGET_HAS_VPP
+     VPPProcessor *mVPPProcessor;
++    bool mVPPInit;
+ #endif
+ 
+     int64_t mLastVideoTimeUs;
+-- 
+1.7.4.1
+

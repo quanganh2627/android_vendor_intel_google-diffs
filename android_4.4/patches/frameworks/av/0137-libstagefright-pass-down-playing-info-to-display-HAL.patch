@@ -1,0 +1,473 @@
+From 29cec4cc82e9be9ca82aee8df3613c7f5e50baf4 Mon Sep 17 00:00:00 2001
+From: Jason Hu <jason.hu@intel.com>
+Date: Mon, 30 Jul 2012 18:14:07 -0400
+Subject: libstagefright: pass down playing info to display HAL.
+
+BZ: 49467 48272 49089 54636 73585 82175
+
+We need to pass down playing info to display Hal. Display Hal
+can set proper display mode according to this info. This patch
+is an extension for libstagefright to support multiple display
+devices.
+
+When httplive streaming is playing on a small window, should
+according to the property of ANativeWindow to decide whether
+switch mode.
+
+video playback status will be out of sync in MultiDisplay Service
+if media player service crashes during playback and restarts.
+Always send "video is not playing" info when media player service
+launches such that multidisplay service can set display mode
+properly.
+When video playback stops, video playback status needs to be
+updated to MultiDisplay service first before video decodoer
+is unloaded.
+
+Category: feature differentiation
+Domain: Video.Rendering-HDMI
+Origin: internal
+Upstream-Candidate: no
+
+Change-Id: I44175a44a7ffbafcbbf48fa823381ce72f5e94d1
+Orig-Change-Id: I2a2ad5f66e3423401665f1c4d13d7442873c7263
+Orig-Change-Id: I510c831a3c7f684f6576d8d33b09b4c4c8eafe29
+Orig-Change-Id: I292a7865d2ec59c2fc8fa3718ffb0062501ab502
+Orig-Change-Id: I8a0d6ada1b196f3d3ccdf00fb526882549012277
+Orig-Change-Id: I1fa48235e6f033315fa2e63ee36b4a8c805de046
+Orig-Change-Id: I619b4fe8552636ac5abc8514b978672d5d92afe7
+Orig-Change-Id: I5295ebca3a2f4adc4e0fb1641d41ac4d777b7c9e
+Orig-Change-Id: I6d552bca9583a648b25abccd39c8495f4f26c586
+Orig-Change-Id: I3dfee200a28ed50c15cd5623e21ae6774ca9f34b
+Signed-off-by: Jason Hu <jason.hu@intel.com>
+Signed-off-by: Lin Xie <lin.xie@intel.com>
+---
+ media/libmediaplayerservice/Android.mk             |    6 ++
+ media/libmediaplayerservice/MediaPlayerService.cpp |   15 ++++
+ media/libmediaplayerservice/nuplayer/Android.mk    |    6 ++
+ media/libmediaplayerservice/nuplayer/NuPlayer.cpp  |   67 ++++++++++++++++++
+ media/libmediaplayerservice/nuplayer/NuPlayer.h    |    8 ++
+ media/libstagefright/Android.mk                    |    6 ++
+ media/libstagefright/AwesomePlayer.cpp             |   74 ++++++++++++++++++++
+ media/libstagefright/Utils.cpp                     |    7 ++-
+ media/libstagefright/include/AwesomePlayer.h       |   10 +++
+ 9 files changed, 198 insertions(+), 1 deletions(-)
+
+diff --git a/media/libmediaplayerservice/Android.mk b/media/libmediaplayerservice/Android.mk
+index 74bc563..3feaa11 100644
+--- a/media/libmediaplayerservice/Android.mk
++++ b/media/libmediaplayerservice/Android.mk
+@@ -68,6 +68,12 @@ ifeq ($(TARGET_HAS_VPP), true)
+         $(TARGET_OUT_HEADERS)/libva
+ endif
+ 
++ifeq ($(TARGET_HAS_MULTIPLE_DISPLAY),true)
++    LOCAL_C_INCLUDES += $(TARGET_OUT_HEADERS)/display
++    LOCAL_SHARED_LIBRARIES += libmultidisplay
++    LOCAL_CFLAGS += -DTARGET_HAS_MULTIPLE_DISPLAY
++endif
++
+ LOCAL_MODULE:= libmediaplayerservice
+ 
+ include $(BUILD_SHARED_LIBRARY)
+diff --git a/media/libmediaplayerservice/MediaPlayerService.cpp b/media/libmediaplayerservice/MediaPlayerService.cpp
+index 464daa8..bb18869 100644
+--- a/media/libmediaplayerservice/MediaPlayerService.cpp
++++ b/media/libmediaplayerservice/MediaPlayerService.cpp
+@@ -79,6 +79,10 @@
+ #include "HTTPBase.h"
+ #include "RemoteDisplay.h"
+ 
++#ifdef TARGET_HAS_MULTIPLE_DISPLAY
++#include <display/MultiDisplayClient.h>
++#endif
++
+ namespace {
+ using android::media::Metadata;
+ using android::status_t;
+@@ -221,6 +225,17 @@ MediaPlayerService::MediaPlayerService()
+     mBatteryAudio.deviceOn[SPEAKER] = 1;
+ 
+     MediaPlayerFactory::registerBuiltinFactories();
++
++#ifdef TARGET_HAS_MULTIPLE_DISPLAY
++    // Reset video playback status in case media server crashes.
++    MultiDisplayClient* client = new MultiDisplayClient;
++    if (client) {
++        MDSVideoSourceInfo info;
++        memset(&info, 0, sizeof(MDSVideoSourceInfo));
++        client->setVideoSourceInfo(&info);
++        delete client;
++    }
++#endif
+ }
+ 
+ MediaPlayerService::~MediaPlayerService()
+diff --git a/media/libmediaplayerservice/nuplayer/Android.mk b/media/libmediaplayerservice/nuplayer/Android.mk
+index cc81d5e..0144abe 100644
+--- a/media/libmediaplayerservice/nuplayer/Android.mk
++++ b/media/libmediaplayerservice/nuplayer/Android.mk
+@@ -30,6 +30,12 @@ LOCAL_SHARED_LIBRARIES += libva \
+                           libva-tpi
+ endif
+ 
++ifeq ($(TARGET_HAS_MULTIPLE_DISPLAY),true)
++    LOCAL_C_INCLUDES += $(TARGET_OUT_HEADERS)/display
++    LOCAL_SHARED_LIBRARIES += libmultidisplay
++    LOCAL_CFLAGS += -DTARGET_HAS_MULTIPLE_DISPLAY
++endif
++
+ LOCAL_MODULE:= libstagefright_nuplayer
+ 
+ LOCAL_MODULE_TAGS := eng
+diff --git a/media/libmediaplayerservice/nuplayer/NuPlayer.cpp b/media/libmediaplayerservice/nuplayer/NuPlayer.cpp
+index 50ae142..65df53a 100644
+--- a/media/libmediaplayerservice/nuplayer/NuPlayer.cpp
++++ b/media/libmediaplayerservice/nuplayer/NuPlayer.cpp
+@@ -166,11 +166,17 @@ NuPlayer::NuPlayer()
+ #ifdef TARGET_HAS_VPP
+       mIsVppInit(false),
+ #endif
++#ifdef TARGET_HAS_MULTIPLE_DISPLAY
++      mMDClient(NULL),
++#endif
+       mVideoScalingMode(NATIVE_WINDOW_SCALING_MODE_SCALE_TO_WINDOW),
+       mStarted(false) {
+ }
+ 
+ NuPlayer::~NuPlayer() {
++#ifdef TARGET_HAS_MULTIPLE_DISPLAY
++    setDisplaySource(false);
++#endif
+ }
+ 
+ void NuPlayer::setUID(uid_t uid) {
+@@ -198,6 +204,57 @@ void NuPlayer::setDataSourceAsync(const sp<IStreamSource> &source) {
+     msg->post();
+ }
+ 
++#ifdef TARGET_HAS_MULTIPLE_DISPLAY
++void NuPlayer::setDisplaySource(bool isplaying) {
++    MDSVideoSourceInfo info;
++    memset(&info, 0 ,sizeof(&info));
++    if (isplaying) {
++        int wcom = 0;
++        if (mANativeWindow != NULL) {
++            mANativeWindow->query(mANativeWindow.get(),
++                    NATIVE_WINDOW_QUEUES_TO_WINDOW_COMPOSER, &wcom);
++        }
++        if (mVideoDecoder != NULL && wcom == 1) {
++            if (mMDClient == NULL) {
++                mMDClient = new MultiDisplayClient();
++            }
++            sp<AMessage> msg = NULL;
++            int32_t displayW, displayH, frameRate;
++            bool success = false;
++            displayW = displayH = frameRate = 0;
++            info.isplaying = true;
++            info.isprotected = false;
++            msg = mSource->getFormat(false);
++            if (msg != NULL) {
++                success = msg->findInt32("frame-rate", &frameRate);
++                if (!success)
++                    frameRate = 0;
++                success = msg->findInt32("width", &displayW);
++                if (!success)
++                    displayW = 0;
++                success = msg->findInt32("height", &displayH);
++                if (!success)
++                    displayH = 0;
++            }
++            info.frameRate = frameRate;
++            info.displayW  = displayW;
++            info.displayH  = displayH;
++            mMDClient->setVideoSourceInfo(&info);
++            mMDClient->setVideoState(MDS_VIDEO_PREPARED);
++        }
++    } else {
++      if (mMDClient != NULL) {
++          info.isplaying = false;
++          info.isprotected = false;
++          mMDClient->setVideoSourceInfo(&info);
++          mMDClient->setVideoState(MDS_VIDEO_UNPREPARED);
++          delete mMDClient;
++          mMDClient = NULL;
++      }
++    }
++}
++#endif
++
+ static bool IsHTTPLiveURL(const char *url) {
+     if (!strncasecmp("http://", url, 7)
+             || !strncasecmp("https://", url, 8)
+@@ -287,6 +344,12 @@ void NuPlayer::setVideoSurfaceTextureAsync(
+     }
+ 
+     msg->post();
++#ifdef TARGET_HAS_MULTIPLE_DISPLAY
++    if (mVideoDecoder != NULL) {
++        setDisplaySource(false);
++    }
++    mANativeWindow = surfaceTextureClient;
++#endif
+ }
+ 
+ void NuPlayer::setAudioSink(const sp<MediaPlayerBase::AudioSink> &sink) {
+@@ -1012,6 +1075,10 @@ status_t NuPlayer::instantiateDecoder(bool audio, sp<Decoder> *decoder) {
+     }
+ #endif
+ 
++#ifdef TARGET_HAS_MULTIPLE_DISPLAY
++    if (!audio)
++        setDisplaySource(true);
++#endif
+     return OK;
+ }
+ 
+diff --git a/media/libmediaplayerservice/nuplayer/NuPlayer.h b/media/libmediaplayerservice/nuplayer/NuPlayer.h
+index b0b473e..2f7bd17 100644
+--- a/media/libmediaplayerservice/nuplayer/NuPlayer.h
++++ b/media/libmediaplayerservice/nuplayer/NuPlayer.h
+@@ -21,6 +21,9 @@
+ #include <media/MediaPlayerInterface.h>
+ #include <media/stagefright/foundation/AHandler.h>
+ #include <media/stagefright/NativeWindowWrapper.h>
++#ifdef TARGET_HAS_MULTIPLE_DISPLAY
++#include <display/MultiDisplayClient.h>
++#endif
+ 
+ #ifdef TARGET_HAS_VPP
+ #include <NuPlayerVPPProcessor.h>
+@@ -165,6 +168,11 @@ private:
+ 
+     int64_t mVideoLateByUs;
+     int64_t mNumFramesTotal, mNumFramesDropped;
++#ifdef TARGET_HAS_MULTIPLE_DISPLAY
++    MultiDisplayClient* mMDClient;
++    sp<ANativeWindow> mANativeWindow;
++    void setDisplaySource(bool isplaying);
++#endif
+ 
+     int32_t mVideoScalingMode;
+ 
+diff --git a/media/libstagefright/Android.mk b/media/libstagefright/Android.mk
+index a3ac68a..617ffe9 100644
+--- a/media/libstagefright/Android.mk
++++ b/media/libstagefright/Android.mk
+@@ -183,6 +183,12 @@ LOCAL_STATIC_LIBRARIES += \
+ LOCAL_CPPFLAGS += -DUSE_INTEL_MDP
+ endif
+ 
++ifeq ($(TARGET_HAS_MULTIPLE_DISPLAY),true)
++        LOCAL_C_INCLUDES += $(TARGET_OUT_HEADERS)/display
++        LOCAL_SHARED_LIBRARIES += libmultidisplay
++        LOCAL_CFLAGS += -DTARGET_HAS_MULTIPLE_DISPLAY
++endif
++
+ LOCAL_SHARED_LIBRARIES += libstlport
+ include external/stlport/libstlport.mk
+ 
+diff --git a/media/libstagefright/AwesomePlayer.cpp b/media/libstagefright/AwesomePlayer.cpp
+index 8f1f68e..cdc61c0 100644
+--- a/media/libstagefright/AwesomePlayer.cpp
++++ b/media/libstagefright/AwesomePlayer.cpp
+@@ -212,6 +212,9 @@ AwesomePlayer::AwesomePlayer()
+       mVPPProcessor(NULL),
+       mVPPInit(false),
+ #endif
++#ifdef TARGET_HAS_MULTIPLE_DISPLAY
++      mMDClient(NULL),
++#endif
+       mLastVideoTimeUs(-1),
+       mTextDriver(NULL),
+       mOffloadAudio(false),
+@@ -249,6 +252,9 @@ AwesomePlayer::~AwesomePlayer() {
+     reset();
+ 
+     mClient.disconnect();
++#ifdef TARGET_HAS_MULTIPLE_DISPLAY
++    setDisplaySource_l(false);
++#endif
+ }
+ 
+ void AwesomePlayer::cancelPlayerEvents(bool keepNotifications) {
+@@ -381,6 +387,64 @@ void AwesomePlayer::checkDrmStatus(const sp<DataSource>& dataSource) {
+     }
+ }
+ 
++#ifdef TARGET_HAS_MULTIPLE_DISPLAY
++void AwesomePlayer::notifyMDSPlayerStatus_l(int status) {
++    if (mMDClient == NULL) {
++        mMDClient = new MultiDisplayClient();
++    }
++
++    if (mMDClient != NULL) {
++        mMDClient->setVideoState((MDS_VIDEO_STATE)status);
++
++        if (status == MDS_VIDEO_UNPREPARED) {
++            delete mMDClient;
++            mMDClient = NULL;
++        }
++    } else {
++        LOGI("NULL MDClient in AwesomePlayer!");
++    }
++}
++
++void AwesomePlayer::setDisplaySource_l(bool isplaying) {
++    MDSVideoSourceInfo info;
++    memset(&info, 0, sizeof(MDSVideoSourceInfo));
++
++    if (isplaying) {
++        if (mVideoSource != NULL) {
++            if (mMDClient == NULL) {
++                mMDClient = new MultiDisplayClient();
++            }
++            int wcom = 0;
++            if (mNativeWindow != NULL)
++                mNativeWindow->query(mNativeWindow.get(), NATIVE_WINDOW_QUEUES_TO_WINDOW_COMPOSER, &wcom);
++            /*
++             * 0 means the buffers do not go directly to the window compositor;
++             * 1 means the ANativeWindow DOES send queued buffers
++             * directly to the window compositor;
++             */
++            if (wcom == 1) {
++                info.isplaying = true;
++                info.isprotected = (mDecryptHandle != NULL);
++                {
++                    Mutex::Autolock autoLock(mStatsLock);
++                    info.frameRate = mStats.mFrameRate;
++                    info.displayW = mStats.mVideoWidth;
++                    info.displayH = mStats.mVideoHeight;
++                }
++                mMDClient->setVideoSourceInfo(&info);
++                notifyMDSPlayerStatus_l(MDS_VIDEO_PREPARED);
++            }
++        }
++    } else {
++        if (mMDClient != NULL) {
++           info.isplaying = false;
++           info.isprotected = false;
++           mMDClient->setVideoSourceInfo(&info);
++        }
++    }
++}
++#endif
++
+ status_t AwesomePlayer::setDataSource_l(const sp<MediaExtractor> &extractor) {
+     // Attempt to approximate overall stream bitrate by summing all
+     // tracks' individual bitrates, if not all of them advertise bitrate,
+@@ -617,6 +681,7 @@ void AwesomePlayer::reset_l() {
+         mStats.mNumVideoFramesDropped = 0;
+         mStats.mVideoWidth = -1;
+         mStats.mVideoHeight = -1;
++        mStats.mFrameRate = -1;
+         mStats.mFlags = 0;
+         mStats.mTracks.clear();
+     }
+@@ -1029,6 +1094,9 @@ status_t AwesomePlayer::play_l() {
+         postBufferingEvent_l();
+     }
+ 
++#ifdef TARGET_HAS_MULTIPLE_DISPLAY
++    setDisplaySource_l(true);
++#endif
+     return OK;
+ }
+ 
+@@ -1169,6 +1237,9 @@ void AwesomePlayer::notifyVideoSize_l() {
+         Mutex::Autolock autoLock(mStatsLock);
+         mStats.mVideoWidth = usableWidth;
+         mStats.mVideoHeight = usableHeight;
++        if (!mVideoTrack->getFormat()->findInt32(kKeyFrameRate, &mStats.mFrameRate)) {
++            mStats.mFrameRate = 0;
++        }
+     }
+ 
+     int32_t rotationDegrees;
+@@ -1339,6 +1410,9 @@ void AwesomePlayer::shutdownVideoDecoder_l() {
+         mVideoBuffer->release();
+         mVideoBuffer = NULL;
+     }
++#ifdef TARGET_HAS_MULTIPLE_DISPLAY
++    setDisplaySource_l(false);
++#endif
+ 
+ #ifdef TARGET_HAS_VPP
+     if (mVPPProcessor != NULL) {
+diff --git a/media/libstagefright/Utils.cpp b/media/libstagefright/Utils.cpp
+index 2350f0b..6c66e60 100644
+--- a/media/libstagefright/Utils.cpp
++++ b/media/libstagefright/Utils.cpp
+@@ -93,12 +93,14 @@ status_t convertMetaDataToMessage(
+     }
+ 
+     if (!strncasecmp("video/", mime, 6)) {
+-        int32_t width, height;
++        int32_t width, height, frameRate;
+         CHECK(meta->findInt32(kKeyWidth, &width));
+         CHECK(meta->findInt32(kKeyHeight, &height));
+ 
+         msg->setInt32("width", width);
+         msg->setInt32("height", height);
++        if (meta->findInt32(kKeyFrameRate, &frameRate))
++            msg->setInt32("frame-rate", frameRate);
+ 
+         int32_t sarWidth, sarHeight;
+         if (meta->findInt32(kKeySARWidth, &sarWidth)
+@@ -401,9 +403,12 @@ void convertMessageToMetaData(const sp<AMessage> &msg, sp<MetaData> &meta) {
+     if (mime.startsWith("video/")) {
+         int32_t width;
+         int32_t height;
++        int32_t frameRate;
+         if (msg->findInt32("width", &width) && msg->findInt32("height", &height)) {
+             meta->setInt32(kKeyWidth, width);
+             meta->setInt32(kKeyHeight, height);
++            if (msg->findInt32("frame-rate", &frameRate))
++                meta->setInt32(kKeyFrameRate, frameRate);
+         } else {
+             ALOGW("did not find width and/or height");
+         }
+diff --git a/media/libstagefright/include/AwesomePlayer.h b/media/libstagefright/include/AwesomePlayer.h
+index 3f1c966..ca34329 100644
+--- a/media/libstagefright/include/AwesomePlayer.h
++++ b/media/libstagefright/include/AwesomePlayer.h
+@@ -33,6 +33,9 @@
+ #include <media/stagefright/MetaData.h>
+ #include <utils/threads.h>
+ #include <drm/DrmManagerClient.h>
++#ifdef TARGET_HAS_MULTIPLE_DISPLAY
++#include <display/MultiDisplayClient.h>
++#endif
+ 
+ namespace android {
+ 
+@@ -209,6 +212,9 @@ private:
+ 
+     bool mWatchForAudioSeekComplete;
+     bool mWatchForAudioEOS;
++#ifdef TARGET_HAS_MULTIPLE_DISPLAY
++    MultiDisplayClient* mMDClient;
++#endif
+ 
+     sp<TimedEventQueue::Event> mVideoEvent;
+     bool mVideoEventPending;
+@@ -262,6 +268,9 @@ private:
+ 
+     status_t setDataSource_l(const sp<DataSource> &dataSource);
+     status_t setDataSource_l(const sp<MediaExtractor> &extractor);
++#ifdef TARGET_HAS_MULTIPLE_DISPLAY
++    void setDisplaySource_l(bool isplaying);
++#endif
+     void reset_l();
+     status_t seekTo_l(int64_t timeUs);
+     status_t pause_l(bool at_eos = false);
+@@ -349,6 +358,7 @@ private:
+         int64_t mNumVideoFramesDropped;
+         int32_t mVideoWidth;
+         int32_t mVideoHeight;
++        int32_t mFrameRate;
+         uint32_t mFlags;
+         Vector<TrackStat> mTracks;
+     } mStats;
+-- 
+1.7.4.1
+

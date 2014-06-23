@@ -1,0 +1,187 @@
+From 693f9fefab5ada1a6f8aaf3af5c1f8e9f149755d Mon Sep 17 00:00:00 2001
+From: Jeremie GARCIA <jeremiex.garcia@intel.com>
+Date: Thu, 19 Jan 2012 20:08:39 +0100
+Subject: [PORT FROM MAIN]wifi: crda/iw porting to R3
+
+BZ: 19941 108362
+
+Adaptation and squash for JB
+Porting crda/iw from R2 to R3, is not possible as is:
+- ICS introduced a new version of libnl (v2). However, it is not the opensource libnl2.
+Instead, Google decided to make its own re-implementation. However, they've only done the
+very strict minimum to have wpa_supplicant_8 works.
+Furthermore, this library must be statically linked and have some known issues.
+- crda deals with uevents. These ones are caught in userspace by ueventd. When crda-related uevents
+are caught, uevents forks and executes crda binary in the child.
+However, ICS has modified the signal handler for SIGCHLD. (to prevent ueventd from having zombies
+children). The way they've done it makes waitpid systematically returns in error with errno
+set with ECHLD although job has been correctly executed by the forked process.
+On such error, our previous implementation of ueventd makes ueventd exits.
+ueventd is monitored by a watchdog that detects its death, increments a counter and relaunches it.
+If the counter goes too high during a defined period, the system decides to make a "reboot recovery".
+
+This patches does following:
+- add a function to google libnl2 needed by iw (nl_socket_set_cb)
+- make crda/iw statically links it to google libnl2
+- prevent crda from calling undefined google libnl2 undefined function (nl_wait_for_ack).
+This one is not mandatory for its correct execution.(we did not add them to libnl2 due to google libnl2 issues)
+- in ueventd, remove waitpid handling for crda execution since it is no more valid and since we don't need to
+check crda return code.
+- on CRDA uevent receive, init tries to exec crda.
+An execv error happens when crda binary is not present.
+crda is not present in BCM based platform cause it is not
+used by the bcm chips (regulatory domains are managed internally).
+This patch prevents this error.
+
+Change-Id: Id326f678be053b706516d27da82500f971dfea8f
+Orig-Change-Id: I2b78fdd6c4ed3a6955e9eb7d8b6223e2e9f9f065
+Category: device enablement
+Domain: CWS.WIFI-TI
+Origin: upstream
+Upstream-Candidate: no,proprietary
+Orig-Change-Id: I84a089c00357a580a773a102773a81a7fdcd63e4
+Signed-off-by: Jeremie GARCIA <jeremiex.garcia@intel.com>
+Reviewed-on: http://android.intel.com:8080/32534
+Reviewed-by: Yin, Fengwei <fengwei.yin@intel.com>
+Reviewed-by: Regairaz, JulieX <juliex.regairaz@intel.com>
+Tested-by: Zurmely, PierreX <pierrex.zurmely@intel.com>
+Reviewed-by: buildbot <buildbot@intel.com>
+Tested-by: buildbot <buildbot@intel.com>
+Signed-off-by: Jonathan DE CESCO <jonathan.de.cesco@intel.com>
+---
+ init/devices.c |   70 +++++++++++++++++++++++++++++++++++++++++++++++++++++--
+ init/devices.h |    1 +
+ 2 files changed, 68 insertions(+), 3 deletions(-)
+
+diff --git a/init/devices.c b/init/devices.c
+index 0f6da35..09c690b 100644
+--- a/init/devices.c
++++ b/init/devices.c
+@@ -55,6 +55,9 @@
+ #define FIRMWARE_DIR1   "/etc/firmware"
+ #define FIRMWARE_DIR2   "/vendor/firmware"
+ #define FIRMWARE_DIR3   "/firmware/image"
++#define CRDA_BIN_PATH   "/system/bin/crda"
++#define PLATFORM_STR    "platform"
++#define CHANGE_STR      "change"
+ 
+ extern struct selabel_handle *sehandle;
+ 
+@@ -454,6 +457,7 @@ static void parse_event(const char *msg, struct uevent *uevent)
+     uevent->path = "";
+     uevent->subsystem = "";
+     uevent->firmware = "";
++    uevent->country = "";
+     uevent->major = -1;
+     uevent->minor = -1;
+     uevent->partition_name = NULL;
+@@ -494,7 +498,10 @@ static void parse_event(const char *msg, struct uevent *uevent)
+         } else if(!strncmp(msg, "TYPE=", 5)) {
+             msg += 5;
+             uevent->type = msg;
+-        } else if(!strncmp(msg, "MODALIAS=", 9)) {
++        } else if (!strncmp(msg, "COUNTRY=", 8)) {
++            msg += 8;
++            uevent->country = msg;
++        } else if (!strncmp(msg, "MODALIAS=", 9)) {
+             msg += 9;
+             uevent->modalias = msg;
+         }
+@@ -504,9 +511,10 @@ static void parse_event(const char *msg, struct uevent *uevent)
+             ;
+     }
+ 
+-    log_event_print("event { '%s', '%s', '%s', '%s', %d, %d }\n",
++    log_event_print("event { '%s', '%s', '%s', '%s', %d, %d, '%s' }\n",
+                     uevent->action, uevent->path, uevent->subsystem,
+-                    uevent->firmware, uevent->major, uevent->minor);
++                    uevent->firmware, uevent->major, uevent->minor,
++                    uevent->country);
+ }
+ 
+ static char **get_character_device_symlinks(struct uevent *uevent)
+@@ -1076,6 +1084,61 @@ root_free_out:
+     free(root);
+ }
+ 
++static int handle_crda_event(struct uevent *uevent)
++{
++    int status;
++    int ret;
++    pid_t pid;
++    char country_env[11];
++    char *argv[] = { CRDA_BIN_PATH, NULL };
++    char *envp[] = { country_env  , NULL };
++
++    if(strncmp(uevent->subsystem, PLATFORM_STR, strlen(PLATFORM_STR)))
++       return (-1);
++
++    if(strncmp(uevent->action, CHANGE_STR, strlen(CHANGE_STR)))
++       return (-1);
++
++    INFO("executing CRDA country=%s\n", uevent->country);
++    snprintf(country_env, sizeof(country_env), "COUNTRY=%s", uevent->country);
++
++    if (access(argv[0], X_OK)) {
++        INFO("crda_event not handled - no crda executable\n");
++        return -1;
++    }
++
++    switch(pid = fork()) {
++    case -1:
++         /* Error occured */
++         ERROR("handle_crda_event - fork error\n");
++         return (-1);
++         break;
++    case  0:
++         /* Child related processing */
++         if (execve(argv[0], argv, envp) ==  -1) {
++              ERROR("handle_crda_event - execve error\n");
++              return (-1);
++         }
++         break;
++    default:
++         /* Parent related processing */
++         /*
++          * man waitpid: POSIX.1-2001 specifies that if the disposition
++          * of SIGCHLD is set to SIG_IGN, then children that terminate
++          * do not become zombies and a call to waitpid() will block
++          * until all children have terminated, and then fail with errno
++          * set to ECHILD.
++          * With ICS, google has introduced this behavior in "ueventd.c"
++          *          signal(SIGCHLD, SIG_IGN);
++          * So handling of waitpid() return is no more needed.
++          */
++          waitpid (pid, &status,0);
++          break;
++    }
++
++    return 0;
++}
++
+ void handle_firmware_event(struct uevent *uevent)
+ {
+     pid_t pid;
+@@ -1106,6 +1169,7 @@ void handle_events_fd(void (*handle_event_fp)(struct uevent*))
+         parse_event(msg, &uevent);
+ 
+         handle_event_fp(&uevent);
++        handle_crda_event(&uevent);
+     }
+ }
+ 
+diff --git a/init/devices.h b/init/devices.h
+index ebcf6fb..24169ac 100644
+--- a/init/devices.h
++++ b/init/devices.h
+@@ -26,6 +26,7 @@ struct uevent {
+     const char *firmware;
+     const char *partition_name;
+     const char *device_name;
++    const char *country;
+     const char *modalias;
+     const char *type;
+     const char *product;
+-- 
+1.7.4.1
+

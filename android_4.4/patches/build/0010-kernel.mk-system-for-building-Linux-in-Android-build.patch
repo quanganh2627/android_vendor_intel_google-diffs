@@ -1,0 +1,589 @@
+From 18bc228fe7b3611613b14ba14beedc48191300f9 Mon Sep 17 00:00:00 2001
+From: Andrew Boie <andrew.p.boie@intel.com>
+Date: Wed, 16 Mar 2011 10:36:30 +0800
+Subject: kernel.mk: system for building Linux in Android build
+
+Author: Alin Dobre <alin.m.dobre@intel.com>
+Author: Andrew Boie <andrew.p.boie@intel.com>
+Author: Bruce Beare <bruce.j.beare@intel.com>
+Author: Chih-Wei Huang <cwhuang@linux.org.tw>
+Author: Daniel Leung <daniel.leung@intel.com>
+Author: Hans Odeberg <hans.odeberg@intel.com>
+Author: Igor Zamyatin <igor.zamyatin@intel.com>
+Author: Jianxun Zhang <jianxun.zhang@intel.com>
+Author: Lukasz Anaczkowski <lukasz.anaczkowski@intel.com>
+Author: Matt Gumbel <matthew.k.gumbel@intel.com>
+
+This is a system for building the Linux kernel from source within
+the context of an Android build. This patch is originally based
+on some work by Chih-Wei Huang <cwhuang@linux.org.tw> in the
+Android-X86 project but has changed significantly since then.
+
+The kernel build produces 5 artifacts: the image itself, a tarball
+full of modules, a tarball full of firmware, a set of scripts, and
+System.map. We introduce INSTALLED_MODULES_TARGET,
+INSTALLED_KERNELFW_TARGET, and INSTALLED_SYSTEM_MAP for the latter 3
+items so that they can be referenced elsewhere in the build.  If
+there are no modules or firmware the respective tarballs still exist
+but are empty. System.map doesn't go on the device, but is extremely
+useful for debugging and needs to be stored with release deliverables.
+
+BUILT_SYSTEMIMAGE and INSTALLED_SYSTEMTARBALL_TARGET now depend on the
+modules and firmware tarballs, and their contents are expanded in the
+proper locations during the creation of these targets.
+
+The kernel source scripts/ directory may contain scripts that will
+need to be used elsewhere in the build; the initial use-case is the
+sign-file script which attaches a digital signature to kernel modules.
+Kernel build now creates a tarball containing script files
+specified with TARGET_KERNEL_SCRIPTS inside the Makefile, plus
+any BOARD_KERNEL_SCRIPTS in product-specific configuration. Directory
+structure is collapsed.
+
+The kernel defconfig can now be constructed out of an arbitrary number
+of fragments which are assembled by the build prior to invoking the
+kernel build. This allows, for example, to have a base configuration
+plus some overlays which alter it to enable/disable options based on
+whether a build is debug-enabled. Users set TARGET_KERNEL_CONFIG to
+their base defconfig, and can add any number of overlays to
+TARGET_KERNEL_CONFIG_OVERRIDES.
+
+There is support for building out-of-tree kernel modules. Users will
+want to set EXTERNAL_KERNEL_MODULES as a list of paths to the
+directories where the modules live.
+
+We want the kernel build process to be the same whether we are
+doing a clean kernel build or an incremental one. The 'oldnoconfig'
+command used updates .config.old based on the contents of .config,
+but we don't want any prior state hanging around that affects how
+the kernel is built. Hence delete .config.old before building each
+time.
+
+We support prebuilt kernels, modules, scripts, and firmware. Setting
+BUILD_KERNEL=1 will force a kernel compile, otherwise if suitable
+prebuilts exist in TARGET_PREBUILT_KERNEL_DIR they will be used
+instead. This is desirable for speeding up build times; the kernel
+build must be called as a sub-make and the resulting images are always
+touched. Typical use is to have a Jenkins job which watches for
+changes in the source tree and generates/commits new prebuilts
+when that happens, or to manually update the prebuilts on some
+release cycle.
+
+Support for MODSIGN with pre-generated keys can be done by setting the
+following BoardConfig variables:
+ $(TARGET_MODULE_PRIVATE_KEY)
+ $(TARGET_MODULE_CERTIFICATE)
+ $(TARGET_MODULE_GENKEY)
+
+TODO:
+- Fixup out-of-tree kernel module build to be more like other Android
+  modules
+- Fix Linux kbuild Makefiles so that you can use M= and O=
+  simultaneously
+- Fix kernel_{mod|fw}_enabled to also check overrides
+
+Change-Id: Ib836f8b3fca633e086050d9f2bff5e10a9ad5a69
+---
+ core/Makefile                  |   26 ++++-
+ core/cleanbuild.mk             |    6 +-
+ core/combo/TARGET_linux-x86.mk |    8 ++
+ core/config.mk                 |    8 ++
+ core/dumpvar.mk                |    1 +
+ core/kernel.mk                 |  263 ++++++++++++++++++++++++++++++++++++++++
+ tools/build-defconfig.py       |   87 +++++++++++++
+ 7 files changed, 396 insertions(+), 3 deletions(-)
+ create mode 100644 core/kernel.mk
+ create mode 100755 tools/build-defconfig.py
+
+diff --git a/core/Makefile b/core/Makefile
+index bf23225..c808409 100644
+--- a/core/Makefile
++++ b/core/Makefile
+@@ -463,6 +463,8 @@ $(INSTALLED_BOOTIMAGE_TARGET): $(MAKE_NO_DEFAULT_BOOTIMAGE_ITEMS)
+ 	$(MAKE_NO_DEFAULT_BOOTIMAGE)
+ endif # TARGET_MAKE_NO_DEFAULT_BOOTIMAGE
+ 
++include $(BUILD_SYSTEM)/kernel.mk
++
+ else	# TARGET_NO_KERNEL
+ # HACK: The top-level targets depend on the bootimage.  Not all targets
+ # can produce a bootimage, though, and emulator targets need the ramdisk
+@@ -835,7 +837,18 @@ define build-systemimage-target
+       $(TARGET_OUT) $(systemimage_intermediates)/system_image_info.txt $(1)
+ endef
+ 
+-$(BUILT_SYSTEMIMAGE): $(FULL_SYSTEMIMAGE_DEPS) $(INSTALLED_FILES_FILE)
++$(BUILT_SYSTEMIMAGE): $(INSTALLED_MODULES_TARGET) \
++		      $(INSTALLED_KERNELFW_TARGET) \
++		      $(INTERNAL_SYSTEMIMAGE_FILES) \
++		      $(INTERNAL_USERIMAGES_DEPS) \
++
++	$(hide) rm -rf $(TARGET_OUT)/lib/modules
++	$(hide) rm -rf $(TARGET_OUT)/lib/firmware
++	$(hide) mkdir -p $(TARGET_OUT)/lib/
++	$(if $(INSTALLED_MODULES_TARGET),$(hide) tar -xz -C $(TARGET_OUT)/lib/ -f $(INSTALLED_MODULES_TARGET))
++	$(if $(INSTALLED_MODULES_TARGET),$(hide) chmod -fR g-w $(TARGET_OUT)/lib/modules)
++	$(if $(INSTALLED_KERNELFW_TARGET),$(hide) tar -xz -C $(TARGET_OUT)/lib/ -f $(INSTALLED_KERNELFW_TARGET))
++	$(if $(INSTALLED_KERNELFW_TARGET),$(hide) chmod -fR g-w $(TARGET_OUT)/lib/firmware)
+ 	$(call build-systemimage-target,$@)
+ 
+ INSTALLED_SYSTEMIMAGE := $(PRODUCT_OUT)/system.img
+@@ -895,7 +908,16 @@ endif
+ system_tar := $(PRODUCT_OUT)/system.tar
+ INSTALLED_SYSTEMTARBALL_TARGET := $(system_tar).$(SYSTEM_TARBALL_FORMAT)
+ $(INSTALLED_SYSTEMTARBALL_TARGET): PRIVATE_SYSTEM_TAR := $(system_tar)
+-$(INSTALLED_SYSTEMTARBALL_TARGET): $(FS_GET_STATS) $(INTERNAL_SYSTEMIMAGE_FILES)
++$(INSTALLED_SYSTEMTARBALL_TARGET): $(FS_GET_STATS) \
++		$(INTERNAL_SYSTEMIMAGE_FILES) \
++		$(INSTALLED_MODULES_TARGET) \
++		$(INSTALLED_KERNELFW_TARGET) \
++
++	$(hide) rm -rf $(TARGET_OUT)/lib/modules
++	$(hide) rm -rf $(TARGET_OUT)/lib/firmware
++	$(hide) mkdir -p $(TARGET_OUT)/lib/
++	$(if $(INSTALLED_MODULES_TARGET),$(hide) tar -xz -C $(TARGET_OUT)/lib/ -f $(INSTALLED_MODULES_TARGET))
++	$(if $(INSTALLED_KERNELFW_TARGET),$(hide) tar -xz -C $(TARGET_OUT)/lib/ -f $(INSTALLED_KERNELFW_TARGET))
+ 	$(build-systemtarball-target)
+ 
+ .PHONY: systemtarball-nodeps
+diff --git a/core/cleanbuild.mk b/core/cleanbuild.mk
+index 7103140..2406616 100644
+--- a/core/cleanbuild.mk
++++ b/core/cleanbuild.mk
+@@ -184,6 +184,7 @@ installclean_files := \
+ 	$(PRODUCT_OUT)/*.xlb \
+ 	$(PRODUCT_OUT)/*.zip \
+ 	$(PRODUCT_OUT)/kernel \
++	$(PRODUCT_OUT)/*.tar.gz \
+ 	$(PRODUCT_OUT)/data \
+ 	$(PRODUCT_OUT)/obj/APPS \
+ 	$(PRODUCT_OUT)/obj/NOTICE_FILES \
+@@ -198,7 +199,10 @@ installclean_files := \
+ 	$(PRODUCT_OUT)/obj/EXECUTABLES/init_intermediates \
+ 	$(PRODUCT_OUT)/obj/ETC/mac_permissions.xml_intermediates \
+ 	$(PRODUCT_OUT)/obj/ETC/sepolicy_intermediates \
+-	$(PRODUCT_OUT)/iago
++	$(PRODUCT_OUT)/iago \
++	$(PRODUCT_OUT)/obj/kernel \
++	$(PRODUCT_OUT)/obj/kernelmods \
++	$(PRODUCT_OUT)/System.map
+ 
+ # The files/dirs to delete during a dataclean, which removes any files
+ # in the staging and emulator data partitions.
+diff --git a/core/combo/TARGET_linux-x86.mk b/core/combo/TARGET_linux-x86.mk
+index 7a2ac60..9272d56 100644
+--- a/core/combo/TARGET_linux-x86.mk
++++ b/core/combo/TARGET_linux-x86.mk
+@@ -47,6 +47,14 @@ TARGET_TOOLCHAIN_ROOT := prebuilts/gcc/$(HOST_PREBUILT_TAG)/x86/i686-linux-andro
+ TARGET_TOOLS_PREFIX := $(TARGET_TOOLCHAIN_ROOT)/bin/i686-linux-android-
+ endif
+ 
++ifeq ($(TARGET_KERNEL_ARCH),x86_64)
++TARGET_KERNEL_TOOLCHAIN_ROOT := prebuilts/gcc/$(HOST_PREBUILT_TAG)/host/x86_64-linux-glibc2.7-4.6
++TARGET_KERNEL_TOOLS_PREFIX := $(TARGET_KERNEL_TOOLCHAIN_ROOT)/bin/x86_64-linux-
++else
++TARGET_KERNEL_TOOLCHAIN_ROOT := $(TARGET_TOOLCHAIN_ROOT)
++TARGET_KERNEL_TOOLS_PREFIX := $(TARGET_TOOLS_PREFIX)
++endif
++
+ TARGET_CC := $(TARGET_TOOLS_PREFIX)gcc$(HOST_EXECUTABLE_SUFFIX)
+ TARGET_CXX := $(TARGET_TOOLS_PREFIX)g++$(HOST_EXECUTABLE_SUFFIX)
+ TARGET_AR := $(TARGET_TOOLS_PREFIX)ar$(HOST_EXECUTABLE_SUFFIX)
+diff --git a/core/config.mk b/core/config.mk
+index 627cd96..19e2745 100644
+--- a/core/config.mk
++++ b/core/config.mk
+@@ -178,8 +178,16 @@ else
+ endif # TARGET_NO_BOOTLOADER
+ ifneq ($(strip $(TARGET_NO_KERNEL)),true)
+   INSTALLED_KERNEL_TARGET := $(PRODUCT_OUT)/kernel
++  INSTALLED_MODULES_TARGET := $(PRODUCT_OUT)/kernelmod.tar.gz
++  INSTALLED_KERNELFW_TARGET := $(PRODUCT_OUT)/kernelfw.tar.gz
++  INSTALLED_SYSTEM_MAP := $(PRODUCT_OUT)/System.map
++  INSTALLED_KERNEL_SCRIPTS := $(PRODUCT_OUT)/kernelscr.tar.gz
+ else
+   INSTALLED_KERNEL_TARGET :=
++  INSTALLED_MODULES_TARGET :=
++  INSTALLED_KERNELFW_TARGET :=
++  INSTALLED_SYSTEM_MAP :=
++  INSTALLED_KERNEL_SCRIPTS :=
+ endif
+ 
+ 
+diff --git a/core/dumpvar.mk b/core/dumpvar.mk
+index 92bf6af..ef601e6 100644
+--- a/core/dumpvar.mk
++++ b/core/dumpvar.mk
+@@ -99,6 +99,7 @@ $(info   TARGET_BUILD_APPS=$(TARGET_BUILD_APPS))
+ $(info   TARGET_ARCH=$(TARGET_ARCH))
+ $(info   TARGET_ARCH_VARIANT=$(TARGET_ARCH_VARIANT))
+ $(info   TARGET_CPU_VARIANT=$(TARGET_CPU_VARIANT))
++$(info   TARGET_KERNEL_ARCH=$(TARGET_KERNEL_ARCH))
+ $(info   HOST_ARCH=$(HOST_ARCH))
+ $(info   HOST_OS=$(HOST_OS))
+ $(info   HOST_OS_EXTRA=$(HOST_OS_EXTRA))
+diff --git a/core/kernel.mk b/core/kernel.mk
+new file mode 100644
+index 0000000..ab4ea30
+--- /dev/null
++++ b/core/kernel.mk
+@@ -0,0 +1,263 @@
++#
++# Copyright (C) 2009 The Android-x86 Open Source Project
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++
++ifneq ($(strip $(TARGET_NO_KERNEL)),true)
++
++# Location of the kernel archive as generated by the build system. Use a stable
++# name so it's easy to find in scripts. We'll properly namespace it when we put
++# it in out/dist/
++INSTALLED_KERNEL_ARCHIVE := $(OUT)/kernel-archive.zip
++
++# use_prebuilt_kernel is the variable used for determining if we will be using
++# prebuilt kernel components or build kernel from source, in the code that
++# follows below.
++use_prebuilt_kernel :=
++
++# Test for the presence of a prebuilt kernel archive. If this variable is set
++# in BoardConfig.mk and the file exists, we'll use that instead of building from
++# source using the policy in the lines below.
++kernel_prebuilt_archive := $(wildcard $(TARGET_PREBUILT_KERNEL_ARCHIVE))
++
++ifneq ($(kernel_prebuilt_archive),)
++  $(info KERNEL: Kernel prebuilt archive is available)
++
++  # We have all the ingredients necessary for prebuilt kernels, but we make sure
++  # that the user didn't set the BUILD_KERNEL variable, in which case we will be
++  # forcing the kernel build from source.
++  ifeq ($(BUILD_KERNEL),)
++    $(info KERNEL: BUILD_KERNEL is not set, will not force kernel source build)
++
++    # Under this condition, we set use_prebuilt_kernel to true, which means that we
++    # will be using prebuilt kernels below.
++    use_prebuilt_kernel := true
++    $(info KERNEL: Will use prebuilt kernel)
++  else # BUILD_KERNEL != null
++    # This is the case where users force kernel build from source.
++    $(info KERNEL: BUILD_KERNEL is set to a non-null value. Will not use prebuilt kernels)
++  endif
++else # kernel prebuilt mandatory ingredients are not available
++  $(info KERNEL: Kernel prebuilt archive is not available. Will not use prebuilt kernels)
++endif
++
++TARGET_KERNEL_SCRIPTS := sign-file $(BOARD_KERNEL_SCRIPTS)
++
++ifneq ($(use_prebuilt_kernel),true)
++
++$(info Building kernel from source)
++
++# Boards will typically need to set the following variables
++# TARGET_KERNEL_CONFIG - Name of the base defconfig to use
++# TARGET_KERNEL_CONFIG_OVERRIDES - 0 or more 'override' files to modify the
++#     base defconfig; for enable, special overrides for user builds to disable
++#     debug features, etc.
++# TARGET_KERNEL_SOURCE - Location of kernel source directory relative to the
++#     top level
++# TARGET_KERNEL_EXTRA_CFLAGS - Additional CFLAGS which will be passed to the
++#     kernel 'make' invocation as KCFLAGS
++
++
++ifeq ($(TARGET_ARCH),x86)
++  KERNEL_TARGET := bzImage
++  TARGET_KERNEL_CONFIG ?= android-x86_defconfig
++  ifeq ($(TARGET_KERNEL_ARCH),)
++    TARGET_KERNEL_ARCH := i386
++  endif
++endif
++
++ifeq ($(TARGET_ARCH),arm)
++  KERNEL_TARGET := zImage
++  TARGET_KERNEL_CONFIG ?= goldfish_defconfig
++  ifeq ($(TARGET_KERNEL_ARCH),)
++    TARGET_KERNEL_ARCH := arm
++  endif
++endif
++
++TARGET_KERNEL_SOURCE ?= kernel
++
++kernel_script_deps := $(foreach s,$(TARGET_KERNEL_SCRIPTS),$(TARGET_KERNEL_SOURCE)/scripts/$(s))
++kbuild_output := $(CURDIR)/$(TARGET_OUT_INTERMEDIATES)/kernel
++script_output := $(CURDIR)/$(TARGET_OUT_INTERMEDIATES)/kscripts
++modbuild_output := $(CURDIR)/$(TARGET_OUT_INTERMEDIATES)/kernelmods
++
++# Leading "+" gives child Make access to the jobserver.
++# Be sure to have CONFIG_KERNEL_MINIGZIP enabled or your
++# incremental OTA binary diffs will be very large.
++mk_kernel := + $(hide) $(MAKE) -C $(TARGET_KERNEL_SOURCE)  O=$(kbuild_output) ARCH=$(TARGET_KERNEL_ARCH) $(if $(SHOW_COMMANDS),V=1) KCFLAGS="$(TARGET_KERNEL_EXTRA_CFLAGS)"
++ifneq ($(TARGET_KERNEL_CROSS_COMPILE),false)
++  ifneq ($(TARGET_KERNEL_TOOLS_PREFIX),)
++    ifneq ($(USE_CCACHE),)
++      mk_kernel += CROSS_COMPILE="$(CCACHE_BIN) $(CURDIR)/$(TARGET_KERNEL_TOOLS_PREFIX)"
++    else
++       mk_kernel += CROSS_COMPILE=$(CURDIR)/$(TARGET_KERNEL_TOOLS_PREFIX)
++    endif
++  endif
++endif
++
++# If there's a file in the arch-specific configs directory that matches
++# what's in $(TARGET_KERNEL_CONFIG), use that. Otherwise, use $(TARGET_KERNEL_CONFIG)
++# verbatim
++ifneq ($(wildcard $(TARGET_KERNEL_SOURCE)/arch/$(TARGET_ARCH)/configs/$(TARGET_KERNEL_CONFIG)),)
++  kernel_config_file := $(TARGET_KERNEL_SOURCE)/arch/$(TARGET_ARCH)/configs/$(TARGET_KERNEL_CONFIG)
++else
++  kernel_config_file := $(TARGET_KERNEL_CONFIG)
++endif
++
++# FIXME: doesn't check overrides, only the base configuration file
++kernel_mod_enabled = $(shell grep ^CONFIG_MODULES=y $(kernel_config_file))
++kernel_fw_enabled = $(shell grep ^CONFIG_FIRMWARE_IN_KERNEL=y $(kernel_config_file))
++
++# signed kernel modules
++kernel_signed_mod_enabled = $(shell grep ^CONFIG_MODULE_SIG=y $(kernel_config_file))
++kernel_genkey := $(kbuild_output)/x509.genkey
++kernel_private_key := $(kbuild_output)/signing_key.priv
++kernel_public_key := $(kbuild_output)/signing_key.x509
++kernel_key_deps := $(if kernel_signed_mod_enabled,$(kernel_genkey) $(kernel_private_key) $(kernel_public_key))
++
++$(kernel_public_key): $(TARGET_MODULE_KEY_PAIR).x509.pem
++	$(hide) mkdir -p $(dir $@)
++	$(hide) openssl x509 -inform PEM -outform DER -in $(TARGET_MODULE_KEY_PAIR).x509.pem -out $@
++
++$(kernel_private_key): $(TARGET_MODULE_KEY_PAIR).pk8
++	$(hide) mkdir -p $(dir $@)
++	$(hide) openssl pkcs8 -nocrypt -inform DER -outform PEM -in $(TARGET_MODULE_KEY_PAIR).pk8 -out $@
++
++$(kernel_genkey): $(TARGET_MODULE_GENKEY) | $(ACP)
++	$(copy-file-to-target)
++
++# The actual .config that is in use during the build is derived from
++# a base $kernel_config_file, plus a a list of config overrides which
++# are processed in order.
++kernel_dotconfig_file := $(kbuild_output)/.config
++$(kernel_dotconfig_file): $(kernel_config_file) $(TARGET_KERNEL_CONFIG_OVERRIDES) | $(ACP)
++	$(hide) mkdir -p $(dir $@)
++	build/tools/build-defconfig.py $^ > $@
++
++built_kernel_target := $(kbuild_output)/arch/$(TARGET_ARCH)/boot/$(KERNEL_TARGET)
++
++# Declared .PHONY to force a rebuild each time. We can't tell if the kernel
++# sources have changed from this context
++.PHONY : $(INSTALLED_KERNEL_TARGET)
++
++$(INSTALLED_KERNEL_TARGET): $(kernel_dotconfig_file) $(kernel_key_deps) $(MINIGZIP) | $(ACP)
++	$(hide) rm -f $(kbuild_output)/.config.old
++	$(mk_kernel) oldnoconfig
++	$(mk_kernel) $(KERNEL_TARGET) $(if $(kernel_mod_enabled),modules)
++	$(hide) $(ACP) -fp $(built_kernel_target) $@
++
++$(INSTALLED_SYSTEM_MAP): $(INSTALLED_KERNEL_TARGET) | $(ACP)
++	$(hide) $(ACP) $(kbuild_output)/System.map $@
++
++# FIXME Workaround due to lack of simultaneous support of M= and O=; copy the
++# source into an intermediate directory and compile it there, preserving
++# timestamps so code is only rebuilt if it changes.
++# Extra newline intentional to prevent calling foreach from concatenating
++# into a single line
++# FIXME: Need to extend this so that all external modules are not built by
++# default, need to define them each as an Android module and include them as
++# needed in PRODUCT_PACKAGES
++define make-ext-module
++	$(hide) mkdir -p $(kbuild_output)/extmods/$(1)
++	$(hide) $(ACP) -rtf $(1)/* $(kbuild_output)/extmods/$(1)
++	$(mk_kernel) M=$(kbuild_output)/extmods/$(1) INSTALL_MOD_PATH=$(2) modules
++	$(mk_kernel) M=$(kbuild_output)/extmods/$(1) INSTALL_MOD_PATH=$(2) modules_install
++
++endef
++
++define make-modules
++	$(mk_kernel) INSTALL_MOD_PATH=$(1) modules_install
++	$(foreach item,$(EXTERNAL_KERNEL_MODULES),$(call make-ext-module,$(item),$(1)))
++	$(hide) rm -f $(1)/lib/modules/*/{build,source}
++	$(hide) cd $(1)/lib/modules && find -type f -print0 | xargs -t -0 -I{} mv {} .
++endef
++
++$(INSTALLED_MODULES_TARGET): $(INSTALLED_KERNEL_TARGET) $(MINIGZIP) | $(ACP)
++	$(hide) rm -rf $(modbuild_output)/lib/modules
++	$(hide) mkdir -p $(modbuild_output)/lib/modules
++	$(if $(kernel_mod_enabled),$(call make-modules,$(modbuild_output)))
++	$(hide) tar -cz -C $(modbuild_output)/lib/ -f $(CURDIR)/$@ modules
++
++$(INSTALLED_KERNELFW_TARGET): $(INSTALLED_KERNEL_TARGET) $(INSTALLED_MODULES_TARGET) $(MINIGZIP)
++	$(hide) rm -rf $(modbuild_output)/lib/firmware
++	$(hide) mkdir -p $(modbuild_output)/lib/firmware
++	$(if $(kernel_fw_enabled),$(mk_kernel) INSTALL_MOD_PATH=$(modbuild_output) firmware_install)
++	$(hide) tar -cz -C $(modbuild_output)/lib/ -f $(CURDIR)/$@ firmware
++
++$(INSTALLED_KERNEL_SCRIPTS): $(kernel_script_deps) | $(ACP)
++	$(hide) rm -rf $(script_output)
++	$(hide) mkdir -p $(script_output)
++	$(hide) $(ACP) -p $(kernel_script_deps) $(script_output)
++	$(hide) tar -cz -C $(script_output) -f $(CURDIR)/$@ $(foreach item,$(kernel_script_deps),$(notdir $(item)))
++
++PREBUILT-PROJECT-linux: \
++		$(INSTALLED_KERNEL_TARGET) \
++		$(INSTALLED_SYSTEM_MAP) \
++		$(INSTALLED_MODULES_TARGET) \
++		$(INSTALLED_KERNELFW_TARGET) \
++		$(INSTALLED_KERNEL_SCRIPTS) \
++
++	$(hide) rm -rf out/prebuilt/linux/$(TARGET_PREBUILT_TAG)/kernel/$(TARGET_PRODUCT)-$(TARGET_BUILD_VARIANT)
++	$(hide) mkdir -p out/prebuilt/linux/$(TARGET_PREBUILT_TAG)/kernel/$(TARGET_PRODUCT)-$(TARGET_BUILD_VARIANT)
++	$(hide) $(ACP) -fp $^ out/prebuilt/linux/$(TARGET_PREBUILT_TAG)/kernel/$(TARGET_PRODUCT)-$(TARGET_BUILD_VARIANT)
++
++$(INSTALLED_KERNEL_ARCHIVE):  \
++			$(INSTALLED_KERNEL_TARGET) \
++			$(INSTALLED_SYSTEM_MAP) \
++			$(INSTALLED_MODULES_TARGET) \
++			$(INSTALLED_KERNELFW_TARGET) \
++			$(INSTALLED_KERNEL_SCRIPTS)
++	$(hide) zip -qj $@ $^
++
++else # use_prebuilt_kernel = true
++
++define extract-from-zip
++@echo "Unzip $(dir $@) <- $<"
++$(hide) mkdir -p $(dir $@)
++$(hide) unzip -qo $< -d $(dir $@) $(notdir $@)
++endef
++
++$(info Using prebuilt kernel components)
++$(INSTALLED_KERNEL_TARGET): $(kernel_prebuilt_archive)
++	$(extract-from-zip)
++
++$(INSTALLED_SYSTEM_MAP): $(kernel_prebuilt_archive)
++	$(extract-from-zip)
++
++$(INSTALLED_KERNEL_SCRIPTS): $(kernel_prebuilt_archive)
++	$(extract-from-zip)
++
++$(INSTALLED_MODULES_TARGET): $(kernel_prebuilt_archive)
++	$(extract-from-zip)
++
++$(INSTALLED_KERNELFW_TARGET): $(kernel_prebuilt_archive)
++	$(extract-from-zip)
++
++$(INSTALLED_KERNEL_ARCHIVE): $(kernel_prebuilt_archive) | $(ACP)
++	$(copy-file-to-new-target)
++
++# It makes no sense to use the automatic prebuilts machinery target, if we have
++# used the prebuilt kernel. It would mean re-copying the same files in the
++# upstream repository, from where they came initially. So, we return an error
++# if anyone is trying a "make PREBUILT-*" target.
++PREBUILT-PROJECT-linux:
++	$(error Automatic prebuilts for kernel are available only when building kernel from source)
++
++endif # use_prebuilt_kernel
++
++use_prebuilt_kernel :=
++host_scripts := $(foreach item,$(TARGET_KERNEL_SCRIPTS),$(HOST_OUT_EXECUTABLES)/$(notdir $(item)))
++$(host_scripts): $(INSTALLED_KERNEL_SCRIPTS)
++	$(hide) tar -C $(HOST_OUT_EXECUTABLES) -xzvf $(INSTALLED_KERNEL_SCRIPTS) $(notdir $@)
++
++.PHONY: kernel
++kernel: $(INSTALLED_KERNEL_ARCHIVE)
++
++$(call dist-for-goals,droidcore,$(INSTALLED_KERNEL_ARCHIVE):$(TARGET_PRODUCT)-kernel-archive-$(FILE_NAME_TAG).zip)
++
++endif # TARGET_NO_KERNEL
+diff --git a/tools/build-defconfig.py b/tools/build-defconfig.py
+new file mode 100755
+index 0000000..24d9f2e
+--- /dev/null
++++ b/tools/build-defconfig.py
+@@ -0,0 +1,87 @@
++#!/usr/bin/env python
++
++#
++# This script is designed to build a Linux kernel defconfig file out of an
++# arbitrary number of fragments. Input can be passed on stdin or as a list of
++# filenames to read as program arguments. Each input line is analyzed for a
++# config variable. If found, any previous setting of that variable is discarded
++# and replaced with the new setting. If no previous setting of the variable
++# existed, the new setting is added as-is.
++#
++
++import fileinput, sys, re
++
++# Extract the CONFIG_ variable name from an input line:
++def varname(line):
++	comments_stripped = re.sub( r'^[# \t]*', "", line)
++	tokens = re.split( '[= ]', comments_stripped)
++	return tokens[0]
++
++# Determine if line specifies a CONFIG variable or not:
++def is_config(line):
++	if re.search( '^\s*CONFIG', line):                    return True
++	if re.search( '^\s*#\s*CONFIG.*is not set\s*', line): return True
++	return False
++
++if __name__ == "__main__":
++	output = []
++	cache = {}
++	for input_line in fileinput.input():
++
++		# Pass comments directly through:
++		if not is_config(input_line):
++			output.append(input_line)
++			continue
++
++		# If we've already seen this variable, update it:
++		name = varname(input_line)
++		if name in cache:
++			lineno = cache[name]
++			output[lineno] = input_line
++			continue
++
++		# If we haven't seen this variable before, cache it and pass it
++		# through:
++		cache[name] = len(output)
++		output.append(input_line)
++
++	sys.stdout.writelines(output)
++	sys.exit(0)
++
++# Test dataset:
++
++# # Un-duplicated variable
++# CONFIG_A=A
++#
++# # Variable gets changed
++# CONFIG_B=B
++# CONFIG_B=A
++#
++# # Not set variable gets passed through
++# # CONFIG_C is not set
++#
++# # Not set variable gets set
++# # CONFIG_D is not set
++# CONFIG_D=D
++#
++# # Set variable gets unset
++# CONFIG_E=E
++# # CONFIG_E is not set
++
++# Output should be:
++
++# # Un-duplicated variable
++# CONFIG_A=A
++#
++# # Variable gets changed
++# CONFIG_B=A
++#
++# # Not set variable gets passed through
++# # CONFIG_C is not set
++#
++# # Not set variable gets set
++# CONFIG_D=D
++#
++# # Set variable gets unset
++# # CONFIG_E is not set
++
+-- 
+1.7.4.1
+

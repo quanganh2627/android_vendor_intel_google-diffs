@@ -1,0 +1,3392 @@
+From 099ab2ea39937301daae53ce788b0843992671ba Mon Sep 17 00:00:00 2001
+From: Udayan Banerji <udayan.banerji@intel.com>
+Date: Mon, 19 Aug 2013 18:25:21 -0700
+Subject: Dalvik: Vectorization Support for ME
+
+BZ: 132506
+
+A new pass has been added to the middle-end to support doing vectorization.
+The pass is applied to only very simple loops. Only add-int and
+mul-int instructions are supported for vectorization. The pass finds
+a simple loop with those instructions and then creates a sibling loop that
+is a vectorized equivalent. A test is added at top of vectorized loop
+that checks if there are enough iterations to do packed work. The vectorized
+loop always goes next to the normal loop in case any final iterations need
+completed in a non-vectorized fashion. The ME vectorization pass generates
+extended MIRs for vectorized instructions which must be supported by BE.
+
+The LoopInformation structure received several new helper methods. Three
+of them are for requesting specific blocks. Others are helpers for getting
+induction variable information.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Ib0cdc43a4b4004f0c3232b2b179e0b19316439d1
+Orig-MCG-Change-Id: Ic6bb216b18452741fcad4bd63e44cdfd4535a143
+Signed-off-by: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Signed-off-by: Udayan Banerji <udayan.banerji@intel.com>
+Signed-off-by: Yixin Shou <yixin.shou@intel.com>
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Reviewed-on: http://android.intel.com:8080/123704
+Reviewed-by: Provodin, Vitaly A <vitaly.a.provodin@intel.com>
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/Dvm.mk                           |    3 +-
+ vm/Globals.h                        |    8 +-
+ vm/Init.cpp                         |   38 +-
+ vm/compiler/AccumulationSinking.cpp |   28 +-
+ vm/compiler/AccumulationSinking.h   |    2 +-
+ vm/compiler/Frontend.cpp            |   35 +
+ vm/compiler/InvariantRemoval.cpp    |    2 +-
+ vm/compiler/InvariantRemoval.h      |    2 +-
+ vm/compiler/Loop.cpp                |    2 +-
+ vm/compiler/LoopInformation.cpp     |  227 +++++-
+ vm/compiler/LoopInformation.h       |   60 +-
+ vm/compiler/LoopOpt.cpp             |   21 +-
+ vm/compiler/LoopOpt.h               |   12 +-
+ vm/compiler/Pass.cpp                |    2 +-
+ vm/compiler/Pass.h                  |    8 +-
+ vm/compiler/RegisterizationME.cpp   |  263 +++---
+ vm/compiler/RegisterizationME.h     |    7 -
+ vm/compiler/SSATransformation.cpp   |  120 +++-
+ vm/compiler/Vectorization.cpp       | 1877 +++++++++++++++++++++++++++++++++++
+ vm/compiler/Vectorization.h         |   43 +
+ 20 files changed, 2538 insertions(+), 222 deletions(-)
+ create mode 100644 vm/compiler/Vectorization.cpp
+ create mode 100644 vm/compiler/Vectorization.h
+
+diff --git a/vm/Dvm.mk b/vm/Dvm.mk
+index b6237c3..d537fc1 100644
+--- a/vm/Dvm.mk
++++ b/vm/Dvm.mk
+@@ -379,7 +379,8 @@ ifeq ($(dvm_arch),x86)
+               compiler/RegisterizationME.cpp \
+               compiler/Expression.cpp \
+               compiler/AccumulationSinking.cpp \
+-              compiler/SinkCastOpt.cpp
++              compiler/SinkCastOpt.cpp \
++              compiler/Vectorization.cpp
+ 
+        # need apache harmony x86 encoder/decoder
+        LOCAL_C_INCLUDES += \
+diff --git a/vm/Globals.h b/vm/Globals.h
+index f6257f4..3efcacb 100644
+--- a/vm/Globals.h
++++ b/vm/Globals.h
+@@ -809,7 +809,7 @@ typedef struct sJitFramework
+     Pass *firstPass;
+ 
+     /** @brief The general pass gate if there is one, called before each Pass */
+-    bool (*generalGate) (const CompilationUnit *, const Pass*);
++    bool (*generalGate) (const CompilationUnit *, Pass*);
+ 
+     /** @brief Back-end function pointer */
+     void (*backEndFunction) (CompilationUnit *, JitTranslationInfo *);
+@@ -1018,6 +1018,12 @@ struct DvmJitGlobals {
+     /* Flag to control backend registerization */
+     bool backEndRegisterization;
+ 
++    /* Flag to control the number of vector registers to use */
++    unsigned char vectorRegisters;
++
++    /* Flag to control the number of the minimum vectorized iterations */
++    unsigned char minVectorizedIterations;
++
+     /* Structure to handle the Jit framework */
+     SJitFramework jitFramework;
+ 
+diff --git a/vm/Init.cpp b/vm/Init.cpp
+index a43091a..c97e1e0 100644
+--- a/vm/Init.cpp
++++ b/vm/Init.cpp
+@@ -1537,9 +1537,6 @@ int processOptions(int argc, const char* const argv[], bool ignoreUnrecognized)
+             gDvmJit.scheduling = false;
+         } else if (strncmp(argv[i], "-Xjitnestedloops", 16) == 0) {
+             gDvmJit.nestedLoops = true;
+-            //For the moment turn off registerization in the back-end in the case of nested loops
+-            gDvmJit.backEndRegisterization = false;
+-            gDvmJit.maximumRegisterization = 0;
+         } else if (strncmp(argv[i], "-Xjittestloops", 14) == 0) {
+             gDvmJit.testLoops = true;
+         } else if (strncmp(argv[i], "-Xjitbranchloops", 16) == 0) {
+@@ -1552,6 +1549,36 @@ int processOptions(int argc, const char* const argv[], bool ignoreUnrecognized)
+             gDvmJit.maximumRegisterization = 0;
+         } else if (strncmp(argv[i], "-Xjitextraoptsfile:", 19) == 0) {
+             gDvm.extraOptionsFile = strdup (argv[i] + 19);
++        } else if (strncmp(argv[i], "-XjitvectorizedIterations:", 26) == 0) {
++            char *endptr = NULL;
++            //Get requested style
++            long res = strtol (argv[i] + 26, &endptr, 0);
++
++            //Error checking: basic ones first
++            if (endptr != NULL && *endptr == '\0' && res != LONG_MIN && res != LONG_MAX && res > 0)
++            {
++                dvmFprintf (stderr, "Setting Vector registers value to: %ld\n", res);
++                gDvmJit.minVectorizedIterations = res;
++            }
++            else
++            {
++                dvmFprintf (stderr, "Refusing option for %s, it is not a valid number: must be only a strictly positive number\n", argv[i]);
++            }
++        } else if (strncmp(argv[i], "-XjitvectorRegisters:", 21) == 0) {
++            char *endptr = NULL;
++            //Get requested style
++            long res = strtol (argv[i] + 21, &endptr, 0);
++
++            //Error checking: basic ones first
++            if (endptr != NULL && *endptr == '\0' && res != LONG_MIN && res != LONG_MAX && res > 0)
++            {
++                dvmFprintf (stderr, "Setting Vector registers value to: %ld\n", res);
++                gDvmJit.vectorRegisters = res;
++            }
++            else
++            {
++                dvmFprintf (stderr, "Refusing option for %s, it is not a valid number: must be only a strictly positive number\n", argv[i]);
++            }
+         } else if (strncmp(argv[i], "-Xjitregisterization:", 21) == 0) {
+             char *endptr = NULL;
+             //Get requested style
+@@ -1858,6 +1885,11 @@ static void setCommandLineDefaults()
+     gDvmJit.maximumRegisterization = UINT_MAX;
+     gDvmJit.abortOnCompilerError = false;
+ 
++    //Maximum vectorized registers
++    gDvmJit.vectorRegisters = 8;
++    //Minimum vectorized iterations or we won't vectorize
++    gDvmJit.minVectorizedIterations = 3;
++
+     gDvmJit.ignorePasses = 0;
+ #if defined(ARCH_IA32)
+     //Set the jit framework in place
+diff --git a/vm/compiler/AccumulationSinking.cpp b/vm/compiler/AccumulationSinking.cpp
+index bc888b9..a5ab804 100644
+--- a/vm/compiler/AccumulationSinking.cpp
++++ b/vm/compiler/AccumulationSinking.cpp
+@@ -813,29 +813,6 @@ static void removeAccumulations(const std::vector<MIR *> & toRemove)
+ }
+ 
+ /**
+- * @brief Sink the accumulations
+- * @param cUnit the CompilationUnit
+- * @param info the LoopInformation
+- * @param toSink the vector of new expressions to sink
+- */
+-static void sinkAccumulations (CompilationUnit *cUnit, LoopInformation *info, const std::vector<MIR *> &toSink)
+-{
+-    //We need to sink to the exit loops and the backward chaining cell
+-
+-    //First, handle the exit loops
+-    BitVector *bv = const_cast<BitVector *> (info->getExitLoops ());
+-
+-    //Add the instructions to the basic blocks defined by the vector
+-    dvmCompilerPrependInstructionsToBasicBlocks (cUnit, bv, toSink);
+-
+-    //Now get the backward chaining cells
+-    bv = const_cast<BitVector *> (info->getBackwardBranches ());
+-
+-    //Add the instructions to the basic blocks defined by the vector
+-    dvmCompilerPrependInstructionsToBasicBlocks (cUnit, bv, toSink);
+-}
+-
+-/**
+  * @brief Handle a loop for the sinking of an accumulation
+  * @param cUnit the CompilationUnit
+  * @param info the LoopInformation
+@@ -876,14 +853,13 @@ static bool sinkAccumulation (CompilationUnit *cUnit, LoopInformation *info, voi
+             toSink, toHoist);
+ 
+     //Step 5: Sink the accumulation
+-    sinkAccumulations (cUnit, info, toSink);
++    info->addInstructionsToExits (cUnit, toSink);
+ 
+     //Step 6: Hoist the initial value decrementation
+     dvmCompilerAddInstructionsToBasicBlock (info->getPreHeader (), toHoist);
+ 
+     //Step 7: Remove MIRs no longer needed
+     removeAccumulations (toRemove);
+-
+     return true;
+ }
+ 
+@@ -946,7 +922,7 @@ static bool compilerSinkAccumulationsGateHelper(const CompilationUnit *cUnit, Lo
+     return true;
+ }
+ 
+-bool dvmCompilerSinkAccumulationsGate(const CompilationUnit *cUnit, const Pass *curPass)
++bool dvmCompilerSinkAccumulationsGate(const CompilationUnit *cUnit, Pass *curPass)
+ {
+     //First, make sure we are in the new loop detection system
+     if (dvmCompilerTraceIsLoopNewSystem(cUnit, curPass) == false)
+diff --git a/vm/compiler/AccumulationSinking.h b/vm/compiler/AccumulationSinking.h
+index cb0ea2c..ddb4c7b 100644
+--- a/vm/compiler/AccumulationSinking.h
++++ b/vm/compiler/AccumulationSinking.h
+@@ -35,5 +35,5 @@ void dvmCompilerAccumulationSinking (CompilationUnit *cUnit, Pass *pass);
+  * @param curPass the Pass
+  * @return whether the sink accumulation sinking
+  */
+-bool dvmCompilerSinkAccumulationsGate (const CompilationUnit *cUnit, const Pass *curPass);
++bool dvmCompilerSinkAccumulationsGate (const CompilationUnit *cUnit, Pass *curPass);
+ #endif
+diff --git a/vm/compiler/Frontend.cpp b/vm/compiler/Frontend.cpp
+index 397e3fc..4bc62e4 100644
+--- a/vm/compiler/Frontend.cpp
++++ b/vm/compiler/Frontend.cpp
+@@ -1924,6 +1924,35 @@ static void printAcceptedLoop (CompilationUnit *cUnit)
+     free (signature), signature = NULL;
+ }
+ 
++/**
++ * @brief Count the bytecodes in the CompilationUnit
++ * @param cUnit the CompilationUnit
++ * @return the number of bytecodes to be compiled
++ */
++static unsigned int countByteCodes (CompilationUnit *cUnit)
++{
++    unsigned int res = 0;
++
++    GrowableListIterator iterator;
++    dvmGrowableListIteratorInit(&cUnit->blockList, &iterator);
++
++    while (true)
++    {
++        BasicBlock *bbscan = (BasicBlock *) dvmGrowableListIteratorNext(&iterator);
++        if (bbscan == NULL)
++        {
++            break;
++        }
++
++        for (MIR *mir = bbscan->firstMIRInsn; mir != 0; mir = mir->next)
++        {
++            res++;
++        }
++    }
++
++    return res;
++}
++
+ /* Compile a loop */
+ static bool compileLoop(CompilationUnit *cUnit, unsigned int startOffset,
+                         JitTraceDescription *desc, int numMaxInsts,
+@@ -2031,6 +2060,12 @@ static bool compileLoop(CompilationUnit *cUnit, unsigned int startOffset,
+     //Set that the CompilationUnit is a loop
+     dvmCompilerLoopOpt(cUnit);
+ 
++    //If over accepted amount, bail
++    if (countByteCodes (cUnit) > JIT_MAX_TRACE_LEN)
++    {
++        goto bail;
++    }
++
+     //If anybody wanted to quit, exit now
+     if (cUnit->quitLoopMode == true)
+     {
+diff --git a/vm/compiler/InvariantRemoval.cpp b/vm/compiler/InvariantRemoval.cpp
+index 8e6b1ca..8480110 100644
+--- a/vm/compiler/InvariantRemoval.cpp
++++ b/vm/compiler/InvariantRemoval.cpp
+@@ -1025,7 +1025,7 @@ static bool invariantRemovalGateHelper (const CompilationUnit *cUnit, LoopInform
+     return true;
+ }
+ 
+-bool dvmCompilerInvariantRemovalGate (const CompilationUnit *cUnit, const Pass *curPass)
++bool dvmCompilerInvariantRemovalGate (const CompilationUnit *cUnit, Pass *curPass)
+ {
+     //Get the loop
+     LoopInformation *loopInfo = cUnit->loopInformation;
+diff --git a/vm/compiler/InvariantRemoval.h b/vm/compiler/InvariantRemoval.h
+index 2971aa8..45d0993 100644
+--- a/vm/compiler/InvariantRemoval.h
++++ b/vm/compiler/InvariantRemoval.h
+@@ -43,6 +43,6 @@ void dvmCompilerIgetIputRemoval (CompilationUnit *cUnit, Pass *curPass);
+  * @param curPass the current pass
+  * @return Returns whether invariant removal optimization can be done.
+  */
+-bool dvmCompilerInvariantRemovalGate (const CompilationUnit *cUnit, const Pass *curPass);
++bool dvmCompilerInvariantRemovalGate (const CompilationUnit *cUnit, Pass *curPass);
+ 
+ #endif
+diff --git a/vm/compiler/Loop.cpp b/vm/compiler/Loop.cpp
+index bfc724a..4027c75 100644
+--- a/vm/compiler/Loop.cpp
++++ b/vm/compiler/Loop.cpp
+@@ -951,7 +951,7 @@ void dvmCompilerBodyCodeMotion (CompilationUnit *cUnit, Pass *currentPass)
+     (void) currentPass;
+ }
+ 
+-bool dvmCompilerHoistedChecksGate(const CompilationUnit* cUnit, const Pass* pass)
++bool dvmCompilerHoistedChecksGate(const CompilationUnit* cUnit, Pass* pass)
+ {
+     if (cUnit->loopInformation != NULL && isSimpleCountedLoop((CompilationUnit*)cUnit)) {
+         return true;
+diff --git a/vm/compiler/LoopInformation.cpp b/vm/compiler/LoopInformation.cpp
+index 2e9928a..e63cab4 100644
+--- a/vm/compiler/LoopInformation.cpp
++++ b/vm/compiler/LoopInformation.cpp
+@@ -401,7 +401,7 @@ void LoopInformation::init (void)
+     scratchRegisters = 0;
+     peeledBlocks = 0;
+     countUpLoop = false;
+-    ssaBIV = NULL;
++    ssaBIV = 0;
+     endConditionReg = -1; // -1 for validation reasons
+ 
+     if (interIterationVariables == 0)
+@@ -531,6 +531,31 @@ LoopInformation *LoopInformation::getLoopInformationByEntry (const BasicBlock *e
+     return 0;
+ }
+ 
++BasicBlock *LoopInformation::getExitBlock (const CompilationUnit *cUnit)
++{
++    //Check if we have the exitLoop BitVector
++    if (exitLoop == 0)
++    {
++        return 0;
++    }
++
++    //Check if we have only one exit block
++    int numBlocks = dvmCountSetBits (exitLoop);
++
++    if (numBlocks != 1)
++    {
++        return 0;
++    }
++
++    //Get the basic block
++    BitVectorIterator bvIterator;
++    dvmBitVectorIteratorInit (exitLoop, &bvIterator);
++
++    BasicBlock *bb = dvmCompilerGetNextBasicBlockViaBitVector (bvIterator, cUnit->blockList);
++
++    return bb;
++}
++
+ BitVector *LoopInformation::getPostExitLoops (const CompilationUnit *cUnit)
+ {
+     BitVector *postExitLoop = dvmCompilerAllocBitVector (1, true);
+@@ -553,6 +578,64 @@ BitVector *LoopInformation::getPostExitLoops (const CompilationUnit *cUnit)
+     return postExitLoop;
+ }
+ 
++BasicBlock *LoopInformation::getPostExitBlock (const CompilationUnit *cUnit)
++{
++    //Get the post exit BasicBlocks BitVector
++    BitVector *postExitBlocks = getPostExitLoops (cUnit);
++
++    if (postExitBlocks == 0)
++    {
++        return 0;
++    }
++
++    //Check if we have only one post exit block
++    int numBlocks = dvmCountSetBits (postExitBlocks);
++
++    if (numBlocks != 1)
++    {
++        return 0;
++    }
++
++    //Get the basic block
++    BitVectorIterator bvIterator;
++    dvmBitVectorIteratorInit (postExitBlocks, &bvIterator);
++
++    BasicBlock *bb = dvmCompilerGetNextBasicBlockViaBitVector (bvIterator, cUnit->blockList);
++
++    return bb;
++}
++
++BasicBlock *LoopInformation::getBackwardBranchBlock (const CompilationUnit *cUnit)
++{
++    //Check if we have a backward blocks bitvector (Paranoid)
++    if (backward == 0)
++    {
++        return 0;
++    }
++
++    //Check if we have only one post exit block
++    int numBlocks = dvmCountSetBits (backward);
++
++    if (numBlocks != 1)
++    {
++        return 0;
++    }
++
++    //Get the basic block
++    BitVectorIterator bvIterator;
++    dvmBitVectorIteratorInit(backward, &bvIterator);
++
++    BasicBlock *bb = dvmCompilerGetNextBasicBlockViaBitVector (bvIterator, cUnit->blockList);
++
++    //Make sure it is a backward branch (Paranoid)
++    if (bb->blockType != kChainingCellBackwardBranch)
++    {
++        return 0;
++    }
++
++    return bb;
++}
++
+ bool LoopInformation::contains (const BasicBlock *bb) const
+ {
+     if (bb == 0 || basicBlocks == 0)
+@@ -699,7 +782,7 @@ bool LoopInformation::executedPerIteration (const CompilationUnit *cUnit, const
+     return executedPerIteration (cUnit, current);
+ }
+ 
+-bool LoopInformation::isAnInductionVariable (CompilationUnit *cUnit, unsigned int reg, bool isSSA)
++int LoopInformation::getInductionIncrement (const CompilationUnit *cUnit, unsigned int reg, bool isSSA)
+ {
+     //Go through the induction variable list
+     GrowableListIterator iterator;
+@@ -716,7 +799,42 @@ bool LoopInformation::isAnInductionVariable (CompilationUnit *cUnit, unsigned in
+         }
+ 
+         //Get the ssa register for this induction
+-        int ssaReg = info->ssaReg;
++        unsigned int ssaReg = info->ssaReg;
++
++        //Is it a match?
++        if (isSSA == false) {
++            if (dvmExtractSSARegister (cUnit, ssaReg) == reg) {
++                return info->inc;
++            }
++        } else {
++            if (ssaReg == reg) {
++                return info->inc;
++            }
++        }
++    }
++
++    //Did not find it
++    return 0;
++}
++
++bool LoopInformation::isAnInductionVariable (const CompilationUnit *cUnit, unsigned int reg, bool isSSA)
++{
++    //Go through the induction variable list
++    GrowableListIterator iterator;
++    dvmGrowableListIteratorInit(&inductionVariableList, &iterator);
++
++    while (true)
++    {
++        InductionVariableInfo *info = (InductionVariableInfo *) (dvmGrowableListIteratorNext(&iterator));
++
++        //Bail at the end
++        if (info == 0)
++        {
++            break;
++        }
++
++        //Get the ssa register for this induction
++        unsigned int ssaReg = info->ssaReg;
+ 
+         //Is it a match?
+         if (isSSA == false) {
+@@ -734,6 +852,41 @@ bool LoopInformation::isAnInductionVariable (CompilationUnit *cUnit, unsigned in
+     return false;
+ }
+ 
++bool LoopInformation::isAnBasicInductionVariable (const CompilationUnit *cUnit, unsigned int reg, bool isSSA)
++{
++    //Go through the induction variable list
++    GrowableListIterator iterator;
++    dvmGrowableListIteratorInit(&inductionVariableList, &iterator);
++
++    while (true)
++   {
++        InductionVariableInfo *info = (InductionVariableInfo *) (dvmGrowableListIteratorNext(&iterator));
++
++        //Bail at the end
++        if (info == 0)
++        {
++            break;
++        }
++
++        //Get the ssa register for this induction
++        unsigned int basicSSAReg = info->basicSSAReg;
++
++        //Is it a match?
++        if (isSSA == false) {
++            if (dvmExtractSSARegister (cUnit, basicSSAReg) == reg) {
++                return true;
++            }
++        } else {
++           if (basicSSAReg == reg) {
++                return true;
++            }
++        }
++    }
++
++    //Did not find it
++    return false;
++}
++
+ MIR *LoopInformation::getPhiInstruction (CompilationUnit *cUnit, unsigned int vr) const
+ {
+     //Get the BasicBlock vector for this loop
+@@ -902,8 +1055,34 @@ bool dvmCompilerVerySimpleLoopGate (const CompilationUnit *cUnit, LoopInformatio
+     return true;
+ }
+ 
++
++//The following gate accepts only very simple loops: one basicblock, no nesting
++bool dvmCompilerVerySimpleLoopGateWithLoopInfo (const CompilationUnit *cUnit, LoopInformation * loopInfo)
++{
++    LoopInformation *info = 0;
++
++    //Only do something if we have the loop information
++    if (loopInfo != 0)
++    {
++        info = loopInfo;
++    }
++    else
++    {
++        info = cUnit->loopInformation;
++    }
++
++    if (info != 0)
++    {
++        if (info->iterateWithConst (cUnit, dvmCompilerVerySimpleLoopGate) == true)
++        {
++            return true;
++        }
++    }
++    return false;
++}
++
+ //The following gate accepts only very simple loops: one basicblock, no nesting
+-bool dvmCompilerVerySimpleLoopGate (const CompilationUnit *cUnit, const Pass *curPass)
++bool dvmCompilerVerySimpleLoopGate (const CompilationUnit *cUnit, Pass *curPass)
+ {
+     //Only do something if we have the loop information
+     LoopInformation *info = cUnit->loopInformation;
+@@ -1095,6 +1274,44 @@ int LoopInformation::getNumBasicIV(CompilationUnit* cUnit)
+     return number;
+ }
+ 
++/**
++  * @brief set the countUpLoop info for this loop and return countUpLoop
++  * @return whether this loop is a count up loop
++  */
++bool LoopInformation::getCountUpLoop(void)
++{
++    GrowableList* ivList = &inductionVariableList;
++    unsigned int number = 0;
++
++   for (int i = 0; i < ivList->numUsed; i++)
++   {
++        InductionVariableInfo *ivInfo;
++
++        ivInfo = GET_ELEM_N(ivList, InductionVariableInfo*, i);
++
++        /* Count up or down loop? */
++        if (ivInfo->ssaReg == ivInfo->basicSSAReg)
++        {
++            number++;
++
++            /* Infinite loop */
++            if (ivInfo->inc == 0)
++            {
++               return false;
++            }
++
++            /* as of now only accept one BIV */
++            if (number > 1)
++            {
++                return false;
++            }
++            countUpLoop = (ivInfo->inc > 0);
++        }
++    }
++    return countUpLoop;
++}
++
++
+ //Sink a vector of instructions
+ void LoopInformation::sinkInstructions (CompilationUnit *cUnit, std::vector<MIR *> &insns) const
+ {
+@@ -1454,7 +1671,7 @@ void LoopInformation::addInstructionsToExits (CompilationUnit *cUnit, const std:
+     bv = getBackwardBranches ();
+ 
+     //Add the instructions to the basic blocks defined by the vector
+-   dvmCompilerPrependInstructionsToBasicBlocks (cUnit, bv, insns);
++    dvmCompilerPrependInstructionsToBasicBlocks (cUnit, bv, insns);
+ }
+ 
+ void LoopInformation::addInstructionToExits (CompilationUnit *cUnit, MIR *mir)
+diff --git a/vm/compiler/LoopInformation.h b/vm/compiler/LoopInformation.h
+index ea1247f..fa627a7 100644
+--- a/vm/compiler/LoopInformation.h
++++ b/vm/compiler/LoopInformation.h
+@@ -246,6 +246,13 @@ class LoopInformation
+         BitVector *getExitLoops (void) const {return exitLoop;}
+ 
+         /**
++         * @brief Get the one and only exit block of the loop
++         * @param cUnit the CompilationUnit
++         * @return the exit basic block, or 0 if it is not exactly one
++         */
++        BasicBlock *getExitBlock (const CompilationUnit *cUnit);
++
++        /**
+          * @brief Get the post exit loop BasicBlocks BitVector
+          * @details Be careful using this function before loop formation
+          *     It will return incorrect value and assert library may be aborted.
+@@ -255,6 +262,13 @@ class LoopInformation
+         BitVector *getPostExitLoops (const CompilationUnit *cUnit);
+ 
+         /**
++         * @brief Get the one and only post exit block of the loop
++         * @param cUnit the CompilationUnit
++         * @return the post exit basic block, or 0 if it is not exactly one
++         */
++        BasicBlock *getPostExitBlock (const CompilationUnit *cUnit);
++
++        /**
+          * @brief Get the BasicBlocks of the loop
+          * @return the BitVector that represents the BasicBlocks of the loop
+          */
+@@ -267,6 +281,12 @@ class LoopInformation
+         BitVector *getBackwardBranches (void) const {return backward;}
+ 
+         /**
++         * @brief Get the one and only backward branch of the loop
++         * @return the backward branch BasicBlock, or 0 if it is not exactly one
++         */
++        BasicBlock *getBackwardBranchBlock (const CompilationUnit *);
++
++        /**
+          * @brief Get the next scratch register
+          * @return the next scratch register
+          */
+@@ -307,7 +327,25 @@ class LoopInformation
+           * @param isSSA if the reg is SSA or Virtual register
+           * @return whether reg is an induction variable
+           */
+-         bool isAnInductionVariable (CompilationUnit *cUnit, unsigned int reg, bool isSSA = false);
++         bool isAnInductionVariable (const CompilationUnit *cUnit, unsigned int reg, bool isSSA = false);
++
++         /**
++          * @brief Is a register an basic induction variable for the loop?
++          * @param cUnit the CompilationUnit
++          * @param reg the register we are curious about
++          * @param isSSA if the reg is SSA or Virtual register
++          * @return whether reg is an basic induction variable
++          */
++         bool isAnBasicInductionVariable (const CompilationUnit *cUnit, unsigned int reg, bool isSSA = false);
++
++         /**
++          * @brief Get the increment for an induction variable
++          * @param cUnit the CompilationUnit
++          * @param reg the register we are curious about
++          * @param isSSA if the reg is SSA or Virtual register
++          * @return the increment for the induction variable, returns 0 if not found
++          */
++         int getInductionIncrement (const CompilationUnit *cUnit, unsigned int reg, bool isSSA = false);
+ 
+          /**
+           * @brief Get the Phi node defining a given SSA register
+@@ -472,7 +510,7 @@ class LoopInformation
+           * @param cUnit the CompilationUnit
+           * @param pass the Pass
+           */
+-         bool isSimpleCountedLoop (CompilationUnit *cUnit, const Pass *pass);
++         bool isSimpleCountedLoop (CompilationUnit *cUnit, Pass *pass);
+ 
+          /**
+           * @brief get the basic IV for the loop
+@@ -504,6 +542,12 @@ class LoopInformation
+           */
+          void setCountUpLoop (bool up) {countUpLoop = up;}
+ 
++          /**
++          * @brief set if the loop is counted up/down and return countUpLoop
++          * @return True if the loop is counted up, false - otherwise
++          */
++         bool getCountUpLoop (void);
++
+          /**
+           * @brief Get loop condition end reg
+           * @return loop condition end reg
+@@ -546,7 +590,7 @@ class LoopInformation
+           * @param cUnit the CompilationUnit
+           * @param mir the MIR to add
+           */
+-        void addInstructionToExits (CompilationUnit *cUnit, MIR *mir);
++         void addInstructionToExits (CompilationUnit *cUnit, MIR *mir);
+ };
+ 
+ /**
+@@ -564,6 +608,14 @@ bool dvmCompilerVerySimpleLoopGate (const CompilationUnit *cUnit, LoopInformatio
+  * @param curPass the Pass structure
+  * @return whether to execute the pass or not: currently only very simple loops are supported
+  */
+-bool dvmCompilerVerySimpleLoopGate (const CompilationUnit *cUnit, const Pass *curPass);
++bool dvmCompilerVerySimpleLoopGate (const CompilationUnit *cUnit, Pass *curPass);
++
++/**
++ * @brief Gate to determine if the LoopInformation only contains a very simple loop: not nested, one BasicBlock
++ * @param cUnit the CompilationUnit
++ * @param loopInfo the LoopInformation
++ * @return whether to execute the pass or not: currently only very simple loops are supported
++ */
++bool dvmCompilerVerySimpleLoopGateWithLoopInfo (const CompilationUnit *cUnit, LoopInformation* loopInfo);
+ 
+ #endif
+diff --git a/vm/compiler/LoopOpt.cpp b/vm/compiler/LoopOpt.cpp
+index 513cfa0..e3f00d5 100644
+--- a/vm/compiler/LoopOpt.cpp
++++ b/vm/compiler/LoopOpt.cpp
+@@ -28,6 +28,7 @@
+ #include "LoopRegisterUsage.h"
+ #include "Pass.h"
+ #include "RegisterizationME.h"
++#include "Vectorization.h"
+ 
+ /**
+  * @brief Static functions defined below
+@@ -91,11 +92,13 @@ START_PASSES
+                dvmCompilerSinkCasts, 0, 0, 0, kOptimizationBasicBlockChange),
+     NEW_PASS ("Accumulation_Sinking", kAllNodes, 0, dvmCompilerSinkAccumulationsGate,
+             0, dvmCompilerAccumulationSinking, 0, 0, kOptimizationBasicBlockChange),
++    NEW_PASS ("Vectorization", kAllNodes, 0, dvmCompilerVectorizationGate,
++            dvmCompilerVectorize, 0, 0, dvmCompilerFreeVectorization, kOptimizationBasicBlockChange | kLoopStructureChange),
+     //This should be after the last optimization that changes instruction sequence or BB logic
+     //Note: reorder is safe and should be after
+     //We do registerization for all traces to provide spill information to the BE
+     NEW_PASS ("Write_Back_Registers", kAllNodes, 0, 0, 0, 0, dvmCompilerWriteBackAll, 0, 0),
+-    NEW_PASS ("Registerization_ME", kAllNodes, 0, dvmCompilerRegisterizeGate,
++    NEW_PASS ("Registerization_ME", kAllNodes, 0, dvmCompilerTraceIsLoopNewSystem,
+                 0, dvmCompilerRegisterize, 0, 0, 0),
+     NEW_PASS ("Fix_Chaining_Cells", kAllNodesAndNew, 0, 0,
+                 0, 0, dvmCompilerFixChainingCellPredecessors, 0, kOptimizationBasicBlockChange | kLoopStructureChange),
+@@ -187,7 +190,7 @@ void dvmCompilerLoopOptimizationDriver (CompilationUnit *cUnit)
+         }
+ 
+         //Do we have a general gate defined?
+-        bool (*generalGate) (const CompilationUnit *, const Pass *) = gDvmJit.jitFramework.generalGate;
++        bool (*generalGate) (const CompilationUnit *, Pass *) = gDvmJit.jitFramework.generalGate;
+ 
+         //We suppose we can apply the pass
+         bool applyPass = true;
+@@ -236,19 +239,19 @@ void dvmCompilerLoopOptimizationDriver (CompilationUnit *cUnit)
+     }
+ }
+ 
+-bool dvmCompilerTraceIsLoop (const CompilationUnit *cUnit, const Pass *curPass)
++bool dvmCompilerTraceIsLoop (const CompilationUnit *cUnit, Pass *curPass)
+ {
+     (void) curPass;
+     return cUnit->jitMode == kJitLoop;
+ }
+ 
+-bool dvmCompilerTraceIsLoopNewSystem (const CompilationUnit *cUnit, const Pass *curPass)
++bool dvmCompilerTraceIsLoopNewSystem (const CompilationUnit *cUnit, Pass *curPass)
+ {
+     (void) curPass;
+     return dvmCompilerTraceIsLoop (cUnit, curPass) && (gDvmJit.oldLoopDetection == false);
+ }
+ 
+-bool dvmCompilerTraceIsLoopOldSystem (const CompilationUnit *cUnit, const Pass *curPass)
++bool dvmCompilerTraceIsLoopOldSystem (const CompilationUnit *cUnit, Pass *curPass)
+ {
+     (void) curPass;
+     return dvmCompilerTraceIsLoop (cUnit, curPass) && (gDvmJit.oldLoopDetection == true);
+@@ -317,7 +320,7 @@ static bool exitLoopHelper (LoopInformation *info, void *data)
+     return dvmCountSetBits (info->getExitLoops ()) <= 1;
+ }
+ 
+-bool dvmCompilerCheckLoops (const CompilationUnit *cUnit, const Pass *curPass)
++bool dvmCompilerCheckLoops (const CompilationUnit *cUnit, Pass *curPass)
+ {
+     // Build loop information
+     LoopInformation *loopInfo = LoopInformation::getLoopInformation (const_cast<CompilationUnit *>(cUnit), 0);
+@@ -392,7 +395,7 @@ bool dvmCompilerCheckLoops (const CompilationUnit *cUnit, const Pass *curPass)
+                 BitVectorIterator bvIterator;
+                 dvmBitVectorIteratorInit(blocks, &bvIterator);
+                 for (BasicBlock *bb = dvmCompilerGetNextBasicBlockViaBitVector(bvIterator, cUnit->blockList); bb != 0;
+-                                 bb = dvmCompilerGetNextBasicBlockViaBitVector(bvIterator, cUnit->blockList))
++                        bb = dvmCompilerGetNextBasicBlockViaBitVector(bvIterator, cUnit->blockList))
+                 {
+                     if (bb == backward)
+                     {
+@@ -563,13 +566,13 @@ bool dvmCompilerInsertUserPass (Pass *newPass, const char *name, enum PassInstru
+     return true;
+ }
+ 
+-void dvmCompilerSetGeneralGate (bool (*general) (const CompilationUnit *, const Pass*))
++void dvmCompilerSetGeneralGate (bool (*general) (const CompilationUnit *, Pass*))
+ {
+     gDvmJit.jitFramework.generalGate = general;
+ }
+ 
+ //Replace a given pass gate
+-bool dvmCompilerReplaceGate (const char *name, bool (*gate) (const CompilationUnit *, const Pass*))
++bool dvmCompilerReplaceGate (const char *name, bool (*gate) (const CompilationUnit *, Pass*))
+ {
+     //Find the pass
+     Pass *curPass = dvmCompilerGetPass (name);
+diff --git a/vm/compiler/LoopOpt.h b/vm/compiler/LoopOpt.h
+index 494113e..80f1c3a 100644
+--- a/vm/compiler/LoopOpt.h
++++ b/vm/compiler/LoopOpt.h
+@@ -43,7 +43,7 @@ void dvmCompilerLoopOptimizationDriver (CompilationUnit *cUnit);
+   * @param curPass the Pass
+   * @return whether or not the cUnit represents a loop
+   */
+-bool dvmCompilerTraceIsLoop (const CompilationUnit *cUnit, const Pass *curPass);
++bool dvmCompilerTraceIsLoop (const CompilationUnit *cUnit, Pass *curPass);
+ 
+ /**
+   * @brief Is the trace a loop formed by the new system?
+@@ -51,7 +51,7 @@ bool dvmCompilerTraceIsLoop (const CompilationUnit *cUnit, const Pass *curPass);
+   * @param curPass the Pass
+   * @return whether or not the cUnit represents a loop
+   */
+-bool dvmCompilerTraceIsLoopNewSystem (const CompilationUnit *cUnit, const Pass *curPass);
++bool dvmCompilerTraceIsLoopNewSystem (const CompilationUnit *cUnit, Pass *curPass);
+ 
+ /**
+   * @brief Is the trace a loop formed by the old system?
+@@ -59,7 +59,7 @@ bool dvmCompilerTraceIsLoopNewSystem (const CompilationUnit *cUnit, const Pass *
+   * @param curPass the Pass
+   * @return whether or not the cUnit represents a loop
+   */
+-bool dvmCompilerTraceIsLoopOldSystem (const CompilationUnit *cUnit, const Pass *curPass);
++bool dvmCompilerTraceIsLoopOldSystem (const CompilationUnit *cUnit, Pass *curPass);
+ 
+ /**
+  * @brief Print the pass names
+@@ -77,7 +77,7 @@ void dvmCompilerPrintIgnorePasses (void);
+  * @param curPass the Pass
+  * @return Whether to continue as a loop or bail
+  */
+-bool dvmCompilerCheckLoops (const CompilationUnit *cUnit, const Pass *curPass);
++bool dvmCompilerCheckLoops (const CompilationUnit *cUnit, Pass *curPass);
+ 
+ /**
+  * @brief Verify that hoisted checks optimization is applicable
+@@ -85,7 +85,7 @@ bool dvmCompilerCheckLoops (const CompilationUnit *cUnit, const Pass *curPass);
+  * @param curPass the Pass
+  * @return Whether to generate hoisted checks for the loop
+  */
+-bool dvmCompilerHoistedChecksGate (const CompilationUnit *cUnit, const Pass *curPass);
++bool dvmCompilerHoistedChecksGate (const CompilationUnit *cUnit, Pass *curPass);
+ 
+ /**
+  * @brief Remove an optimization Pass
+@@ -107,7 +107,7 @@ Pass *dvmCompilerGetPass (const char *name);
+  * @param gate the new gate
+  * @return whether the gate replacement was successful
+  */
+-bool dvmCompilerReplaceGate (const char *name, bool (*gate) (const CompilationUnit *, const Pass*));
++bool dvmCompilerReplaceGate (const char *name, bool (*gate) (const CompilationUnit *, Pass*));
+ 
+ /**
+  * @brief Insert the user pass
+diff --git a/vm/compiler/Pass.cpp b/vm/compiler/Pass.cpp
+index c27f9f7..af100df 100644
+--- a/vm/compiler/Pass.cpp
++++ b/vm/compiler/Pass.cpp
+@@ -21,7 +21,7 @@
+ Pass::Pass (const std::string &name,
+         DataFlowAnalysisMode traversalType,
+         void *data,
+-        bool (*gatePtr) (const CompilationUnit *, const Pass *),
++        bool (*gatePtr) (const CompilationUnit *, Pass *),
+         void (*startPtr) (CompilationUnit *, Pass *),
+         void (*endPtr) (CompilationUnit *, Pass *),
+         bool (*doWorkPtr) (CompilationUnit *, BasicBlock *),
+diff --git a/vm/compiler/Pass.h b/vm/compiler/Pass.h
+index 9052fdd..039c1e2 100644
+--- a/vm/compiler/Pass.h
++++ b/vm/compiler/Pass.h
+@@ -27,7 +27,7 @@ class Pass;
+ //We need a typedef for returning a work function pointer
+ typedef bool (*fctWorkPtr) (CompilationUnit *, BasicBlock *);
+ //We need a typedef for returning a gate function pointer
+-typedef bool (*fctGatePtr) (const CompilationUnit *, const Pass *);
++typedef bool (*fctGatePtr) (const CompilationUnit *, Pass *);
+ 
+ /**
+  * @brief OptimizationFlag is an enumeration to perform certain tasks for a given pass.
+@@ -59,7 +59,7 @@ class Pass
+         void *data;
+ 
+         /** @brief Gate for the pass, taking the CompilationUnit and the pass information */
+-        bool (*gatePtr) (const CompilationUnit *cUnit, const Pass *curPass);
++        bool (*gatePtr) (const CompilationUnit *cUnit, Pass *curPass);
+ 
+         /** @brief Start of the pass function */
+         void (*startPtr) (CompilationUnit *cUnit, Pass *curPass);
+@@ -104,7 +104,7 @@ class Pass
+          Pass (const std::string &name,
+                DataFlowAnalysisMode traversalType,
+                void *data,
+-               bool (*gatePtr) (const CompilationUnit *, const Pass *),
++               bool (*gatePtr) (const CompilationUnit *, Pass *),
+                void (*startPtr) (CompilationUnit *, Pass *),
+                void (*endPtr) (CompilationUnit *, Pass *),
+                bool (*doWorkPtr) (CompilationUnit *, BasicBlock *),
+@@ -209,7 +209,7 @@ class Pass
+          * @brief Set gate
+          * @param newGate the new gate pointer
+          */
+-        void setGate (bool (*newGate) (const CompilationUnit *cUnit, const Pass *curPass)) {gatePtr = newGate;}
++        void setGate (bool (*newGate) (const CompilationUnit *cUnit, Pass *curPass)) {gatePtr = newGate;}
+ 
+         /**
+          * @brief Get the gate
+diff --git a/vm/compiler/RegisterizationME.cpp b/vm/compiler/RegisterizationME.cpp
+index c4db994..d954dba 100644
+--- a/vm/compiler/RegisterizationME.cpp
++++ b/vm/compiler/RegisterizationME.cpp
+@@ -399,129 +399,6 @@ class RegisterSorter
+ };
+ 
+ /**
+- * @brief Regiseterize a given loop
+- * @param cUnit the CompilationUnit
+- * @param info the LoopInformation
+- * @param data required by interface (not used)
+- * @return true to continue iteration over loops
+- */
+-static bool registerizeLoop (CompilationUnit *cUnit, LoopInformation *info, void *data = 0)
+-{
+-    // Works only for innermost loops
+-    if (info->getNested () != 0)
+-    {
+-        return true;
+-    }
+-
+-    RegisterSorter sorter;
+-    std::vector<std::pair<int, RegisterClass> > registers;
+-    std::map<int, int> &registerCounts = sorter.getRegisterCounts ();
+-
+-    BasicBlock *preHeader = info->getPreHeader ();
+-
+-    //Paranoid
+-    assert (preHeader != 0);
+-
+-    //Select which registers should get registerized
+-    selectRegisters (cUnit, info, registers);
+-
+-    //Set maximum registerization
+-    cUnit->maximumRegisterization = registers.size ();
+-
+-    //Now count the uses of each register, do it for all, it's simpler than trying to do it only for the ones we care
+-    countRegisters (cUnit, registerCounts);
+-
+-    //Finally, filter out and sort the registers in priority order
+-    std::sort (registers.begin (), registers.end (), sorter);
+-
+-    //Now go through these registers and add the instructions
+-    for (std::vector<std::pair<int, RegisterClass> >::const_iterator it = registers.begin (); it != registers.end (); it++)
+-    {
+-        //Get the values
+-        const std::pair<int, RegisterClass> &p = *it;
+-
+-        int reg = p.first;
+-        // Get the Dalvik number
+-        reg = dvmConvertSSARegToDalvik(cUnit, reg);
+-
+-        RegisterClass regClass = p.second;
+-
+-        //Create a registerize request in the preheader
+-        //Actually generate the hoisting code
+-        MIR *registerizeInsn = static_cast<MIR *> (dvmCompilerNew (sizeof (*registerizeInsn), true));
+-        registerizeInsn->dalvikInsn.opcode = static_cast<Opcode> (kMirOpRegisterize);
+-        //We only care about the register number
+-        registerizeInsn->dalvikInsn.vA = DECODE_REG (reg);
+-        registerizeInsn->dalvikInsn.vB = regClass;
+-        registerizeInsn->dalvikInsn.vC = 0;
+-
+-        dvmCompilerAppendMIR(preHeader, registerizeInsn);
+-    }
+-
+-    //Handle the BasicBlocks of the loop
+-    const BitVector *basicBlocks = info->getBasicBlocks ();
+-
+-    //Paranoid
+-    assert (basicBlocks != 0);
+-
+-    //Call the helper function to set the writebacks for each BasicBlock
+-    handleWriteBackRequests (cUnit, basicBlocks);
+-
+-    //Paranoid
+-    assert (preHeader->requestWriteBack != 0);
+-
+-    //Clear the writebacks for the loop preheader
+-    handlePreHeaderWriteBackRequests (preHeader);
+-
+-    //Handle the backward chaining cells of the loop
+-    const BitVector *backwards = info->getBackwardBranches ();
+-
+-    //Paranoid
+-    assert (backwards != 0);
+-
+-    //Call the helper function to set the writebacks for the backward chaining cells
+-    handleWriteBackRequests (cUnit, backwards);
+-
+-    //Last handle the write backs of all live outs for the post loops
+-    handleWriteBackRequestsPostLoop (cUnit, info);
+-
+-    return true;
+-}
+-
+-bool dvmCompilerWriteBackAll (CompilationUnit *cUnit, BasicBlock *bb)
+-{
+-    //First job is going through the BasicBlocks and requesting to write back any defs
+-    dvmClearAllBits (bb->requestWriteBack);
+-
+-    if (bb->dataFlowInfo != 0 && bb->dataFlowInfo->defV != 0 && bb->dataFlowInfo->useV != 0)
+-    {
+-        dvmUnifyBitVectors (bb->requestWriteBack, bb->requestWriteBack, bb->dataFlowInfo->defV);
+-        // We also add the uses because it is possible to enter loop preheader with
+-        // physical register association but when going through interpreter, we may
+-        // clobber those register associations.
+-        dvmUnifyBitVectors (bb->requestWriteBack, bb->requestWriteBack, bb->dataFlowInfo->useV);
+-    }
+-
+-    //We don't want to iterate, do this once
+-    return false;
+-}
+-
+-void dvmCompilerRegisterize (CompilationUnit *cUnit, Pass *currentPass)
+-{
+-    //Now let's go through the loop information
+-    LoopInformation *info = cUnit->loopInformation;
+-
+-    //Now registerize it
+-    if (info != 0)
+-    {
+-        info->iterate (cUnit, registerizeLoop);
+-    }
+-
+-    //Unused argument
+-    (void) currentPass;
+-}
+-
+-/**
+  * @brief Parse a BasicBlock of the loop
+  * @param bb the BasicBlock of the loop
+  * @param verbose are we in verbose mode or not
+@@ -536,7 +413,6 @@ static bool parseBlock (BasicBlock *bb, bool verbose)
+ 
+         switch (opcode)
+         {
+-            case kMirOpPhi:
+             case OP_NOP:
+             case OP_MOVE_FROM16:
+             case OP_MOVE_16:
+@@ -716,7 +592,15 @@ static bool parseBlock (BasicBlock *bb, bool verbose)
+ 
+             //Not the quick
+ 
+-            //Not the extended except PHI
++            //Only a few of the extended
++            case kMirOpPhi:
++            case kMirOpConst128b:
++            case kMirOpMove128b:
++            case kMirOpPackedMultiply:
++            case kMirOpPackedAddition:
++            case kMirOpPackedAddReduce:
++            case kMirOpPackedSet:
++
+                 break;
+ 
+             default:
+@@ -737,16 +621,14 @@ static bool parseBlock (BasicBlock *bb, bool verbose)
+  * @brief Check a loop: is it ok to registerize
+  * @param cUnit the CompilationUnit
+  * @param info the LoopInformation
+- * @param data required by interface (not used)
+  * @return whether it is acceptable for registerization
+  */
+-static bool checkLoop (const CompilationUnit *cUnit, LoopInformation *info, void * data)
++static bool checkLoop (CompilationUnit *cUnit, LoopInformation *info)
+ {
+     // Consider only innermost loops
+     if (info->getNested () != 0)
+     {
+-        //Only accept perfectly nested loops
+-        return info->getNested ()->getNextSibling () == 0;
++        return false;
+     }
+ 
+     const BitVector *blocks = info->getBasicBlocks ();
+@@ -785,33 +667,124 @@ static bool checkLoop (const CompilationUnit *cUnit, LoopInformation *info, void
+ }
+ 
+ /**
+- * @brief Should we registerize ?
++ * @brief Registerize a given loop
+  * @param cUnit the CompilationUnit
+- * @param currentPass the Pass
+- * @return whether or not to registerize
++ * @param info the LoopInformation
++ * @param data required by interface (not used)
++ * @return true to continue iteration over loops
+  */
+-bool dvmCompilerRegisterizeGate (const CompilationUnit *cUnit, const Pass *currentPass)
++static bool registerizeLoop (CompilationUnit *cUnit, LoopInformation *info, void *data = 0)
+ {
+-    //Is it a loop
+-    if (dvmCompilerTraceIsLoopNewSystem (cUnit, currentPass) == false)
++    // Now we check the loop. If it returns false then we don't continue with trying to registerize
++    if (checkLoop (cUnit, info) == false)
+     {
+-        return false;
++        return true;
+     }
+ 
++    RegisterSorter sorter;
++    std::vector<std::pair<int, RegisterClass> > registers;
++    std::map<int, int> &registerCounts = sorter.getRegisterCounts ();
++
++    BasicBlock *preHeader = info->getPreHeader ();
++
++    //Paranoid
++    assert (preHeader != 0);
++
++    //Select which registers should get registerized
++    selectRegisters (cUnit, info, registers);
++
++    //Set maximum registerization
++    cUnit->maximumRegisterization = registers.size ();
++
++    //Now count the uses of each register, do it for all, it's simpler than trying to do it only for the ones we care
++    countRegisters (cUnit, registerCounts);
++
++    //Finally, filter out and sort the registers in priority order
++    std::sort (registers.begin (), registers.end (), sorter);
++
++    //Now go through these registers and add the instructions
++    for (std::vector<std::pair<int, RegisterClass> >::const_iterator it = registers.begin (); it != registers.end (); it++)
++    {
++        //Get the values
++        const std::pair<int, RegisterClass> &p = *it;
++
++        int reg = p.first;
++        // Get the Dalvik number
++        reg = dvmConvertSSARegToDalvik(cUnit, reg);
++
++        RegisterClass regClass = p.second;
++
++        //Create a registerize request in the preheader
++        //Actually generate the hoisting code
++        MIR *registerizeInsn = static_cast<MIR *> (dvmCompilerNew (sizeof (*registerizeInsn), true));
++        registerizeInsn->dalvikInsn.opcode = static_cast<Opcode> (kMirOpRegisterize);
++        //We only care about the register number
++        registerizeInsn->dalvikInsn.vA = DECODE_REG (reg);
++        registerizeInsn->dalvikInsn.vB = regClass;
++        registerizeInsn->dalvikInsn.vC = 0;
++
++        dvmCompilerPrependMIR (preHeader, registerizeInsn);
++    }
++
++    //Handle the BasicBlocks of the loop
++    const BitVector *basicBlocks = info->getBasicBlocks ();
++
++    //Paranoid
++    assert (basicBlocks != 0);
++
++    //Call the helper function to set the writebacks for each BasicBlock
++    handleWriteBackRequests (cUnit, basicBlocks);
++
++    //Paranoid
++    assert (preHeader->requestWriteBack != 0);
++
++    //Clear the writebacks for the loop preheader
++    handlePreHeaderWriteBackRequests (preHeader);
++
++    //Handle the backward chaining cells of the loop
++    const BitVector *backwards = info->getBackwardBranches ();
++
++    //Paranoid
++    assert (backwards != 0);
++
++    //Call the helper function to set the writebacks for the backward chaining cells
++    handleWriteBackRequests (cUnit, backwards);
++
++    //Last handle the write backs of all live outs for the post loops
++    handleWriteBackRequestsPostLoop (cUnit, info);
++
++    return true;
++}
++
++bool dvmCompilerWriteBackAll (CompilationUnit *cUnit, BasicBlock *bb)
++{
++    //First job is going through the BasicBlocks and requesting to write back any defs
++    dvmClearAllBits (bb->requestWriteBack);
++
++    if (bb->dataFlowInfo != 0 && bb->dataFlowInfo->defV != 0 && bb->dataFlowInfo->useV != 0)
++    {
++        dvmUnifyBitVectors (bb->requestWriteBack, bb->requestWriteBack, bb->dataFlowInfo->defV);
++        // We also add the uses because it is possible to enter loop preheader with
++        // physical register association but when going through interpreter, we may
++        // clobber those register associations.
++        dvmUnifyBitVectors (bb->requestWriteBack, bb->requestWriteBack, bb->dataFlowInfo->useV);
++    }
++
++    //We don't want to iterate, do this once
++    return false;
++}
++
++void dvmCompilerRegisterize (CompilationUnit *cUnit, Pass *currentPass)
++{
+     //Now let's go through the loop information
+     LoopInformation *info = cUnit->loopInformation;
+ 
+-    //Unused argument
+-    (void) currentPass;
+-
++    //Now registerize it
+     if (info != 0)
+     {
+-        if (info->iterateWithConst (cUnit, checkLoop) == true)
+-        {
+-            return true;
+-        }
++        info->iterate (cUnit, registerizeLoop);
+     }
+ 
+-    //Return result
+-    return false;
++    //Unused argument
++    (void) currentPass;
+ }
+diff --git a/vm/compiler/RegisterizationME.h b/vm/compiler/RegisterizationME.h
+index 561ccfb..4746512 100644
+--- a/vm/compiler/RegisterizationME.h
++++ b/vm/compiler/RegisterizationME.h
+@@ -37,11 +37,4 @@ void dvmCompilerRegisterize (CompilationUnit *cUnit, Pass *pass);
+  */
+ bool dvmCompilerWriteBackAll (CompilationUnit *cUnit, BasicBlock *bb);
+ 
+-/**
+- * @brief Should we registerize ? Currently simple loops with certain opcodes are accepted
+- * @param cUnit the CompilationUnit
+- * @param currentPass the Pass
+- * @return whether or not to registerize
+- */
+-bool dvmCompilerRegisterizeGate (const CompilationUnit *cUnit, const Pass *currentPass);
+ #endif
+diff --git a/vm/compiler/SSATransformation.cpp b/vm/compiler/SSATransformation.cpp
+index 3af3d1c..7f67083 100644
+--- a/vm/compiler/SSATransformation.cpp
++++ b/vm/compiler/SSATransformation.cpp
+@@ -17,6 +17,7 @@
+ //Need it for UINT_MAX
+ #include <limits.h>
+ 
++#include "BBOptimization.h"
+ #include "Dalvik.h"
+ #include "Dataflow.h"
+ #include "Loop.h"
+@@ -589,6 +590,56 @@ static void insertPhiNodes(CompilationUnit *cUnit)
+     }
+ }
+ 
++/**
++ * @brief Walk up the predecessors to get to a kDalvikByteCode block
++ * @param blockList the GrowableList representing the block list
++ * @param bb the BasicBlock we want to walk upwards from
++ * @return the first kDalvikByteCode basicblock ancestor of bb, 0 otherwise and 0 if a given bb has more than one ancestor on the walk upwards
++ */
++static BasicBlock *walkUpPredecessorsToByteCode (GrowableList *blockList, BasicBlock *bb)
++{
++    //Get the predecessors
++    BitVector *predecessors = bb->predecessors;
++
++    //If predecessors is 0, we are done
++    if (predecessors == 0)
++    {
++        return 0;
++    }
++
++    //If the BB has more than one predecessor we are done
++    //  - This is actually an error because normally we started with the BWCC
++    //  - Then, potentially it could have a single parent which is either the last loop's BB (the one we want)
++    //      - Or before hitting that, we might have the pre-BWCC
++    //  - But all should have only one parent...
++    if (dvmCountSetBits (predecessors) != 1)
++    {
++        return 0;
++    }
++
++    //Get its index
++    int idx = dvmHighestBitSet (predecessors);
++
++    //Get the BB
++    BasicBlock *predBB = (BasicBlock *) dvmGrowableListGetElement (blockList, idx);
++
++    //Paranoid
++    if (predBB == 0)
++    {
++        return 0;
++    }
++
++    //Now technically this might not be a PBWCC type yet, it could be our last iteration BB
++    if (predBB->blockType != kDalvikByteCode)
++    {
++        //Recursive call
++        return walkUpPredecessorsToByteCode (blockList, predBB);
++    }
++
++    //Otherwise we are done
++    return predBB;
++}
++
+ /*
+  * Worker function to insert phi-operands with latest SSA names from
+  * predecessor blocks
+@@ -598,17 +649,24 @@ static bool insertPhiNodeOperands(CompilationUnit *cUnit, BasicBlock *bb)
+     BitVector *ssaRegV = cUnit->tempSSARegisterV;
+     BitVectorIterator bvIterator;
+     GrowableList *blockList = &cUnit->blockList;
+-    MIR *mir;
+ 
+-    /* Phi nodes are at the beginning of each block */
+-    for (mir = bb->firstMIRInsn; mir; mir = mir->next) {
++    //Walk the basic block
++    MIR *mir = bb->firstMIRInsn;
++
++    while (mir != 0)
++    {
++        //If it isn't a PHI node, we are done
+         if (mir->dalvikInsn.opcode != (Opcode)kMirOpPhi)
++        {
+             return true;
++        }
++
+         int ssaReg = mir->ssaRep->defs[0];
+         int encodedDalvikValue =
+             (int) dvmGrowableListGetElement(cUnit->ssaToDalvikMap, ssaReg);
+         int dalvikReg = DECODE_REG(encodedDalvikValue);
+ 
++        //Clear the bitvector, this bitvector will hold all the SSA registers that should be in the PHI node's operands
+         dvmClearAllBits(ssaRegV);
+ 
+         /* Iterate through the predecessors */
+@@ -618,18 +676,65 @@ static bool insertPhiNodeOperands(CompilationUnit *cUnit, BasicBlock *bb)
+             if (predIdx == -1) break;
+             BasicBlock *predBB = (BasicBlock *) dvmGrowableListGetElement(
+                                      blockList, predIdx);
++
++            if (predBB->blockType == kChainingCellBackwardBranch)
++            {
++                //Ok there is an exception: if this is a BWCC, actually we want the BB from the loop leading to this
++                predBB = walkUpPredecessorsToByteCode (blockList, predBB);
++            }
++
++            //Paranoid
++            assert (predBB != 0);
++
++            //Now get the SSA combination (SSA register, SSA Subscript) via the SSA map at the exit of the predecessor
+             int encodedSSAValue =
+                 predBB->dataFlowInfo->dalvikToSSAMap[dalvikReg];
++
++            //Get the SSA register itself
+             int ssaReg = DECODE_REG(encodedSSAValue);
++
++            //Add this SSA register to the bitvector
+             dvmSetBit(ssaRegV, ssaReg);
+         }
+ 
++        //Ok, we know the PHI node has a def, what is it?
++        int tmp = mir->ssaRep->defs[0];
++
++        //In a particular case it is possible to have set the bit of the def here:
++        //  - If ever we sunk something, the whole SSA algorithm believes there to be a PHI node for that VR (which is correct if you follow the CFG)
++        //  - Problem is that it is wrong: the PBWCC, where that sunk code lies actually should not be an operand, from PBWCC we go back to the interpreter not the loop head...
++        //  - Thus the walkUpPredecessorsToByteCode gives us the SSA number at the exit of the loop
++        //  - However, if the SSA number has not changed in the loop, this whole PHI node should never have existed
++        //     -> All of this is a huge TODO: getting an actual CFG that really shows what is happening and not pretending certain things
++        dvmClearBit (ssaRegV, tmp);
++
+         /* Count the number of SSA registers for a Dalvik register */
+         int numUses = dvmCountSetBits(ssaRegV);
++
++        //If ever this MIR only has now one numUses due to the previous statement, than it isn't even a PHI node
++        //Remove it now
++        if (numUses == 1)
++        {
++            //First get the next one
++            MIR *old = mir;
++            mir = mir->next;
++
++            dvmCompilerRemoveMIR (old);
++
++            //On with the next MIR
++            continue;
++        }
++
++        //Only need to allocate if we don't have enough in size
++        if (mir->ssaRep->numUses < numUses)
++        {
++            mir->ssaRep->uses = (int *) dvmCompilerNew(sizeof(int) * numUses, false);
++            mir->ssaRep->fpUse = (bool *) dvmCompilerNew(sizeof(bool) * numUses, true);
++            mir->ssaRep->defWhere = static_cast<MIR **> (dvmCompilerNew (sizeof (* (mir->ssaRep->defWhere)) * numUses, true));
++        }
++
++        //Set size
+         mir->ssaRep->numUses = numUses;
+-        mir->ssaRep->uses = (int *) dvmCompilerNew(sizeof(int) * numUses, false);
+-        mir->ssaRep->fpUse = (bool *) dvmCompilerNew(sizeof(bool) * numUses, true);
+-        mir->ssaRep->defWhere = static_cast<MIR **> (dvmCompilerNew (sizeof (* (mir->ssaRep->defWhere)) * numUses, true));
+ 
+         BitVectorIterator phiIterator;
+ 
+@@ -642,6 +747,9 @@ static bool insertPhiNodeOperands(CompilationUnit *cUnit, BasicBlock *bb)
+             if (ssaRegIdx == -1) break;
+             *usePtr++ = ssaRegIdx;
+         }
++
++        //Next MIR
++        mir = mir->next;
+     }
+ 
+     return true;
+diff --git a/vm/compiler/Vectorization.cpp b/vm/compiler/Vectorization.cpp
+new file mode 100644
+index 0000000..e19efb2
+--- /dev/null
++++ b/vm/compiler/Vectorization.cpp
+@@ -0,0 +1,1877 @@
++/*
++* Copyright (C) 2012 Intel Corporation
++*
++* Licensed under the Apache License, Version 2.0 (the "License");
++* you may not use this file except in compliance with the License.
++* You may obtain a copy of the License at
++*
++*      http://www.apache.org/licenses/LICENSE-2.0
++*
++* Unless required by applicable law or agreed to in writing, software
++* distributed under the License is distributed on an "AS IS" BASIS,
++* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++* See the License for the specific language governing permissions and
++* limitations under the License.
++*/
++
++#include <vector>
++#include <map>
++#include <set>
++
++#include "Dalvik.h"
++#include "Compiler.h"
++#include "CompilerIR.h"
++#include "Dataflow.h"
++#include "LoopOpt.h"
++#include "Pass.h"
++#include "Vectorization.h"
++
++enum VectorizedType
++{
++    kVectorizedNoType,
++    kVectorizedByte,
++    kVectorizedShort,
++    kVectorizedInt,
++};
++
++/**
++ * @class RegisterAssociation
++ * @brief RegisterAssociation is an association between Virtual Registers and vectorized registers
++ */
++struct RegisterAssociation
++{
++    /** @brief Vectorized register */
++    int vectorized;
++
++    /** @brief Is it an input? */
++    bool input;
++
++    /** @brief Is it an output? */
++    bool output;
++};
++
++/**
++ * @class VectorizationInfo
++ * @brief VectorizationInfo contains information required for the vectorization pass
++ */
++struct VectorizationInfo
++{
++    /** @brief Register Map of VRs requiring vectorization */
++    std::map <int, RegisterAssociation> registers;
++
++    /**
++     * @brief Constant list of VRs requiring vectorization
++     * @details Contains constants used in this basic block, except constant used only for the
++     * bound check
++     */
++    std::map<int, int> constants;
++
++    /** @brief Type for the vectorization */
++    VectorizedType type;
++
++    /** @brief Upper bound */
++    int upperBound;
++
++    /** @brief scratch register which can be used in generating main test and vectorized test */
++    int scratchVrForTest;
++};
++
++/**
++ * @brief Check whether this MIR can remain in vectorized loop
++ * @param mir The MIR to check for
++ * @return Whether this MIR can remain in the loop
++ */
++static bool isVectorizable (MIR *mir)
++{
++    switch (mir->dalvikInsn.opcode)
++    {
++        case OP_ADD_INT:
++        case OP_ADD_INT_LIT8:
++        case OP_MUL_INT:
++            return true;
++        default:
++            break;
++    }
++
++    //We also allow conditionals in vectorized loops
++    if (dvmCompilerIsMIRConditional (mir) == true)
++    {
++        return true;
++    }
++
++    //We also allow constants in the loop but not wide
++    int flags = dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
++    if ((flags & DF_DA_WIDE) != 0)
++    {
++        return false;
++    }
++
++    if ((flags & DF_SETS_CONST) != 0)
++    {
++        return true;
++    }
++
++    return false;
++}
++
++/**
++ * @brief Does the instruction supported by isVectorizable use a constant in vC?
++ * @param mir the MIR instruction
++ * @return whether or not the instruction uses a constant in vC
++ */
++static bool isVectorizableInstructionUseConstant (MIR *mir)
++{
++    int opcode = mir->dalvikInsn.opcode;
++
++    switch (opcode)
++    {
++        case OP_ADD_INT_LIT8:
++            return true;
++        default:
++            break;
++    }
++    return false;
++}
++
++
++/**
++ * @brief Find the upper bound
++ * @param info the LoopInformation
++ * @param upperBound reference to where to store the upperBound
++ * @return whether or not the function found the upper bound
++ */
++static bool findUpperBound (LoopInformation *info, int &upperBound)
++{
++    //Paranoid
++    if (info == 0)
++    {
++        return false;
++    }
++
++    BasicBlock *bb = info->getEntryBlock();
++
++    //Paranoid
++    if (bb == 0)
++    {
++        return false;
++    }
++
++    //Make sure we have an "if" at the end
++    MIR *lastMIR = bb->lastMIRInsn;
++    if (lastMIR == 0)
++    {
++        return false;
++    }
++
++    Opcode opcode = lastMIR->dalvikInsn.opcode;
++    if (opcode < OP_IF_EQ || opcode > OP_IF_LEZ)
++    {
++        return false;
++    }
++
++    //Get the SSA
++    SSARepresentation *ssaRep = lastMIR->ssaRep;
++
++    //Make sure we have only two uses
++    if (ssaRep == 0 || ssaRep->numUses != 2)
++    {
++        return false;
++    }
++
++    //This will hold the const value if found
++    int constValue = 0;
++
++    //We don't care about wide constants
++    int constValueIgnored = 0;
++
++    bool isWide = false;
++
++    //Check the MIR defining the first use
++    MIR *mirUseFirst = ssaRep->defWhere[0];
++
++    //Paranoid
++    if (mirUseFirst == 0)
++    {
++        return false;
++    }
++
++    bool setsConst = dexGetConstant (mirUseFirst->dalvikInsn, constValue, constValueIgnored, isWide);
++
++    if (setsConst == true && isWide == false)
++    {
++        upperBound = constValue;
++        return true;
++    }
++
++    //Otherwise, check the other use
++    MIR *mirUseSecond = ssaRep->defWhere[1];
++
++    //Paranoid
++    if (mirUseSecond == 0)
++    {
++        return false;
++    }
++
++    setsConst = dexGetConstant (mirUseSecond->dalvikInsn, constValue, constValueIgnored, isWide);
++
++    if (setsConst == true && isWide == false)
++    {
++        upperBound = constValue;
++        return true;
++    }
++
++    return false;
++}
++
++/**
++ * @brief Set the input parameter of a VR to the specified value in the register association
++ * @param info vectorization info structure
++ * @param vr virtual register number
++ * @param value The value to set the input to
++ */
++static void setInputRegister (VectorizationInfo *info, int vr, bool value)
++{
++    // First search the map to see if we have the entry for this vr
++    std::map <int, RegisterAssociation>::iterator it = info->registers.find (vr);
++
++    // If found, get the register association to update
++    if (it != info->registers.end())
++    {
++        RegisterAssociation &association = it->second;
++        association.input = true;
++    }
++    else
++    {
++        // Otherwise, insert a new entry for this vr
++        RegisterAssociation newAssociation;
++        newAssociation.vectorized = 0;
++        newAssociation.input = true;
++        newAssociation.output = false;
++        info->registers[vr] = newAssociation;
++    }
++}
++
++/**
++ * @brief Set the output parameter of a VR to the specified value in the register association
++ * @param info vectorization info structure
++ * @param vr virtual register number
++ * @param value The value to set the output to
++ */
++static void setOutputRegister (VectorizationInfo *info, int vr, bool value)
++{
++    // First search the map to see if we have the entry for this vr
++    std::map <int, RegisterAssociation>::iterator it = info->registers.find (vr);
++
++    // If found, get the register association to update
++    if (it != info->registers.end())
++    {
++        RegisterAssociation &association = it->second;
++        association.output = value;
++    }
++    else
++    {
++        //Otherwise, insert a new entry for this vr
++        RegisterAssociation newAssociation;
++        newAssociation.vectorized = 0;
++        newAssociation.input = false;
++        newAssociation.output = value;
++        info->registers[vr] = newAssociation;
++    }
++}
++
++/**
++ * @brief Find type for the vectorization
++ * @param cUnit the CompilationUnit
++ * @param loopInfo the LoopInformation
++ * @return the type for the vectorization
++ */
++static VectorizedType findType (const CompilationUnit *cUnit, LoopInformation *loopInfo)
++{
++    BasicBlock *loopBB = loopInfo->getEntryBlock ();
++
++    if (loopBB == 0)
++    {
++        return kVectorizedNoType;
++    }
++
++    //Go through all the MIR's of the BB and see if there is a cast
++    //We cannot do vectorization if there is one
++    for (MIR *mir = loopBB->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        Opcode opcode = mir->dalvikInsn.opcode;
++
++        //Check if this is a cast
++        if (opcode >= OP_INT_TO_LONG && opcode <= OP_INT_TO_SHORT)
++        {
++            return kVectorizedNoType;
++        }
++    }
++
++    //Now check the loop exit blocks, and see if there are casts there. If we do, we should have
++    //only one kind
++    BasicBlock *exitBlock = loopInfo->getExitBlock(cUnit);
++
++    if (exitBlock == 0)
++    {
++        return kVectorizedNoType;
++    }
++
++    //We record the cast bytecodes here
++    Opcode targetOpcode = OP_NOP;
++
++    //Go through all the MIR's of the BB and see if there is a cast
++    //We record the first one we see, and then only approve that type for others
++    for (MIR *mir = exitBlock->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        Opcode opcode = mir->dalvikInsn.opcode;
++
++        //Check if this is a cast
++        if (opcode >= OP_INT_TO_LONG && opcode <= OP_INT_TO_SHORT)
++        {
++            if (targetOpcode == OP_NOP)
++            {
++                targetOpcode = opcode;
++            }
++            else
++            {
++                //We saw two different casts:
++                if (targetOpcode != opcode)
++                {
++                    return kVectorizedNoType;
++                }
++            }
++        }
++    }
++
++    //Now return the appropriate type of VectorizationInfo
++    //depending on the opcode
++    if (targetOpcode == OP_INT_TO_BYTE)
++    {
++        return kVectorizedByte;
++    }
++
++    if (targetOpcode == OP_INT_TO_SHORT)
++    {
++        return kVectorizedShort;
++    }
++
++    //If we saw no casts, return int type
++    if (targetOpcode == OP_NOP)
++    {
++        return kVectorizedInt;
++    }
++
++    //We don't care about other casts
++    return kVectorizedNoType;
++}
++
++/**
++ * @brief Convert a type to how many elements per iteration
++ * @param type the type for the vectorization
++ * @return the number of executions in parallel for the vectorization
++ */
++unsigned int convertTypeToHowManyPerIteration (VectorizedType type)
++{
++    switch (type)
++    {
++        case kVectorizedByte:
++            return 8;
++        case kVectorizedShort:
++            return 8;
++        case kVectorizedInt:
++            return 4;
++        default:
++            return 1;
++    }
++}
++
++/**
++ * @brief Convert a type to size
++ * @param type the type for the vectorization
++ * @return the size in bytes for each type
++ */
++unsigned int convertTypeToSize (VectorizedType type)
++{
++    switch (type)
++    {
++        case kVectorizedByte:
++        case kVectorizedShort:
++            return 2;
++        case kVectorizedInt:
++            return 4;
++        default:
++            return 1;
++    }
++}
++
++/**
++ * @brief bb The BasicBlock of the loop
++ * @param cUnit the CompilationUnit
++ * @param loopInformation the LoopInformation
++ * @param bb the unique BasicBlock of the loop
++ * @param info the VectorizationInfo associated to the pass
++ */
++static bool fillVectorizationInformation (const CompilationUnit *cUnit, LoopInformation *loopInformation, BasicBlock *bb, VectorizationInfo *info)
++{
++    //Paranoid
++    if (bb == 0 || info == 0)
++    {
++        return false;
++    }
++
++    //Let's get the IV to begin with
++    InductionVariableInfo *ivInfo = (InductionVariableInfo *) dvmGrowableListGetElement (& (loopInformation->getInductionVariableList()), 0);
++
++    //Paranoid
++    if (ivInfo == 0)
++    {
++        return false;
++    }
++
++    unsigned int vrIV = dvmExtractSSARegister (cUnit, ivInfo->basicSSAReg);
++    int increment = ivInfo->inc;
++
++    //It is a count up loop so this should not happen
++    if (increment < 0)
++    {
++        return false;
++    }
++
++    //Since this is the IV increment, we will multiply it by the number of iterations we are able
++    //to skip using vectorization
++    increment *= convertTypeToHowManyPerIteration (info->type);
++
++    //Add it as a constant
++    //Add 0, the proper XMM value will be filled up later
++    info->constants[increment] = 0;
++
++    //Go through the MIRs of the BB and fill up information
++    MIR *mir;
++
++    for (mir = bb->firstMIRInsn; mir != bb->lastMIRInsn->next; mir = mir->next)
++    {
++        //Get the SSA
++        SSARepresentation *ssaRep = mir->ssaRep;
++
++        //We cannot continue of there is no SSA information
++        if (ssaRep == 0)
++        {
++            return false;
++        }
++
++        //For phi nodes, we have input and output registers both
++        if (mir->dalvikInsn.opcode == static_cast<Opcode>(kMirOpPhi))
++        {
++            setInputRegister (info, static_cast<int>(mir->dalvikInsn.vA), true);
++            setOutputRegister (info, static_cast<int>(mir->dalvikInsn.vA), true);
++            continue;
++        }
++
++        //Now let's bail if we have any other bytecode which cannot be in a vectorized loop
++        if (isVectorizable (mir) == false)
++        {
++            return false;
++        }
++
++        //If this the IV bytecode, ignore it (we handle it later
++        if (mir->dalvikInsn.vA == vrIV && dvmCompilerIsMIRConditional (mir) == false)
++        {
++            continue;
++        }
++
++        //Let's first look at constants
++        bool isWide = false;
++        int constValueLow;
++        int constValueHigh;
++
++        bool setsConst = dexGetConstant (mir->dalvikInsn, constValueLow, constValueHigh, isWide);
++
++        //Fill the corresponding VRs
++        if (setsConst == true && isWide == false)
++        {
++            //We actually don't care if this constant is the one for the IV
++            SSARepresentation *ssaRep = mir->ssaRep;
++
++            //Paranoid
++            assert (ssaRep != 0);
++
++            if (ssaRep == 0)
++            {
++                return false;
++            }
++
++            //Unmark its definition
++            int defDalvikReg = dvmExtractSSARegister (cUnit, ssaRep->defs[0]);
++            setOutputRegister (info, defDalvikReg, false);
++
++            //Get its used
++            SUsedChain *next = ssaRep->usedNext[0];
++
++            //Skip it if no use
++            if (next == 0)
++            {
++                continue;
++            }
++
++            MIR *used = next->mir;
++
++            /* If the use is the last MIR of the loop basic block, or belongs to another basic block,
++            * ignore it
++            */
++            if (used->next == 0 || used->bb != mir->bb)
++            {
++                continue;
++            }
++
++            //If the next used is not the if OR if there is another use, we bail as well
++            if (dvmCompilerIsMIRConditional (used) == false || next->nextUse != 0)
++            {
++                return false;
++            }
++
++            info->constants[constValueLow] = 0;
++
++            //Move to the next MIR
++            continue;
++        }
++
++        //Explicitly go through the defines to add them as outputs
++        if (ssaRep->defs != 0)
++        {
++            for (int defIndex = 0; defIndex < ssaRep->numDefs; defIndex++)
++            {
++                //Get the defined dalvik reg
++                int defDalvikReg = dvmExtractSSARegister (cUnit, ssaRep->defs[defIndex]);
++
++                //Now set it as output
++                setOutputRegister (info, defDalvikReg, true);
++            }
++        }
++
++        //See if we have uses
++        if (ssaRep->uses == 0)
++        {
++            return false;
++        }
++
++        //Go through all the uses
++        int useIndex = ssaRep->numUses - 1;
++
++        //For each use, check the defines
++        while (useIndex >= 0) {
++
++            //Get the used ssa register
++            int ssaReg = ssaRep->uses[useIndex];
++
++            int vrUsed = dvmExtractSSARegister (cUnit, ssaReg);
++
++            //Get the defining MIR
++            MIR *defMir = ssaRep->defWhere[useIndex];
++
++            //If no define, this is an input
++            if (defMir == 0)
++            {
++                setInputRegister (info, vrUsed, true);
++            }
++            else
++            {
++                setOutputRegister (info, vrUsed, true);
++            }
++
++            //Finally, if the define is a CONST bytecode, remove it as an output, and remove the constant
++            if ((dvmCompilerDataFlowAttributes[defMir->dalvikInsn.opcode] & DF_SETS_CONST) != 0 )
++            {
++                setOutputRegister (info, vrUsed, false);
++            }
++
++            //Go to the next use
++            useIndex--;
++        }
++
++        //Handle constant case
++        if (isVectorizableInstructionUseConstant (mir) == true)
++        {
++            //Add it to the constant map
++            info->constants[mir->dalvikInsn.vC] = 0;
++        }
++
++    }
++
++    //We have added the IV as an output due to the PHI node. Remove it now
++    setOutputRegister (info, vrIV, false);
++
++    return true;
++}
++
++
++/**
++ * @brief Find a vectorized temporary register
++ * @param info the vectorization information
++ * @return the vectorized register to be used as a temporary, -1 if not found
++ */
++static int findVectorTemporary (VectorizationInfo *info)
++{
++    int vectorRegister = -1;
++    std::map<int, RegisterAssociation> &registers = info->registers;
++    std::set<int> usedVectorRegisters;
++
++    //Go through the registers to find unused vector we can use for temp
++    for (std::map<int, RegisterAssociation>::const_iterator it = registers.begin (); it != registers.end (); it++)
++    {
++        usedVectorRegisters.insert (it->second.vectorized);
++    }
++
++    //Also go through the constants
++    for (std::map<int, int>::const_iterator it = info->constants.begin (); it != info->constants.end (); it++)
++    {
++        usedVectorRegisters.insert (it->second);
++    }
++
++    //Now go through the available vector registers to see if we find a free one
++    for (unsigned char reg = 0; reg < gDvmJit.vectorRegisters; reg++)
++    {
++        if (usedVectorRegisters.find (static_cast<int> (reg)) == usedVectorRegisters.end())
++        {
++            //We found one
++            vectorRegister = static_cast<int> (reg);
++            break;
++        }
++    }
++
++    //We did not find a vector temporary
++    return vectorRegister;
++}
++
++
++void handleInductionVariable (CompilationUnit *cUnit, LoopInformation *loopInfo, VectorizationInfo *info, BasicBlock *bb, int vr, MIR *vr2vectorized)
++{
++    //Theoretically, it would be better to not have to go through the list again
++    int increment = loopInfo->getInductionIncrement (cUnit, vr);
++
++    //Create the XMM we need here
++    MIR *cst = dvmCompilerNewMIR ();
++
++    //Paranoid
++    assert (cst != 0);
++
++    cst->dalvikInsn.opcode = static_cast<Opcode> (kMirOpConst128b);
++
++    //Find a temporary
++    cst->dalvikInsn.vA = findVectorTemporary (info);
++
++    //We want to create the incremental constant
++    int max = convertTypeToHowManyPerIteration (info->type);
++    int size = convertTypeToSize (info->type);
++    int current = 0;
++    char args[16];
++    char *ptr = args;
++
++    assert (size * max == sizeof (args));
++
++    for (int i = 0; i < max; i++)
++    {
++        switch (size)
++        {
++            case 4:
++                {
++                    //It is 4 bytes for each type
++                    int *iptr = (int *) (ptr);
++                    *iptr = current;
++                    //Increment ptr
++                    ptr += sizeof (*iptr);
++                }
++                break;
++            case 2:
++                {
++                    //It is 2 bytes for each type
++                    short *sptr = (short *) (ptr);
++                    *sptr = current;
++                    //Increment ptr
++                    ptr += sizeof (*sptr);
++                }
++                break;
++            default:
++                //Should never happen
++                assert (0);
++                break;
++        }
++
++        //Increment increment :)
++        current += increment;
++    }
++
++    //Now copy it to the args
++    memcpy (cst->dalvikInsn.arg, args, sizeof (args));
++
++    dvmCompilerAppendMIR (bb, cst);
++
++    //Finally we want to add to the IV this constant
++    MIR *mir = dvmCompilerNewMIR ();
++
++    //Paranoid
++    assert (mir != 0);
++
++    mir->dalvikInsn.opcode = static_cast<Opcode> (kMirOpPackedAddition);
++    mir->dalvikInsn.vA = vr2vectorized->dalvikInsn.vA;
++    mir->dalvikInsn.vB = cst->dalvikInsn.vA;
++    mir->dalvikInsn.vC = vr2vectorized->dalvikInsn.vC;
++    dvmCompilerAppendMIR (bb, mir);
++}
++/**
++ * @brief Hoist the setup of the vectorization loop in bb
++ * @param cUnit the CompilationUnit
++ * @param loopInfo the LoopInformation
++ * @param info the VectorizationInfo
++ * @param bb the BasicBlock to hoist in
++ */
++static void hoistSetup (CompilationUnit *cUnit, LoopInformation *loopInfo, VectorizationInfo *info, BasicBlock *bb)
++{
++    //Paranoid
++    if (info == 0 || info->type == kVectorizedNoType)
++    {
++        return;
++    }
++
++    //Get the lists
++    std::map<int, RegisterAssociation> &registers = info->registers;
++    std::map<int, int> &constants = info->constants;
++
++    //Get an iterator for the list
++
++    //First, go through the inputs, and generate the instructions to set
++    for (std::map<int, RegisterAssociation>::const_iterator it = registers.begin(); it != registers.end(); it++)
++    {
++
++        //Get local association
++        const RegisterAssociation &association = it->second;
++
++        //If it isn't an input, skip it
++        if (association.input == false)
++        {
++            continue;
++        }
++
++        MIR *mir = dvmCompilerNewMIR();
++
++        //Paranoid
++        assert (mir != 0);
++
++        //Get the vectorized register
++        mir->dalvikInsn.vA = association.vectorized;
++
++        /*
++         * If the VR is just an input, we do a PackedSet
++         * Else we just load up 0s, since if it is an output
++         * it has to be an accumulation, and the gate ensures that
++         */
++        if (association.output == true)
++        {
++            //We need a move data
++            mir->dalvikInsn.opcode = static_cast<Opcode>(kMirOpConst128b);
++
++            //We want to load 0 as the data
++            mir->dalvikInsn.arg[0] = 0;
++            mir->dalvikInsn.arg[1] = 0;
++            mir->dalvikInsn.arg[2] = 0;
++            mir->dalvikInsn.arg[3] = 0;
++
++            dvmCompilerAppendMIR (bb, mir);
++        }
++        else
++        {
++            //We do a packed set of all input VRs
++            mir->dalvikInsn.opcode = static_cast<Opcode>(kMirOpPackedSet);
++
++            //Fill in the appropriate size
++            mir->dalvikInsn.vC = convertTypeToSize (info->type);
++
++            //Set the vR
++            int vr = it->first;
++            mir->dalvikInsn.vB = vr;
++
++            dvmCompilerAppendMIR (bb, mir);
++
++            //If we have an induction variable, we have a bit more work
++            if (loopInfo->isAnInductionVariable (cUnit, vr) == true)
++            {
++                handleInductionVariable (cUnit, loopInfo, info, bb, vr, mir);
++            }
++        }
++    }
++
++    //Now go through the constants and create constant extended ops
++    for (std::map<int, int>::const_iterator it = constants.begin (); it != constants.end (); it++)
++    {
++        MIR *mir = dvmCompilerNewMIR ();
++
++        //Create a packed data move
++        mir->dalvikInsn.opcode = static_cast<Opcode>(kMirOpConst128b);
++
++        //Get the const value
++        int constValue = it->first;
++
++        //Make the constant a 16-bit value if that is the size
++        if (info->type == kVectorizedByte || info->type == kVectorizedShort)
++        {
++            constValue = constValue << 16;
++            constValue |= ((it->first) & 0xFF);
++        }
++
++        mir->dalvikInsn.arg[0] = constValue;
++        mir->dalvikInsn.arg[1] = constValue;
++        mir->dalvikInsn.arg[2] = constValue;
++        mir->dalvikInsn.arg[3] = constValue;
++
++        //Get the vectorized register
++        mir->dalvikInsn.vA = it->second;
++
++        dvmCompilerAppendMIR (bb, mir);
++    }
++}
++
++/**
++ * @brief Sink the wrap up of the vectorization loop in bb
++ * @param info the VectorizationInfo
++ * @param bb the BasicBlock to sink in
++ */
++static void sinkWrapUp (VectorizationInfo *info, BasicBlock *bb)
++{
++    //Paranoid
++    if (info == 0)
++    {
++        return;
++    }
++
++    std::map<int, RegisterAssociation> &registers = info->registers;
++
++    //Convert all outputs to Packed Reduce
++    for (std::map<int, RegisterAssociation>::const_iterator it = registers.begin (); it != registers.end (); it++)
++    {
++        //Get the output VR
++        const RegisterAssociation &association = it->second;
++
++        //Only care if it is an exit
++        if (association.output == true)
++        {
++            int vr = it->first;
++
++            MIR *mir = dvmCompilerNewMIR();
++
++            mir->dalvikInsn.opcode = static_cast<Opcode>(kMirOpPackedAddReduce);
++
++            mir->dalvikInsn.vA = vr;
++
++            //Get the vectorized register
++            mir->dalvikInsn.vB = association.vectorized;
++
++            mir->dalvikInsn.vC = convertTypeToSize(info->type);
++
++            dvmCompilerPrependMIR(bb, mir);
++        }
++    }
++}
++
++/**
++ * @brief Check for inter-loop dependencies
++ * @param cUnit the CompilationUnit containing the loop
++ * @param info the LoopInformation
++ * @return whether there is a loop interdependency
++ */
++static bool checkLoopDependency (const CompilationUnit *cUnit, LoopInformation *info)
++{
++    BasicBlock *bb = info->getEntryBlock ();
++
++    if (bb == 0)
++    {
++        return true;
++    }
++
++    //Get the basic IV of the loop
++    unsigned int vrIV = dvmExtractSSARegister (cUnit, info->getSSABIV());
++
++    std::set<int> phiVRs;
++
++    //Now go through all the Phi Nodes and check them
++    for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        //We only care about Phi nodes
++        if (mir->dalvikInsn.opcode != static_cast<Opcode>(kMirOpPhi))
++        {
++            continue;
++        }
++
++        //Get the SSA representation
++        SSARepresentation *ssaRep = mir->ssaRep;
++
++        //Paranoid
++        assert (ssaRep != 0 && ssaRep->defs != 0);
++
++        phiVRs.insert(dvmExtractSSARegister (cUnit, ssaRep->defs[0]));
++
++    }
++
++    std::set<int> dirtyVRs;
++
++    //Now go through the rest of the MIRs and mark them dirty
++    for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        SSARepresentation *ssaRep = mir->ssaRep;
++
++        if (ssaRep == 0)
++        {
++            return true;
++        }
++
++        //Go through all the uses of the MIR
++        for (int i = 0 ; i < ssaRep->numUses ; i++)
++        {
++            unsigned int vrUse = dvmExtractSSARegister (cUnit, ssaRep->uses[i]);
++
++            //Check if the use is dirty
++            if (dirtyVRs.find (vrUse) != dirtyVRs.end ())
++            {
++                //Go through all the defs and mark them dirty
++                for (int j = 0 ; j < ssaRep->numDefs ; j++)
++                {
++                    dirtyVRs.insert(dvmExtractSSARegister (cUnit, ssaRep->defs[j]));
++                }
++                continue;
++            }
++
++            //Otherwise, if the use is a phi node VR...
++            if (phiVRs.find(vrUse) != phiVRs.end ())
++            {
++                //If it is not an IV
++                if (vrUse != vrIV)
++                {
++                    //if all the defs are not the same VR
++                    for (int j = 0 ; j < ssaRep->numDefs ; j++)
++                    {
++                        if (vrUse != dvmExtractSSARegister(cUnit, ssaRep->defs[j]))
++                        {
++                            //Mark it as dirty
++                            dirtyVRs.insert(dvmExtractSSARegister (cUnit, ssaRep->defs[j]));
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    //Now go through the two lists and see if there is anything common
++    std::set<int>::iterator it;
++
++    for (it = phiVRs.begin (); it != phiVRs.end (); it++)
++    {
++        if (dirtyVRs.find (*it) != dirtyVRs.end ())
++        {
++            //We have a phi VR which is dirty
++            return true;
++        }
++    }
++
++    return false;
++}
++
++/**
++ * @brief Does the loop have a safe accumulation or would it be unsafe to vectorize?
++ * @param cUnit the CompilationUnit
++ * @param loopInfo the LoopInformation
++ * @param outputVR the output virtual register
++ * @return whether or not the loop has a safe accumulation when considering a given outputVR
++ */
++static bool haveSafeAccumulation (CompilationUnit *cUnit, LoopInformation *loopInfo, unsigned int outputVR)
++{
++    //Get the phi associated with the output VR
++    MIR *phi = loopInfo->getPhiInstruction (cUnit, outputVR);
++
++    if (phi == 0)
++    {
++        //The output VR must be a phi node
++        return false;
++    }
++
++    //Check that our only use is accumulation
++    SSARepresentation *ssaRep = phi->ssaRep;
++
++    if (ssaRep->numDefs != 1)
++    {
++        //We do not have logic to handle wide defines
++        return false;
++    }
++
++    SUsedChain *chain = ssaRep->usedNext[0];
++
++    if (chain->nextUse != 0)
++    {
++        //We cannot have more than one use
++        return false;
++    }
++
++    assert (chain->mir != 0);
++    assert (chain->mir->bb != 0);
++
++    Opcode opcode = chain->mir->dalvikInsn.opcode;
++
++    if ((dvmCompilerDataFlowAttributes[opcode] & DF_ADD_EXPRESSION) == 0)
++    {
++        //We don't have accumulation, we cannot vectorize
++        return false;
++    }
++
++    if (loopInfo->isBasicBlockInLoop (chain->mir->bb) == false)
++    {
++        //This must be in the loop
++        return false;
++    }
++
++    //Now check that we are redefining output VR
++    ssaRep = chain->mir->ssaRep;
++
++    if (ssaRep->numDefs != 1)
++    {
++        //We do not have logic to handle wide defines
++        return false;
++    }
++
++    if (dvmExtractSSARegister (cUnit, ssaRep->defs[0]) != outputVR)
++    {
++        //We must redefine ourselves
++        return false;
++    }
++
++    //Find the next use of this redefinition
++    chain = ssaRep->usedNext[0];
++
++    while (chain != 0)
++    {
++        //The next use must be input into phi node we started with
++        if (chain->mir->bb == phi->bb)
++        {
++            if (chain->mir != phi)
++            {
++                return false;
++            }
++        }
++
++        chain = chain->nextUse;
++    }
++
++    //Everything is good
++    return true;
++}
++
++static bool vectorizationGateHelper (const CompilationUnit *cUnit, LoopInformation *loopInfo, void *data)
++{
++    Pass *pass = (Pass *) (data);
++
++    if (loopInfo == 0)
++    {
++        return false;
++    }
++
++    //We only care about the inner loop here
++    if (loopInfo->getNested () != 0)
++    {
++        return true;
++    }
++
++    if (dvmCompilerVerySimpleLoopGateWithLoopInfo (cUnit, loopInfo) == false)
++    {
++        return false;
++    }
++
++    //We can only handle loops with an increment of 1 to the IV
++    if (loopInfo->isUniqueIVIncrementingBy1() == false)
++    {
++        return false;
++    }
++
++    //Create a vectorization system
++    VectorizationInfo *info = 0;
++    //Create space
++    void *space = dvmCompilerNew (sizeof (*info), true);
++    //Create the information for the vectorization information
++    info = new (space) VectorizationInfo ();
++
++    //Set the pass data
++    pass->setData (info);
++
++    //Get entry block
++    BasicBlock *bb = loopInfo->getEntryBlock ();
++
++    //Paranoid
++    assert (bb != 0);
++
++    // Request a scratch virtual register to use for generating test in vectorization
++    int scratchVrForTest = loopInfo->getFreeScratchRegisters (const_cast<CompilationUnit*>(cUnit), 1);
++
++    // bail if no free scratch to use
++    if (scratchVrForTest == -1)
++    {
++        return false;
++    }
++
++    // Now we have a free scratch register to use, remember it in VectorizationInfo
++    info->scratchVrForTest = scratchVrForTest;
++
++    //Find the type for the vectorization
++    info->type = findType (cUnit, loopInfo);
++
++    //If no type, we are done
++    if (info->type == kVectorizedNoType)
++    {
++        return false;
++    }
++
++    //Does the vectorization in the BE support the size
++    if (dvmCompilerArchSupportsVectorizedPackedSize (convertTypeToSize (info->type)) == false )
++    {
++        return false;
++    }
++
++    //For the moment we only handle count-up loops
++    if (loopInfo->getCountUpLoop () == false)
++    {
++        return false;
++    }
++
++    //Find the upper bound
++    bool foundUpperBound = findUpperBound (loopInfo, info->upperBound);
++
++    //If problem, bail
++    if (foundUpperBound == false)
++    {
++        return false;
++    }
++
++    //How many iterations would we have vectorized at max?
++    unsigned int cnt = (info->upperBound > 0) ? info->upperBound : - info->upperBound;
++
++    //How many are done at the same time
++    unsigned int howManyPerIteration = convertTypeToHowManyPerIteration (info->type);
++
++    //Paranoid
++    assert (howManyPerIteration != 0);
++
++    //Calculate how many vectorized iterations
++    cnt /= howManyPerIteration;
++
++    if (info->upperBound < gDvmJit.minVectorizedIterations)
++    {
++        return false;
++    }
++
++    //Last check: interdependency
++    if (checkLoopDependency (cUnit, loopInfo) == true)
++    {
++        return false;
++    }
++
++
++    //First job: gather input, output, constants
++    if (fillVectorizationInformation (cUnit, loopInfo, bb, info) == false)
++    {
++        return false;
++    }
++
++    //Now check if we have enough vectorized registers for this
++    unsigned int count = info->registers.size () + info->constants.size ();
++    if (count >= gDvmJit.vectorRegisters)
++    {
++        return false;
++    }
++
++    //We also need to check if it is safe to sink the accumulation on the output registers
++    std::map <int, RegisterAssociation>::iterator it;
++    for (it = info->registers.begin(); it != info->registers.end(); it++)
++    {
++        //For each output VR check if it is safe to accumulate (if accumulating)
++        if (it->second.output == true)
++        {
++            if (haveSafeAccumulation ((CompilationUnit *) cUnit, loopInfo, static_cast<unsigned int>(it->first)) == false)
++            {
++                return false;
++            }
++        }
++    }
++
++    return true;
++}
++
++bool dvmCompilerVectorizationGate (const CompilationUnit *cUnit, Pass *pass)
++{
++    //First, make sure we are in the new loop detection system
++    if (dvmCompilerTraceIsLoopNewSystem(cUnit, pass) == false)
++    {
++        return false;
++    }
++
++    LoopInformation *info = cUnit->loopInformation;
++
++    //Find the innermost loop and test it
++    if (info != 0)
++    {
++        if (info->iterateWithConst (cUnit, vectorizationGateHelper, pass) == true)
++        {
++            // Optimization can be applicable
++            return true;
++        }
++    }
++
++    return false;
++}
++
++void dvmCompilerFreeVectorization (void *data)
++{
++    //Get the VectorizationInfo from data
++    VectorizationInfo *info = static_cast<VectorizationInfo *> (data);
++
++    if (info != 0)
++    {
++        //info->registers.clear();
++       // info->constants.clear();
++    }
++}
++
++/**
++ * @brief Create the main test: the test performed before entering the non vectorized loop
++ * @param cUnit The CompilationUnit
++ * @param loopInfo the LoopInformation
++ * @param info the VectorizationInfo
++ * @param return a BasicBlock containing the test to know if the code should enter the non vectorized loop
++ */
++static BasicBlock *createMainTest (CompilationUnit *cUnit, LoopInformation *loopInfo, VectorizationInfo *info)
++{
++    if (loopInfo == 0 || info == 0)
++    {
++        //bail
++        return 0;
++    }
++
++    //Get the basic block of the loop
++    BasicBlock *bb = loopInfo->getEntryBlock ();
++
++    //Get the if bytecode
++    MIR *ifMIR = bb->lastMIRInsn;
++
++    //Duplicate it
++    MIR *copyIF = dvmCompilerCopyMIR (ifMIR);
++
++    //Get the ssa representation
++    SSARepresentation *ssaRep = ifMIR->ssaRep;
++
++    //Paranoid
++    assert (ssaRep != 0);
++
++    //We also need the constant: again the gate should check if it's here
++    int vA = ifMIR->dalvikInsn.vA;
++    MIR *constMIR = 0;
++
++    //Is it the IV?
++    if (loopInfo->isAnInductionVariable (cUnit, vA) == true)
++    {
++        //Paranoid
++        assert (ssaRep->numUses > 1);
++
++        //Then the constMIR is the second
++        constMIR = ssaRep->defWhere[1];
++
++        // replace the use which is not induction variable in copyIF mir with scratch register
++        copyIF->dalvikInsn.vB = info->scratchVrForTest;
++    }
++    else
++    {
++        //Paranoid
++        assert (ssaRep->numUses > 0);
++
++        //Otherwise it's the first guy
++        constMIR = ssaRep->defWhere[0];
++
++        // replace the use which is not induction variable in copyIF mir with scratch register
++        copyIF->dalvikInsn.vA = info->scratchVrForTest;
++    }
++
++    assert (constMIR != 0);
++
++    //Duplicate it
++    MIR *copyConstMIR = dvmCompilerCopyMIR (constMIR);
++
++    // replace def in constMIR with scratch register
++    copyConstMIR->dalvikInsn.vA = info->scratchVrForTest;
++
++    //Now create a BasicBlock with these instructions
++    BasicBlock *res = dvmCompilerNewBBinCunit (cUnit, kDalvikByteCode);
++
++    //Append the MIRs
++    dvmCompilerAppendMIR (res, copyConstMIR);
++    dvmCompilerAppendMIR (res, copyIF);
++
++    return res;
++}
++
++/**
++ * @brief Create a vectorized test: the test performed before entering the vectorized loop
++ * @param cUnit The CompilationUnit
++ * @param loopInfo the LoopInformation
++ * @param info the VectorizationInfo
++ * @param return a BasicBlock containing the test to know if the code should enter the vectorized loop
++ */
++static BasicBlock *createVectorizedTest (CompilationUnit *cUnit, LoopInformation *loopInfo, VectorizationInfo *info)
++{
++    BasicBlock *bb = createMainTest (cUnit, loopInfo, info);
++
++    //Paranoid
++    assert (bb != 0);
++
++    //Now just get the opcode for the const
++    MIR *first = bb->firstMIRInsn;
++
++    //Paranoid
++    assert (first != 0 && first->dalvikInsn.opcode == OP_CONST);
++
++    //Now just get the vectorized upper bound
++    unsigned int howManyPerIteration = convertTypeToHowManyPerIteration (info->type);
++
++    //Update upper bound
++    first->dalvikInsn.vB -= howManyPerIteration;
++
++    return bb;
++}
++
++/**
++ * @brief Form the vectorized loop
++ * @param vectorizedTest the test before the vectorized loop
++ * @param vectorizedPreHeader the preheader block for the vectorized loop
++ * @param vectorizedBB the vectorized BB
++ * @param vectorizedExit the exit basic block for the vectorized loop
++ * @param bwcc the Backward Chaining Cell block
++ */
++static void formVectorizedLoop (BasicBlock *vectorizedTest,
++                                BasicBlock *vectorizedPreHeader,
++                                BasicBlock *vectorizedBB,
++                                BasicBlock *vectorizedExit,
++                                BasicBlock *bwcc)
++{
++    //The preheader goes to the loop
++    vectorizedPreHeader->fallThrough = vectorizedBB;
++
++    //The loop either goes to the exit or the bwcc, which depends on where the bwcc is
++    if (vectorizedBB->fallThrough->blockType == kChainingCellBackwardBranch)
++    {
++        vectorizedBB->fallThrough = bwcc;
++        vectorizedBB->taken = vectorizedExit;
++
++        vectorizedTest->fallThrough = vectorizedPreHeader;
++        vectorizedTest->taken = 0;
++    }
++    else
++    {
++        vectorizedBB->taken = bwcc;
++        vectorizedBB->fallThrough = vectorizedExit;
++
++        vectorizedTest->fallThrough = 0;
++        vectorizedTest->taken = vectorizedPreHeader;
++    }
++
++    //Link bwcc to vectorized loop
++    bwcc->fallThrough = vectorizedBB;
++}
++
++/**
++ * @brief Form the vectorized loop
++ * @param normalTest the test before the normal loop
++ * @param preHeader the preheader block for the normal loop
++ * @param bb the BasicBlock
++ * @param exit the exit basic block for the normal loop
++ */
++static void formNormalLoop (BasicBlock *normalTest,
++                       BasicBlock *preHeader,
++                       BasicBlock *bb,
++                       BasicBlock *exit)
++{
++    if (bb->fallThrough->blockType == kDalvikByteCode)
++    {
++        normalTest->fallThrough = exit;
++        normalTest->taken = preHeader;
++    }
++    else
++    {
++        normalTest->taken = exit;
++        normalTest->fallThrough = preHeader;
++    }
++
++    //Preheader goes to the loop
++    preHeader->fallThrough = bb;
++}
++
++/**
++ * @brief Link the loops together
++ * @param vectorizedTest the test before the vectorized loop
++ * @param vectorizedExit the exit basic block for the vectorized loop
++ * @param normalTest the test before the normal loop
++ * @param postExit the post exit basic block
++ */
++static void linkBlocks (BasicBlock *vectorizedTest,
++                        BasicBlock *vectorizedExit,
++                        BasicBlock *normalTest,
++                        BasicBlock *postExit)
++{
++    //Link the vectorized test's uninitialized branch to normalTest
++    if (vectorizedTest->taken == 0)
++    {
++        vectorizedTest->taken = normalTest;
++    }
++    else
++    {
++        vectorizedTest->fallThrough = normalTest;
++    }
++    //So will the vectorized exit
++    vectorizedExit->fallThrough = normalTest;
++}
++
++ /**
++ * @brief a helper function to return association vectorized version for an opcode
++ * @param scalarOpcode the scalar version of opcode
++ * @return vectorized version of opcode or 0 if no match
++ */
++ExtendedMIROpcode getVectorizedOpcode (Opcode scalarOpcode)
++{
++    ExtendedMIROpcode vectorizedOpcode = (ExtendedMIROpcode) 0;
++
++    switch (scalarOpcode)
++    {
++        case OP_ADD_INT:
++        case OP_ADD_INT_LIT8:
++            vectorizedOpcode = kMirOpPackedAddition;
++            break;
++        case OP_MUL_INT:
++            vectorizedOpcode = kMirOpPackedMultiply;
++            break;
++        default:
++            // not supported yet
++            break;
++    }
++
++    return vectorizedOpcode;
++}
++
++/**
++ * @brief Handle the add literal vectorization
++ * @param cUnit the CompilationUnit
++ * @param loopInformation the LoopInformation
++ * @param info the VectorizationInfo
++ * @param vectorizedBB the BasicBlock which is getting vectorized
++ * @param mir the MIR instruction
++ * @param size of the vectorization in bytes
++ */
++static void handleAddLiteral (CompilationUnit *cUnit, LoopInformation *loopInformation, VectorizationInfo *info, BasicBlock *vectorizedBB, MIR *mir, unsigned int size)
++{
++    //Get the opcode
++    Opcode opcode = mir->dalvikInsn.opcode;
++
++    //Let's see if this is an IV
++    if (loopInformation->isAnBasicInductionVariable(cUnit, mir->dalvikInsn.vA) == true)
++    {
++        MIR *vectorizedIV = dvmCompilerNewMIR ();
++
++        /* We need to generate an IV increment adjusted to the vectorization
++         * Basically look for the XMM containing the constant increment adjusted
++         * to the number of iterations skipped due to vectorization
++         */
++        int increment = mir->dalvikInsn.vC;
++        increment *= convertTypeToHowManyPerIteration(info->type);
++
++        std::map <int, int>::iterator itConst = info->constants.find (increment);
++
++        //Convert the IV increment to a regular XMM addition
++        DecodedInstruction &insn = vectorizedIV->dalvikInsn;
++
++        insn.opcode = static_cast<Opcode> (getVectorizedOpcode (opcode));
++
++        std::map <int, RegisterAssociation>::iterator itA = info->registers.find (mir->dalvikInsn.vA);
++        RegisterAssociation &associationA = itA->second;
++        insn.vA = associationA.vectorized;
++        insn.vB = itConst->second;
++
++        insn.vC = size;
++
++        //Now add it before
++        dvmCompilerInsertMIRBefore (mir->bb, mir, vectorizedIV);
++
++        //Our non-vectorized increment now skips iterations
++        mir->dalvikInsn.vC = convertTypeToHowManyPerIteration(info->type);
++
++        return;
++    }
++    else
++    {
++        //This is not an IV. We need to transform it into one vector add using the constant vectorized register
++        std::map <int, int>::iterator itConst = info->constants.find (mir->dalvikInsn.vC);
++
++        //Get instruction
++        DecodedInstruction &insn = mir->dalvikInsn;
++
++        // source are not equal to destination, we need to generate a kMirOpMove128b
++        if (insn.vA != insn.vB) {
++
++            // create a new mir
++            MIR* newMir = dvmCompilerNewMIR();
++            DecodedInstruction &newInsn = newMir->dalvikInsn;
++
++            // set the opcode to be kMirOpMove128b
++            newMir->dalvikInsn.opcode = static_cast<Opcode> (kMirOpMove128b);
++
++            // set the vA for new mir
++            std::map <int, RegisterAssociation>::iterator itA = info->registers.find (insn.vA);
++            RegisterAssociation &associationA = itA->second;
++            newInsn.vA = associationA.vectorized;
++
++            // set the vB for new mir
++            std::map <int, RegisterAssociation>::iterator itB = info->registers.find (insn.vB);
++            RegisterAssociation &associationB = itB->second;
++            newInsn.vB = associationB.vectorized;
++
++            // insert it before current mir
++            dvmCompilerInsertMIRBefore(vectorizedBB, mir, newMir);
++        }
++
++        //Now change this MIR
++        mir->dalvikInsn.vA = (info->registers.find (mir->dalvikInsn.vA)->second).vectorized;
++        mir->dalvikInsn.vB = itConst->second;
++        mir->dalvikInsn.vC = convertTypeToSize(info->type);
++        mir->dalvikInsn.opcode = static_cast<Opcode>(getVectorizedOpcode (mir->dalvikInsn.opcode));
++    }
++}
++
++/**
++ * @brief Handle the vectorization of an addition or a multiplication
++ * @param cUnit the CompilationUnit
++ * @param info the VectorizationInfo
++ * @param vectorizedBB the BasicBlock which is getting vectorized
++ * @param mir the MIR instruction
++ * @param size of the vectorization in bytes
++ */
++static void handleAddMultiply (CompilationUnit *cUnit, VectorizationInfo *info, BasicBlock *vectorizedBB, MIR *mir, unsigned int size)
++{
++    //Get opcode
++    Opcode opcode = mir->dalvikInsn.opcode;
++
++    //Get vectorized version of the opcode
++    ExtendedMIROpcode vectorizedOpcode = getVectorizedOpcode (opcode);
++
++    //If we found a matched vectorized version, update current mir to vectorized version
++    if (vectorizedOpcode != 0) {
++
++        //Get instruction
++        DecodedInstruction &insn = mir->dalvikInsn;
++
++        insn.opcode = static_cast<Opcode> (vectorizedOpcode);
++        int srcVr2 = insn.vC;
++
++        if (insn.vA == insn.vC) {
++            srcVr2 = insn.vB;
++        }
++
++        //Both sources are not equal to destination, we need to generate a kMirOpMove128b
++        else if (insn.vA != insn.vB) {
++
++            int srcVr1 = insn.vB;
++
++            // create a new mir
++            MIR* newMir = dvmCompilerNewMIR();
++            DecodedInstruction &newInsn = newMir->dalvikInsn;
++
++            // set the opcode to be kMirOpMove128b
++            newMir->dalvikInsn.opcode = static_cast<Opcode> (kMirOpMove128b);
++
++            // set the vA for new mir
++            std::map <int, RegisterAssociation>::iterator itA = info->registers.find (insn.vA);
++            RegisterAssociation &associationA = itA->second;
++            newInsn.vA = associationA.vectorized;
++
++            // set the vB for new mir
++            std::map <int, RegisterAssociation>::iterator itB = info->registers.find (srcVr1);
++            RegisterAssociation &associationB = itB->second;
++            newInsn.vB = associationB.vectorized;
++
++            // insert it before current mir
++            dvmCompilerInsertMIRBefore(vectorizedBB, mir, newMir);
++        }
++
++        // find destination XMM Reg
++        std::map <int, RegisterAssociation>::iterator itA = info->registers.find (insn.vA);
++        RegisterAssociation &associationA = itA->second;
++        insn.vA = associationA.vectorized;
++
++        // find source XMM Reg
++        std::map <int, RegisterAssociation>::iterator itC = info->registers.find (srcVr2);
++        RegisterAssociation &associationC = itC->second;
++        insn.vB = associationC.vectorized;
++
++        // fill the size info
++        mir->dalvikInsn.vC = size;
++    }
++}
++
++/**
++ * @brief Handle the vectorization of a constant
++ * @param cUnit the CompilationUnit
++ * @param loopInformation the LoopInformation
++ * @param info the VectorizationInfo
++ * @param mir the MIR instruction
++ */
++static void handleConstant (CompilationUnit *cUnit, LoopInformation *loopInformation, VectorizationInfo *info, MIR *mir)
++{
++    //If this is a const, check if this is the loop bound. If it is, this needs to be adjusted
++    SSARepresentation *ssaRep = mir->ssaRep;
++
++    //Get the IV
++    InductionVariableInfo *ivInfo = (InductionVariableInfo *) dvmGrowableListGetElement (& (loopInformation->getInductionVariableList()), 0);
++
++    unsigned int vrIV = dvmExtractSSARegister (cUnit, ivInfo->basicSSAReg);
++
++    if (ssaRep == 0)
++    {
++        if (mir->copiedFrom != 0)
++        {
++            ssaRep = mir->copiedFrom->ssaRep;
++        }
++
++        if (ssaRep == 0)
++        {
++            ALOGE("Returning");
++            return;
++        }
++    }
++
++    //Find the MIR where this is used
++    if (ssaRep->usedNext != 0 && ssaRep->usedNext[0] != 0)
++    {
++        MIR *useMIR = ssaRep->usedNext[0]->mir;
++
++        if (useMIR->dalvikInsn.opcode >= OP_IF_EQ && useMIR->dalvikInsn.opcode <= OP_IF_LE)
++        {
++            if (useMIR->dalvikInsn.vA == vrIV || useMIR->dalvikInsn.vB == vrIV)
++            {
++                //We are sure this const is setting the loop bounds. Adjust it.
++                mir->dalvikInsn.vB -= convertTypeToHowManyPerIteration(info->type);
++            }
++        }
++    }
++}
++
++/**
++  * @brief Transform mir in the vectorized loop
++  * @param cUnit CompilationUnit
++  * @param loopInformation the LoopInformation
++  * @param info vectorization information
++  * @param vectorizedBB the vectorized BB
++  * @param mir current mir need to transformed
++  */
++static void transformMirVectorized (CompilationUnit *cUnit,
++                                    LoopInformation *loopInformation,
++                                    VectorizationInfo *info,
++                                    BasicBlock *vectorizedBB,
++                                    MIR* mir)
++{
++    //Get size
++    int size = convertTypeToSize (info->type);
++
++    //Get the opcode
++    Opcode opcode = mir->dalvikInsn.opcode;
++
++    switch (opcode) {
++        case OP_ADD_INT_LIT8:
++            handleAddLiteral (cUnit, loopInformation, info, vectorizedBB, mir, size);
++            break;
++
++        case OP_ADD_INT:
++        case OP_MUL_INT:
++            handleAddMultiply (cUnit, info, vectorizedBB, mir, size);
++            break;
++
++        case OP_CONST:
++        case OP_CONST_4:
++        case OP_CONST_16:
++            handleConstant (cUnit, loopInformation, info, mir);
++            break;
++        //For all the other opcodes, skipped it for now for vectorization transformation
++        default:
++            return;
++    }
++    return;
++}
++
++/**
++  * @brief Transform Form the vectorized loop
++  * @param cUnit CompilationUnit
++  * @param loopInformation the LoopInformation
++  * @param info vectorization information
++  * @param vectorizedPreHeader the preheader for the vectorized loop
++  * @param vectorizedBB the vectorized BB
++  * @param vectorizedExit the vectorized Exit
++  * @param bwcc The backward chaining cell block of the loop
++  * @return whether the transformation was successful
++  */
++static bool transformVectorized (CompilationUnit *cUnit,
++                                 LoopInformation *loopInformation,
++                                 VectorizationInfo *info,
++                                 BasicBlock *vectorizedPreHeader,
++                                 BasicBlock *vectorizedBB,
++                                 BasicBlock *vectorizedExit,
++                                 BasicBlock *bwcc)
++{
++    //Hoist set up before loop
++    hoistSetup (cUnit, loopInformation, info, vectorizedPreHeader);
++
++    //Sink wrap up before loop
++    sinkWrapUp (info, vectorizedExit);
++    sinkWrapUp (info, bwcc);
++
++    if (vectorizedBB == 0)
++        return false;
++
++    // Scan each instructions
++    for (MIR *mir = vectorizedBB->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        transformMirVectorized(cUnit, loopInformation, info, vectorizedBB, mir);
++    }
++
++    return true;
++}
++
++/**
++ * @brief Assign vectorized registers for each VR in the Vectorized information
++ * @param info the Vectorized information
++ */
++static void assignVectorizedRegisters (VectorizationInfo *info)
++{
++    int cnt = 0;
++
++    for (std::map<int, RegisterAssociation>::iterator it = info->registers.begin (); it != info->registers.end (); it++)
++    {
++        //Get a local version
++        RegisterAssociation &association = it->second;
++
++        association.vectorized = cnt;
++        cnt++;
++    }
++
++    for (std::map<int, int>::iterator it = info->constants.begin (); it != info->constants.end (); it++)
++    {
++        it->second = cnt;
++        cnt++;
++    }
++
++    //Assert because normally the gate ensured this was fine
++    assert (cnt < gDvmJit.vectorRegisters);
++}
++
++/**
++ * @brief Update the dalvik bytecode predecessors of a BasicBlock to now go to another
++ * @param cUnit The CompilationUnit
++ * @param orig the original destination of the predecessors
++ * @param newDest the new destination of the predecessors
++ */
++static void updatePredecessors (CompilationUnit *cUnit, BasicBlock *orig, BasicBlock *newDest)
++{
++    //Get the predecessors
++    BitVector *predecessors = orig->predecessors;
++
++    //Now walk them
++    BitVectorIterator iterator;
++    dvmBitVectorIteratorInit (predecessors, &iterator);
++    BasicBlock *predecessor = dvmCompilerGetNextBasicBlockViaBitVector (iterator, cUnit->blockList);
++
++    while (predecessor != 0)
++    {
++
++        //The we want to change the link
++        if (predecessor->taken == orig)
++        {
++            predecessor->taken = newDest;
++        }
++        else
++        {
++            predecessor->fallThrough = newDest;
++        }
++
++
++        //Get next predecessor
++        predecessor = dvmCompilerGetNextBasicBlockViaBitVector (iterator, cUnit->blockList);
++    }
++}
++
++static bool vectorizeHelper (CompilationUnit *cUnit, LoopInformation *loopInformation, void *data)
++{
++    Pass *pass = (Pass *) data;
++
++    // Only apply pass to innermost loop
++    if (loopInformation->getNested () != 0)
++    {
++        return true;
++    }
++
++    //First: get the Loop's BB
++    BasicBlock *bb = loopInformation->getEntryBlock ();
++    //Second: get the loop's preheader
++    BasicBlock *preheader = loopInformation->getPreHeader ();
++    //Third: get the loop's exit
++    BasicBlock *exit = loopInformation->getExitBlock (cUnit);
++    //Third: get the loop's post-exit
++    BasicBlock *postExit = loopInformation->getPostExitBlock (cUnit);
++    //Fourth: get the BWCC
++    BasicBlock *bwcc = loopInformation->getBackwardBranchBlock (cUnit);
++
++    //Huge paranoid
++    assert (bb != 0 && preheader != 0 && exit != 0 && postExit != 0);
++
++    //Get info for the vectorization
++    VectorizationInfo *info = static_cast<VectorizationInfo *> (pass->getData ());
++
++    //We want a copy of all of these
++    BasicBlock *copyBasicBlock = dvmCompilerCopyBasicBlock (cUnit, bb);
++    BasicBlock *copyPreHeader = dvmCompilerCopyBasicBlock (cUnit, preheader);
++    BasicBlock *copyExit = dvmCompilerCopyBasicBlock (cUnit, exit);
++    BasicBlock *copyBWCC = dvmCompilerCopyBasicBlock (cUnit, bwcc);
++
++    //We want two test blocks: main block test and vectorized version
++    BasicBlock *mainTest = createMainTest (cUnit, loopInformation, info);
++
++    //We want the vectorized test
++    BasicBlock *vectorizedTest = createVectorizedTest (cUnit, loopInformation, info);
++
++    //Now assign the vectorized registers
++    assignVectorizedRegisters (info);
++
++    //Update all predecessors of the preheader to now go to the vectorized test
++    updatePredecessors (cUnit, preheader, vectorizedTest);
++
++    //First assemble all vectorized blocks together to form the loop
++    formVectorizedLoop (vectorizedTest, copyPreHeader, copyBasicBlock, copyExit, copyBWCC);
++
++    //Now the normal loop no longer needs the bwcc because it will finish automatically
++    //Therefore, let's form the new one
++    formNormalLoop (mainTest, preheader, bb, postExit);
++
++    //We want to link things together
++    linkBlocks (vectorizedTest, copyExit, mainTest, postExit);
++
++    //We have the CFG up now, what we want to do is now transform the vectorized loop into... a vectorized loop
++    transformVectorized (cUnit, loopInformation, info, copyPreHeader, copyBasicBlock, copyExit, copyBWCC);
++
++    return true;
++}
++
++void dvmCompilerVectorize (CompilationUnit *cUnit, Pass *pass)
++{
++    //Now let's go through the loop information
++    LoopInformation *info = cUnit->loopInformation;
++
++    //Now try to sink accumulations
++    if (info != 0)
++    {
++        info->iterate (cUnit, vectorizeHelper, pass);
++    }
++}
+diff --git a/vm/compiler/Vectorization.h b/vm/compiler/Vectorization.h
+new file mode 100644
+index 0000000..6d8a674
+--- /dev/null
++++ b/vm/compiler/Vectorization.h
+@@ -0,0 +1,43 @@
++/*
++* Copyright (C) 2012 Intel Corporation
++*
++* Licensed under the Apache License, Version 2.0 (the "License");
++* you may not use this file except in compliance with the License.
++* You may obtain a copy of the License at
++*
++*      http://www.apache.org/licenses/LICENSE-2.0
++*
++* Unless required by applicable law or agreed to in writing, software
++* distributed under the License is distributed on an "AS IS" BASIS,
++* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++* See the License for the specific language governing permissions and
++* limitations under the License.
++*/
++
++#ifndef DALVIK_VM_VECTORIZATION_H_
++#define DALVIK_VM_VECTORIZATION_H_
++
++//Forward declaration
++struct CompilationUnit;
++class Pass;
++
++/**
++ * @brief The gate to the vectorization pass
++ * @param cUnit the CompilationUnit
++ * @param pass the Pass to the vectorization pass
++ */
++bool dvmCompilerVectorizationGate (const CompilationUnit *cUnit, Pass *pass);
++
++/**
++ * @brief The vectorization pass entry point
++ * @param cUnit the CompilationUnit
++ * @param pass the Pass to the vectorization pass
++ */
++void dvmCompilerVectorize (CompilationUnit *cUnit, Pass *pass);
++
++/**
++ * @brief The data for the vectorization pass
++ */
++void dvmCompilerFreeVectorization (void *data);
++
++#endif
+-- 
+1.7.4.1
+

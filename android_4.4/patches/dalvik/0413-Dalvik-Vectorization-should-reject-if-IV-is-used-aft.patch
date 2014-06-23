@@ -1,0 +1,123 @@
+From 7042b74b13e8847b62f4be1ccb098e58f1fddd7d Mon Sep 17 00:00:00 2001
+From: Serguei Katkov <serguei.i.katkov@intel.com>
+Date: Mon, 18 Nov 2013 23:09:03 +0700
+Subject: Dalvik: Vectorization should reject if IV is used after update
+
+BZ: 142241
+
+Vectorization optimization is written in a way that it is expected
+that induction variable is updated after all usages. It leads to
+incorrect computation in case it is updated before the last usage.
+
+The patch rejects the optimization of the loop if IV is used after
+update.
+
+Change-Id: Ie934b888efe967098bf1ab711b467bb8f41cb79d
+Category: device enablement
+Domain: AOSP.Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, need rework
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/CompilerIR.h      |    3 ++-
+ vm/compiler/LoopInformation.h |    2 +-
+ vm/compiler/Vectorization.cpp |   35 ++++++++++++++++++++++++++++++++++-
+ 3 files changed, 37 insertions(+), 3 deletions(-)
+
+diff --git a/vm/compiler/CompilerIR.h b/vm/compiler/CompilerIR.h
+index e85f753..c7ea72d 100644
+--- a/vm/compiler/CompilerIR.h
++++ b/vm/compiler/CompilerIR.h
+@@ -219,7 +219,8 @@ enum ExtendedMIROpcode {
+ 
+     /**
+        @brief Reduce a 128-bit packed element into a single VR by taking lower bits
+-       @details Instruction does a horizontal addition of the different packed elements and then adds it to VR
++       @details Instruction does a horizontal addition of the different packed elements and then adds it to VR:
++          vA = xmmvB + vA, size vC
+        vA: destination and source VR
+        vB: 128-bit source register
+        vC: operands' size (2 bytes, 4 bytes)
+diff --git a/vm/compiler/LoopInformation.h b/vm/compiler/LoopInformation.h
+index 16c4b27..a0796cf 100644
+--- a/vm/compiler/LoopInformation.h
++++ b/vm/compiler/LoopInformation.h
+@@ -347,7 +347,7 @@ class LoopInformation
+          int getInductionIncrement (const CompilationUnit *cUnit, unsigned int reg, bool isSSA = false);
+ 
+          /**
+-          * @brief Get the Phi node defining a given SSA register
++          * @brief Get the Phi node defining a given virtual register
+           * @param cUnit the CompilationUnit
+           * @param vr the virtual register we want the phi node from
+           * @return 0 if not found, the MIR otherwise
+diff --git a/vm/compiler/Vectorization.cpp b/vm/compiler/Vectorization.cpp
+index 8a39ad6..08c7ff7 100644
+--- a/vm/compiler/Vectorization.cpp
++++ b/vm/compiler/Vectorization.cpp
+@@ -148,6 +148,17 @@ static void dumpVectorRegisterUsage (const CompilationUnit * const cUnit, Vector
+         }
+     }
+ 
++    ALOGI("\t___Others___");
++
++    for (std::map<int, RegisterAssociation>::iterator it = info->registers.begin();
++            it != info->registers.end(); it++)
++    {
++        if (it->second.output == false && it->second.input == false)
++        {
++            ALOGI("\tv%d (XMM%d)", it->first, it->second.vectorized);
++        }
++    }
++
+     ALOGI("\t___Constants___");
+ 
+     for (std::map<int, int>::iterator it = info->constants.begin();
+@@ -1096,6 +1107,13 @@ static bool checkLoopDependency (const CompilationUnit * const cUnit, LoopInform
+     //Get the basic IV of the loop
+     unsigned int vrIV = dvmExtractSSARegister (cUnit, info->getSSABIV());
+ 
++    MIR *phiIV = info->getPhiInstruction (cUnit, vrIV);
++    if (phiIV == 0 || phiIV->ssaRep == 0 || phiIV->ssaRep->defs == 0)
++    {
++        return true;
++    }
++    int ssaVrIV = phiIV->ssaRep->defs[0];
++
+     std::set<int> phiVRs;
+ 
+     //Now go through all the Phi Nodes and check them
+@@ -1161,6 +1179,21 @@ static bool checkLoopDependency (const CompilationUnit * const cUnit, LoopInform
+                         }
+                     }
+                 }
++                else
++                {
++                    //If it is IV we should mark all defs as dirty if use is not original phi node
++                    if (ssaRep->uses[i] != ssaVrIV)
++                    {
++                        for (int j = 0 ; j < ssaRep->numDefs ; j++)
++                        {
++                            if (vrIV != dvmExtractSSARegister(cUnit, ssaRep->defs[j]))
++                            {
++                                //Mark it as dirty
++                                dirtyVRs.insert(dvmExtractSSARegister (cUnit, ssaRep->defs[j]));
++                            }
++                        }
++                    }
++                }
+             }
+         }
+     }
+@@ -1172,7 +1205,7 @@ static bool checkLoopDependency (const CompilationUnit * const cUnit, LoopInform
+     {
+         if (dirtyVRs.find (*it) != dirtyVRs.end ())
+         {
+-            //We have a phi VR which is dirty
++            PASS_LOG (ALOGI, cUnit, "JIT_INFO: We have a phi VR%u which is dirty", *it);
+             return true;
+         }
+     }
+-- 
+1.7.4.1
+

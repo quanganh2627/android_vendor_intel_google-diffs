@@ -1,0 +1,671 @@
+From cae2aca428fb8141a1004743346e74be1859107d Mon Sep 17 00:00:00 2001
+From: wchen61 <weiwu.chen@intel.com>
+Date: Fri, 31 May 2013 17:09:55 +0800
+Subject: Dalvik: Dump the method CFG with execution count of each edge
+
+BZ: 112561
+
+Add an option "-Xmethodprofile:" to Dump the specified methods' CFG
+with execution count of each edge. There are 2 ways to give the
+profile methods' list, '-Xmethodprofile:signature[, signature]*' or
+'-Xmethodprofile:filename', the format align with -Xjitmethod and
+-Xjitconfig. After give this option, classloader will mark the method
+as METHOD_PROFILE_MATCHED if the method is in the profile methods'
+list when method loaded, and VM will run under the mode
+kSubModeCheckAlways, in this mode, every execution of each bytecode
+will run dvmCheckbefore before interpreted, at this function we record
+the execution count of the bytecode for profiling methods. Finally,
+calculate the edge's execution count from the bytecode execution count,
+and dump the method CFG with this infomation. The default dumpped
+method CFG path is /sdcard/cfg/method, but user can also change this path
+through the option -Xcfgdirprefix:<PATH>.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME; AOSP-Dalvik-Interpreter; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Iab230b43e78fced0702443b9bf8f640e09389515
+Orig-MCG-Change-Id: I81e1dd1397224924d12d0a743d8406ea1a522254
+Signed-off-by: Weiwu Chen <weiwu.chen@intel.com>
+Reviewed-on: http://android.intel.com:8080/111003
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: Beyler, Jean Christophe <jean.christophe.beyler@intel.com>
+Reviewed-by: Lupusoru, Razvan A <razvan.a.lupusoru@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/Globals.h             |    5 +
+ vm/Init.cpp              |   29 +++++
+ vm/SignalCatcher.cpp     |    8 ++
+ vm/compiler/Compiler.cpp |   10 ++
+ vm/compiler/Compiler.h   |   17 +++
+ vm/compiler/Frontend.cpp |  290 ++++++++++++++++++++++++++++++++++++++++++++++
+ vm/interp/Interp.cpp     |   19 +++
+ vm/oo/Class.cpp          |   62 ++++++++++
+ vm/oo/Object.h           |    8 ++
+ 9 files changed, 448 insertions(+), 0 deletions(-)
+
+diff --git a/vm/Globals.h b/vm/Globals.h
+index 928e0d8..ed3b87f 100644
+--- a/vm/Globals.h
++++ b/vm/Globals.h
+@@ -1143,6 +1143,11 @@ struct DvmJitGlobals {
+     u8                 compilerThreadBlockGCStart;
+     u8                 compilerThreadBlockGCTime;
+     u8                 maxCompilerThreadBlockGCTime;
++
++    /* The list of methods that is being profiled, if not NULL, VM is run in method profile mode */
++    HashTable*         methodProfTable;
++    /* The dir prefix for cfg dump */
++    char*              cfgDirPrefix;
+ #endif
+ 
+ #if defined(ARCH_IA32)
+diff --git a/vm/Init.cpp b/vm/Init.cpp
+index 7b8073b..74711c0 100644
+--- a/vm/Init.cpp
++++ b/vm/Init.cpp
+@@ -194,6 +194,11 @@ static void usage(const char* progName)
+ #if defined(WITH_SELF_VERIFICATION)
+     dvmFprintf(stderr, "  -Xjitselfverificationspin\n");
+ #endif
++#if defined(WITH_JIT_TUNING)
++    dvmFprintf(stderr, "  -Xjitmethodprofile:signature[, signature]* (eg Ljava/lang/String\\;replace) or -Xjitmethodprofile:filename "
++                       " (Dump specified methods' CFG)\n");
++    dvmFprintf(stderr, "  -Xjitmethodprofileprefix:<PATH> Change the CFG dump dir prefix, default is /sdcard/cfg/method/\n");
++#endif
+ #endif
+     dvmFprintf(stderr, "\n");
+     dvmFprintf(stderr, "Configured with:"
+@@ -1748,6 +1753,21 @@ int processOptions(int argc, const char* const argv[], bool ignoreUnrecognized)
+         } else if (strncmp(argv[i], "-Xjitselfverificationspin", 25) == 0) {
+           gDvmJit.selfVerificationSpin = true;
+ #endif
++#if defined(WITH_JIT_TUNING)
++        } else if (strncmp(argv[i], "-Xjitmethodprofile:", 19) == 0) {
++            if (argv[i][19] == '/') {
++                processXjitconfig(argv[i] + 19);
++            } else {
++                processXjitmethod(argv[i] +19, true);
++            }
++            if (gDvmJit.methodTable != NULL) {
++                gDvmJit.methodProfTable = dvmHashTableCreate(8, NULL);
++            } else {
++                dvmFprintf (stderr, "Profile method list not set, continue without method profile");
++            }
++        } else if (strncmp(argv[i], "-Xjitmethodprofileprefix:", 25) == 0) {
++            gDvmJit.cfgDirPrefix = strdup(argv[i]+25);
++#endif
+ #endif
+ 
+         } else if (strncmp(argv[i], "-Xstacktracefile:", 17) == 0) {
+@@ -1941,6 +1961,10 @@ static void setCommandLineDefaults()
+     gDvm.constInit = false;
+     gDvm.commonInit = false;
+     gDvmJit.disableOpt = 1<<kMethodJit;
++#if defined(WITH_JIT_TUNING)
++    gDvmJit.methodProfTable = NULL;
++    gDvmJit.cfgDirPrefix = NULL;
++#endif
+ #if defined(WITH_SELF_VERIFICATION)
+     gDvmJit.selfVerificationSpin = false;
+ #endif
+@@ -2713,6 +2737,11 @@ void dvmShutdown()
+         /* shut down the compiler thread */
+         dvmCompilerShutdown();
+     }
++
++#ifdef WITH_JIT_TUNING
++    free(gDvmJit.cfgDirPrefix), gDvmJit.cfgDirPrefix = NULL;
++#endif
++
+ #endif
+ 
+     /*
+diff --git a/vm/SignalCatcher.cpp b/vm/SignalCatcher.cpp
+index 0dc05a8..8e62e26 100644
+--- a/vm/SignalCatcher.cpp
++++ b/vm/SignalCatcher.cpp
+@@ -273,6 +273,14 @@ static void handleSigUsr2()
+         dvmCompilerDumpStats();
+         /* Stress-test unchain all */
+         dvmJitUnchainAll();
++
++        /* Dump method cfg with execution count of each edge in method profile mode */
++        if (gDvmJit.methodProfTable != NULL) {
++            dvmHashTableLock(gDvmJit.methodProfTable);
++            dvmHashForeach(gDvmJit.methodProfTable, dvmCompilerDumpMethodCFGHandle, NULL);
++            dvmHashTableUnlock(gDvmJit.methodProfTable);
++        }
++
+         ALOGD("Send %d more signals to reset the code cache",
+              codeCacheResetCount & 7);
+     }
+diff --git a/vm/compiler/Compiler.cpp b/vm/compiler/Compiler.cpp
+index 7c42fbb..3eae123 100644
+--- a/vm/compiler/Compiler.cpp
++++ b/vm/compiler/Compiler.cpp
+@@ -785,6 +785,16 @@ void dvmCompilerShutdown(void)
+         dvmCompilerDumpStats();
+         while (gDvmJit.compilerQueueLength)
+           sleep(5);
++
++#if defined(WITH_JIT_TUNING)
++    /* Dump method cfg with execution count of each edge in method profile mode */
++    if (gDvmJit.methodProfTable != NULL) {
++        dvmHashTableLock(gDvmJit.methodProfTable);
++        dvmHashForeach(gDvmJit.methodProfTable, dvmCompilerDumpMethodCFGHandle, NULL);
++        dvmHashTableUnlock(gDvmJit.methodProfTable);
++    }
++#endif
++
+     }
+ 
+     if (gDvmJit.compilerHandle) {
+diff --git a/vm/compiler/Compiler.h b/vm/compiler/Compiler.h
+index 46eee57..49b7e6d 100644
+--- a/vm/compiler/Compiler.h
++++ b/vm/compiler/Compiler.h
+@@ -352,4 +352,21 @@ bool dvmCompilerBuildDefUseChain (CompilationUnit *cUnit, BasicBlock *bb);
+  */
+ bool dvmCompilerIsOpcodeConditionalBranch (int opcode);
+ 
++#if defined(WITH_JIT_TUNING)
++/**
++ * @brief a dvmHashForeach callback, dump the Method CFG for each method, helper function to call dvmCompilerDumpMethodCFG
++ * @param data the Method being processed
++ * @param arg this is the parameter dvmHashForeach required, not used in this function
++ * @return 0 for success
++ */
++int dvmCompilerDumpMethodCFGHandle(void* vmethodProf, void* arg);
++
++/**
++ * @brief Dump the Method CFG of every BasicBlock into a DOT graph, and lable the execution count of each edge
++ * @param method the method we are trying to dump
++ * @param profileTable this is a array that contains the execution count of each bytecode
++ */
++void dvmCompilerDumpMethodCFG(const Method* method, int* profileTable);
++#endif
++
+ #endif  // DALVIK_VM_COMPILER_H_
+diff --git a/vm/compiler/Frontend.cpp b/vm/compiler/Frontend.cpp
+index 1600cbe..9e4665a 100644
+--- a/vm/compiler/Frontend.cpp
++++ b/vm/compiler/Frontend.cpp
+@@ -726,6 +726,89 @@ static void dumpMIRInstructions (CompilationUnit *cUnit, const BasicBlock *bb, F
+     }
+ }
+ 
++#if defined(WITH_JIT_TUNING)
++/*
++ * @class edge
++ * @brief An edge in method's CFG
++ */
++struct CfgEdge{
++    unsigned int    startOffset;    /**< @brief The start point's bytecode offset */
++    int             startValue;     /**< @brief The execution count of start bytecode */
++    unsigned int    endOffset;      /**< @brief The end point's bytecode offset */
++    int             endValue;       /**< @brief The execution count of end bytecode */
++    int             value;          /**< @brief The execution count of the edge */
++};
++
++/**
++  * @brief Get an edge's value in edges' set
++  * @param edgeList the edges' set
++  * @param startOffset the startOffset of the edge
++  * @param endOffset the endOffset of the edge
++  * @return the edge's value
++  */
++static int getEdgeValue(GrowableList* edgeList, unsigned int startOffset, unsigned int endOffset) {
++    int value = 0;
++    unsigned int idx;
++    struct CfgEdge *edge;
++    for (idx = 0; idx < dvmGrowableListSize(edgeList); idx++) {
++        edge = (struct CfgEdge *) dvmGrowableListGetElement(edgeList, idx);
++        if (edge->startOffset == startOffset && edge->endOffset == endOffset) {
++            value = edge->value;
++            break;
++        }
++    }
++    return value;
++}
++
++/**
++  * @brief dump an edge with value
++  * @param cUnit the CompilationUnit
++  * @param bb the BasicBlock
++  * @param bbName the BasicBlock's name
++  * @param blockName the target BasicBlock's name
++  * @param file the File in which to dump the edge
++  * @param isTaken is the edge a taken or a fallThrough?
++  */
++static void dumpEdgeWithValue(CompilationUnit *cUnit, BasicBlock *bb, char* bbName, char* blockName, FILE *file, bool isTaken) {
++        int value = 0;
++        BasicBlock *targetBB;
++        if (isTaken == true) {
++            targetBB = bb->taken;
++        } else {
++            targetBB = bb->fallThrough;
++        }
++
++        if (targetBB != NULL && bb->lastMIRInsn != NULL && targetBB->firstMIRInsn != NULL) {
++            // Get the edges' set
++            GrowableList* edgeList = static_cast<GrowableList*> (cUnit->walkData);
++
++            // Get the value of this edge in edges' set
++            if (edgeList != NULL) {
++                value = getEdgeValue(edgeList, bb->lastMIRInsn->offset, targetBB->firstMIRInsn->offset);
++            }
++        }
++
++        // if the edge's value is not zero, label it on the CFG
++        if (value != 0) {
++            if (isTaken == true) {
++                fprintf(file, "  %s:s -> %s:n [style=dotted, label=\"%d\"]\n",
++                        bbName, blockName, value);
++            } else {
++                fprintf(file, "  %s:s -> %s:n [label=\"%d\"]\n",
++                        bbName, blockName, value);
++            }
++        } else {
++            if (isTaken == true) {
++                fprintf(file, "  %s:s -> %s:n [style=dotted]\n",
++                        bbName, blockName);
++            } else {
++                fprintf(file, "  %s:s -> %s:n \n",
++                        bbName, blockName);
++            }
++        }
++}
++#endif
++
+ /**
+   * @brief Dump a BasicBlock
+   * @param cUnit the CompilationUnit
+@@ -787,13 +870,25 @@ void dvmDumpBasicBlock (CompilationUnit *cUnit, BasicBlock *bb, FILE *file, bool
+ 
+         if (bb->taken) {
+             dvmGetBlockName(bb->taken, blockName);
++
++#if defined(WITH_JIT_TUNING)
++            dumpEdgeWithValue(cUnit, bb, bbName, blockName, file, true);
++#else
+             fprintf(file, "  %s:s -> %s:n [style=dotted]\n",
+                     bbName, blockName);
++#endif
++
+         }
+ 
+         if (bb->fallThrough) {
+             dvmGetBlockName(bb->fallThrough, blockName);
++
++#if defined(WITH_JIT_TUNING)
++            dumpEdgeWithValue(cUnit, bb, bbName, blockName, file, false);
++#else
+             fprintf(file, "  %s:s -> %s:n\n", bbName, blockName);
++#endif
++
+         }
+ 
+         if (bb->successorBlockList.blockListType != kNotUsed) {
+@@ -1352,6 +1447,201 @@ static void processCanThrow(const Method *method, GrowableList *blockList,
+     }
+ }
+ 
++#if defined(WITH_JIT_TUNING)
++/* (documented in header file) */
++int dvmCompilerDumpMethodCFGHandle(void* data, void* arg)
++{
++    struct Method* method = (struct Method*)data;
++    dvmCompilerDumpMethodCFG(method, method->profileTable);
++    return 0;
++}
++
++/**
++ * @brief Add an edge into the edges' set
++ * @param edgeList the edges' set
++ * @param startMir the MIR of the edge's startOffset
++ * @param endMir the MIR of the edge's endOffset
++ * @param profileTable the method's profile table
++ */
++static void addEdge(GrowableList &edgeList, MIR* startMir, MIR* endMir, int* profileTable) {
++    struct CfgEdge *edge = (struct CfgEdge *) dvmCompilerNew(sizeof(struct CfgEdge), true);
++    edge->startOffset = startMir->offset;
++    edge->startValue = profileTable[edge->startOffset];
++    edge->endOffset = endMir->offset;
++    edge->endValue = profileTable[edge->endOffset];
++    edge->value = -1;
++    dvmInsertGrowableList(&edgeList, (intptr_t) edge);
++}
++
++/* (documented in header file) */
++void dvmCompilerDumpMethodCFG(const Method* method, int* profileTable)
++{
++    CompilationUnit cUnit;
++    GrowableListIterator iterator;
++    GrowableListIterator iterator1;
++    BasicBlock *bb;
++
++    unsigned int idx;
++    struct CfgEdge *edge;
++    struct CfgEdge *edge1;
++    GrowableList edgeList;
++
++    bool singleOut;         //Flags to indicate if the edge being processed shared the start point (startOffset) with other edges, true for not share
++    bool singleIn;          //Flags to indicate if the edge being processed shared the end point (endOffset) with other edges, true for not share
++    bool change = true;     //Whether we need process the edges set one more time
++
++    /* Initialize cUnit */
++    memset(&cUnit, 0, sizeof(cUnit));
++    cUnit.method = method;
++
++    /* Initialize the block list */
++    dvmInitGrowableList(&cUnit.blockList, 4);
++
++    /* Build CGF for the method */
++    bool createdCFG = dvmCompilerBuildCFG (cUnit.method, &cUnit.blockList);
++
++    if (createdCFG == false)
++    {
++        return;
++    }
++
++    /* We need calculate each edge's execution count from profileTable, and then lable the value of each edge on CFG.
++     * Bellow is the process:
++     * 1. Initlize the edges set.
++     * 2. Find the method's edges and filled the edges into edges set.
++     *    Now only conside the "tabken" and "fallThrough" edges.
++     *    There are 5 elements for an edge, startOffset, endOffset, startValue, endValue and value.
++     *    startOffset is the basicblock's lastMIRInsn offset and endOffset is the taken bb's or fallThrough bb's firstMIRInsn offset.
++     *    startValue and endValue is the execution count of the correspongding Insn which can be get from profileTable.
++     *    value stands for edge's execution count, which is set to -1 at the first.
++     * 3. Calculate the value of each edge in the edges set.
++     *    Two rules that can guide us to evaluate the value of each edge:
++     *        i.    if the edge does not share startOffset with other edge, then : edge.value = edge.startValue
++     *              if the edge does not share endOffset with other edge, the : edge.value = edge.endValue
++     *        ii.   Once we can confirm a edge's value, say edgeA, the edges set can be updated as bellow:
++     *              a.  For each edge that share startOffset with this edge, say edgeB, then : edgeB.startValue = edgeB.startValue - edgeA.value
++     *              b.  For each edge that share endOffset with this edge, say edgeB, then : edgeB.endValue = edgeB.endValue - edgeA.value
++     *              c.  Remove the edgeA from the edges set.
++     *     We can apply the two rules on the edges set, until all the edge is empty. Then we get all the edges's value been fixed.
++     */
++
++    // Initialize the edges set
++    dvmInitGrowableList(&edgeList, 8);
++
++    // Pass the edges set to dvmCompilerDumpBasicBlocks via Cunit's walkData
++    cUnit.walkData = static_cast<void *> (&edgeList);
++
++    // Fill up the edges set with method's edges, after this, each edge's startOffset, startValue, endOffset, endValue is set, and value is -1;
++    dvmGrowableListIteratorInit(&cUnit.blockList, &iterator);
++    for (bb = (BasicBlock *) (dvmGrowableListIteratorNext(&iterator));
++         bb != NULL;
++         bb = (BasicBlock *) (dvmGrowableListIteratorNext(&iterator))) {
++
++        if (bb->taken != NULL && bb->lastMIRInsn != NULL && bb->taken->firstMIRInsn != NULL) {
++            addEdge(edgeList, bb->lastMIRInsn, bb->taken->firstMIRInsn, profileTable);
++        }
++        if (bb->fallThrough != NULL && bb->lastMIRInsn != NULL && bb->fallThrough->firstMIRInsn != NULL) {
++            addEdge(edgeList, bb->lastMIRInsn, bb->fallThrough->firstMIRInsn, profileTable);
++        }
++    }
++
++    // Process the edges set and try to fix the value for each edge according to the rules described above.
++    // Actually we do not really remove the fixed edges from set, but just ignore the edges if the value has been set.
++    // If there is a edge's value being fixed, then we process the edges set one more time. Same as check if the set is empty
++    while (change == true) {
++        change = false;
++
++        dvmGrowableListIteratorInit(&edgeList, &iterator);
++        for (edge = (struct CfgEdge *) (dvmGrowableListIteratorNext(&iterator));
++             edge != NULL;
++             edge = (struct CfgEdge *) (dvmGrowableListIteratorNext(&iterator))) {
++
++            if (edge == NULL) {
++                break;
++            }
++            if (edge->value != -1) {
++                continue;
++            }
++
++            singleOut = true;
++            singleIn = true;
++
++            // Check if this edge shared startOffset or endOffset with other edges in the set, and set the flag
++            dvmGrowableListIteratorInit(&edgeList, &iterator1);
++            for (edge1 = (struct CfgEdge *) (dvmGrowableListIteratorNext(&iterator1));
++                 edge1 != NULL;
++                 edge1 = (struct CfgEdge *) (dvmGrowableListIteratorNext(&iterator1))) {
++
++                if (edge1->value != -1 || edge == edge1) {
++                    continue;
++                }
++
++                if (edge->startOffset == edge1->startOffset) {
++                    singleOut = false;
++                }
++
++                if (edge->endOffset == edge1->endOffset) {
++                    singleIn = false;
++                }
++            }
++
++            // This edge does not share startOffset with others, set the value and update edges set
++            if (singleOut == true) {
++                edge->value = edge->startValue;
++
++                dvmGrowableListIteratorInit(&edgeList, &iterator1);
++                for (edge1 = (struct CfgEdge *) (dvmGrowableListIteratorNext(&iterator1));
++                     edge1 != NULL;
++                     edge1 = (struct CfgEdge *) (dvmGrowableListIteratorNext(&iterator1))) {
++
++                    if (edge1->value != -1) {
++                        continue;
++                    }
++
++                    if (edge->endOffset == edge1->endOffset) {
++                        edge1->endValue -= edge->startValue;
++                    }
++                }
++                change = true;
++                continue;
++            }
++
++            // This edge does not share endOffset with others, set the value and update edges set
++            if (singleIn == true) {
++                edge->value = edge->endValue;
++
++                dvmGrowableListIteratorInit(&edgeList, &iterator1);
++                for (edge1 = (struct CfgEdge *) (dvmGrowableListIteratorNext(&iterator1));
++                     edge1 != NULL;
++                     edge1 = (struct CfgEdge *) (dvmGrowableListIteratorNext(&iterator1))) {
++
++                    if (edge1->value != -1) {
++                        continue;
++                    }
++                    if (edge->startOffset == edge1->startOffset) {
++                        edge1->startValue -= edge->endValue;
++                    }
++                }
++                change = true;
++                continue;
++            }
++        }
++    }
++
++    // Finally, we dump the method CFG
++    // This is the default path where the cfg files will be placed, can be changed by gDvmJit.cfgDirPrefix (-Xjitmethodprofileprefix)
++    const char* dirPrefix = "/sdcard/cfg/method/";
++    if (gDvmJit.cfgDirPrefix != NULL) {
++        dirPrefix = gDvmJit.cfgDirPrefix;
++    }
++
++    dvmCompilerDumpBasicBlocks(&cUnit, dirPrefix);
++
++    // Just for safety, reset walkData
++    cUnit.walkData = 0;
++}
++#endif
++
+ /**
+  * Decodes methods and creates control flow graph for it with single entry and single exit.
+  * @see Compiler.h
+diff --git a/vm/interp/Interp.cpp b/vm/interp/Interp.cpp
+index a21a6e6..a7ea797 100644
+--- a/vm/interp/Interp.cpp
++++ b/vm/interp/Interp.cpp
+@@ -1674,9 +1674,18 @@ void dvmInitializeInterpBreak(Thread* thread)
+     if (gDvm.debuggerActive) {
+         dvmEnableSubMode(thread, kSubModeDebuggerActive);
+     }
++
+ #if defined(WITH_JIT)
+     dvmJitUpdateThreadStateSingle(thread);
+ #endif
++
++#if defined(WITH_JIT) && defined(WITH_JIT_TUNING)
++    // Method profile mode, force checkBefore
++    if (gDvmJit.methodProfTable != NULL) {
++        dvmEnableSubMode(thread, kSubModeCheckAlways);
++    }
++#endif
++
+ #if 0
+     // Debugging stress mode - force checkBefore
+     dvmEnableSubMode(thread, kSubModeCheckAlways);
+@@ -1695,6 +1704,16 @@ void dvmCheckBefore(const u2 *pc, u4 *fp, Thread* self)
+     assert(pc >= method->insns && pc <
+            method->insns + dvmGetMethodInsnsSize(method));
+ 
++#if defined(WITH_JIT) && defined(WITH_JIT_TUNING)
++     /*
++     * In method profile mode, if the method is which we are profiling, increase the counter
++     * of the bytecode, so we can record how many times this bytecode has been executed.
++     */
++    if (IS_METHOD_FLAG_SET(method, METHOD_PROFILE_MATCHED) == true) {
++        android_atomic_inc(&method->profileTable[pc - method->insns]);
++    }
++#endif
++
+ #if 0
+     /*
+      * When we hit a specific method, enable verbose instruction logging.
+diff --git a/vm/oo/Class.cpp b/vm/oo/Class.cpp
+index 7ae6cbf..a75792a 100644
+--- a/vm/oo/Class.cpp
++++ b/vm/oo/Class.cpp
+@@ -2130,6 +2130,16 @@ static void freeMethodInnards(Method* meth)
+         DexCode* methodDexCode = (DexCode*) dvmGetMethodCode(meth);
+         dvmLinearFree(meth->clazz->classLoader, methodDexCode);
+     }
++
++#if defined(WITH_JIT) && defined(WITH_JIT_TUNING)
++    /*
++     * Free the profileTable if have
++     */
++    if (IS_METHOD_FLAG_SET(meth, METHOD_PROFILE_MATCHED) == true) {
++        free(meth->profileTable), meth->profileTable = NULL;
++    }
++#endif
++
+ }
+ 
+ /*
+@@ -2146,6 +2156,19 @@ static void cloneMethod(Method* dst, const Method* src)
+     memcpy(dst, src, sizeof(Method));
+ }
+ 
++#if defined(WITH_JIT) && defined(WITH_JIT_TUNING)
++/**
++ * @brief Check if the two method pointers point the same method.
++ * @param m1 the method pointer compared
++ * @param m2 the method pointer compared
++ * @return return zero if equal, else non-zero
++ */
++static int compareMethod(const Method* m1, const Method* m2)
++{
++    return (int) m1 - (int) m2;
++}
++#endif
++
+ /*
+  * Pull the interesting pieces out of a DexMethod.
+  *
+@@ -2216,6 +2239,45 @@ static void loadMethodFromDex(ClassObject* clazz, const DexMethod* pDexMethod,
+             meth->jniArgInfo = computeJniArgInfo(&meth->prototype);
+         }
+     }
++
++#if defined(WITH_JIT) && defined(WITH_JIT_TUNING)
++    /*
++     * In method profile mode, check if the method is the method we
++     * want to profile, if yes, set the METHOD_PROFILE_MATCHED flag
++     * and initialize the profileTable
++     */
++    if (gDvmJit.methodProfTable != NULL) {
++        // Firstly, we need check if the method's signature (class descriptor + method name) is in the method profile table.
++        int len = strlen(clazz->descriptor) +
++                  strlen(meth->name) + 1;
++        char fullSignature[len];
++        memset((void *)fullSignature, 0, len);
++        strncpy(fullSignature, clazz->descriptor, len);
++        strncat(fullSignature, meth->name, len - strlen(fullSignature));
++        int hashValue = dvmComputeUtf8Hash(fullSignature);
++        bool methodMatch =
++            dvmHashTableLookup(gDvmJit.methodTable, hashValue,
++                               fullSignature, (HashCompareFunc) strcmp,
++                               false) != NULL;
++
++        // If matched, we set the flag to the method
++        if (methodMatch == true) {
++            SET_METHOD_FLAG(meth, METHOD_PROFILE_MATCHED);
++            u4 insnsSize = dvmGetMethodInsnsSize(meth);
++            meth->profileTable = (int*) malloc(insnsSize*sizeof(int));
++            if (meth->profileTable == NULL) {
++                ALOGE("Heap alloc for method prof table failed");
++            } else {
++                memset(meth->profileTable, 0, insnsSize*sizeof(int));
++            }
++
++            dvmHashTableLock(gDvmJit.methodProfTable);
++            dvmHashTableLookup(gDvmJit.methodProfTable, hashValue, meth, (HashCompareFunc) compareMethod, true);
++            dvmHashTableUnlock(gDvmJit.methodProfTable);
++        }
++    }
++#endif
++
+ }
+ 
+ #if 0       /* replaced with private/read-write mapping */
+diff --git a/vm/oo/Object.h b/vm/oo/Object.h
+index 01e5e8c..e92f518 100644
+--- a/vm/oo/Object.h
++++ b/vm/oo/Object.h
+@@ -103,6 +103,9 @@ enum ClassFlags {
+  */
+ enum MethodFlags {
+     METHOD_ISWRITABLE       = (1<<31),  // the method's code is writable
++#if defined(WITH_JIT) && defined(WITH_JIT_TUNING)
++    METHOD_PROFILE_MATCHED  = (1<<30),  // the method is matched in profile mode
++#endif
+ };
+ 
+ /*
+@@ -585,6 +588,11 @@ struct Method {
+ #ifdef WITH_HOUDINI
+     bool            needHoudini;
+ #endif
++
++#if defined(WITH_JIT) && defined(WITH_JIT_TUNING)
++    /* The execution counter of each bytecode */
++    int*            profileTable;
++#endif
+ };
+ 
+ u4 dvmGetMethodIdx(const Method* method);
+-- 
+1.7.4.1
+

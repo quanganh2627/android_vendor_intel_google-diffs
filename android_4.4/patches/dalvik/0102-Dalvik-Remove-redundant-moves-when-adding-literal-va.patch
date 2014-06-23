@@ -1,0 +1,348 @@
+From 1003724e5508697b005567708f28b05937fa3cc5 Mon Sep 17 00:00:00 2001
+From: Udayan Banerji <udayan.banerji@intel.com>
+Date: Tue, 12 Mar 2013 12:32:35 -0700
+Subject: Dalvik: Remove redundant moves when adding literal values
+
+BZ: 89580
+
+Try to avoid redundant moves when dealing with literal values. Operate on
+VR directly at their memory locations, use LEA to perform ADD and MOV in
+one instruction, or just update constants when VRs are constant.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Ic9e780f96e4e26e185720e6d5b3545a6ec9d5d4a
+Orig-MCG-Change-Id: Ibd3adef77885ff03d3c2bbc7ce39f7709ef45cb7
+Signed-off-by: Udayan Banerji <udayan.banerji@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ tests/intel-006-int-overflow/expected.txt  |    2 +
+ tests/intel-006-int-overflow/info.txt      |    3 +
+ tests/intel-006-int-overflow/src/Main.java |   28 ++++
+ vm/compiler/codegen/x86/AnalysisO1.h       |    3 +
+ vm/compiler/codegen/x86/Lower.h            |    3 +
+ vm/compiler/codegen/x86/LowerAlu.cpp       |   21 +++-
+ vm/compiler/codegen/x86/LowerHelper.cpp    |  187 ++++++++++++++++++++++++++++
+ 7 files changed, 244 insertions(+), 3 deletions(-)
+ create mode 100644 tests/intel-006-int-overflow/expected.txt
+ create mode 100644 tests/intel-006-int-overflow/info.txt
+ create mode 100644 tests/intel-006-int-overflow/src/Main.java
+
+diff --git a/tests/intel-006-int-overflow/expected.txt b/tests/intel-006-int-overflow/expected.txt
+new file mode 100644
+index 0000000..ec60270
+--- /dev/null
++++ b/tests/intel-006-int-overflow/expected.txt
+@@ -0,0 +1,2 @@
++2147483347
++-2147483348
+diff --git a/tests/intel-006-int-overflow/info.txt b/tests/intel-006-int-overflow/info.txt
+new file mode 100644
+index 0000000..74e3d8c
+--- /dev/null
++++ b/tests/intel-006-int-overflow/info.txt
+@@ -0,0 +1,3 @@
++Make sure that the VM handles integer overflow and underflow correctly when
++performing additions. Internal operations performed in the VM should comply
++with Java's expected behavior of wrap around in case of an overflow or underflow.
+diff --git a/tests/intel-006-int-overflow/src/Main.java b/tests/intel-006-int-overflow/src/Main.java
+new file mode 100644
+index 0000000..195599c
+--- /dev/null
++++ b/tests/intel-006-int-overflow/src/Main.java
+@@ -0,0 +1,28 @@
++public class Main {
++    final static int LOOP_ITERATIONS = 10000;
++    final static int INNER_LOOP_ITERATIONS = 300;
++
++    public static void main(String args[]) {
++        int res1 = 0;
++        int res2 = 0;
++        //Check for underflow
++        for (int i = 0; i < LOOP_ITERATIONS; i++) {
++            //Start with Integer.MIN_VALUE
++            //and Integer.MAX_VALUE
++            //Then cross over the fence and
++            //see where we land.
++            int b = Integer.MIN_VALUE;
++            int c = Integer.MAX_VALUE;
++
++            do {
++                b--; //Should rollover
++                c++; //Should rollover
++            }
++            while ((b > (Integer.MAX_VALUE - INNER_LOOP_ITERATIONS)) &&
++                    (c < (Integer.MIN_VALUE + INNER_LOOP_ITERATIONS)));
++            res1 = b;
++            res2 = c;
++        }
++        System.out.println(res1 + "\n" + res2);
++    }
++}
+\ No newline at end of file
+diff --git a/vm/compiler/codegen/x86/AnalysisO1.h b/vm/compiler/codegen/x86/AnalysisO1.h
+index 3fea79e..b79f02b 100644
+--- a/vm/compiler/codegen/x86/AnalysisO1.h
++++ b/vm/compiler/codegen/x86/AnalysisO1.h
+@@ -387,6 +387,9 @@ int getVirtualRegInfo(VirtualRegInfo* infoArray, const MIR * currentMIR);
+ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR);
+ int createCFGHandler(Method* method);
+ 
++//Set a VR to a constant value
++void setVRToConst(int regNum, OpndSize size, int* tmpValue);
++
+ int findVirtualRegInTable(u2 vA, LowOpndRegType type);
+ int searchCompileTable(int type, int regNum);
+ void handleJump(BasicBlock_O1* bb_prev, int relOff);
+diff --git a/vm/compiler/codegen/x86/Lower.h b/vm/compiler/codegen/x86/Lower.h
+index e30a8cc..8c3d86e 100644
+--- a/vm/compiler/codegen/x86/Lower.h
++++ b/vm/compiler/codegen/x86/Lower.h
+@@ -849,6 +849,9 @@ void alu_unary_mem(LowOp* op, OpndSize size, ALU_Opcode opc, int disp, int base_
+ void alu_binary_imm_mem(OpndSize size, ALU_Opcode opc,
+                          int imm, int disp, int base_reg, bool isBasePhysical);
+ void alu_binary_imm_reg(OpndSize size, ALU_Opcode opc, int imm, int reg, bool isPhysical);
++//Operate on a VR with another VR and an immediate
++bool alu_imm_to_VR(OpndSize size, ALU_Opcode opc,
++                         u2 srcVR, u2 destVR, int imm, int tempReg, bool isTempPhysical);
+ void alu_binary_mem_reg(OpndSize size, ALU_Opcode opc,
+                          int disp, int base_reg, bool isBasePhysical,
+                          int reg, bool isPhysical);
+diff --git a/vm/compiler/codegen/x86/LowerAlu.cpp b/vm/compiler/codegen/x86/LowerAlu.cpp
+index aa607d7..678b521 100644
+--- a/vm/compiler/codegen/x86/LowerAlu.cpp
++++ b/vm/compiler/codegen/x86/LowerAlu.cpp
+@@ -967,10 +967,25 @@ int op_rem_int_2addr(const MIR * mir) {
+ }
+ 
+ #define P_GPR_1 PhysicalReg_EBX
+-//! common code to handle integer ALU ops with literal
+-
+-//! It uses GPR
++/**
++ * @brief Common function to handle alu operations involving literals
++ * @param opc The Opcode to perform
++ * @param vA The destination VR
++ * @param vB The source VR
++ * @param imm The literal value
++ * @return value >= 0 when handled
++ */
+ int common_alu_int_lit(ALU_Opcode opc, u2 vA, u2 vB, s2 imm) { //except div and rem
++    // For add and sub, try if we can operate directly on VRs
++    if ((opc == add_opc) || (opc == sub_opc)) {
++        bool success = alu_imm_to_VR(OpndSize_32, opc, vB, vA, imm, 1, false);
++        //If succeeded, we are done
++        if (success == true) {
++            return 0;
++        }
++        //Otherwise, go the normal path
++    }
++
+     get_virtual_reg(vB, OpndSize_32, 1, false);
+     alu_binary_imm_reg(OpndSize_32, opc, imm, 1, false);
+     set_virtual_reg(vA, OpndSize_32, 1, false);
+diff --git a/vm/compiler/codegen/x86/LowerHelper.cpp b/vm/compiler/codegen/x86/LowerHelper.cpp
+index cdb20e9..65ca37e 100644
+--- a/vm/compiler/codegen/x86/LowerHelper.cpp
++++ b/vm/compiler/codegen/x86/LowerHelper.cpp
+@@ -1719,6 +1719,193 @@ void alu_binary_imm_reg(OpndSize size, ALU_Opcode opc, int imm, int reg, bool is
+         m = map_of_alu_opcode_2_mnemonic[opc];
+     dump_imm_reg(m, ATOM_NORMAL_ALU, size, imm, reg, isPhysical, getTypeFromIntSize(size), false);
+ }
++
++/**
++ * @brief Performs get_VR, alu_op and set_VR but with lesser instructions
++ * @details Only for 32-bit integers for now
++ * @param size The Operand size (Only 32-bit currently)
++ * @param opc The alu operation to perform (add or subtract)
++ * @param sourceVR The source VR to fetch
++ * @param destVR The destination VR to set
++ * @param imm The literal value to be added to VR value
++ * @param tempReg A temporary register
++ * @param isTempPhysical Whether the tempReg is physical
++ * @return whether we were successful. If false, caller needs to perform
++ *         get_VR, alu_op, set_VR separately
++ */
++bool alu_imm_to_VR(OpndSize size, ALU_Opcode opc, u2 srcVR, u2 destVR, int imm, int tempReg, bool isTempPhysical) {
++    const LowOpndRegType pType = getTypeFromIntSize(size); //gp or xmm
++
++    //We accept only add_opc and sub_opc for now
++    if (opc != add_opc && opc != sub_opc) {
++        return false;
++    }
++
++    //We accept only 32-bit values for now
++    if (size != OpndSize_32) {
++        return false;
++    }
++
++    Mnemonic alu_mn = map_of_alu_opcode_2_mnemonic[opc];
++
++    enum CaseSrc {
++        SRC_IS_CONSTANT,
++        SRC_IN_MEMORY,
++        SRC_IS_ALLOCATED
++    };
++
++    enum CaseDest {
++        DEST_SAME_AS_SRC,
++        DEST_IN_MEMORY,
++        DEST_IS_ALLOCATED
++    };
++
++    if(gDvm.executionMode == kExecutionModeNcgO1) {
++
++        /*
++         * We have the following possibilities with the VRs
++         *
++         *  CaseSrc == 1: srcVR is constant
++         *          CaseDest == 1: destVR == srcVR (We do constant += IMM)
++         *          CaseDest == 2: destVR is in Memory (We do MOV IMM + const, MEM)
++         *          CaseDest == 3: destVR is allocated (We do MOV IMM + const, REG)
++         *
++         * CaseSrc == 2: srcVR is in memory
++         *          CaseDest == 1: destVR == srcVR (We do <op> IMM, MEM)
++         *          CaseDest == 2: destVR is in memory (worst case. We return from here and do normal op)
++         *          CaseDest == 3: destVR is allocated (We spill srcVR to same reg, then <op> imm, reg)
++         *
++         * CaseSrc == 3: srcVR is allocated
++         *          CaseDest == 1: destVR == srcVR (We do <op> IMM, REG)
++         *          CaseDest == 2: destVR is in memory (We LEA srcVR plus imm to a temp, and then set destVR to temp)
++         *          CaseDest == 3: destVR is allocated (LEA IMM(srcVR), destVR)
++         *
++         * Now depending on above, we find out the cases, and if needed, find out the const value of src,
++         * and reg allocated to dest and/or src. Memory locations, if needed, are (4*destVRNum/srcVRNum + PhysicalReg_FP)
++         */
++
++        //Initializing
++        CaseSrc caseSrc = SRC_IS_CONSTANT;
++        CaseDest caseDest = DEST_SAME_AS_SRC;
++        int constValSrc = 0;
++        int regDest = -1;
++        int regSrc = -1;
++
++        //Check the case for srcVR
++        int constValue[2];
++        int isConst = isVirtualRegConstant(srcVR, pType, constValue, true/*updateRefCount*/);
++        int tempPhysicalReg = checkVirtualReg(srcVR, pType, 0);
++        if (isConst == 3) {
++            caseSrc = SRC_IS_CONSTANT;
++            constValSrc = constValue[0];
++        }
++        else if (tempPhysicalReg != PhysicalReg_Null) {
++            caseSrc = SRC_IS_ALLOCATED;
++            regSrc = tempPhysicalReg;
++        }
++        else {
++            caseSrc = SRC_IN_MEMORY;
++        }
++
++        //Check the case for destVR
++        if (destVR != srcVR) {
++            tempPhysicalReg = checkVirtualReg(destVR, pType, 0);
++            if (tempPhysicalReg != PhysicalReg_Null) {
++                caseDest = DEST_IS_ALLOCATED;
++                regDest = tempPhysicalReg;
++            }
++            else {
++                caseDest = DEST_IN_MEMORY;
++            }
++        }
++        else {
++            caseDest = DEST_SAME_AS_SRC;
++        }
++
++        int signedImm = (opc == add_opc ? imm : -imm);
++        int finalSum = constValSrc + signedImm;
++
++        //Now handle the cases
++        switch (caseSrc) {
++            case SRC_IS_CONSTANT:
++                if (caseDest == DEST_SAME_AS_SRC) {
++                    //Add or subtract
++                    constValue[0] = finalSum;
++                    constValue[1] = 0; //To be safe
++                    setVRToConst(destVR, size, constValue);
++                    return true; //Successfully updated
++                }
++                else if (caseDest == DEST_IN_MEMORY) {
++                    dump_imm_mem_noalloc(Mnemonic_MOV, size, finalSum, 4*destVR, PhysicalReg_FP, true, MemoryAccess_VR, destVR);
++                    return true; //Successfully updated
++                }
++                else if (caseDest == DEST_IS_ALLOCATED) {
++                    dump_imm_reg_noalloc(Mnemonic_MOV, size, finalSum, regDest, true, pType);
++                    updateRefCount(destVR, pType);
++                    updateVirtualReg(destVR, pType);
++                    return true; //Successfully updated
++                }
++                break;
++
++            case SRC_IN_MEMORY:
++                if (caseDest == DEST_SAME_AS_SRC) {
++                    dump_imm_mem_noalloc(alu_mn, size, imm, 4*destVR, PhysicalReg_FP, true, MemoryAccess_VR, destVR);
++                    return true; //Successfully updated
++                }
++                else if (caseDest == DEST_IN_MEMORY) {
++                    //We can in no way do better than get_VR, add / sub, set_VR
++                    return false;
++                }
++                else if (caseDest == DEST_IS_ALLOCATED) {
++                    //Load srcVR to regDest, and then add the constant
++                    //Note that with MOVE_OPT on, this is as good as get_VR, add / sub , set_VR
++                    dump_mem_reg_noalloc(Mnemonic_MOV, size, 4*srcVR, PhysicalReg_FP, true, MemoryAccess_VR, srcVR, regDest, true, pType);
++                    dump_imm_reg_noalloc(alu_mn, size, imm, regDest, true, pType);
++                    updateRefCount(destVR, pType);
++                    updateVirtualReg(destVR, pType);
++                    return true; //Successfully updated
++                }
++                break;
++
++            case SRC_IS_ALLOCATED:
++                if (caseDest == DEST_SAME_AS_SRC) {
++                    dump_imm_reg_noalloc(alu_mn, size, imm, regSrc, true, pType);
++                    //We have to reduce refCounts twice. Let's call the VR with
++                    //different names, even though srcVR == destVR
++                    updateRefCount(srcVR, pType);
++                    updateRefCount(destVR, pType);
++                    updateVirtualReg(destVR, pType);
++                    return true; //Successfully updated
++                }
++                else if (caseDest == DEST_IN_MEMORY) {
++                    //We can write regSrc directly to destVR, and then ADD imm, destVR (which is 2 inst). But
++                    //if destVR gets used later, we will load it to a reg anyways. That makes it 3 instructions.
++                    //Instead, let's do LEA imm(regSrc), temp. And assign destVR to temp. Worst case we write
++                    // back destVR soon after, which is still 2 instructions. Best case we get away with just 1.
++                    dump_mem_reg_noalloc_mem(Mnemonic_LEA, ATOM_NORMAL, size, signedImm, regSrc, true, MemoryAccess_Unknown, -1, tempReg, isTempPhysical, pType);
++                    set_virtual_reg(destVR, size, tempReg, isTempPhysical);
++                    updateRefCount(srcVR, pType);
++                    return true; //Successfully updated
++                }
++                else if (caseDest == DEST_IS_ALLOCATED) {
++                    dump_mem_reg_noalloc(Mnemonic_LEA, size, signedImm, regSrc, true, MemoryAccess_Unknown, -1, regDest, true, pType);
++                    //Done with srcVR and destVR
++                    updateRefCount(srcVR, pType);
++                    updateRefCount(destVR, pType);
++                    updateVirtualReg(destVR, pType);
++                    return true; //Successfully updated
++                }
++                break;
++
++            default:
++                return false;
++        }
++    }
++
++    //No optimization for O0
++    return false;
++}
++
+ //!alu binary op with one mem operand and one reg operand
+ 
+ //!
+-- 
+1.7.4.1
+

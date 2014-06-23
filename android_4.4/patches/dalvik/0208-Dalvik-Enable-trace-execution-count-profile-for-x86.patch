@@ -1,0 +1,900 @@
+From 5cb55aa0b720d213904ac7d6b90a7124f598c8b2 Mon Sep 17 00:00:00 2001
+From: Mahesh Aswani <mahesh.aswani@intel.com>
+Date: Wed, 5 Jun 2013 15:41:44 -0700
+Subject: Dalvik: Enable trace execution count profile for x86
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+BZ: 101637
+
+Generate 16 bytes profile code at the start of the trace translation code,
+when the trace execute in profiling mode(-Xjitprofile), it will increase
+the corresponding count. The profile code looks like bellow, add nops to
+align the address (the real code start addr) with 16 bytes.
+    MOV   EAX, addr     @ get prof count addr    [5 bytes]
+    ADD   #1,  0(EAX)   @ increment counter      [6 bytes]
+    NOPS                                         [5 bytes]
+Also install the trace description after the section “Chaning cell counts”
+in translation code. The x86/Profile.cpp contains the functions for dump
+the trace description and trace execution count. If the trace is a loop,
+add similar profile code to bump up the loop counter at each loop iteration.
+There is no impact on performance when disable profiling, and some expected
+performance degradation when profiling. The generated code size for each
+trace will be added. (4 bytes loop counter addr + 4 bytes trace prof count
+addr + 16 bytes profile code + 19 bytes loop counter profile code + Trace
+description size)
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I26e28eacf5c3549ec115d2e1861547d00a622917
+Orig-MCG-Change-Id: I4fe606bba5349152bee168b1278f0a053a5dba43
+Signed-off-by: Weiwu Chen <weiwu.chen@intel.com>
+Signed-off-by: Mahesh Aswani <mahesh.aswani@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/Dvm.mk                                    |    1 +
+ vm/compiler/Compiler.h                       |    2 +-
+ vm/compiler/codegen/x86/CodegenInterface.cpp |  164 ++++-----
+ vm/compiler/codegen/x86/Profile.cpp          |  492 ++++++++++++++++++++++++++
+ vm/compiler/codegen/x86/Profile.h            |   61 ++++
+ 5 files changed, 625 insertions(+), 95 deletions(-)
+ create mode 100644 vm/compiler/codegen/x86/Profile.cpp
+ create mode 100644 vm/compiler/codegen/x86/Profile.h
+
+diff --git a/vm/Dvm.mk b/vm/Dvm.mk
+index 5b96d74..4bc2286 100644
+--- a/vm/Dvm.mk
++++ b/vm/Dvm.mk
+@@ -359,6 +359,7 @@ ifeq ($(dvm_arch),x86)
+               compiler/codegen/$(dvm_arch_variant)/RegisterizationBE.cpp \
+               compiler/codegen/$(dvm_arch_variant)/StackExtensionX86.cpp \
+               compiler/codegen/$(dvm_arch_variant)/x86Specific.cpp \
++              compiler/codegen/$(dvm_arch_variant)/Profile.cpp \
+               compiler/LoopOpt.cpp \
+               compiler/Checks.cpp \
+               compiler/LoopRegisterUsage.cpp \
+diff --git a/vm/compiler/Compiler.h b/vm/compiler/Compiler.h
+index f6bd26e..de89bdf 100644
+--- a/vm/compiler/Compiler.h
++++ b/vm/compiler/Compiler.h
+@@ -139,7 +139,7 @@ typedef struct ICPatchWorkOrder {
+  * conserve space in the translation cache, total length of JitTraceRun
+  * array must be recomputed via seqential scan if needed.
+  */
+-typedef struct {
++typedef struct JitTraceDescription {
+     const Method* method;
+     JitTraceRun trace[0];       // Variable-length trace descriptors
+ } JitTraceDescription;
+diff --git a/vm/compiler/codegen/x86/CodegenInterface.cpp b/vm/compiler/codegen/x86/CodegenInterface.cpp
+index 4581ae6..4aa5c28 100644
+--- a/vm/compiler/codegen/x86/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/CodegenInterface.cpp
+@@ -29,6 +29,7 @@
+ #include "ExceptionHandling.h"
+ #include "Scheduler.h"
+ #include "CodegenErrors.h"
++#include "Profile.h"
+ 
+ #ifdef HAVE_ANDROID_OS
+ #include <cutils/properties.h>
+@@ -460,11 +461,6 @@ void dvmCompilerArchDump(void)
+ {
+ }
+ 
+-char *getTraceBase(const JitEntry *p)
+-{
+-    return NULL;
+-}
+-
+ void dvmCompilerAssembleLIR(CompilationUnit *cUnit, JitTranslationInfo* info)
+ {
+ }
+@@ -482,64 +478,6 @@ void dvmJitScanAllClassPointers(void (*callback)(void *))
+ {
+ }
+ 
+-/* Handy function to retrieve the profile count */
+-static inline int getProfileCount(const JitEntry *entry)
+-{
+-    if (entry->dPC == 0 || entry->codeAddress == 0)
+-        return 0;
+-    u4 *pExecutionCount = (u4 *) getTraceBase(entry);
+-
+-    return pExecutionCount ? *pExecutionCount : 0;
+-}
+-
+-/* qsort callback function */
+-static int sortTraceProfileCount(const void *entry1, const void *entry2)
+-{
+-    const JitEntry *jitEntry1 = (const JitEntry *)entry1;
+-    const JitEntry *jitEntry2 = (const JitEntry *)entry2;
+-
+-    JitTraceCounter_t count1 = getProfileCount(jitEntry1);
+-    JitTraceCounter_t count2 = getProfileCount(jitEntry2);
+-    return (count1 == count2) ? 0 : ((count1 > count2) ? -1 : 1);
+-}
+-
+-/* Sort the trace profile counts and dump them */
+-void dvmCompilerSortAndPrintTraceProfiles() //in Assemble.c
+-{
+-    JitEntry *sortedEntries;
+-    int numTraces = 0;
+-    unsigned long counts = 0;
+-    unsigned int i;
+-
+-    /* Make sure that the table is not changing */
+-    dvmLockMutex(&gDvmJit.tableLock);
+-
+-    /* Sort the entries by descending order */
+-    sortedEntries = (JitEntry *)malloc(sizeof(JitEntry) * gDvmJit.jitTableSize);
+-    if (sortedEntries == NULL)
+-        goto done;
+-    memcpy(sortedEntries, gDvmJit.pJitEntryTable,
+-           sizeof(JitEntry) * gDvmJit.jitTableSize);
+-    qsort(sortedEntries, gDvmJit.jitTableSize, sizeof(JitEntry),
+-          sortTraceProfileCount);
+-
+-    /* Dump the sorted entries */
+-    for (i=0; i < gDvmJit.jitTableSize; i++) {
+-        if (sortedEntries[i].dPC != 0) {
+-            numTraces++;
+-        }
+-#endif
+-    }
+-    if (numTraces == 0)
+-        numTraces = 1;
+-    ALOGI("JIT: Average execution count -> %d",(int)(counts / numTraces));
+-
+-    free(sortedEntries);
+-done:
+-    dvmUnlockMutex(&gDvmJit.tableLock);
+-    return;
+-}
+-
+ /**
+  * @brief Generates a jump with 32-bit relative immediate that jumps
+  * to the target.
+@@ -1438,18 +1376,6 @@ void handleExtendedMIR(CompilationUnit *cUnit, MIR *mir)
+     gDvm.executionMode = origMode;
+ }
+ 
+-static int genTraceProfileEntry(CompilationUnit *cUnit)
+-{
+-    cUnit->headerSize = 6;
+-    if ((gDvmJit.profileMode == kTraceProfilingContinuous) ||
+-        (gDvmJit.profileMode == kTraceProfilingDisabled)) {
+-        return 12;
+-    } else {
+-        return 4;
+-    }
+-
+-}
+-
+ #define PRINT_BUFFER_LEN 1024
+ /* Print the code block in code cache in the range of [startAddr, endAddr)
+  * in readable format.
+@@ -1461,6 +1387,21 @@ void printEmittedCodeBlock(unsigned char *startAddr, unsigned char *endAddr)
+     unsigned char *next_addr;
+     int n;
+ 
++    static const unsigned char nops[10][9] = {
++        { 0, },                                                     // 0, this line is dummy and not used in the loop below
++        { 0x90, },                                                  // 1-byte NOP
++        { 0x66, 0x90, },                                            // 2
++        { 0x0F, 0x1F, 0x00, },                                      // 3
++        { 0x0F, 0x1F, 0x40, 0x00, },                                // 4
++        { 0x0F, 0x1F, 0x44, 0x00, 0x00, },                          // 5
++        { 0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00, },                    // 6
++        { 0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00, },              // 7
++        { 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00, },        // 8
++        { 0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00 },   // 9-byte NOP
++    };
++    int nopSize;
++    int pos;
++
+     if (gDvmJit.printBinary) {
+         // print binary in bytes
+         n = 0;
+@@ -1483,17 +1424,19 @@ void printEmittedCodeBlock(unsigned char *startAddr, unsigned char *endAddr)
+                                        strbuf, PRINT_BUFFER_LEN));
+         if (addr != next_addr) {
+             ALOGD("**  %p: %s", addr, strbuf);
+-        } else {                // check whether this is nop padding
+-            if (addr[0] == 0x90) {
+-                ALOGD("**  %p: NOP (1 byte)", addr);
+-                next_addr += 1;
+-            } else if (addr[0] == 0x66 && addr[1] == 0x90) {
+-                ALOGD("**  %p: NOP (2 bytes)", addr);
+-                next_addr += 2;
+-            } else if (addr[0] == 0x0f && addr[1] == 0x1f && addr[2] == 0x00) {
+-                ALOGD("**  %p: NOP (3 bytes)", addr);
+-                next_addr += 3;
+-            } else {
++        } else {
++            for (nopSize = 1; nopSize < 10; nopSize++) {
++                for (pos = 0; pos < nopSize; pos++) {
++                    if (addr[pos] != nops[nopSize][pos])
++                        break;
++                }
++                if (pos == nopSize) {
++                    ALOGD("**  %p: NOP (%d byte)", addr, nopSize);
++                    next_addr += nopSize;
++                    break;
++                }
++            }
++            if (nopSize == 10) {
+                 ALOGD("** unable to decode binary at %p", addr);
+                 break;
+             }
+@@ -1851,6 +1794,10 @@ static bool generateCode (CompilationUnit *cUnit, BasicBlock *bb, BasicBlock **n
+     if(gDvm.executionMode == kExecutionModeNcgO1 &&
+             bb->blockType != kEntryBlock) {
+ 
++#ifdef WITH_JIT_TPROFILE
++        //Generate the loop counter profile code for loop
++        genLoopCounterProfileCode(cUnit, bbO1);
++#endif
+         //Generate the code
+         startOfBasicBlock(bb);
+         int cg_ret = codeGenBasicBlockJit(cUnit->method, bb);
+@@ -1947,10 +1894,6 @@ static bool generateCode (CompilationUnit *cUnit, BasicBlock *bb, BasicBlock **n
+     return true;
+ }
+ 
+-/* 4 is the number  f additional bytes needed for chaining information for trace:
+- * 2 bytes for chaining cell count offset and 2 bytes for chaining cell offset */
+-#define EXTRA_BYTES_FOR_CHAINING 4
+-
+ //! \brief Lower middle-level IR ro low-level IR
+ //!
+ //! \details Entry function to invoke the backend of the JIT compiler
+@@ -1987,9 +1930,6 @@ static void compilerMIR2LIRJit(CompilationUnit_O1 *cUnit, JitTranslationInfo *in
+ 
+     GrowableListIterator iterator;
+ 
+-    /* Traces start with a profiling entry point.  Generate it here */
+-    cUnit->profileCodeSize = genTraceProfileEntry(cUnit);
+-
+     //BasicBlock **blockList = cUnit->blockList;
+     GrowableList *blockList = &cUnit->blockList;
+     BasicBlock *bb;
+@@ -2006,7 +1946,18 @@ static void compilerMIR2LIRJit(CompilationUnit_O1 *cUnit, JitTranslationInfo *in
+     (void) unprotected_code_cache_bytes;
+ 
+     streamStart = stream; /* trace start before alignment */
+-    stream += EXTRA_BYTES_FOR_CHAINING; /* This is needed for chaining. Add the bytes before the alignment */
++
++#if defined(WITH_JIT_TPROFILE)
++    /* Align stream's address end with 0100, this is to make sure the code start address align to 16-bytes after add the extra bytes */
++    stream = ((u4)stream & 0x7) < 4 ? (char*)(((unsigned int)stream + 0x4) & ~0x3) : (char*)(((unsigned int)stream + 0x8) & ~0x3);
++    stream += EXTRA_BYTES_FOR_LOOP_COUNT_ADDR; /*This is for the loop count's addr*/
++    stream += EXTRA_BYTES_FOR_PROF_ADDR; /* This is for the execution count's addr */
++
++    //zero the loop count address, so we can check if the trace is a loop
++    memset(stream - EXTRA_BYTES_FOR_LOOP_COUNT_ADDR - EXTRA_BYTES_FOR_PROF_ADDR, 0, EXTRA_BYTES_FOR_LOOP_COUNT_ADDR + EXTRA_BYTES_FOR_PROF_ADDR);
++#endif
++
++    stream += EXTRA_BYTES_FOR_CHAINING; /* This is needed for chaining. */
+     stream = (char*)(((unsigned int)stream + 0xF) & ~0xF); /* Align trace to 16-bytes */
+     streamMethodStart = stream; /* code start */
+ 
+@@ -2018,6 +1969,9 @@ static void compilerMIR2LIRJit(CompilationUnit_O1 *cUnit, JitTranslationInfo *in
+     }
+     startOfTrace(cUnit->method, cUnit->exceptionBlockId, cUnit);
+ 
++    /* Traces start with a profiling entry point.  Generate it here */
++    cUnit->profileCodeSize = genTraceProfileEntry(cUnit);
++
+     cUnit->constListHead = NULL; // Initialize constant list
+ 
+     if(gDvm.executionMode == kExecutionModeNcgO1) {
+@@ -2310,6 +2264,25 @@ static void compilerMIR2LIRJit(CompilationUnit_O1 *cUnit, JitTranslationInfo *in
+     *pOffset = streamCountStart - streamMethodStart; /* from codeAddr */
+     pOffset[1] = streamChainingStart - streamMethodStart;
+ 
++#if defined(WITH_JIT_TPROFILE)
++    /* Install the trace description, so that we can retrieve the trace info from trace code addr later */
++    int descSize = (cUnit->jitMode == kJitMethod) ?
++        0 : getTraceDescriptionSize(cUnit->traceDesc);
++    memcpy((char*) stream, cUnit->traceDesc, descSize);
++    stream += descSize;
++    cUnit->totalSize = (stream - streamStart);
++
++    /* Check if the trace installation will cause the code cache full */
++    if(gDvmJit.codeCacheByteUsed + cUnit->totalSize + CODE_CACHE_PADDING > gDvmJit.codeCacheSize) {
++        ALOGI("JIT_INFO: Code cache full after Trace Description (trace uses %uB)", (stream - streamStart));
++        SET_JIT_ERROR(kJitErrorCodeCacheFull);
++        gDvmJit.codeCacheFull = true;
++        cUnit->baseAddr = NULL;
++        PROTECT_CODE_CACHE(stream, unprotected_code_cache_bytes);
++        return;
++    }
++#endif
++
+     PROTECT_CODE_CACHE(stream, unprotected_code_cache_bytes);
+ 
+     /* Align trace to 16-bytes before Constant Data Section */
+@@ -2377,6 +2350,9 @@ static void compilerMIR2LIRJit(CompilationUnit_O1 *cUnit, JitTranslationInfo *in
+     cUnit->baseAddr = streamMethodStart;
+ 
+     info->codeAddress = (char*)cUnit->baseAddr;// + cUnit->headerSize;
++#if defined(WITH_JIT_TPROFILE)
++    info->profileCodeSize = cUnit->profileCodeSize;
++#endif
+ }
+ 
+ //! \brief Helper function to call compilerMIR2LIRJit
+diff --git a/vm/compiler/codegen/x86/Profile.cpp b/vm/compiler/codegen/x86/Profile.cpp
+new file mode 100644
+index 0000000..076b524
+--- /dev/null
++++ b/vm/compiler/codegen/x86/Profile.cpp
+@@ -0,0 +1,492 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "Dalvik.h"
++#include "libdex/DexOpcodes.h"
++
++#include "compiler/CompilerInternals.h"
++#include <sys/mman.h>           /* for protection change */
++#include "Profile.h"
++#include "Singleton.h"
++#include "Scheduler.h"
++
++#if defined(WITH_JIT_TPROFILE)
++/*
++ * Translation layout in the code cache.  Note that the codeAddress pointer
++ * in JitTable will point directly to the code body (field codeAddress).  The
++ * chain cell offset codeAddress - 4, the address of the trace profile counter
++ * is at codeAddress - 8, and the loop counter address is codeAddress - 12.
++ *
++ *      +----------------------------+
++ *      | Trace Loop Counter addr    |  -> 4 bytes (EXTRA_BYTES_FOR_LOOP_COUNT_ADDR)
++ *      +----------------------------+
++ *      | Trace Profile Counter addr |  -> 4 bytes (EXTRA_BYTES_FOR_PROF_ADDR)
++ *      +----------------------------+
++ *   +--| Offset to chain cell counts|  -> 2 bytes (CHAIN_CELL_COUNT_OFFSET)
++ *   |  +----------------------------+
++ *   |  | Offset to chain cell       |  -> 2 bytes (CHAIN_CELL_OFFSET)
++ *   |  +----------------------------+
++ *   |  | Trace profile code         |  <- entry point when profiling (16 bytes)
++ *   |  .  -   -   -   -   -   -   - .
++ *   |  | Code body                  |  <- entry point when not profiling
++ *   |  .                            .
++ *   |  |                            |
++ *   |  +----------------------------+
++ *   |  | Chaining Cells             |  -> 16/20 bytes, 4 byte aligned
++ *   |  .                            .
++ *   |  .                            .
++ *   |  |                            |
++ *   |  +----------------------------+
++ *   |  | Gap for large switch stmt  |  -> # cases >= MAX_CHAINED_SWITCH_CASES
++ *   |  +----------------------------+
++ *   +->| Chaining cell counts       |  -> 8 bytes, chain cell counts by type
++ *      +----------------------------+
++ *      | Trace description          |  -> variable sized
++ *      .                            .
++ *      |                            |
++ *      +----------------------------+
++ *      | # Class pointer pool size  |  -> 4 bytes
++ *      +----------------------------+
++ *      | Class pointer pool         |  -> 4-byte aligned, variable size
++ *      .                            .
++ *      .                            .
++ *      |                            |
++ *      +----------------------------+
++ *      | Literal pool               |  -> 4-byte aligned, variable size
++ *      .                            .
++ *      .                            .
++ *      |                            |
++ *      +----------------------------+
++ *
++ */
++
++/**
++ * @brief A map between bytecode offset and source code line number
++ */
++typedef struct jitProfileAddrToLine {
++    u4 lineNum;              /**< @brief The source code line number */
++    u4 bytecodeOffset;       /**< @brief The bytecode offset */
++} jitProfileAddrToLine;
++
++/**
++ * @brief Get the loop counter's address
++ * @param p The JitEntry of the trace
++ * @return The address of the loop counter
++ */
++static inline char *getLoopCounterBase(const JitEntry *p)
++{
++    return (char*)p->codeAddress -
++        (EXTRA_BYTES_FOR_PROF_ADDR + EXTRA_BYTES_FOR_CHAINING + EXTRA_BYTES_FOR_LOOP_COUNT_ADDR);
++}
++
++/**
++ * @brief Get the trace counter's address
++ * @param p The JitEntry of the trace
++ * @return The address of the trace counter
++ */
++static inline char *getTraceCounterBase(const JitEntry *p)
++{
++    return (char*)p->codeAddress -
++        (EXTRA_BYTES_FOR_PROF_ADDR + EXTRA_BYTES_FOR_CHAINING);
++}
++
++/**
++ * @brief Check the trace's loop info
++ * @param entry The JitEntry of the trace
++ * @return 0 for non-loop, -1 for nested loop, otherwise non-nested loop
++ */
++static inline int checkLoopInfo(const JitEntry *entry)
++{
++    if (entry->dPC == 0 || entry->codeAddress == 0) {
++        return 0;
++    }
++
++    JitTraceCounter_t **addr = (JitTraceCounter_t **) getLoopCounterBase(entry);
++    return (int) *addr;
++}
++
++/**
++ * @brief Retrieve the profile loop count for a loop trace
++ * @param entry The JitEntry of the trace
++ * @return The loop count value
++ */
++static inline JitTraceCounter_t getProfileLoopCount(const JitEntry *entry)
++{
++    if (entry->dPC == 0 || entry->codeAddress == 0) {
++        return 0;
++    }
++
++    JitTraceCounter_t **p = (JitTraceCounter_t **) getLoopCounterBase(entry);
++
++    return **p;
++}
++
++/**
++ * @brief Callback function to track the bytecode offset/line number relationiship
++ * @param cnxt A point of jitProfileAddrToLine
++ * @param bytecodeOffset The offset of the bytecode
++ * @param lineNum The line number
++ * @return 0 for success
++ */
++static int addrToLineCb (void *cnxt, u4 bytecodeOffset, u4 lineNum)
++{
++    jitProfileAddrToLine *addrToLine = (jitProfileAddrToLine *) cnxt;
++
++    /* Best match so far for this offset */
++    if (addrToLine->bytecodeOffset >= bytecodeOffset) {
++        addrToLine->lineNum = lineNum;
++    }
++    return 0;
++}
++
++/**
++ * @brief Reset the trace profile count
++ * @param entry The JitEntry of the trace
++ */
++static inline void resetProfileCount(const JitEntry *entry)
++{
++    if (entry->dPC == 0 || entry->codeAddress == 0) {
++        return;
++    }
++
++    JitTraceCounter_t **p = (JitTraceCounter_t **) getTraceCounterBase(entry);
++
++    **p = 0;
++}
++
++/**
++ * @brief Get the pointer of the chain cell count
++ * @param base The pointer point to trace counter
++ * @return The pointer of Chain Cell Counts
++ */
++static inline ChainCellCounts* getChainCellCountsPointer(const char *base)
++{
++    /* 4 is the size of the profile count */
++    u2 *chainCellOffsetP = (u2 *) (base + EXTRA_BYTES_FOR_PROF_ADDR);
++    u2 chainCellOffset = *chainCellOffsetP;
++    return (ChainCellCounts *) ((char *) chainCellOffsetP + chainCellOffset + EXTRA_BYTES_FOR_CHAINING);
++}
++
++/**
++ * @brief Get the starting pointer of the trace description section
++ * @param base The pointer point to trace counter
++ * @return The pointer of Trace Description
++ */
++static JitTraceDescription* getTraceDescriptionPointer(const char *base)
++{
++    ChainCellCounts* pCellCounts = getChainCellCountsPointer(base);
++    return (JitTraceDescription*) ((char*)pCellCounts + sizeof(*pCellCounts));
++}
++
++/**
++ * @brief Retrieve the trace profile count
++ * @param entry The JitEntry of the trace
++ * @return The trace profile count
++ */
++static inline JitTraceCounter_t getProfileCount(const JitEntry *entry)
++{
++    if (entry->dPC == 0 || entry->codeAddress == 0) {
++        return 0;
++    }
++
++    JitTraceCounter_t **p = (JitTraceCounter_t **) getTraceCounterBase(entry);
++
++    return **p;
++}
++
++/**
++ * @brief Qsort callback function
++ * @param entry1 The JitEntry compared
++ * @param entry2 The JitEntry compared
++ * @return 0 if count is equal, -1 for entry1's counter greater than entry2's, otherwise return 1
++ */
++static int sortTraceProfileCount(const void *entry1, const void *entry2)
++{
++    const JitEntry *jitEntry1 = (const JitEntry *)entry1;
++    const JitEntry *jitEntry2 = (const JitEntry *)entry2;
++
++    JitTraceCounter_t count1 = getProfileCount(jitEntry1);
++    JitTraceCounter_t count2 = getProfileCount(jitEntry2);
++
++    return (count1 == count2) ? 0 : ((count1 > count2) ? -1 : 1);
++}
++
++/**
++ * @brief Dumps profile info for a single trace
++ * @param p The JitEntry of the trace
++ * @param silent Wheter to dump the trace count info
++ * @param reset Whether to reset the counter
++ * @param sum The total count of all the trace
++ * @return The trace count
++ */
++static int dumpTraceProfile(JitEntry *p, bool silent, bool reset,
++                            unsigned long sum)
++{
++    int idx;
++
++    if (p->codeAddress == 0) {
++        if (silent == false) {
++            ALOGD("TRACEPROFILE NULL");
++        }
++        return 0;
++    }
++
++    JitTraceCounter_t count = getProfileCount(p);
++
++    if (reset == true) {
++        resetProfileCount(p);
++    }
++    if (silent == true) {
++        return count;
++    }
++
++    JitTraceDescription *desc = getTraceDescriptionPointer(getTraceCounterBase(p));
++    const Method *method = desc->method;
++    char *methodDesc = dexProtoCopyMethodDescriptor(&method->prototype);
++    jitProfileAddrToLine addrToLine = {0, desc->trace[0].info.frag.startOffset};
++
++    /*
++     * We may end up decoding the debug information for the same method
++     * multiple times, but the tradeoff is we don't need to allocate extra
++     * space to store the addr/line mapping. Since this is a debugging feature
++     * and done infrequently so the slower but simpler mechanism should work
++     * just fine.
++     */
++    dexDecodeDebugInfo(method->clazz->pDvmDex->pDexFile,
++                       dvmGetMethodCode(method),
++                       method->clazz->descriptor,
++                       method->prototype.protoIdx,
++                       method->accessFlags,
++                       addrToLineCb, 0, &addrToLine);
++
++    ALOGD("TRACEPROFILE 0x%08x % 10d %5.2f%% [%#x(+%d), %d] %s%s;%s",
++         (int) getTraceCounterBase(p),
++         count,
++         ((float ) count) / sum * 100.0,
++         desc->trace[0].info.frag.startOffset,
++         desc->trace[0].info.frag.numInsts,
++         addrToLine.lineNum,
++         method->clazz->descriptor, method->name, methodDesc);
++    free(methodDesc);
++    methodDesc = 0;
++
++    if (checkLoopInfo(p) != 0 && checkLoopInfo(p) != -1) {
++        ALOGD("++++++++++ Loop Trace, loop executed: %d ++++++++++", (int) getProfileLoopCount(p));
++    } else if (checkLoopInfo(p) == -1) {
++        ALOGD("++++++++++ Loop Trace with Nested Loop, can't handle the loop counter for this currently ++++++++++");
++    }
++
++    /* Find the last fragment (ie runEnd is set) */
++    for (idx = 0;
++         (desc->trace[idx].isCode == true) && (desc->trace[idx].info.frag.runEnd == false);
++         idx++) {
++    }
++
++    /*
++     * runEnd must comes with a JitCodeDesc frag. If isCode is false it must
++     * be a meta info field (only used by callsite info for now).
++     */
++    if (desc->trace[idx].isCode == false) {
++        const Method *method = (const Method *)
++            desc->trace[idx+JIT_TRACE_CUR_METHOD-1].info.meta;
++        char *methodDesc = dexProtoCopyMethodDescriptor(&method->prototype);
++        /* Print the callee info in the trace */
++        ALOGD("    -> %s%s;%s", method->clazz->descriptor, method->name,
++             methodDesc);
++        free(methodDesc);
++        methodDesc = 0;
++    }
++    return count;
++}
++
++/**
++ * @brief Get the size of a jit trace description
++ * @param desc the point of jit trace description we want check
++ * @return The size of the jit trace description
++ */
++int getTraceDescriptionSize(const JitTraceDescription *desc)
++{
++    int runCount;
++    /* Trace end is always of non-meta type (ie isCode == true) */
++    for (runCount = 0; ; runCount++) {
++        if (desc->trace[runCount].isCode &&
++            desc->trace[runCount].info.frag.runEnd)
++           break;
++    }
++    return sizeof(JitTraceDescription) + ((runCount+1) * sizeof(JitTraceRun));
++}
++
++/**
++ * @brief Generate the loop counter profile code for loop trace
++ *   Currently only handle the loop trace without nested loops, so just add code to bump up the loop counter before the loop entry basic block
++ *   For loop trace with nested loops, set the loop counter's addr to -1
++ * @param cUnit The compilation unit of the trace
++ * @param bb The basic block is processing
++ * @param bbO1 The processing basic block's BasicBlock_O1 version
++ * @return the size (in bytes) of the generated code
++ */
++int genLoopCounterProfileCode(CompilationUnit *cUnit, BasicBlock_O1 *bbO1)
++{
++    //If the trace is loop trace without nested loop, and the bb processing is the loop entry basic block,
++    //      add loop counter before the trace stream and profile code before the bb
++    //else if the trace is loop trace with nested loop, and the bb processing is the loop entry basic block,
++    //      set the loop counter to -1, so that we can dump the infomation later
++    LoopInformation *info = cUnit->loopInformation;
++    if (info != 0 && bbO1->lastMIRInsn != 0 && info->getLoopInformationByEntry(bbO1) != 0) {
++        if (info->getLoopInformationByEntry(bbO1) != 0) {
++            int nesting = info->getNestedNbr();
++            if (nesting == 0) {
++                if ((gDvmJit.profileMode == kTraceProfilingContinuous) ||
++                    (gDvmJit.profileMode == kTraceProfilingDisabled)) {
++                        //Set the loop counter address
++                        intptr_t addr = (intptr_t)dvmJitNextTraceCounter();
++                        unsigned int *intaddr = reinterpret_cast<unsigned int *>(streamMethodStart
++                                    - EXTRA_BYTES_FOR_LOOP_COUNT_ADDR - EXTRA_BYTES_FOR_PROF_ADDR - EXTRA_BYTES_FOR_CHAINING);
++                        *intaddr = addr;
++
++                        //Add the code before loop entry basic block to bump up the loop counter, the generated code may looks like (19 bytes):
++                        //  LEA -4(ESP), ESP
++                        //  MOV EAX, 0(ESP)
++                        //  MOV #80049734, EAX
++                        //  ADD #1, 0(EAX)
++                        //  MOV 0(ESP), EAX
++                        //  LEA 4(ESP), ESP
++                        load_effective_addr(-4, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++                        move_reg_to_mem(OpndSize_32, PhysicalReg_EAX, true, 0, PhysicalReg_ESP, true);
++                        move_imm_to_reg(OpndSize_32, (int)addr, PhysicalReg_EAX, true);
++                        alu_binary_imm_mem(OpndSize_32, add_opc, 1, 0, PhysicalReg_EAX, true);
++                        move_mem_to_reg(OpndSize_32, 0, PhysicalReg_ESP, true, PhysicalReg_EAX, true);
++                        load_effective_addr(4, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++
++                        return 19;
++                }
++            } else {
++                // TODO: we should refine the nested loop handle when nested loop enabled
++                // For nested loop, currently we just set the loop counter's addr to -1
++                ALOGD("This trace contains nested loops, cann't handle this currently");
++                unsigned int *intaddr = reinterpret_cast<unsigned int *>(streamMethodStart
++                                    - EXTRA_BYTES_FOR_LOOP_COUNT_ADDR - EXTRA_BYTES_FOR_PROF_ADDR - EXTRA_BYTES_FOR_CHAINING);
++                *intaddr = -1;
++
++                return 0;
++            }
++        }
++    }
++    return 0;
++}
++#endif /* WITH_JIT_TPROFILE */
++
++/**
++ * @brief Sort the trace profile counts and dump them
++ */
++void dvmCompilerSortAndPrintTraceProfiles(void)
++{
++#if defined(WITH_JIT_TPROFILE)
++    JitEntry *sortedEntries;
++    int numTraces = 0;
++    unsigned long sum = 0;
++    unsigned int i;
++
++    /* Make sure that the table is not changing */
++    dvmLockMutex(&gDvmJit.tableLock);
++
++    /* Sort the entries by descending order */
++    sortedEntries = (JitEntry *)alloca(sizeof(JitEntry) * gDvmJit.jitTableSize);
++    memcpy(sortedEntries, gDvmJit.pJitEntryTable,
++           sizeof(JitEntry) * gDvmJit.jitTableSize);
++    qsort(sortedEntries, gDvmJit.jitTableSize, sizeof(JitEntry),
++          sortTraceProfileCount);
++
++    /* Dump the sorted entries */
++    for (i=0; i < gDvmJit.jitTableSize; i++) {
++        if (sortedEntries[i].dPC != 0) {
++            sum += dumpTraceProfile(&sortedEntries[i],
++                                    true,
++                                    false,
++                                    0);
++            numTraces++;
++        }
++    }
++
++    if (numTraces == 0) {
++        numTraces = 1;
++    }
++    if (sum == 0) {
++        sum = 1;
++    }
++
++    ALOGI("JIT: Average execution count -> %d",(int)(sum / numTraces));
++
++    /* Dump the sorted entries. The count of each trace will be reset to 0. */
++    for (i=0; i < gDvmJit.jitTableSize; i++) {
++        if (sortedEntries[i].dPC != 0) {
++                dumpTraceProfile(&sortedEntries[i],
++                             false /* silent */,
++                             true /* reset */,
++                             sum);
++        }
++    }
++
++done:
++    dvmUnlockMutex(&gDvmJit.tableLock);
++#endif
++    return;
++}
++
++/**
++ *@brief Generate the trace count profile code before the begin of trace code
++ *@details Reserve 12 bytes at the beginning of the trace
++ *        +----------------------------+
++ *        | loop counter addr (4 bytes)|
++ *        +----------------------------+
++ *        | prof counter addr (4 bytes)|
++ *        +----------------------------+
++ *        | chain cell offset (4 bytes)|
++ *        +----------------------------+
++ *
++ * ...and then code to increment the execution
++ *
++ * For continuous profiling (16 bytes)
++ *       MOV   EAX, addr     @ get prof count addr    [5 bytes]
++ *       ADD   #1, 0(EAX)    @ increment counter      [6 bytes]
++ *       NOPS                                         [5 bytes]
++ *
++ *@param cUnit the compilation unit
++ *@return the size (in bytes) of the generated code.
++ */
++int genTraceProfileEntry(CompilationUnit *cUnit)
++{
++#if defined(WITH_JIT_TPROFILE)
++    intptr_t addr = (intptr_t)dvmJitNextTraceCounter();
++    assert(__BYTE_ORDER == __LITTLE_ENDIAN);
++    unsigned int *intaddr = reinterpret_cast<unsigned int *>(streamMethodStart - EXTRA_BYTES_FOR_PROF_ADDR - EXTRA_BYTES_FOR_CHAINING);
++    *intaddr = addr;
++
++    cUnit->headerSize = EXTRA_BYTES_FOR_PROF_ADDR + EXTRA_BYTES_FOR_CHAINING + EXTRA_BYTES_FOR_LOOP_COUNT_ADDR;
++    if ((gDvmJit.profileMode == kTraceProfilingContinuous) ||
++        (gDvmJit.profileMode == kTraceProfilingDisabled)) {
++        move_imm_to_reg(OpndSize_32, (int)addr, PhysicalReg_EAX, true);
++        alu_binary_imm_mem(OpndSize_32, add_opc, 1, 0, PhysicalReg_EAX, true);
++        if(gDvmJit.scheduling == true) {
++            singletonPtr<Scheduler>()->signalEndOfNativeBasicBlock();
++        }
++        /*Add 5 nops to the end to make sure trace can align with 16B*/
++        stream = encoder_nops(5, stream);
++        return 16;
++    }
++#endif
++    return 0;
++}
+diff --git a/vm/compiler/codegen/x86/Profile.h b/vm/compiler/codegen/x86/Profile.h
+new file mode 100644
+index 0000000..9d58a43
+--- /dev/null
++++ b/vm/compiler/codegen/x86/Profile.h
+@@ -0,0 +1,61 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef H_ASSEMBLE
++#define H_ASSEMBLE
++
++struct BasicBlock_O1;
++struct JitTraceDescription;
++struct CompilationUnit;
++
++/* 4 is the number  f additional bytes needed for chaining information for trace:
++ * 2 bytes for chaining cell count offset and 2 bytes for chaining cell offset */
++#define EXTRA_BYTES_FOR_CHAINING 4
++
++#ifdef WITH_JIT_TPROFILE
++
++/* 4 is the number  f additional bytes needed for loop count addr */
++#define EXTRA_BYTES_FOR_LOOP_COUNT_ADDR 4
++/* 4 is the number  f additional bytes needed for execution count addr */
++#define EXTRA_BYTES_FOR_PROF_ADDR 4
++
++/**
++ * @brief Get the size of a jit trace description
++ * @param desc the point of jit trace description we want check
++ * @return The size of the jit trace description
++ */
++int getTraceDescriptionSize(const JitTraceDescription *desc);
++
++/**
++ * @brief Generate the loop counter profile code for loop trace
++ *   Currently only handle the loop trace without nested loops, so just add code to bump up the loop counter before the loop entry basic block
++ *   For loop trace with nested loops, set the loop counter's addr to -1
++ * @param cUnit The compilation unit of the trace
++ * @param bbO1 The current basic block being processed
++ * @return the size (in bytes) of the generated code
++ */
++int genLoopCounterProfileCode(CompilationUnit *cUnit, BasicBlock_O1 *bbO1);
++
++#endif /* WITH_JIT_TPROFILE */
++
++/**
++ * @brief Generate the trace counter profile code for each trace
++ * @param cUnit The compilation unit of the trace
++ * @return the size (in bytes) of the generated code
++ */
++int genTraceProfileEntry(CompilationUnit *cUnit);
++
++#endif
+-- 
+1.7.4.1
+

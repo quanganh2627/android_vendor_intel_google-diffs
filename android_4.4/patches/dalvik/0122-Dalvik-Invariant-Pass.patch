@@ -1,0 +1,409 @@
+From a76055971d677c14b3cbdc75e05839fda6043c8f Mon Sep 17 00:00:00 2001
+From: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Date: Thu, 4 Apr 2013 21:30:05 -0700
+Subject: Dalvik: Invariant Pass
+
+BZ: 98047
+
+CompilerIR.h:
+    - Added to MIR whether it is an invariant to the loop or not
+
+LoopInformation:
+    - Added variant BitVector to LoopInformation
+
+LoopOpt:
+    - Added a new pass to determine which elements are invariants for the loop
+
+LoopRegisterUsage:
+    - Implementation of the invariant detection
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I8b8de24964eec3c95e1afff3490f2dbed50d4c18
+Orig-MCG-Change-Id: I81793b2572325c005176f23825dde6aea59f49d4
+Signed-off-by: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/CompilerIR.h          |    3 +-
+ vm/compiler/LoopInformation.cpp   |   12 ++
+ vm/compiler/LoopInformation.h     |   16 +++
+ vm/compiler/LoopOpt.cpp           |    2 +
+ vm/compiler/LoopRegisterUsage.cpp |  241 ++++++++++++++++++++++++++++++++++++-
+ vm/compiler/LoopRegisterUsage.h   |    8 ++
+ 6 files changed, 279 insertions(+), 3 deletions(-)
+
+diff --git a/vm/compiler/CompilerIR.h b/vm/compiler/CompilerIR.h
+index 7edce81..55145c7 100644
+--- a/vm/compiler/CompilerIR.h
++++ b/vm/compiler/CompilerIR.h
+@@ -179,7 +179,8 @@ typedef struct MIR {
+     unsigned int offset;
+     unsigned int topologicalOrder;      //Topological order of the MIR in the entire CFG
+     BasicBlock *bb;                     //BasicBlock containing the MIR
+-    SInstructionColor color;             //Instruction color
++    SInstructionColor color;            //Instruction color
++    bool invariant;                     //Is the MIR an invariant for the loop?
+     struct MIR *prev;
+     struct MIR *next;
+     struct SSARepresentation *ssaRep;
+diff --git a/vm/compiler/LoopInformation.cpp b/vm/compiler/LoopInformation.cpp
+index 0e214c9..b701e64 100644
+--- a/vm/compiler/LoopInformation.cpp
++++ b/vm/compiler/LoopInformation.cpp
+@@ -34,6 +34,7 @@ LoopInformation::~LoopInformation (void)
+ 
+ void LoopInformation::init (const Method *method)
+ {
++    variants = 0;
+     parent = 0;
+     depth = 0;
+     basicBlocks = 0;
+@@ -756,3 +757,14 @@ bool dvmCompilerVerySimpleLoopGate (const CompilationUnit *cUnit, const Pass *cu
+ 
+     return true;
+ }
++
++bool LoopInformation::isInvariant (unsigned int ssa)
++{
++    //If we don't have the bitvector, we don't know. So be conservative
++    if (variants == 0)
++    {
++        return false;
++    }
++
++    return dvmIsBitSet (variants, ssa) == false;
++}
+diff --git a/vm/compiler/LoopInformation.h b/vm/compiler/LoopInformation.h
+index f8f05dc..211d8be 100644
+--- a/vm/compiler/LoopInformation.h
++++ b/vm/compiler/LoopInformation.h
+@@ -68,6 +68,9 @@ class LoopInformation
+         /** @brief List of Induction Variables */
+         GrowableList inductionVariableList;
+ 
++        /** @brief Variants registers of the loop */
++        BitVector *variants;
++
+         /**
+          * @brief Fill the basicBlock vector with the BasicBlocks composing the loop
+          * @param bb the current BasicBlock
+@@ -278,6 +281,19 @@ class LoopInformation
+           * @brief Clear inter iteration variables
+           */
+          void clearInterIterationVariables (void);
++
++         /**
++          * @brief Set Variant BitVector
++          * @param bv the BitVector to set as the variant registers
++          */
++         void setVariants (BitVector *bv) {variants = bv;}
++
++         /**
++          * @brief Is a SSA register an invariant for the loop?
++          * @param ssa the SSA register
++          * @return whether or not it is an invariant for the loop
++          */
++         bool isInvariant (unsigned int ssa);
+ };
+ 
+ /**
+diff --git a/vm/compiler/LoopOpt.cpp b/vm/compiler/LoopOpt.cpp
+index 540fb7a..f9af3b8 100644
+--- a/vm/compiler/LoopOpt.cpp
++++ b/vm/compiler/LoopOpt.cpp
+@@ -62,6 +62,8 @@ START_PASSES
+                 0, 0, dvmCompilerMergeBasicBlocks, 0, kOptimizationBasicBlockChange),
+     NEW_PASS ("Memory Aliasing", kAllNodes, 0, dvmCompilerVerySimpleLoopGate,
+               0, 0, dvmCompilerMemoryAliasing, 0, 0),
++    NEW_PASS ("Variant", kAllNodes, 0, dvmCompilerVerySimpleLoopGate,
++              0, 0, dvmCompilerVariant, 0, 0),
+     //This should be after the last optimization that changes instruction sequence or BB logic
+     //Note: reorder is safe and should be after
+     //We do registerization for all traces to provide spill information to the BE
+diff --git a/vm/compiler/LoopRegisterUsage.cpp b/vm/compiler/LoopRegisterUsage.cpp
+index 4f2b867..f002c5e 100644
+--- a/vm/compiler/LoopRegisterUsage.cpp
++++ b/vm/compiler/LoopRegisterUsage.cpp
+@@ -23,6 +23,163 @@
+ #include <set>
+ 
+ /**
++ * @brief Is the instruction's results invariant: depends on opcode and operands
++ * @param mir the MIR instruction
++ * @param variants the currently known variants of the loop
++ * @return whether or not the operation is invariant or not
++ */
++static bool usesAreInvariant (const MIR *mir, const BitVector *variants)
++{
++    //Ok now we care about the uses: if they are invariant, the result is as well
++    SSARepresentation *ssaRep = mir->ssaRep;
++
++    //If no ssaRep, we know nothing
++    if (ssaRep == 0)
++    {
++        return false;
++    }
++
++    //Get uses
++    int numUses = ssaRep->numUses;
++
++    for (int i = 0; i < numUses; i++)
++    {
++        //Get local use
++        int use = ssaRep->uses[i];
++
++        //Is it a variant already?
++        if (dvmIsBitSet (variants, use) == true)
++        {
++            return false;
++        }
++    }
++
++    //If we got to here, then it is invariant, just return true
++    return true;
++}
++
++/**
++ * @brief Check if an instruction is invariant or not
++ * @param elem the instruction
++ * @param variants the variant BitVector
++ * @return whether the instruction is variant
++ */
++static bool checkVariant (MIR *elem, BitVector *variants)
++{
++    //In the general case, we only care about the uses
++    return (usesAreInvariant (elem, variants) == false);
++}
++
++/**
++ * @brief Mark the instruction as a variant and set all the defines in the variant BitVector
++ * @param current the MIR instruction
++ * @param variants the variant BitVector
++ */
++static void markMIRAsVariant (const MIR *current, BitVector *variants)
++{
++    //Go through the defs
++    SSARepresentation *ssaRep = current->ssaRep;
++
++    //Paranoid
++    assert (ssaRep);
++
++    //Go through the defs and set the bits
++    int numDefs = ssaRep->numDefs;
++    for (int i = 0; i < numDefs; i++)
++    {
++        dvmSetBit (variants, ssaRep->defs[i]);
++    }
++}
++
++/**
++ * @brief Handle a MIR to update the variant bitvector
++ * @param highest the highest MIR instruction in the color link list
++ * @param variants the variant BitVector
++ */
++static void handleVariants (MIR *highest, BitVector *variants)
++{
++    /*
++     The algorithm in this function is conservative: if there is a getter AND a setter in the color:
++      - Every MIR in the color is set as variant
++     A refinement for it would actually be:
++      - If there is a setter, check if what it is setting is the same as what you got
++        That would handle the case:
++          int val = tab[i];
++          ... use of val but never redefining it
++          tab[i] = val;
++     */
++
++    bool haveGetter = false;
++    bool haveSetter = false;
++    bool haveVariant = false;
++
++    //Walk the color link list to find a getter/setter, at the same time, find out if the uses would make it an invariant or not
++    MIR *current = highest;
++
++    while (current != 0)
++    {
++        //Get the opcode
++        int opcode = current->dalvikInsn.opcode;
++
++        //Get flags for it
++        int dfAttributes = dvmCompilerDataFlowAttributes[opcode];
++
++        //Check if getter/setter
++        if ( (dfAttributes & DF_IS_SETTER) != 0)
++        {
++            haveSetter = true;
++        }
++
++        if ( (dfAttributes & DF_IS_GETTER) != 0)
++        {
++            haveGetter = true;
++        }
++
++        //Now check if it's variant
++        if (checkVariant (current, variants) == true)
++        {
++            haveVariant = true;
++
++            //We can break here, we are done in this case
++            break;
++        }
++
++        current = current->color.next;
++    }
++
++    //If the color had one variant or if it had a setter and a getter, all become variants
++    if ( (haveVariant == true) || (haveGetter == true && haveSetter == true))
++    {
++        //Walk the color again
++        MIR *current = highest;
++
++        while (current != 0)
++        {
++            markMIRAsVariant (current, variants);
++
++            //Get next
++            current = current->color.next;
++        }
++    }
++    else
++    {
++        //They are all invariant then
++
++        //Walk the color again
++        MIR *current = highest;
++
++        while (current != 0)
++        {
++            //Mark as such
++            current->invariant = 1;
++
++            //Get next
++            current = current->color.next;
++        }
++    }
++}
++
++/**
+  * @brief Get the start index we actually care about for coloring depending on the opcode
+  * @param opcode the considered opcode
+  * @return the start index to be considered when comparing two instructions
+@@ -346,8 +503,17 @@ static bool similarInstructions (MIR *first, MIR *second, const std::map<MIR *,
+         //It is possible the use is not defined in the trace
+         if (defFirst == 0 || defSecond == 0)
+         {
+-            //Then we don't know, be conservative
+-            return true;
++            //That is fine, as long as both are not defined
++            if (defFirst != 0 || defSecond != 0)
++            {
++                return false;
++            }
++
++            //If this happens, then the use actually must be the same SSA register
++            if (ssaRepFirst->uses[i + startUseIndexFirst] != ssaRepSecond->uses[i + startUseIndexSecond])
++            {
++                return false;
++            }
+         }
+         else
+         {
+@@ -536,3 +702,74 @@ bool dvmCompilerMemoryAliasing (CompilationUnit *cUnit, BasicBlock *bb)
+     //Did not change the BasicBlock
+     return false;
+ }
++
++//The actual entry function to the variant pass
++bool dvmCompilerVariant (CompilationUnit *cUnit, BasicBlock *bb)
++{
++    //Map to keep track of considered colors
++    std::map <int, bool> consideredColors;
++
++    //Get a local version of the loop information
++    LoopInformation *info = cUnit->loopInformation;
++
++    //We have a bitvector for the current variants
++    BitVector *variants = dvmCompilerAllocBitVector (1, true);
++
++    for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        //Get the color
++        int currentColor = mir->color.aliasingColor;
++
++        //Did we already consider the color?
++        if (consideredColors.find (currentColor) != consideredColors.end ())
++        {
++            //Skip it then
++            continue;
++        }
++
++        //Otherwise, mark it
++        consideredColors[currentColor] = true;
++
++        //Find the highest and lowest color elements
++        MIR *highest = dvmCompilerFindHighestMIRInColor (mir);
++        MIR *lowest = dvmCompilerFindLowestMIRInColor (mir);
++
++        //If all the same, then things are simpler
++        if (highest == lowest)
++        {
++            //If it's extended, we mark it as variant
++            int opcode = highest->dalvikInsn.opcode;
++
++            if (opcode < static_cast<int> (kMirOpFirst))
++            {
++                //If the opcode is alone in its color, we only care about its uses
++                if (usesAreInvariant (mir, variants) == true)
++                {
++                    //Mark it as so
++                    mir->invariant = true;
++                }
++                else
++                {
++                    //Mark it as variant
++                    markMIRAsVariant (mir, variants);
++                }
++            }
++            else
++            {
++                //Mark it as variant
++                markMIRAsVariant (mir, variants);
++            }
++        }
++        else
++        {
++            //Otherwise go to the general case
++            handleVariants (highest, variants);
++        }
++    }
++
++    //Set variants
++    info->setVariants (variants);
++
++    //Did not change the BasicBlock
++    return false;
++}
+diff --git a/vm/compiler/LoopRegisterUsage.h b/vm/compiler/LoopRegisterUsage.h
+index eb1015b..7e684ab 100644
+--- a/vm/compiler/LoopRegisterUsage.h
++++ b/vm/compiler/LoopRegisterUsage.h
+@@ -29,4 +29,12 @@ class Pass;
+  */
+ bool dvmCompilerMemoryAliasing (CompilationUnit *cUnit, BasicBlock *bb);
+ 
++/**
++ * @brief Variant pass: detect which instructions are invariant or not
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock
++ * @return whether the pass changed something in the BasicBlock
++ */
++bool dvmCompilerVariant (CompilationUnit *cUnit, BasicBlock *bb);
++
+ #endif
+-- 
+1.7.4.1
+

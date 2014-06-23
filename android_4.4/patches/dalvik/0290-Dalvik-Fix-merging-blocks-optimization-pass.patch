@@ -1,0 +1,435 @@
+From 4e47e8eb763d471503544031b6a9da3964736aa7 Mon Sep 17 00:00:00 2001
+From: Dong-Yuan Chen <dong-yuan.chen@intel.com>
+Date: Sat, 17 Aug 2013 22:20:32 -0700
+Subject: Dalvik: Fix merging blocks optimization pass
+
+BZ: 128767
+
+Merge blocks optimization pass contained two bugs:
+1) It does not expect that if the second block is empty
+   and first ends up with goto then after the merge it is
+   possible to get a CFG which has fallThrougn for the block
+   with goto at the end and that leads to crash in backend.
+2) It does not take into account that second merging block
+   can end up with swtich bytecode and in this case not all
+   children will be taking into account while removing the
+   second basic blocks
+
+To solve the first issue new pass Removing GOTO is added
+and additional check is added to merge in case someone skips
+this new step.
+
+To solve the second problem the merge is a bit re-designed.
+Instead of removing the second block we are removing the first
+one. It is easier to update all predecessors than copying all
+successors.
+
+As a side effect new utility function dvmCompilerMoveLinkedMIRsBefore
+is added and dvmCompilerMoveLinkedMIRsAfter is a bit simplified.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I41637a4079886e27364309b3c08e63d22a86536a
+Orig-MCG-Change-Id: Id6364f09f706a7f85d71c1071c14d2ea8449aa05
+Signed-off-by: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+Reviewed-on: http://android.intel.com:8080/124671
+Reviewed-by: lab_aqa <lab_aqa@intel.com>
+Reviewed-by: Semukhina, Elena V <elena.v.semukhina@intel.com>
+Reviewed-by: Banerji, Udayan <udayan.banerji@intel.com>
+Reviewed-by: Lupusoru, Razvan A <razvan.a.lupusoru@intel.com>
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Reviewed-on: http://android.intel.com:8080/125998
+---
+ vm/compiler/BBOptimization.cpp  |   58 ++++++++++---
+ vm/compiler/BBOptimization.h    |   11 ++-
+ vm/compiler/CompilerIR.h        |    9 ++
+ vm/compiler/IntermediateRep.cpp |  179 +++++++++++++++++++++++++--------------
+ vm/compiler/LoopOpt.cpp         |    1 +
+ 5 files changed, 183 insertions(+), 75 deletions(-)
+
+diff --git a/vm/compiler/BBOptimization.cpp b/vm/compiler/BBOptimization.cpp
+index 01dae52..54ee84f 100644
+--- a/vm/compiler/BBOptimization.cpp
++++ b/vm/compiler/BBOptimization.cpp
+@@ -68,9 +68,8 @@ bool dvmCompilerMergeBasicBlocks (CompilationUnit *cUnit, BasicBlock *bb)
+         return false;
+     }
+ 
+-    //We allow merge if one of the blocks has no instructions or if both have no instructions.
+-    //In case when both have instructions, we need to check further if we can do the merge.
+-    if (bb->lastMIRInsn != 0 && child->firstMIRInsn != 0)
++    //In case the first block has instructions, we need to check further if we can do the merge.
++    if (bb->lastMIRInsn != 0)
+     {
+         MIR *lastInsn = bb->lastMIRInsn;
+ 
+@@ -104,21 +103,26 @@ bool dvmCompilerMergeBasicBlocks (CompilationUnit *cUnit, BasicBlock *bb)
+         }
+     }
+ 
+-    //Move the MIRs from child to the new block
+-    dvmCompilerMoveLinkedMIRsAfter (bb, bb->lastMIRInsn, child->firstMIRInsn);
++    //Move the MIRs from this block to the beginning of child
++    dvmCompilerMoveLinkedMIRsBefore (child, 0, bb->firstMIRInsn);
+ 
+-    //Now attach the basic blocks: child is now going to disappear
+-    dvmCompilerReplaceChildBasicBlock (child->taken, bb, kChildTypeTaken);
+-    dvmCompilerReplaceChildBasicBlock (child->fallThrough, bb, kChildTypeFallthrough);
++    //Now we should remove our BB from all predecessors
++    BitVectorIterator bvIterator;
++    dvmBitVectorIteratorInit(bb->predecessors, &bvIterator);
++    for (BasicBlock *predBB = dvmCompilerGetNextBasicBlockViaBitVector (bvIterator, cUnit->blockList); predBB != 0;
++                     predBB = dvmCompilerGetNextBasicBlockViaBitVector (bvIterator, cUnit->blockList))
++    {
++        dvmCompilerReplaceChildBasicBlock (child, predBB, bb);
++    }
+ 
+     //Merge any spill request between what the father has and the child
+-    dvmUnifyBitVectors (bb->requestWriteBack, bb->requestWriteBack, child->requestWriteBack);
++    dvmUnifyBitVectors (child->requestWriteBack, child->requestWriteBack, bb->requestWriteBack);
+ 
+     //Now remove the child from the cUnit
+-    dvmCompilerHideBasicBlock (cUnit->blockList, child);
++    dvmCompilerHideBasicBlock (cUnit->blockList, bb);
+ 
+-    //We have changed the basic block
+-    return true;
++    //Merge completed but no sense to re-iterate because our removing does not give new opportunities
++    return false;
+ }
+ 
+ bool dvmCompilerRemoveUnreachableBlocks (CompilationUnit *cUnit, BasicBlock *bb)
+@@ -1300,3 +1304,33 @@ bool dvmCompilerLocalValueNumbering (CompilationUnit *cunit, BasicBlock *bb)
+     //Nothing changed in the BasicBlock except the localValueNumber in the instructions
+     return false;
+ }
++
++bool dvmCompilerRemoveGoto (CompilationUnit *cUnit, BasicBlock *bb)
++{
++//Get last instruction
++    MIR *lastMIR = bb->lastMIRInsn;
++
++    if (lastMIR != 0)
++    {
++        DecodedInstruction &insn = lastMIR->dalvikInsn;
++
++        if (insn.opcode >= OP_GOTO && insn.opcode <= OP_GOTO_32)
++        {
++            //Ok we do have a goto, in theory we only have a taken
++            if (bb->taken != 0 && bb->fallThrough == 0)
++            {
++                //If the taken goes to a bytecode, then we can remove the goto
++                if (bb->taken->blockType == kDalvikByteCode)
++                {
++                    //Remove the MIR
++                    dvmCompilerRemoveMIR(bb, lastMIR);
++
++                    //FallThrough to the taken branch
++                    bb->fallThrough = bb->taken;
++                    bb->taken = 0;
++                }
++            }
++        }
++    }
++    return false;
++}
+diff --git a/vm/compiler/BBOptimization.h b/vm/compiler/BBOptimization.h
+index 5d0b422..334724a 100644
+--- a/vm/compiler/BBOptimization.h
++++ b/vm/compiler/BBOptimization.h
+@@ -27,7 +27,7 @@ class LoopInformation;
+  * @brief Merge BasicBlocks together to reduce unnecessary jumps
+  * @param cUnit the CompilationUnit
+  * @param bb the BasicBlock
+- * @return returns whether we changed anything in the BasicBlock
++ * @return returns whether we provide new opportunity for merging
+  */
+ bool dvmCompilerMergeBasicBlocks (CompilationUnit *cUnit, BasicBlock *bb);
+ 
+@@ -101,4 +101,13 @@ bool dvmCompilerPeel (CompilationUnit *cUnit, LoopInformation *info);
+  * @return returns whether we changed anything in the BasicBlock
+  */
+ bool dvmCompilerLocalValueNumbering (CompilationUnit *cUnit, BasicBlock *bb);
++
++/**
++ * @brief Remove the gotos
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock
++ * @return returns whether we changed anything in the BasicBlock
++ */
++bool dvmCompilerRemoveGoto (CompilationUnit *cUnit, BasicBlock *bb);
++
+ #endif
+diff --git a/vm/compiler/CompilerIR.h b/vm/compiler/CompilerIR.h
+index 57ea788..1b71a51 100644
+--- a/vm/compiler/CompilerIR.h
++++ b/vm/compiler/CompilerIR.h
+@@ -506,6 +506,15 @@ void dvmCompilerInsertMIRAfter (BasicBlock *bb, MIR *mirToInsertAfter, MIR *newM
+  */
+ void dvmCompilerMoveLinkedMIRsAfter (BasicBlock *bb, MIR *mirToInsertAfter, MIR *mirChainStart);
+ 
++/**
++ * @brief Moves a chain of MIRs before mirToInsertBefore. If no MIR to insert before is provided, the
++ * insertion happens at beginning of block. All MIRs linked forward to mirChainStart are moved.
++ * @param bb the Basic Block where the insertion is to happen
++ * @param mirToInsertBefore the specified mir to insert before (if null, insertion happens at beginning of basic block)
++ * @param mirChainStart The beginning of the MIR chain to be moved
++ */
++void dvmCompilerMoveLinkedMIRsBefore (BasicBlock *bb, MIR *mirToInsertBefore, MIR *mirChainStart);
++
+ void dvmCompilerAppendLIR(CompilationUnit *cUnit, LIR *lir);
+ 
+ void dvmCompilerInsertLIRBefore(LIR *currentLIR, LIR *newLIR);
+diff --git a/vm/compiler/IntermediateRep.cpp b/vm/compiler/IntermediateRep.cpp
+index ab3b5de..066e88f 100644
+--- a/vm/compiler/IntermediateRep.cpp
++++ b/vm/compiler/IntermediateRep.cpp
+@@ -307,6 +307,55 @@ void dvmCompilerInsertMIRAfter (BasicBlock *bb, MIR *mirToInsertAfter, MIR *newM
+     newMIR->bb = bb;
+ }
+ 
++/*
++ * @brief Detach MIRs starting from mirChainStart from BB mirChainStart belongs to.
++ * @param mir MIR starting the chain to be removed.
++ */
++static void detachLinkedMIRsFromBB(MIR *mirChainStart)
++{
++    assert (mirChainStart != 0);
++    BasicBlock *mirChainBlock = mirChainStart->bb;
++
++    if (mirChainBlock != 0)
++    {
++        if (mirChainBlock->firstMIRInsn == mirChainStart)
++        {
++            mirChainBlock->firstMIRInsn = 0;
++            mirChainBlock->lastMIRInsn = 0;
++        }
++        else
++        {
++            mirChainBlock->lastMIRInsn = mirChainStart->prev;
++            mirChainBlock->lastMIRInsn->next = 0;
++            mirChainStart->prev = 0;
++        }
++    }
++}
++
++/*
++ * @brief For each MIR in chained MIRs starting from mirChainStart sets its BB to be bb.
++ * @param bb target BB.
++ * @param mir MIR starting the chain.
++ * @return the last MIR in chain.
++ */
++static MIR* assignLinkedMIRsToBB(BasicBlock *bb, MIR *mirChainStart)
++{
++    assert (mirChainStart != 0);
++    assert (bb != 0);
++
++    MIR *mirChainEnd = mirChainStart;
++    while (mirChainEnd->next != 0)
++    {
++        //Set up the new BB of this mir
++        mirChainEnd->bb = bb;
++
++        mirChainEnd = mirChainEnd->next;
++    }
++    //Set up the new BB for the last MIR and return it
++    mirChainEnd->bb = bb;
++    return mirChainEnd;
++}
++
+ void dvmCompilerMoveLinkedMIRsAfter (BasicBlock *bb, MIR *mirToInsertAfter, MIR *mirChainStart)
+ {
+     //Paranoid
+@@ -316,102 +365,108 @@ void dvmCompilerMoveLinkedMIRsAfter (BasicBlock *bb, MIR *mirToInsertAfter, MIR
+         return;
+     }
+ 
+-    //If we have a previous MIR, then we need to fix its links
+-    if (mirChainStart->prev != 0)
+-    {
+-        MIR *prevMir = mirChainStart->prev;
+-
+-        //Paranoid
+-        assert (prevMir->bb == mirChainStart->bb);
++    //If mirChainStart belongs to some BB we should detach it and tail
++    detachLinkedMIRsFromBB (mirChainStart);
+ 
+-        //Get the previous MIR's block
+-        BasicBlock *prevBlock = prevMir->bb;
++    //Now go through each MIR to make it part of this new block and also to find lastMIR.
++    MIR *mirChainEnd =  assignLinkedMIRsToBB(bb, mirChainStart);
+ 
+-        //The previous MIR becomes the last one in block since we are removing the rest
+-        prevMir->next = 0;
+-        prevBlock->lastMIRInsn = prevMir;
++    //Now attach a chain to new BB
++    //Check if we have a first MIR because if we don't we append to front
++    if (bb->firstMIRInsn == 0)
++    {
++        assert(bb->lastMIRInsn == 0);
++        bb->firstMIRInsn = mirChainStart;
++        bb->lastMIRInsn = mirChainEnd;
++        assert (mirChainEnd->next == 0);
+     }
+     else
+     {
+-        //We don't have a previous MIR so if the start has a BB, the chain start must be the first MIR
+-        BasicBlock *mirChainBlock = mirChainStart->bb;
+-
+-        if (mirChainBlock != 0)
++        //If we don't have a MIR to insert after, then it must be the case we want to insert to end of BB
++        if (mirToInsertAfter == 0)
+         {
+-            assert (mirChainBlock->firstMIRInsn == mirChainStart);
+-
+-            //We are removing from chain start so the new block doesn't have anymore instructions
+-            mirChainBlock->firstMIRInsn = 0;
+-            mirChainBlock->lastMIRInsn = 0;
++            mirToInsertAfter = bb->lastMIRInsn;
+         }
+-    }
+ 
+-    //At this point we have removed the chain from its parent block if we needed to.
+-    //Now go through each MIR to make it part of this new block and also to find lastMIR.
++        //If we are here mirToInsertAfter is a parameter or end of BB which is not empty
++        assert (mirToInsertAfter != 0);
+ 
+-    //We need to find the chain end so initialize it to the start until we start searching
+-    MIR *mirChainEnd = mirChainStart;
+-    while (true)
+-    {
+-        //Set up the new BB of this mir
+-        mirChainEnd->bb = bb;
++        //Keep track of the next for the MIR we need to insert after
++        MIR *mirToInsertAfterNext = mirToInsertAfter->next;
+ 
+-        //If our current end does not have a next, then we truly have reached the end
+-        if (mirChainEnd->next == 0)
++        //Chain start
++        mirToInsertAfter->next = mirChainStart;
++        mirChainStart->prev = mirToInsertAfter;
++
++        //Chain end
++        mirChainEnd->next = mirToInsertAfterNext;
++        if (mirToInsertAfterNext != 0)
+         {
+-            break;
++            mirToInsertAfterNext->prev = mirChainEnd;
+         }
+         else
+         {
+-            mirChainEnd = mirChainEnd->next;
++            //The last instruction now is the chain end
++            bb->lastMIRInsn = mirChainEnd;
+         }
+     }
++}
+ 
+-    //If we don't have a MIR to insert after, then it must be the case we want to insert to end of BB
+-    if (mirToInsertAfter == 0)
++void dvmCompilerMoveLinkedMIRsBefore (BasicBlock *bb, MIR *mirToInsertBefore, MIR *mirChainStart)
++{
++    //Paranoid
++    if (mirChainStart == 0)
+     {
+-        //Check if we have a first MIR because if we don't we append to front
+-        if (bb->firstMIRInsn == 0)
+-        {
+-            assert(bb->lastMIRInsn == 0);
+-            bb->firstMIRInsn = mirChainStart;
+-            mirChainStart->prev = 0;
+-        }
+-        else
+-        {
+-            bb->lastMIRInsn->next = mirChainStart;
+-            mirChainStart->prev = bb->lastMIRInsn;
+-        }
++        //We have no work to do
++        return;
++    }
++
++    //If mirChainStart belongs to some BB we should detach it and tail
++    detachLinkedMIRsFromBB (mirChainStart);
+ 
+-        //The last instruction is the chain end
++    //Now go through each MIR to make it part of this new block and also to find lastMIR.
++    MIR *mirChainEnd =  assignLinkedMIRsToBB(bb, mirChainStart);
++
++    //Now attach a chain to new BB
++    //Check if we have a first MIR because if we don't we append to front
++    if (bb->firstMIRInsn == 0)
++    {
++        assert(bb->lastMIRInsn == 0);
++        bb->firstMIRInsn = mirChainStart;
+         bb->lastMIRInsn = mirChainEnd;
++        assert (mirChainEnd->next == 0);
+     }
+     else
+     {
+-        //Paranoid
+-        assert (mirToInsertAfter->bb == bb);
++        //If we don't have a MIR to insert before, then it must be the case we want to insert to beginning of BB
++        if (mirToInsertBefore == 0)
++        {
++            mirToInsertBefore = bb->firstMIRInsn;
++        }
++
++        //If we are here mirToInsertBefore is a parameter or beginning of BB which is not empty
++        assert (mirToInsertBefore != 0);
+ 
+         //Keep track of the next for the MIR we need to insert after
+-        MIR *mirToInsertAfterNext = mirToInsertAfter->next;
++        MIR *mirToInsertBeforePrev = mirToInsertBefore->prev;
+ 
+-        //Now do the actual insertion
+-        mirToInsertAfter->next = mirChainStart;
+-        mirChainStart->prev = mirToInsertAfter;
++        //Chain end first
++        mirToInsertBefore->prev = mirChainEnd;
++        mirChainEnd->next = mirToInsertBefore;
+ 
+-        //Check if we had a next so we can link it to the chain end
+-        if (mirToInsertAfterNext == 0)
++        //Chain start now
++        mirChainStart->prev = mirToInsertBeforePrev;
++        if (mirToInsertBeforePrev != 0)
+         {
+-            //The last instruction now is the chain end
+-            bb->lastMIRInsn = mirChainEnd;
++            mirToInsertBeforePrev->next = mirChainStart;
+         }
+         else
+         {
+-            mirChainEnd->next = mirToInsertAfterNext;
+-            mirToInsertAfterNext->prev = mirChainEnd;
++            //The last instruction now is the chain end
++            bb->firstMIRInsn = mirChainStart;
+         }
+     }
+ }
+-
+ /*
+  * Append an LIR instruction to the LIR list maintained by a compilation
+  * unit
+diff --git a/vm/compiler/LoopOpt.cpp b/vm/compiler/LoopOpt.cpp
+index e3147b9..0341146 100644
+--- a/vm/compiler/LoopOpt.cpp
++++ b/vm/compiler/LoopOpt.cpp
+@@ -66,6 +66,7 @@ START_PASSES
+     //Memory Aliasing only works on one basic block so let's try to merge first
+     //For the moment, no pass will create new blocks, etc. so this is fine up here
+     //Otherwise, we might want to duplicate the merge or make the gate for memory aliasing smarter
++    NEW_PASS ("Remove_Gotos", kAllNodes, 0, 0, 0, NULL, dvmCompilerRemoveGoto, 0, kOptimizationBasicBlockChange),
+     NEW_PASS ("Merge_Blocks", kAllNodes, 0, 0,
+                 0, 0, dvmCompilerMergeBasicBlocks, 0,
+                 kOptimizationBasicBlockChange | kLoopStructureChange | kOptimizationNeedIterative),
+-- 
+1.7.4.1
+

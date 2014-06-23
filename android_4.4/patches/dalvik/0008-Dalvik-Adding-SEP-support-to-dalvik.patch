@@ -1,0 +1,1429 @@
+From 10ea93f240e69e6ee33592fbd091163837913e4a Mon Sep 17 00:00:00 2001
+From: Sushma Kyasaralli Thimmappa <sushma.kyasaralli.thimmappa@intel.com>
+Date: Sun, 27 May 2012 16:21:28 -0700
+Subject: Dalvik: Adding SEP support to dalvik.
+
+BZ: 47554
+
+This needs to be built with the flag SEP_DALVIK. It needs to be turned on
+dynamically by setting the flag -Xjitsepdalvik.
+The instructions to collect and process the SEP data is mentioned here:
+https://sp2010.amr.ith.intel.com/sites/SSG-703/VM/WIKI/Getting%20Started%20With%20Sep%20and%20VTune.aspx
+under the topic "SEP on ICS"
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I0f86324bb970e27d7a766ddffcbc7e347ec37eff
+Orig-MCG-Change-Id: I9b03774af86d04619c490ff5be36a374fd2c3887
+Signed-off-by: Sushma Kyasaralli Thimmappa <sushma.kyasaralli.thimmappa@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/Dvm.mk                      |    9 +
+ vm/Globals.h                   |    5 +
+ vm/Init.cpp                    |    7 +
+ vm/compiler/Compiler.h         |    3 +
+ vm/compiler/Frontend.cpp       |   76 +++++++-
+ vm/compiler/JitProfiling.cpp   |  450 ++++++++++++++++++++++++++++++++++++++++
+ vm/compiler/JitProfiling.h     |  223 ++++++++++++++++++++
+ vm/compiler/ittnotify_config.h |  437 ++++++++++++++++++++++++++++++++++++++
+ vm/compiler/ittnotify_types.h  |   71 +++++++
+ 9 files changed, 1280 insertions(+), 1 deletions(-)
+ create mode 100644 vm/compiler/JitProfiling.cpp
+ create mode 100644 vm/compiler/JitProfiling.h
+ create mode 100644 vm/compiler/ittnotify_config.h
+ create mode 100644 vm/compiler/ittnotify_types.h
+
+diff --git a/vm/Dvm.mk b/vm/Dvm.mk
+index f4e1cb4..76b297c 100644
+--- a/vm/Dvm.mk
++++ b/vm/Dvm.mk
+@@ -87,6 +87,14 @@ endif  # !dvm_make_debug_vm
+ # bug hunting: checksum and verify interpreted stack when making JNI calls
+ #LOCAL_CFLAGS += -DWITH_JNI_STACK_CHECK
+ 
++ifeq ($(PROFILE_OPCODE),true)
++        LOCAL_CFLAGS += -DPROFILE_OPCODE
++endif
++
++ifeq ($(SEP_DALVIK),true)
++        LOCAL_CFLAGS += -DSEP_DALVIK
++endif
++
+ LOCAL_SRC_FILES := \
+ 	AllocTracker.cpp \
+ 	Atomic.cpp.arm \
+@@ -218,6 +226,7 @@ ifeq ($(WITH_JIT),true)
+   LOCAL_CFLAGS += -DWITH_JIT
+   LOCAL_SRC_FILES += \
+ 	compiler/Compiler.cpp \
++	compiler/JitProfiling.cpp \
+ 	compiler/Frontend.cpp \
+ 	compiler/Utility.cpp \
+ 	compiler/InlineTransformation.cpp \
+diff --git a/vm/Globals.h b/vm/Globals.h
+index 1bf695f..143e72b 100644
+--- a/vm/Globals.h
++++ b/vm/Globals.h
+@@ -900,6 +900,11 @@ struct DvmJitGlobals {
+     /* Flag to dump all compiled code */
+     bool printMe;
+ 
++#ifdef SEP_DALVIK
++    /* Flag to enable sep support for dalvik */
++    bool sepDalvik;
++#endif
++
+     /* Flag to dump compiled binary code in bytes */
+     bool printBinary;
+ 
+diff --git a/vm/Init.cpp b/vm/Init.cpp
+index f1762c9..c5a21ab 100644
+--- a/vm/Init.cpp
++++ b/vm/Init.cpp
+@@ -148,6 +148,9 @@ static void usage(const char* progName)
+     dvmFprintf(stderr, "  -Xjitconfig:filename\n");
+     dvmFprintf(stderr, "  -Xjitcheckcg\n");
+     dvmFprintf(stderr, "  -Xjitverbose\n");
++#ifdef SEP_DALVIK
++    dvmFprintf(stderr, "  -Xjitsepdalvik\n");
++#endif
+     dvmFprintf(stderr, "  -Xjitprofile\n");
+     dvmFprintf(stderr, "  -Xjitdisableopt\n");
+     dvmFprintf(stderr, "  -Xjitsuspendpoll\n");
+@@ -1138,6 +1141,10 @@ static int processOptions(int argc, const char* const argv[],
+           gDvmJit.printBinary = true;
+         } else if (strncmp(argv[i], "-Xjitverbose", 12) == 0) {
+           gDvmJit.printMe = true;
++#ifdef SEP_DALVIK
++        } else if (strncmp(argv[i], "-Xjitsepdalvik", 14) == 0) {
++          gDvmJit.sepDalvik = true;
++#endif
+         } else if (strncmp(argv[i], "-Xjitprofile", 12) == 0) {
+           gDvmJit.profileMode = kTraceProfilingContinuous;
+         } else if (strncmp(argv[i], "-Xjitdisableopt", 15) == 0) {
+diff --git a/vm/compiler/Compiler.h b/vm/compiler/Compiler.h
+index d279ab4..7382f46 100644
+--- a/vm/compiler/Compiler.h
++++ b/vm/compiler/Compiler.h
+@@ -208,6 +208,9 @@ CompilerMethodStats *dvmCompilerAnalyzeMethodBody(const Method *method,
+ bool dvmCompilerCanIncludeThisInstruction(const Method *method,
+                                           const DecodedInstruction *insn);
+ bool dvmCompileMethod(const Method *method, JitTranslationInfo *info);
++#ifdef SEP_DALVIK
++void SendTraceInfoToVTune(CompilationUnit *cUnit, JitTraceDescription *desc);
++#endif
+ bool dvmCompileTrace(JitTraceDescription *trace, int numMaxInsts,
+                      JitTranslationInfo *info, jmp_buf *bailPtr, int optHints);
+ void dvmCompilerDumpStats(void);
+diff --git a/vm/compiler/Frontend.cpp b/vm/compiler/Frontend.cpp
+index 47c1898..7d0b810 100644
+--- a/vm/compiler/Frontend.cpp
++++ b/vm/compiler/Frontend.cpp
+@@ -21,6 +21,17 @@
+ #include "CompilerInternals.h"
+ #include "Dataflow.h"
+ 
++#define BYTECODE_FILTER
++
++#ifdef SEP_DALVIK
++#include "JitProfiling.h"
++#endif
++
++#ifdef PROFILE_OPCODE
++#include "dalvikvm/ProfileOpcodes.h"
++extern int opcodeJit[kNumPackedOpcodes];
++#endif
++
+ static inline bool contentIsInsn(const u2 *codePtr) {
+     u2 instr = *codePtr;
+     Opcode opcode = (Opcode)(instr & 0xff);
+@@ -1602,6 +1613,18 @@ static bool compileLoop(CompilationUnit *cUnit, unsigned int startOffset,
+     methodStats = dvmCompilerAnalyzeMethodBody(desc->method, false);
+     methodStats->nativeSize += cUnit->totalSize;
+ #endif
++
++
++#ifdef SEP_DALVIK
++    /* Send the loop trace information to the VTune */
++    if(gDvmJit.sepDalvik) {
++        if(info->codeAddress) {
++            SendTraceInfoToVTune(cUnit, desc);
++        } else {
++            LOGD("Invalid trace\n");
++        }
++    }
++#endif
+     return info->codeAddress != NULL;
+ 
+ bail:
+@@ -2172,6 +2195,57 @@ bool dvmCompileTrace(JitTraceDescription *desc, int numMaxInsts,
+ #if defined(WITH_JIT_TUNING)
+     methodStats->nativeSize += cUnit.totalSize;
+ #endif
+-
++#ifdef SEP_DALVIK
++    if(gDvmJit.sepDalvik) {
++        if(info->codeAddress) {
++            SendTraceInfoToVTune(&cUnit, desc);
++        } else {
++            LOGD("Invalid trace\n");
++        }
++    }
++#endif
+     return info->codeAddress != NULL;
+ }
++
++#ifdef SEP_DALVIK
++/* Notify the trace formation and send the trace information to VTune
++*/
++void SendTraceInfoToVTune(CompilationUnit *cUnit, JitTraceDescription *desc) {
++    if (cUnit->printMe) {
++        LOGD("JIT API: write a trace of '%s' method in jit file.", cUnit->method->name);
++    }
++
++    DexStringCache params_string;
++    dexStringCacheInit(&params_string);
++    const char* params = dexProtoGetParameterDescriptors(&desc->method->prototype, &params_string);
++    int len = strlen(params) + strlen(desc->method->name) + 3 ;
++    char* name_with_params = (char*) dvmCompilerNew(len, true);
++    strcpy(name_with_params, desc->method->name);
++    strcat(name_with_params, "(");
++    if (params) {
++        strcat(name_with_params, params);
++    }
++    strcat(name_with_params, ")");
++    dexStringCacheRelease(&params_string);
++
++    //Structure to load all the trace details to be sent later to VTune
++    iJIT_Method_Load jitMethod;
++    memset(&jitMethod, 0, sizeof(iJIT_Method_Load));
++    jitMethod.method_id = (int)(cUnit->method);
++    jitMethod.method_name = name_with_params;
++    jitMethod.class_file_name = (char*)(cUnit->method->clazz->descriptor);
++    jitMethod.method_load_address = cUnit->baseAddr;
++    jitMethod.method_size = cUnit->totalSize - cUnit->headerSize;
++    jitMethod.source_file_name = (char*)(cUnit->method->clazz->sourceFile);
++
++    //Send the trace load event to the VTune analyzer
++    int res = iJIT_NotifyEvent(iJVM_EVENT_TYPE_METHOD_LOAD_FINISHED, (void*)&jitMethod);
++    if (cUnit->printMe) {
++        if (res) {
++            LOGD("JIT API: a trace of '%s' method was written successfully.", cUnit->method->name);
++        } else {
++            LOGD("JIT API: failed to write a trace of '%s' method.", cUnit->method->name);
++        }
++    }
++}
++#endif
+diff --git a/vm/compiler/JitProfiling.cpp b/vm/compiler/JitProfiling.cpp
+new file mode 100644
+index 0000000..c9bf884
+--- /dev/null
++++ b/vm/compiler/JitProfiling.cpp
+@@ -0,0 +1,450 @@
++/*
++* Copyright (C) 2010-2012 Intel Corporation
++*
++* Licensed under the Apache License, Version 2.0 (the "License");
++* you may not use this file except in compliance with the License.
++* You may obtain a copy of the License at
++*
++*      http://www.apache.org/licenses/LICENSE-2.0
++*
++* Unless required by applicable law or agreed to in writing, software
++* distributed under the License is distributed on an "AS IS" BASIS,
++* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++* See the License for the specific language governing permissions and
++* limitations under the License.
++*/
++
++#include "ittnotify_config.h"
++
++#if ITT_PLATFORM==ITT_PLATFORM_WIN
++#include <windows.h>
++#pragma optimize("", off)
++#else  /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++#include <pthread.h>
++#include <dlfcn.h>
++#endif /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++#include <malloc.h>
++#include <stdlib.h>
++
++#include "JitProfiling.h"
++
++static const char rcsid[] = "\n@(#) $Revision: 202703 $\n";
++
++#define DLL_ENVIRONMENT_VAR	    "VS_PROFILER"
++
++#ifndef NEW_DLL_ENVIRONMENT_VAR
++#if ITT_ARCH==ITT_ARCH_IA32
++#define NEW_DLL_ENVIRONMENT_VAR     "INTEL_JIT_PROFILER32"
++#else
++#define NEW_DLL_ENVIRONMENT_VAR	    "INTEL_JIT_PROFILER64"
++#endif
++#endif /* NEW_DLL_ENVIRONMENT_VAR */
++
++#if ITT_PLATFORM==ITT_PLATFORM_WIN
++#define DEFAULT_DLLNAME         "JitPI.dll"
++HINSTANCE m_libHandle = NULL;
++#else  /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++#define DEFAULT_DLLNAME         "libJitPI.so"
++void* m_libHandle = NULL;
++#endif /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++
++/* default location of JIT profiling agent on Android */
++#define ANDROID_JIT_AGENT_PATH     "/data/intel/libittnotify.so"
++
++/* the function pointers */
++typedef unsigned int(*TPInitialize)(void);
++static TPInitialize FUNC_Initialize=NULL;
++
++typedef unsigned int(*TPNotify)(unsigned int, void*);
++static TPNotify FUNC_NotifyEvent=NULL;
++
++static iJIT_IsProfilingActiveFlags executionMode = iJIT_NOTHING_RUNNING;
++
++/* end collector dll part. */
++
++/* loadiJIT_Funcs() : this function is called just in the beginning and is responsible
++** to load the functions from BistroJavaCollector.dll
++** result:
++**      on success: the functions loads,    iJIT_DLL_is_missing=0, return value = 1.
++**      on failure: the functions are NULL, iJIT_DLL_is_missing=1, return value = 0.
++*/
++static int loadiJIT_Funcs(void);
++
++/* global representing whether the BistroJavaCollector can't be loaded */
++static int iJIT_DLL_is_missing = 0;
++
++/* Virtual stack - the struct is used as a virtual stack for each thread.
++** Every thread initializes with a stack of size INIT_TOP_STACK.
++** Every method entry decreases from the current stack point,
++** and when a thread stack reaches its top of stack (return from the global function),
++** the top of stack and the current stack increase. Notice that when returning from a function
++** the stack pointer is the address of the function return.
++*/
++#if ITT_PLATFORM==ITT_PLATFORM_WIN
++static DWORD threadLocalStorageHandle = 0;
++#else  /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++static pthread_key_t threadLocalStorageHandle = (pthread_key_t)0;
++#endif /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++
++#define INIT_TOP_Stack 10000
++
++typedef struct
++{
++    unsigned int TopStack;
++    unsigned int CurrentStack;
++} ThreadStack, *pThreadStack;
++
++/* end of virtual stack. */
++
++/*
++** The function for reporting virtual-machine related events to VTune.
++** Note: when reporting iJVM_EVENT_TYPE_ENTER_NIDS, there is no need to fill in the stack_id
++** field in the iJIT_Method_NIDS structure, as VTune fills it.
++**
++** The return value in iJVM_EVENT_TYPE_ENTER_NIDS && iJVM_EVENT_TYPE_LEAVE_NIDS events
++** will be 0 in case of failure.
++** in iJVM_EVENT_TYPE_METHOD_LOAD_FINISHED event it will be -1 if EventSpecificData == 0
++** otherwise it will be 0.
++*/
++
++ITT_EXTERN_C int JITAPI iJIT_NotifyEvent(iJIT_JVM_EVENT event_type, void *EventSpecificData)
++{
++    int ReturnValue;
++
++    /*******************************************************************************
++    ** This section is for debugging outside of VTune.
++    ** It creates the environment variables that indicates call graph mode.
++    ** If running outside of VTune remove the remark.
++    **
++
++      static int firstTime = 1;
++      char DoCallGraph[12] = "DoCallGraph";
++      if (firstTime)
++      {
++      firstTime = 0;
++      SetEnvironmentVariable( "BISTRO_COLLECTORS_DO_CALLGRAPH", DoCallGraph);
++      }
++
++    ** end of section.
++    *******************************************************************************/
++
++    /* initialization part - the functions have not been loaded yet. This part
++    **		will load the functions, and check if we are in Call Graph mode.
++    **		(for special treatment).
++    */
++    if (!FUNC_NotifyEvent)
++    {
++        if (iJIT_DLL_is_missing)
++            return 0;
++
++        // load the Function from the DLL
++        if (!loadiJIT_Funcs())
++            return 0;
++
++        /* Call Graph initialization. */
++    }
++
++    /* If the event is method entry/exit, check that in the current mode
++    ** VTune is allowed to receive it
++    */
++    if ((event_type == iJVM_EVENT_TYPE_ENTER_NIDS || event_type == iJVM_EVENT_TYPE_LEAVE_NIDS) &&
++        (executionMode != iJIT_CALLGRAPH_ON))
++    {
++        return 0;
++    }
++    /* This section is performed when method enter event occurs.
++    ** It updates the virtual stack, or creates it if this is the first
++    ** method entry in the thread. The stack pointer is decreased.
++    */
++    if (event_type == iJVM_EVENT_TYPE_ENTER_NIDS)
++    {
++#if ITT_PLATFORM==ITT_PLATFORM_WIN
++        pThreadStack threadStack = (pThreadStack)TlsGetValue (threadLocalStorageHandle);
++#else  /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++        pThreadStack threadStack = (pThreadStack)pthread_getspecific(threadLocalStorageHandle);
++#endif /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++
++        // check for use of reserved method IDs
++        if ( ((piJIT_Method_NIDS) EventSpecificData)->method_id <= 999 )
++            return 0;
++
++        if (!threadStack)
++        {
++            // initialize the stack.
++            threadStack = (pThreadStack) calloc (sizeof(ThreadStack), 1);
++            threadStack->TopStack = INIT_TOP_Stack;
++            threadStack->CurrentStack = INIT_TOP_Stack;
++#if ITT_PLATFORM==ITT_PLATFORM_WIN
++            TlsSetValue(threadLocalStorageHandle,(void*)threadStack);
++#else  /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++            pthread_setspecific(threadLocalStorageHandle,(void*)threadStack);
++#endif /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++        }
++
++        // decrease the stack.
++        ((piJIT_Method_NIDS) EventSpecificData)->stack_id = (threadStack->CurrentStack)--;
++    }
++
++    /* This section is performed when method leave event occurs
++    ** It updates the virtual stack.
++    **		Increases the stack pointer.
++    **		If the stack pointer reached the top (left the global function)
++    **			increase the pointer and the top pointer.
++    */
++    if (event_type == iJVM_EVENT_TYPE_LEAVE_NIDS)
++    {
++#if ITT_PLATFORM==ITT_PLATFORM_WIN
++        pThreadStack threadStack = (pThreadStack)TlsGetValue (threadLocalStorageHandle);
++#else  /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++        pThreadStack threadStack = (pThreadStack)pthread_getspecific(threadLocalStorageHandle);
++#endif /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++
++        // check for use of reserved method IDs
++        if ( ((piJIT_Method_NIDS) EventSpecificData)->method_id <= 999 )
++            return 0;
++
++        if (!threadStack)
++        {
++            /* Error: first report in this thread is method exit */
++            exit (1);
++        }
++
++        ((piJIT_Method_NIDS) EventSpecificData)->stack_id = ++(threadStack->CurrentStack) + 1;
++
++        if (((piJIT_Method_NIDS) EventSpecificData)->stack_id > threadStack->TopStack)
++            ((piJIT_Method_NIDS) EventSpecificData)->stack_id = (unsigned int)-1;
++    }
++
++    if (event_type == iJVM_EVENT_TYPE_METHOD_LOAD_FINISHED)
++    {
++        // check for use of reserved method IDs
++        if ( ((piJIT_Method_Load) EventSpecificData)->method_id <= 999 )
++            return 0;
++    }
++
++    ReturnValue = (int)FUNC_NotifyEvent(event_type, EventSpecificData);
++
++    return ReturnValue;
++}
++
++ITT_EXTERN_C void JITAPI iJIT_RegisterCallbackEx(void *userdata, iJIT_ModeChangedEx NewModeCallBackFuncEx) // The new mode call back routine
++{
++    // is it already missing... or the load of functions from the DLL failed
++    if (iJIT_DLL_is_missing || !loadiJIT_Funcs())
++    {
++        NewModeCallBackFuncEx(userdata, iJIT_NO_NOTIFICATIONS);  // then do not bother with notifications
++        /* Error: could not load JIT functions. */
++        return;
++    }
++    // nothing to do with the callback
++}
++
++/*
++** This function allows the user to query in which mode, if at all, VTune is running
++*/
++ITT_EXTERN_C iJIT_IsProfilingActiveFlags JITAPI iJIT_IsProfilingActive()
++{
++    loadiJIT_Funcs();
++    return executionMode;
++}
++
++/* this function loads the collector dll (BistroJavaCollector) and the relevant functions.
++** on success: all functions load,     iJIT_DLL_is_missing = 0, return value = 1.
++** on failure: all functions are NULL, iJIT_DLL_is_missing = 1, return value = 0.
++*/
++static int loadiJIT_Funcs()
++{
++    static int bDllWasLoaded = 0;
++    char *dllName = (char*)rcsid; // !!! Just to avoid unused code elimination !!!
++#if ITT_PLATFORM==ITT_PLATFORM_WIN
++    DWORD dNameLength = 0;
++#endif /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++
++    if(bDllWasLoaded)
++    {// dll was already loaded, no need to do it for the second time
++        return 1;
++    }
++
++    // Assumes that the DLL will not be found
++    iJIT_DLL_is_missing = 1;
++    FUNC_NotifyEvent = NULL;
++
++    if (m_libHandle)
++    {
++#if ITT_PLATFORM==ITT_PLATFORM_WIN
++        FreeLibrary(m_libHandle);
++#else  /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++        dlclose(m_libHandle);
++#endif /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++        m_libHandle = NULL;
++    }
++
++    // try to get the dll name from the environment
++#if ITT_PLATFORM==ITT_PLATFORM_WIN
++    dNameLength = GetEnvironmentVariableA(NEW_DLL_ENVIRONMENT_VAR, NULL, 0);
++    if (dNameLength)
++    {
++        DWORD envret = 0;
++        dllName = (char*)malloc(sizeof(char) * (dNameLength + 1));
++        envret = GetEnvironmentVariableA(NEW_DLL_ENVIRONMENT_VAR, dllName, dNameLength);
++        if (envret)
++        {
++            // Try to load the dll from the PATH...
++            m_libHandle = LoadLibraryExA(dllName, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
++        }
++        free(dllName);
++    } else {
++        // Try to use old VS_PROFILER variable
++        dNameLength = GetEnvironmentVariableA(DLL_ENVIRONMENT_VAR, NULL, 0);
++        if (dNameLength)
++        {
++            DWORD envret = 0;
++            dllName = (char*)malloc(sizeof(char) * (dNameLength + 1));
++            envret = GetEnvironmentVariableA(DLL_ENVIRONMENT_VAR, dllName, dNameLength);
++            if (envret)
++            {
++                // Try to load the dll from the PATH...
++                m_libHandle = LoadLibraryA(dllName);
++            }
++            free(dllName);
++        }
++    }
++#else  /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++    dllName = getenv(NEW_DLL_ENVIRONMENT_VAR);
++    if (!dllName)
++        dllName = getenv(DLL_ENVIRONMENT_VAR);
++#ifdef ANDROID
++    if (!dllName)
++        dllName = ANDROID_JIT_AGENT_PATH;
++#endif
++    if (dllName)
++    {
++        // Try to load the dll from the PATH...
++        m_libHandle = dlopen(dllName, RTLD_LAZY);
++    }
++#endif /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++
++    if (!m_libHandle)
++    {
++#if ITT_PLATFORM==ITT_PLATFORM_WIN
++        m_libHandle = LoadLibraryA(DEFAULT_DLLNAME);
++#else  /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++        m_libHandle = dlopen(DEFAULT_DLLNAME, RTLD_LAZY);
++#endif /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++    }
++
++    // if the dll wasn't loaded - exit.
++    if (!m_libHandle)
++    {
++        return 0;
++    }
++
++#if ITT_PLATFORM==ITT_PLATFORM_WIN
++    FUNC_NotifyEvent = (TPNotify)GetProcAddress(m_libHandle, "NotifyEvent");
++#else  /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++    FUNC_NotifyEvent = (TPNotify)dlsym(m_libHandle, "NotifyEvent");
++#endif /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++    if (!FUNC_NotifyEvent)
++    {
++        FUNC_Initialize = NULL;
++        return 0;
++    }
++
++#if ITT_PLATFORM==ITT_PLATFORM_WIN
++    FUNC_Initialize = (TPInitialize)GetProcAddress(m_libHandle, "Initialize");
++#else  /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++    FUNC_Initialize = (TPInitialize)dlsym(m_libHandle, "Initialize");
++#endif /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++    if (!FUNC_Initialize)
++    {
++        FUNC_NotifyEvent = NULL;
++        return 0;
++    }
++
++    executionMode = (iJIT_IsProfilingActiveFlags)FUNC_Initialize();
++
++    bDllWasLoaded = 1;
++    iJIT_DLL_is_missing = 0; // DLL is ok.
++
++    /*
++    ** Call Graph mode: init the thread local storage
++    ** (need to store the virtual stack there).
++    */
++    if ( executionMode == iJIT_CALLGRAPH_ON )
++    {
++        // Allocate a thread local storage slot for the thread "stack"
++        if (!threadLocalStorageHandle)
++#if ITT_PLATFORM==ITT_PLATFORM_WIN
++            threadLocalStorageHandle = TlsAlloc();
++#else  /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++        pthread_key_create(&threadLocalStorageHandle, NULL);
++#endif /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++    }
++
++    return 1;
++}
++
++/*
++** This function should be called by the user whenever a thread ends, to free the thread
++** "virtual stack" storage
++*/
++ITT_EXTERN_C void JITAPI FinalizeThread()
++{
++    if (threadLocalStorageHandle)
++    {
++#if ITT_PLATFORM==ITT_PLATFORM_WIN
++        pThreadStack threadStack = (pThreadStack)TlsGetValue (threadLocalStorageHandle);
++#else  /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++        pThreadStack threadStack = (pThreadStack)pthread_getspecific(threadLocalStorageHandle);
++#endif /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++        if (threadStack)
++        {
++            free (threadStack);
++            threadStack = NULL;
++#if ITT_PLATFORM==ITT_PLATFORM_WIN
++            TlsSetValue (threadLocalStorageHandle, threadStack);
++#else  /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++            pthread_setspecific(threadLocalStorageHandle, threadStack);
++#endif /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++        }
++    }
++}
++
++/*
++** This function should be called by the user when the process ends, to free the local
++** storage index
++*/
++ITT_EXTERN_C void JITAPI FinalizeProcess()
++{
++    if (m_libHandle)
++    {
++#if ITT_PLATFORM==ITT_PLATFORM_WIN
++        FreeLibrary(m_libHandle);
++#else  /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++        dlclose(m_libHandle);
++#endif /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++        m_libHandle = NULL;
++    }
++
++    if (threadLocalStorageHandle)
++#if ITT_PLATFORM==ITT_PLATFORM_WIN
++        TlsFree (threadLocalStorageHandle);
++#else  /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++    pthread_key_delete(threadLocalStorageHandle);
++#endif /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++}
++
++/*
++** This function should be called by the user for any method once.
++** The function will return a unique method ID, the user should maintain the ID for each
++** method
++*/
++ITT_EXTERN_C unsigned int JITAPI iJIT_GetNewMethodID()
++{
++    static unsigned int methodID = 0x100000;
++
++    if (methodID == 0)
++        return 0;     // ERROR : this is not a valid value
++
++    return methodID++;
++}
+diff --git a/vm/compiler/JitProfiling.h b/vm/compiler/JitProfiling.h
+new file mode 100644
+index 0000000..680b887
+--- /dev/null
++++ b/vm/compiler/JitProfiling.h
+@@ -0,0 +1,223 @@
++/*
++* Copyright (C) 2010-2012 Intel Corporation
++*
++* Licensed under the Apache License, Version 2.0 (the "License");
++* you may not use this file except in compliance with the License.
++* You may obtain a copy of the License at
++*
++*      http://www.apache.org/licenses/LICENSE-2.0
++*
++* Unless required by applicable law or agreed to in writing, software
++* distributed under the License is distributed on an "AS IS" BASIS,
++* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++* See the License for the specific language governing permissions and
++* limitations under the License.
++*/
++
++#ifndef __JITPROFILING_H__
++#define __JITPROFILING_H__
++
++/***************************************
++ * Various constants used by functions *
++ ***************************************/
++
++/* event notification */
++typedef enum iJIT_jvm_event
++{
++
++    /* shutdown */
++    iJVM_EVENT_TYPE_SHUTDOWN = 2,                /* Program exiting
++                                                  * EventSpecificData NA
++                                                  */
++
++
++    /* JIT profiling */
++    iJVM_EVENT_TYPE_METHOD_LOAD_FINISHED=13,     /* issued after method code jitted
++                                                  * into memory but before code is executed
++                                                  * EventSpecificData is an iJIT_Method_Load
++                                                  */
++
++    iJVM_EVENT_TYPE_METHOD_UNLOAD_START,         /* issued before unload. Method code will no
++                                                  * longer be executed, but code and info
++                                                  * are still in memory. The VTune profiler
++                                                  * may capture method code only at this point
++                                                  * EventSpecificData is iJIT_Method_Id
++                                                  */
++
++    /* Method Profiling */
++
++    /* method name, Id and stack is supplied */
++    iJVM_EVENT_TYPE_ENTER_NIDS = 19,             /* issued when a method is about to be entered
++                                                  * EventSpecificData is iJIT_Method_NIDS
++                                                  */
++
++    /* method name, Id and stack is supplied */
++    iJVM_EVENT_TYPE_LEAVE_NIDS                   /* issued when a method is about to be left
++                                                  * EventSpecificData is iJIT_Method_NIDS
++                                                  */
++} iJIT_JVM_EVENT;
++
++typedef enum _iJIT_ModeFlags
++{
++    iJIT_NO_NOTIFICATIONS          = 0x0000,     /* No need to Notify VTune,
++                                                  * Since VTune is not running
++                                                  */
++    iJIT_BE_NOTIFY_ON_LOAD         = 0x0001,     /* when turned on the jit must call
++                                                  * iJIT_NotifyEvent
++                                                  * (
++                                                  *     iJVM_EVENT_TYPE_METHOD_LOAD_FINISHED,
++                                                  * )
++                                                  * for all the method already jitted
++                                                  */
++    iJIT_BE_NOTIFY_ON_UNLOAD       = 0x0002,     /* when turned on the jit must call
++                                                  * iJIT_NotifyEvent
++                                                  * (
++                                                  *     iJVM_EVENT_TYPE_METHOD_UNLOAD_FINISHED,
++                                                  *  ) for all the method that are unloaded
++                                                  */
++    iJIT_BE_NOTIFY_ON_METHOD_ENTRY = 0x0004,     /* when turned on the jit must instrument all
++                                                  * the currently jited code with calls on
++                                                  * method entries
++                                                  */
++    iJIT_BE_NOTIFY_ON_METHOD_EXIT  = 0x0008      /* when turned on the jit must instrument all
++                                                  * the currently jited code with calls
++                                                  * on method exit
++                                                  */
++} iJIT_ModeFlags;
++
++
++ /* Flags used by iJIT_IsProfilingActive() */
++typedef enum _iJIT_IsProfilingActiveFlags
++{
++    iJIT_NOTHING_RUNNING           = 0x0000,     /* No profiler is running. Currently not used */
++    iJIT_SAMPLING_ON               = 0x0001,     /* Sampling is running. This is the default value
++                                                  * returned by iJIT_IsProfilingActive()
++                                                  */
++    iJIT_CALLGRAPH_ON              = 0x0002      /* Call Graph is running */
++} iJIT_IsProfilingActiveFlags;
++
++/* Enumerator for the environment of methods*/
++typedef enum _iJDEnvironmentType
++{
++    iJDE_JittingAPI = 2
++} iJDEnvironmentType;
++
++/**********************************
++ * Data structures for the events *
++ **********************************/
++
++/* structure for the events:
++ * iJVM_EVENT_TYPE_METHOD_UNLOAD_START
++ */
++
++typedef struct _iJIT_Method_Id
++{
++    unsigned int       method_id;              /* Id of the method (same as the one passed in
++                                                * the iJIT_Method_Load struct
++                                                */
++
++} *piJIT_Method_Id, iJIT_Method_Id;
++
++
++/* structure for the events:
++ * iJVM_EVENT_TYPE_ENTER_NIDS,
++ * iJVM_EVENT_TYPE_LEAVE_NIDS,
++ * iJVM_EVENT_TYPE_EXCEPTION_OCCURRED_NIDS
++ */
++
++typedef struct _iJIT_Method_NIDS
++{
++    unsigned int       method_id;              /* unique method ID */
++    unsigned int       stack_id;               /* NOTE: no need to fill this field,
++                                                * it's filled by VTune */
++    char*              method_name;            /* method name (just the method,
++                                                * without the class)
++                                                */
++} *piJIT_Method_NIDS, iJIT_Method_NIDS;
++
++/* structures for the events:
++ * iJVM_EVENT_TYPE_METHOD_LOAD_FINISHED
++ */
++
++typedef struct _LineNumberInfo
++{
++    unsigned int        Offset;                 /* x86 Offset from the begining of the method*/
++    unsigned int        LineNumber;             /* source line number from the begining of
++                                                 * the source file
++                                                 */
++
++} *pLineNumberInfo, LineNumberInfo;
++
++typedef struct _iJIT_Method_Load
++{
++    unsigned int        method_id;              /* unique method ID - can be any unique value,
++                                                 * (except 0 - 999)
++                                                 */
++    char*               method_name;            /* method name (can be with or without
++                                                 * the class and signature, in any case
++                                                 * the class name will be added to it)
++                                                 */
++    void*               method_load_address;    /* virtual address of that method
++                                                 * - This determines the method range for the
++                                                 * iJVM_EVENT_TYPE_ENTER/LEAVE_METHOD_ADDR
++                                                 * events
++                                                 */
++    unsigned int        method_size;            /* Size in memory - Must be exact */
++    unsigned int        line_number_size;       /* Line Table size in number of entries
++                                                 * - Zero if none
++                                                 */
++    pLineNumberInfo     line_number_table;      /* Pointer to the begining of the line numbers
++                                                 * info array
++                                                 */
++    unsigned int        class_id;               /* unique class ID */
++    char*               class_file_name;        /* class file name */
++    char*               source_file_name;       /* source file name */
++    void*               user_data;              /* bits supplied by the user for saving in
++                                                 * the JIT file
++                                                 */
++    unsigned int        user_data_size;         /* the size of the user data buffer */
++    iJDEnvironmentType  env;                    /* NOTE: no need to fill this field,
++                                                 * it's filled by VTune
++                                                 */
++} *piJIT_Method_Load, iJIT_Method_Load;
++
++/* API Functions */
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#ifndef CDECL
++#  if defined WIN32 || defined _WIN32
++#    define CDECL __cdecl
++#  else /* defined WIN32 || defined _WIN32 */
++#    if defined _M_X64 || defined _M_AMD64 || defined __x86_64__
++#      define CDECL /* not actual on x86_64 platform */
++#    else  /* _M_X64 || _M_AMD64 || __x86_64__ */
++#      define CDECL __attribute__ ((cdecl))
++#    endif /* _M_X64 || _M_AMD64 || __x86_64__ */
++#  endif /* defined WIN32 || defined _WIN32 */
++#endif /* CDECL */
++
++#define JITAPI CDECL
++
++/* called when the settings are changed with new settings */
++typedef void (*iJIT_ModeChangedEx)(void *UserData, iJIT_ModeFlags Flags);
++
++int JITAPI iJIT_NotifyEvent(iJIT_JVM_EVENT event_type, void *EventSpecificData);
++
++/* The new mode call back routine */
++void JITAPI iJIT_RegisterCallbackEx(void *userdata, iJIT_ModeChangedEx NewModeCallBackFuncEx);
++
++iJIT_IsProfilingActiveFlags JITAPI iJIT_IsProfilingActive(void);
++
++void JITAPI FinalizeThread(void);
++
++void JITAPI FinalizeProcess(void);
++
++unsigned int JITAPI iJIT_GetNewMethodID(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* __JITPROFILING_H__ */
+diff --git a/vm/compiler/ittnotify_config.h b/vm/compiler/ittnotify_config.h
+new file mode 100644
+index 0000000..7c7675d
+--- /dev/null
++++ b/vm/compiler/ittnotify_config.h
+@@ -0,0 +1,437 @@
++/*
++* Copyright (C) 2010-2012 Intel Corporation
++*
++* Licensed under the Apache License, Version 2.0 (the "License");
++* you may not use this file except in compliance with the License.
++* You may obtain a copy of the License at
++*
++*      http://www.apache.org/licenses/LICENSE-2.0
++*
++* Unless required by applicable law or agreed to in writing, software
++* distributed under the License is distributed on an "AS IS" BASIS,
++* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++* See the License for the specific language governing permissions and
++* limitations under the License.
++*/
++
++#ifndef _ITTNOTIFY_CONFIG_H_
++#define _ITTNOTIFY_CONFIG_H_
++
++/** @cond exclude_from_documentation */
++#ifndef ITT_OS_WIN
++#  define ITT_OS_WIN   1
++#endif /* ITT_OS_WIN */
++
++#ifndef ITT_OS_LINUX
++#  define ITT_OS_LINUX 2
++#endif /* ITT_OS_LINUX */
++
++#ifndef ITT_OS_MAC
++#  define ITT_OS_MAC   3
++#endif /* ITT_OS_MAC */
++
++#ifndef ITT_OS
++#  if defined WIN32 || defined _WIN32
++#    define ITT_OS ITT_OS_WIN
++#  elif defined( __APPLE__ ) && defined( __MACH__ )
++#    define ITT_OS ITT_OS_MAC
++#  else
++#    define ITT_OS ITT_OS_LINUX
++#  endif
++#endif /* ITT_OS */
++
++#ifndef ITT_PLATFORM_WIN
++#  define ITT_PLATFORM_WIN 1
++#endif /* ITT_PLATFORM_WIN */
++
++#ifndef ITT_PLATFORM_POSIX
++#  define ITT_PLATFORM_POSIX 2
++#endif /* ITT_PLATFORM_POSIX */
++
++#ifndef ITT_PLATFORM
++#  if ITT_OS==ITT_OS_WIN
++#    define ITT_PLATFORM ITT_PLATFORM_WIN
++#  else
++#    define ITT_PLATFORM ITT_PLATFORM_POSIX
++#  endif /* _WIN32 */
++#endif /* ITT_PLATFORM */
++
++#if defined(_UNICODE) && !defined(UNICODE)
++#define UNICODE
++#endif
++
++#include <stddef.h>
++#if ITT_PLATFORM==ITT_PLATFORM_WIN
++#include <tchar.h>
++#else  /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++#include <stdint.h>
++#if defined(UNICODE) || defined(_UNICODE)
++#include <wchar.h>
++#endif /* UNICODE || _UNICODE */
++#endif /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++
++#ifndef CDECL
++#  if ITT_PLATFORM==ITT_PLATFORM_WIN
++#    define CDECL __cdecl
++#  else /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++#    if defined _M_X64 || defined _M_AMD64 || defined __x86_64__
++#      define CDECL /* not actual on x86_64 platform */
++#    else  /* _M_X64 || _M_AMD64 || __x86_64__ */
++#      define CDECL __attribute__ ((cdecl))
++#    endif /* _M_X64 || _M_AMD64 || __x86_64__ */
++#  endif /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++#endif /* CDECL */
++
++#ifndef STDCALL
++#  if ITT_PLATFORM==ITT_PLATFORM_WIN
++#    define STDCALL __stdcall
++#  else /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++#    if defined _M_X64 || defined _M_AMD64 || defined __x86_64__
++#      define STDCALL /* not supported on x86_64 platform */
++#    else  /* _M_X64 || _M_AMD64 || __x86_64__ */
++#      define STDCALL __attribute__ ((stdcall))
++#    endif /* _M_X64 || _M_AMD64 || __x86_64__ */
++#  endif /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++#endif /* STDCALL */
++
++#define ITTAPI    CDECL
++#define LIBITTAPI CDECL
++
++/* TODO: Temporary for compatibility! */
++#define ITTAPI_CALL    CDECL
++#define LIBITTAPI_CALL CDECL
++
++#if ITT_PLATFORM==ITT_PLATFORM_WIN
++/* use __forceinline (VC++ specific) */
++#define INLINE           __forceinline
++#define INLINE_ATTRIBUTE /* nothing */
++#else  /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++/*
++ * Generally, functions are not inlined unless optimization is specified.
++ * For functions declared inline, this attribute inlines the function even
++ * if no optimization level was specified.
++ */
++#ifdef __STRICT_ANSI__
++#define INLINE           static
++#else  /* __STRICT_ANSI__ */
++#define INLINE           static inline
++#endif /* __STRICT_ANSI__ */
++#define INLINE_ATTRIBUTE __attribute__ ((always_inline))
++#endif /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++/** @endcond */
++
++#ifndef ITT_ARCH_IA32
++#  define ITT_ARCH_IA32  1
++#endif /* ITT_ARCH_IA32 */
++
++#ifndef ITT_ARCH_IA32E
++#  define ITT_ARCH_IA32E 2
++#endif /* ITT_ARCH_IA32E */
++
++#ifndef ITT_ARCH_IA64
++#  define ITT_ARCH_IA64  3
++#endif /* ITT_ARCH_IA64 */
++
++#ifndef ITT_ARCH
++#  if defined _M_X64 || defined _M_AMD64 || defined __x86_64__
++#    define ITT_ARCH ITT_ARCH_IA32E
++#  elif defined _M_IA64 || defined __ia64
++#    define ITT_ARCH ITT_ARCH_IA64
++#  else
++#    define ITT_ARCH ITT_ARCH_IA32
++#  endif
++#endif
++
++//#ifdef __cplusplus
++#  define ITT_EXTERN_C extern "C"
++//#else
++//#  define ITT_EXTERN_C /* nothing */
++//#endif /* __cplusplus */
++
++#define ITT_TO_STR_AUX(x) #x
++#define ITT_TO_STR(x)     ITT_TO_STR_AUX(x)
++
++#define __ITT_BUILD_ASSERT(expr, suffix) do { static char __itt_build_check_##suffix[(expr) ? 1 : -1]; __itt_build_check_##suffix[0] = 0; } while(0)
++#define _ITT_BUILD_ASSERT(expr, suffix)  __ITT_BUILD_ASSERT((expr), suffix)
++#define ITT_BUILD_ASSERT(expr)           _ITT_BUILD_ASSERT((expr), __LINE__)
++
++#define ITT_MAGIC { 0xED, 0xAB, 0xAB, 0xEC, 0x0D, 0xEE, 0xDA, 0x30 }
++
++/* Replace with snapshot date YYYYMMDD for promotion build. */
++#define API_VERSION_BUILD    20111111
++
++#ifndef API_VERSION_NUM
++#define API_VERSION_NUM 0.0.0
++#endif /* API_VERSION_NUM */
++
++#define API_VERSION "ITT-API-Version " ITT_TO_STR(API_VERSION_NUM) " (" ITT_TO_STR(API_VERSION_BUILD) ")"
++
++/* OS communication functions */
++#if ITT_PLATFORM==ITT_PLATFORM_WIN
++#include <windows.h>
++typedef HMODULE           lib_t;
++typedef DWORD             TIDT;
++typedef CRITICAL_SECTION  mutex_t;
++#define MUTEX_INITIALIZER { 0 }
++#define strong_alias(name, aliasname) /* empty for Windows */
++#else  /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++#include <dlfcn.h>
++#if defined(UNICODE) || defined(_UNICODE)
++#include <wchar.h>
++#endif /* UNICODE */
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE 1 /* need for PTHREAD_MUTEX_RECURSIVE */
++#endif /* _GNU_SOURCE */
++#include <pthread.h>
++typedef void*             lib_t;
++typedef pthread_t         TIDT;
++typedef pthread_mutex_t   mutex_t;
++#define MUTEX_INITIALIZER PTHREAD_MUTEX_INITIALIZER
++#define _strong_alias(name, aliasname) extern __typeof (name) aliasname __attribute__ ((alias (#name)));
++#define strong_alias(name, aliasname) _strong_alias(name, aliasname)
++#endif /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++
++#if ITT_PLATFORM==ITT_PLATFORM_WIN
++#define __itt_get_proc(lib, name) GetProcAddress(lib, name)
++#define __itt_mutex_init(mutex)   InitializeCriticalSection(mutex)
++#define __itt_mutex_lock(mutex)   EnterCriticalSection(mutex)
++#define __itt_mutex_unlock(mutex) LeaveCriticalSection(mutex)
++#define __itt_load_lib(name)      LoadLibraryA(name)
++#define __itt_unload_lib(handle)  FreeLibrary(handle)
++#define __itt_system_error()      (int)GetLastError()
++#define __itt_fstrcmp(s1, s2)     lstrcmpA(s1, s2)
++#define __itt_fstrlen(s)          lstrlenA(s)
++#define __itt_fstrcpyn(s1, s2, l) lstrcpynA(s1, s2, l)
++#define __itt_fstrdup(s)          _strdup(s)
++#define __itt_thread_id()         GetCurrentThreadId()
++#define __itt_thread_yield()      SwitchToThread()
++#ifndef ITT_SIMPLE_INIT
++INLINE int __itt_interlocked_increment(volatile long* ptr)
++{
++    return InterlockedIncrement(ptr);
++}
++#endif /* ITT_SIMPLE_INIT */
++#else /* ITT_PLATFORM!=ITT_PLATFORM_WIN */
++#define __itt_get_proc(lib, name) dlsym(lib, name)
++#define __itt_mutex_init(mutex)   \
++    {                                                                                        \
++        pthread_mutexattr_t mutex_attr;                                                      \
++        int error_code = pthread_mutexattr_init(&mutex_attr);                                \
++        if (error_code)                                                                      \
++            __itt_report_error(__itt_error_system, "pthread_mutexattr_init", error_code);    \
++        error_code = pthread_mutexattr_settype(&mutex_attr, PTHREAD_MUTEX_RECURSIVE);        \
++        if (error_code)                                                                      \
++            __itt_report_error(__itt_error_system, "pthread_mutexattr_settype", error_code); \
++        error_code = pthread_mutex_init(mutex, &mutex_attr);                                 \
++        if (error_code)                                                                      \
++            __itt_report_error(__itt_error_system, "pthread_mutex_init", error_code);        \
++        error_code = pthread_mutexattr_destroy(&mutex_attr);                                 \
++        if (error_code)                                                                      \
++            __itt_report_error(__itt_error_system, "pthread_mutexattr_destroy", error_code); \
++    }
++#define __itt_mutex_lock(mutex)   pthread_mutex_lock(mutex)
++#define __itt_mutex_unlock(mutex) pthread_mutex_unlock(mutex)
++#define __itt_load_lib(name)      dlopen(name, RTLD_LAZY)
++#define __itt_unload_lib(handle)  dlclose(handle)
++#define __itt_system_error()      errno
++#define __itt_fstrcmp(s1, s2)     strcmp(s1, s2)
++#define __itt_fstrlen(s)          strlen(s)
++#define __itt_fstrcpyn(s1, s2, l) strncpy(s1, s2, l)
++#define __itt_fstrdup(s)          strdup(s)
++#define __itt_thread_id()         pthread_self()
++#define __itt_thread_yield()      sched_yield()
++#if ITT_ARCH==ITT_ARCH_IA64
++#ifdef __INTEL_COMPILER
++#define __TBB_machine_fetchadd4(addr, val) __fetchadd4_acq((void *)addr, val)
++#else  /* __INTEL_COMPILER */
++/* TODO: Add Support for not Intel compilers for IA64 */
++#endif /* __INTEL_COMPILER */
++#else /* ITT_ARCH!=ITT_ARCH_IA64 */
++INLINE int __TBB_machine_fetchadd4(volatile void* ptr, long addend)
++{
++    int result;
++    __asm__ __volatile__("lock\nxaddl %0,%1"
++                          : "=r"(result),"=m"(*(long*)ptr)
++                          : "0"(addend), "m"(*(long*)ptr)
++                          : "memory");
++    return result;
++}
++#endif /* ITT_ARCH==ITT_ARCH_IA64 */
++#ifndef ITT_SIMPLE_INIT
++INLINE int __itt_interlocked_increment(volatile long* ptr)
++{
++    return __TBB_machine_fetchadd4(ptr, 1) + 1;
++}
++#endif /* ITT_SIMPLE_INIT */
++#endif /* ITT_PLATFORM==ITT_PLATFORM_WIN */
++
++typedef enum {
++    __itt_collection_normal = 0,
++    __itt_collection_paused = 1
++} __itt_collection_state;
++
++typedef enum {
++    __itt_thread_normal  = 0,
++    __itt_thread_ignored = 1
++} __itt_thread_state;
++
++#pragma pack(push, 8)
++
++typedef struct ___itt_thread_info
++{
++    const char* nameA; /*!< Copy of original name in ASCII. */
++#if defined(UNICODE) || defined(_UNICODE)
++    const wchar_t* nameW; /*!< Copy of original name in UNICODE. */
++#else  /* UNICODE || _UNICODE */
++    void* nameW;
++#endif /* UNICODE || _UNICODE */
++    TIDT               tid;
++    __itt_thread_state state;   /*!< Thread state (paused or normal) */
++    int                extra1;  /*!< Reserved to the runtime */
++    void*              extra2;  /*!< Reserved to the runtime */
++    struct ___itt_thread_info* next;
++} __itt_thread_info;
++
++#include "ittnotify_types.h" /* For __itt_group_id definition */
++
++typedef struct ___itt_api_info_20101001
++{
++    const char*    name;
++    void**         func_ptr;
++    void*          init_func;
++    __itt_group_id group;
++}  __itt_api_info_20101001;
++
++typedef struct ___itt_api_info
++{
++    const char*    name;
++    void**         func_ptr;
++    void*          init_func;
++    void*          null_func;
++    __itt_group_id group;
++}  __itt_api_info;
++
++struct ___itt_domain;
++struct ___itt_string_handle;
++
++typedef struct ___itt_global
++{
++    unsigned char          magic[8];
++    unsigned long          version_major;
++    unsigned long          version_minor;
++    unsigned long          version_build;
++    volatile long          api_initialized;
++    volatile long          mutex_initialized;
++    volatile long          atomic_counter;
++    mutex_t                mutex;
++    lib_t                  lib;
++    void*                  error_handler;
++    const char**           dll_path_ptr;
++    __itt_api_info*        api_list_ptr;
++    struct ___itt_global*  next;
++    /* Joinable structures below */
++    __itt_thread_info*     thread_list;
++    struct ___itt_domain*  domain_list;
++    struct ___itt_string_handle* string_list;
++    __itt_collection_state state;
++} __itt_global;
++
++#pragma pack(pop)
++
++#define NEW_THREAD_INFO_W(gptr,h,h_tail,t,s,n) { \
++    h = (__itt_thread_info*)malloc(sizeof(__itt_thread_info)); \
++    if (h != NULL) { \
++        h->tid    = t; \
++        h->nameA  = NULL; \
++        h->nameW  = n ? _wcsdup(n) : NULL; \
++        h->state  = s; \
++        h->extra1 = 0;    /* reserved */ \
++        h->extra2 = NULL; /* reserved */ \
++        h->next   = NULL; \
++        if (h_tail == NULL) \
++            (gptr)->thread_list = h; \
++        else \
++            h_tail->next = h; \
++    } \
++}
++
++#define NEW_THREAD_INFO_A(gptr,h,h_tail,t,s,n) { \
++    h = (__itt_thread_info*)malloc(sizeof(__itt_thread_info)); \
++    if (h != NULL) { \
++        h->tid    = t; \
++        h->nameA  = n ? __itt_fstrdup(n) : NULL; \
++        h->nameW  = NULL; \
++        h->state  = s; \
++        h->extra1 = 0;    /* reserved */ \
++        h->extra2 = NULL; /* reserved */ \
++        h->next   = NULL; \
++        if (h_tail == NULL) \
++            (gptr)->thread_list = h; \
++        else \
++            h_tail->next = h; \
++    } \
++}
++
++#define NEW_DOMAIN_W(gptr,h,h_tail,name) { \
++    h = (__itt_domain*)malloc(sizeof(__itt_domain)); \
++    if (h != NULL) { \
++        h->flags  = 0;    /* domain is disabled by default */ \
++        h->nameA  = NULL; \
++        h->nameW  = name ? _wcsdup(name) : NULL; \
++        h->extra1 = 0;    /* reserved */ \
++        h->extra2 = NULL; /* reserved */ \
++        h->next   = NULL; \
++        if (h_tail == NULL) \
++            (gptr)->domain_list = h; \
++        else \
++            h_tail->next = h; \
++    } \
++}
++
++#define NEW_DOMAIN_A(gptr,h,h_tail,name) { \
++    h = (__itt_domain*)malloc(sizeof(__itt_domain)); \
++    if (h != NULL) { \
++        h->flags  = 0;    /* domain is disabled by default */ \
++        h->nameA  = name ? __itt_fstrdup(name) : NULL; \
++        h->nameW  = NULL; \
++        h->extra1 = 0;    /* reserved */ \
++        h->extra2 = NULL; /* reserved */ \
++        h->next   = NULL; \
++        if (h_tail == NULL) \
++            (gptr)->domain_list = h; \
++        else \
++            h_tail->next = h; \
++    } \
++}
++
++#define NEW_STRING_HANDLE_W(gptr,h,h_tail,name) { \
++    h = (__itt_string_handle*)malloc(sizeof(__itt_string_handle)); \
++    if (h != NULL) { \
++        h->strA   = NULL; \
++        h->strW   = name ? _wcsdup(name) : NULL; \
++        h->extra1 = 0;    /* reserved */ \
++        h->extra2 = NULL; /* reserved */ \
++        h->next   = NULL; \
++        if (h_tail == NULL) \
++            (gptr)->string_list = h; \
++        else \
++            h_tail->next = h; \
++    } \
++}
++
++#define NEW_STRING_HANDLE_A(gptr,h,h_tail,name) { \
++    h = (__itt_string_handle*)malloc(sizeof(__itt_string_handle)); \
++    if (h != NULL) { \
++        h->strA   = name ? __itt_fstrdup(name) : NULL; \
++        h->strW   = NULL; \
++        h->extra1 = 0;    /* reserved */ \
++        h->extra2 = NULL; /* reserved */ \
++        h->next   = NULL; \
++        if (h_tail == NULL) \
++            (gptr)->string_list = h; \
++        else \
++            h_tail->next = h; \
++    } \
++}
++
++#endif /* _ITTNOTIFY_CONFIG_H_ */
+diff --git a/vm/compiler/ittnotify_types.h b/vm/compiler/ittnotify_types.h
+new file mode 100644
+index 0000000..ef631f7
+--- /dev/null
++++ b/vm/compiler/ittnotify_types.h
+@@ -0,0 +1,71 @@
++/*
++* Copyright (C) 2010-2012 Intel Corporation
++*
++* Licensed under the Apache License, Version 2.0 (the "License");
++* you may not use this file except in compliance with the License.
++* You may obtain a copy of the License at
++*
++*      http://www.apache.org/licenses/LICENSE-2.0
++*
++* Unless required by applicable law or agreed to in writing, software
++* distributed under the License is distributed on an "AS IS" BASIS,
++* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++* See the License for the specific language governing permissions and
++* limitations under the License.
++*/
++
++#ifndef _ITTNOTIFY_TYPES_H_
++#define _ITTNOTIFY_TYPES_H_
++
++typedef enum ___itt_group_id
++{
++    __itt_group_none      = 0,
++    __itt_group_legacy    = 1<<0,
++    __itt_group_control   = 1<<1,
++    __itt_group_thread    = 1<<2,
++    __itt_group_mark      = 1<<3,
++    __itt_group_sync      = 1<<4,
++    __itt_group_fsync     = 1<<5,
++    __itt_group_jit       = 1<<6,
++    __itt_group_model     = 1<<7,
++    __itt_group_splitter_min = 1<<7,
++    __itt_group_counter   = 1<<8,
++    __itt_group_frame     = 1<<9,
++    __itt_group_stitch    = 1<<10,
++    __itt_group_heap      = 1<<11,
++    __itt_group_splitter_max = 1<<12,
++    __itt_group_structure = 1<<12,
++    __itt_group_suppress = 1<<13,
++    __itt_group_all       = -1
++} __itt_group_id;
++
++#pragma pack(push, 8)
++
++typedef struct ___itt_group_list
++{
++    __itt_group_id id;
++    const char*    name;
++} __itt_group_list;
++
++#pragma pack(pop)
++
++#define ITT_GROUP_LIST(varname) \
++    static __itt_group_list varname[] = {       \
++        { __itt_group_all,       "all"       }, \
++        { __itt_group_control,   "control"   }, \
++        { __itt_group_thread,    "thread"    }, \
++        { __itt_group_mark,      "mark"      }, \
++        { __itt_group_sync,      "sync"      }, \
++        { __itt_group_fsync,     "fsync"     }, \
++        { __itt_group_jit,       "jit"       }, \
++        { __itt_group_model,     "model"     }, \
++        { __itt_group_counter,   "counter"   }, \
++        { __itt_group_frame,     "frame"     }, \
++        { __itt_group_stitch,    "stitch"    }, \
++        { __itt_group_heap,      "heap"      }, \
++        { __itt_group_structure, "structure" }, \
++        { __itt_group_suppress,  "suppress"  }, \
++        { __itt_group_none,      NULL        }  \
++    }
++
++#endif /* _ITTNOTIFY_TYPES_H_ */
+-- 
+1.7.4.1
+

@@ -1,0 +1,131 @@
+From e8d2cf1ffffd735c8f7e4daa2cc03e11f12eb162 Mon Sep 17 00:00:00 2001
+From: Chuanxiao Dong <chuanxiao.dong@intel.com>
+Date: Tue, 27 Nov 2012 16:14:24 +0800
+Subject: [PORT FROM MAIN]vold: fix format card related issue
+
+BZ: 47043
+
+Original BZ: 15634
+	Vold: fix erase card issue
+	Vold: fix external storage format failed issue
+
+Change-Id: Ie05e2d9f28a34f99bb0e78c7fee382c661037044
+Orig-Change-Id: I1daa82329bfd28505be719ec1b8b4c6876b2f18b
+Category: aosp improvement
+Domain: Storage Removable_Storage
+Origin: internal
+Upstream-Candidate: no, proprietary
+Signed-off-by: Chuanxiao Dong <chuanxiao.dong@intel.com>
+---
+ DirectVolume.cpp |   24 +++++++++++++++++++++++-
+ Volume.cpp       |   24 +++++++++++++++++-------
+ 2 files changed, 40 insertions(+), 8 deletions(-)
+
+diff --git a/DirectVolume.cpp b/DirectVolume.cpp
+index 9146917..ab9ff05 100644
+--- a/DirectVolume.cpp
++++ b/DirectVolume.cpp
+@@ -295,6 +295,28 @@ void DirectVolume::handleDiskRemoved(const char *devpath, NetlinkEvent *evt) {
+     }
+ 
+     SLOGD("Volume %s %s disk %d:%d removed\n", getLabel(), getMountpoint(), major, minor);
++    /*
++     * The disk itself is mounted. We need to unmount it first before remove
++     * disk
++     */
++    if (getState() == Volume::State_Mounted &&
++        (dev_t) MKDEV(major, minor) == mCurrentlyMountedKdev) {
++        snprintf(msg, sizeof(msg), "Volume %s %s bad removal (%d:%d)",
++            getLabel(), getMountpoint(), major, minor);
++        mVm->getBroadcaster()->sendBroadcast(ResponseCode::VolumeBadRemoval, msg, false);
++
++        if (mVm->cleanupAsec(this, true))
++            SLOGE("Failed to cleanup ASEC - unmount will probably fail!");
++
++        if (Volume::unmountVol(true, false)) {
++            SLOGE("Failed to unmount volume on bad removal (%s)", strerror(errno));
++            /* failed to unmount, maybe unexpected error would happen */
++        } else
++           SLOGD("Crisis averted");
++    }
++
++    mPartIdx = -1;
++
+     snprintf(msg, sizeof(msg), "Volume %s %s disk removed (%d:%d)",
+              getLabel(), getFuseMountpoint(), major, minor);
+     mVm->getBroadcaster()->sendBroadcast(ResponseCode::VolumeDiskRemoved,
+@@ -368,7 +390,7 @@ int DirectVolume::getDeviceNodes(dev_t *devs, int max) {
+         // If the disk has no partitions, try the disk itself
+         if (!mDiskNumParts) {
+             devs[0] = MKDEV(mDiskMajor, mDiskMinor);
+-            return 1;
++            return 0;
+         }
+ 
+         int i;
+diff --git a/Volume.cpp b/Volume.cpp
+index 8b98227..7c91d8b 100644
+--- a/Volume.cpp
++++ b/Volume.cpp
+@@ -250,7 +250,7 @@ int Volume::formatVol(bool wipe) {
+     bool formatEntireDevice = (mPartIdx == -1);
+     char devicePath[255];
+     dev_t diskNode = getDiskDevice();
+-    dev_t partNode = MKDEV(MAJOR(diskNode), (formatEntireDevice ? 1 : MINOR(diskNode) + mPartIdx));
++    dev_t partNode = MKDEV(MAJOR(diskNode), (formatEntireDevice ? MINOR(diskNode) : MINOR(diskNode) + mPartIdx));
+ 
+     setState(Volume::State_Formatting);
+ 
+@@ -264,6 +264,15 @@ int Volume::formatVol(bool wipe) {
+             SLOGE("Failed to initialize MBR (%s)", strerror(errno));
+             goto err;
+         }
++        /*
++         * Partition lba will be changed, and vold will record the
++         * new minor/major. vold doesn't provide a sync mechanism
++         * and we also don't know what the major/minor should be.
++         * Waiting for 50ms is just an experience value.
++         */
++        usleep(1000*50);
++        getDeviceNodes((dev_t *)&diskNode, 1);
++        partNode = MKDEV(MAJOR(diskNode), MINOR(diskNode));
+     }
+ 
+     sprintf(devicePath, "/dev/block/vold/%d:%d",
+@@ -325,6 +334,7 @@ int Volume::mountVol() {
+     char decrypt_state[PROPERTY_VALUE_MAX];
+     char crypto_state[PROPERTY_VALUE_MAX];
+     char encrypt_progress[PROPERTY_VALUE_MAX];
++    int nParts = 0;
+ 
+     property_get("vold.decrypt", decrypt_state, "");
+     property_get("vold.encrypt_progress", encrypt_progress, "");
+@@ -357,11 +367,11 @@ int Volume::mountVol() {
+         return 0;
+     }
+ 
+-    n = getDeviceNodes((dev_t *) &deviceNodes, 4);
+-    if (!n) {
+-        SLOGE("Failed to get device nodes (%s)\n", strerror(errno));
+-        return -1;
+-    }
++    nParts = getDeviceNodes((dev_t *) &deviceNodes, 4);
++    if (!nParts)
++        n = 1;
++    else
++        n = nParts;
+ 
+     /* If we're running encrypted, and the volume is marked as encryptable and nonremovable,
+      * and also marked as providing Asec storage, then we need to decrypt
+@@ -474,7 +484,7 @@ int Volume::mountVol() {
+          * And USB mass storage will export entire disk(all the partitions) to host PC.
+          * So update the mPartIdx to export only one proper FAT FS partition.
+          */
+-        if (mPartIdx == -1)
++        if (mPartIdx == -1 && nParts)
+             mPartIdx = i + 1;
+ 
+         return 0;
+-- 
+1.7.4.1
+

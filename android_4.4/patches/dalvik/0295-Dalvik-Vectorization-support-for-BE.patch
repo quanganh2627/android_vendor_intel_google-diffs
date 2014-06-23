@@ -1,0 +1,2241 @@
+From ffee9e068659ec731df780eeb2f9a2626b784d36 Mon Sep 17 00:00:00 2001
+From: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Date: Mon, 12 Aug 2013 12:49:26 -0700
+Subject: Dalvik: Vectorization support for BE
+
+BZ: 132501
+
+New extended MIRs have been added to support vectorization. The extended
+MIRs work on 128-bit values and do work on packed elements:
+-kMirOpConst128b - Put constant in 128-bit registers
+-kMirOpMove128b - Move between two 128-bit registers
+-kMirOpPackedMultiply - Packed multiplication
+-kMirOpPackedAddition - Packed addition
+-kMirOpPackedAddReduce - Horizontal add and reduce to VR
+-kMirOpPackedSet - Shuffle VR in 128-bit register
+
+This patch adds the LCG backend support for these new extended MIRs. It does
+so by creating API methods for doing vectorized operations. Scheduler
+also now supports the new instructions. Encoder can properly encode/decode
+all of the x86 instructions required to support the vector operations.
+
+The LCG backend does a 1:1 mapping between the vector registers in MIR and
+the XMM registers available.
+
+A new function has been added to check if processor support SSE4.1. This is
+done because not all vectorized operations can be done on all processors without
+SSE4.1 support.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I347cccfbda65074602530cfefe8868b560726050
+Orig-MCG-Change-Id: I1585ee31d39f129c9bcd8ed045f565c4aa437287
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Signed-off-by: Udayan Banerji <udayan.banerji@intel.com>
+Signed-off-by: Yixin Shou <yixin.shou@intel.com>
+Reviewed-on: http://android.intel.com:8080/123655
+Reviewed-by: Provodin, Vitaly A <vitaly.a.provodin@intel.com>
+Reviewed-by: Beyler, Jean Christophe <jean.christophe.beyler@intel.com>
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/Globals.h                                       |    5 +
+ vm/compiler/CompilerIR.h                           |   39 ++-
+ vm/compiler/Dataflow.cpp                           |   54 +++
+ vm/compiler/IntermediateRep.cpp                    |    6 +
+ vm/compiler/codegen/CodegenFactory.cpp             |   11 +
+ vm/compiler/codegen/CompilerCodegen.h              |    6 +
+ vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp     |   11 +-
+ .../codegen/x86/lightcg/BytecodeVisitor.cpp        |  143 +++++++
+ vm/compiler/codegen/x86/lightcg/CodegenErrors.cpp  |    8 +-
+ vm/compiler/codegen/x86/lightcg/CodegenErrors.h    |    4 +
+ .../codegen/x86/lightcg/CodegenInterface.cpp       |  117 +++++-
+ .../codegen/x86/lightcg/InstructionGeneration.cpp  |  169 ++++++++
+ .../codegen/x86/lightcg/InstructionGeneration.h    |   50 +++
+ vm/compiler/codegen/x86/lightcg/Lower.h            |  103 +++++-
+ vm/compiler/codegen/x86/lightcg/LowerHelper.cpp    |  408 ++++++++++++++++++--
+ .../codegen/x86/lightcg/RegisterizationBE.cpp      |    8 +-
+ vm/compiler/codegen/x86/lightcg/Scheduler.cpp      |   87 ++++-
+ vm/compiler/codegen/x86/lightcg/libenc/enc_base.h  |    5 +-
+ .../codegen/x86/lightcg/libenc/enc_defs_ext.h      |   51 ++-
+ .../codegen/x86/lightcg/libenc/enc_tabl.cpp        |  129 ++++++
+ .../codegen/x86/lightcg/libenc/enc_wrapper.cpp     |  116 +++++--
+ .../codegen/x86/lightcg/libenc/enc_wrapper.h       |   10 +-
+ 22 files changed, 1432 insertions(+), 108 deletions(-)
+
+diff --git a/vm/Globals.h b/vm/Globals.h
+index 6a606ac..f6257f4 100644
+--- a/vm/Globals.h
++++ b/vm/Globals.h
+@@ -1084,6 +1084,11 @@ struct DvmJitGlobals {
+      *  @details http://software.intel.com/en-us/articles/intel-architecture-and-
+      *  processor-identification-with-cpuid-model-and-family-numbers */
+     int cpuModel;
++
++    /**
++     * @brief CPU Feature information about the CPU
++     */
++    int featureInformation[2];
+ #endif
+ 
+ #if defined(SIGNATURE_BREAKPOINT)
+diff --git a/vm/compiler/CompilerIR.h b/vm/compiler/CompilerIR.h
+index 1b71a51..1c8230d 100644
+--- a/vm/compiler/CompilerIR.h
++++ b/vm/compiler/CompilerIR.h
+@@ -70,6 +70,7 @@ typedef enum BBType {
+     kExceptionHandling,
+     kCatchEntry,
+     kPreBackwardBlock,
++    kVectorized
+ } BBType;
+ 
+ typedef enum JitMode {
+@@ -129,8 +130,44 @@ enum ExtendedMIROpcode {
+     kMirOpBoundCheck,
+     /** @brief MIR for hint to registerize a VR:
+       vA: the VR number, vB: the type using the RegisterClass enum
+-    */
++     */
+     kMirOpRegisterize,
++    /** @brief MIR to move data to a 128-bit vectorized register
++       vA: destination
++       args[0]~args[3]: the 128-bit data to be stored in vA
++     */
++    kMirOpConst128b,
++    /** @brief MIR to move a 128-bit vectorized register to another
++       vA: destination
++       vB: source
++     */
++    kMirOpMove128b,
++    /** @brief Packed multiply: two 128-bit vectorized registers: vA = vA * vB using opnd size to know the data size
++       vA: destination and source
++       vB: source
++     */
++    kMirOpPackedMultiply,
++    /** @brief Packed addition: two 128-bit vectorized registers: vA = vA + vB using opnd size to know the data size
++       vA: destination and source
++       vB: source
++       vC: operands' size (2 bytes, 4 bytes)
++     */
++    kMirOpPackedAddition,
++    /**
++       @brief Reduce a 128-bit packed element into a single VR
++       @details Instruction does an addition of the different packed elements and sets the accumulation into a VR
++       vA: destination VR
++       vB: 128-bit source register
++       vC: operands' size (2 bytes, 4 bytes)
++     */
++    kMirOpPackedAddReduce,
++    /** @brief Create a 128 bit value, with all 16 bytes / vC values equal to vB
++       vA: destination 128-bit vector register
++       vB: source VR
++       vC: operands' size (2 bytes, 4 bytes)
++     */
++    kMirOpPackedSet,
++
+     /** @brief Last enumeration: not used except for array bounds */
+     kMirOpLast,
+ };
+diff --git a/vm/compiler/Dataflow.cpp b/vm/compiler/Dataflow.cpp
+index 222bace..c66df36 100644
+--- a/vm/compiler/Dataflow.cpp
++++ b/vm/compiler/Dataflow.cpp
+@@ -806,15 +806,51 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+ 
+     // This is the beginning of the extended MIR opcodes. We make sure that each receives the
+     // tag for extended format so that we can treat the uses and defs specially for each.
++
++    //kMirOpPhi
+     DF_FORMAT_EXT_OP,
++
++    //kMirOpNullNRangeUpCheck
+     DF_FORMAT_EXT_OP,
++
++    //kMirOpNullNRangeDownCheck
+     DF_FORMAT_EXT_OP,
++
++    //kMirOpLowerBound
+     DF_FORMAT_EXT_OP,
++
++    //kMirOpPunt
+     DF_FORMAT_EXT_OP,
++
++    //kMirOpCheckInlinePrediction
+     DF_FORMAT_EXT_OP,
++
++    //kMirOpNullCheck
+     DF_FORMAT_EXT_OP,
++
++    //kMirOpBoundCheck
+     DF_FORMAT_EXT_OP,
++
++    //kMirOpRegisterize
+     DF_FORMAT_EXT_OP,
++
++    //kMirOpMoveData128b
++    DF_NOP,
++
++    //kMirOpMove128b,
++    DF_NOP,
++
++    //kMirOpPackedMultiply,
++    DF_NOP,
++
++    //kMirOpPackedAddition,
++    DF_NOP,
++
++    //kMirOpPackedReduce,
++    DF_DA | DF_UA,
++
++    //kMirOpPackedSet,
++    DF_UB,
+ };
+ 
+ /* Return the Dalvik register/subscript pair of a given SSA register */
+@@ -1201,6 +1237,24 @@ void dvmCompilerExtendedDisassembler (const CompilationUnit *cUnit,
+             snprintf (buffer, len, "kMirOpRegisterize: v%d %s", insn->vA, regClass);
+             break;
+         }
++        case kMirOpMove128b:
++            snprintf (buffer, len, "kMirOpMove128b xmm%d = xmm%d", insn->vA, insn->vB);
++            break;
++        case kMirOpPackedSet:
++            snprintf (buffer, len, "kMirOpPackedSet xmm%d = v%d, size %d", insn->vA, insn->vB, insn->vC);
++            break;
++        case kMirOpConst128b:
++            snprintf (buffer, len, "kMirOpConst128DW xmm%d = %x, %x, %x, %x", insn->vA, insn->arg[0], insn->arg[1], insn->arg[2], insn->arg[3]);
++            break;
++        case kMirOpPackedAddition:
++            snprintf (buffer, len, "kMirOpPackedAddition xmm%d = xmm%d + xmm%d, size %d", insn->vA, insn->vA, insn->vB, insn->vC);
++            break;
++        case kMirOpPackedMultiply:
++            snprintf (buffer, len, "kMirOpPackedMultiply xmm%d = xmm%d * xmm%d, size %d", insn->vA, insn->vA, insn->vB, insn->vC);
++            break;
++        case kMirOpPackedAddReduce:
++            snprintf (buffer, len, "kMirOpPackedAddReduce v%d = xmm%d, size %d", insn->vA, insn->vB, insn->vC);
++            break;
+         default:
+             snprintf (buffer, len, "Unknown Extended Opcode");
+             break;
+diff --git a/vm/compiler/IntermediateRep.cpp b/vm/compiler/IntermediateRep.cpp
+index 066e88f..36f3ec3 100644
+--- a/vm/compiler/IntermediateRep.cpp
++++ b/vm/compiler/IntermediateRep.cpp
+@@ -860,6 +860,12 @@ BasicBlock *dvmCompilerCopyBasicBlock (CompilationUnit *cUnit, const BasicBlock
+         dvmCompilerAppendMIR (resultBB, copy);
+     }
+ 
++    //Copy the writebacks as well
++    if (old->requestWriteBack != 0 && resultBB->requestWriteBack != 0)
++    {
++        dvmCopyBitVector (resultBB->requestWriteBack, old->requestWriteBack);
++    }
++
+     //Insert it to the cUnit list
+     dvmInsertGrowableList (&cUnit->blockList, (intptr_t) resultBB);
+ 
+diff --git a/vm/compiler/codegen/CodegenFactory.cpp b/vm/compiler/codegen/CodegenFactory.cpp
+index 2291809..02282cd 100644
+--- a/vm/compiler/codegen/CodegenFactory.cpp
++++ b/vm/compiler/codegen/CodegenFactory.cpp
+@@ -313,4 +313,15 @@ bool backendCanBailOut(CompilationUnit *cUnit, MIR *mir) {
+     // non x86 do not use a fake uses
+     return false;
+ }
++
++/**
++ * @brief Check whether architecture supports vectorized packed size in bytes
++ * @param size The vectorized packed size, ie the size of the operands lying in a vectorized instruction
++ * @return Returns whether the architecture supports it
++ */
++bool dvmCompilerArchSupportsVectorizedPackedSize (unsigned int size)
++{
++    //No vectorization support for other architectures unless encoder implements it
++    return false;
++}
+ #endif
+diff --git a/vm/compiler/codegen/CompilerCodegen.h b/vm/compiler/codegen/CompilerCodegen.h
+index 3040062..4a28b90 100644
+--- a/vm/compiler/codegen/CompilerCodegen.h
++++ b/vm/compiler/codegen/CompilerCodegen.h
+@@ -103,4 +103,10 @@ void dvmCompilerDumpArchSpecificBB(CompilationUnit *cUnit, BasicBlock *bb, FILE
+  */
+ bool backendCanBailOut(CompilationUnit *cUnit, MIR *mir);
+ 
++/*
++ * Implemented in codegen/<target>/CodegenDriver.cpp
++ * Backend check whether vectorization of specific packed size is supported
++ */
++bool dvmCompilerArchSupportsVectorizedPackedSize (unsigned int size);
++
+ #endif  // DALVIK_VM_COMPILERCODEGEN_H_
+diff --git a/vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp b/vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp
+index c4192ca..e9897aa 100644
+--- a/vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp
++++ b/vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp
+@@ -1254,9 +1254,16 @@ void endOfBasicBlock(BasicBlock* bb) {
+ bool skipExtendedMir(Opcode opc) {
+     ExtendedMIROpcode extendedOpCode = static_cast<ExtendedMIROpcode> (opc);
+ 
+-    switch (extendedOpCode) {
++    switch (extendedOpCode)
++    {
+         case kMirOpCheckInlinePrediction:
+         case kMirOpRegisterize:
++        case kMirOpMove128b:
++        case kMirOpConst128b:
++        case kMirOpPackedMultiply:
++        case kMirOpPackedAddition:
++        case kMirOpPackedAddReduce:
++        case kMirOpPackedSet:
+             return false;
+         default:
+             return true;
+@@ -2974,7 +2981,7 @@ void dumpPartToMem(int reg /*xmm physical reg*/, int vA, bool isLow) {
+                                    reg, true);
+ #else
+         // right shift high half of xmm to low half xmm
+-        dump_imm_reg_noalloc(Mnemonic_PSRLQ, OpndSize_64, 32, reg, true, LowOpndRegType_xmm);
++        dump_imm_reg_noalloc_alu(Mnemonic_PSRLQ, OpndSize_64, 32, reg, true, LowOpndRegType_xmm);
+ #endif
+         //move low 32 bits of xmm reg to vA+1
+         move_ss_reg_to_mem_noalloc(reg, true, 4*(vA+1), PhysicalReg_FP, true, MemoryAccess_VR, vA+1);
+diff --git a/vm/compiler/codegen/x86/lightcg/BytecodeVisitor.cpp b/vm/compiler/codegen/x86/lightcg/BytecodeVisitor.cpp
+index 5b4be5d..1116a05 100644
+--- a/vm/compiler/codegen/x86/lightcg/BytecodeVisitor.cpp
++++ b/vm/compiler/codegen/x86/lightcg/BytecodeVisitor.cpp
+@@ -1534,6 +1534,31 @@ int getVirtualRegInfo (VirtualRegInfo* infoArray, const MIR * currentMIR, bool u
+ 
+                 num_regs_per_bytecode = 1;
+                 break;
++            case kMirOpConst128b:
++            case kMirOpMove128b:
++            case kMirOpPackedMultiply:
++            case kMirOpPackedAddition:
++                //No virtual registers are being used
++                num_regs_per_bytecode = 0;
++                break;
++            case kMirOpPackedAddReduce:
++                //One virtual register defined to store final reduction
++                infoArray[0].regNum = currentMIR->dalvikInsn.vA;
++                infoArray[0].refCount = 2;
++                infoArray[0].accessType = REGACCESS_UD;
++                infoArray[0].physicalType = LowOpndRegType_gp;
++
++                num_regs_per_bytecode = 1;
++                break;
++            case kMirOpPackedSet:
++                //One virtual register used to load into 128-bit register
++                infoArray[0].regNum = currentMIR->dalvikInsn.vB;
++                infoArray[0].refCount = 1;
++                infoArray[0].accessType = REGACCESS_U;
++                infoArray[0].physicalType = LowOpndRegType_gp;
++
++                num_regs_per_bytecode = 1;
++                break;
+             default:
+                 ALOGI("JIT_INFO: Extended MIR not supported in getVirtualRegInfo");
+                 SET_JIT_ERROR(kJitErrorUnsupportedBytecode);
+@@ -3691,6 +3716,124 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR, const u2* dal
+                 //Return the number of temps being used
+                 return tempRegCount;
+             }
++            case kMirOpConst128b:
++            {
++                const int destXmm = PhysicalReg_StartOfXmmMarker + currentMIR->dalvikInsn.vA;
++
++                infoArray[0].regNum = destXmm;
++                infoArray[0].refCount = 1;
++                infoArray[0].physicalType = LowOpndRegType_xmm | LowOpndRegType_hard;
++
++                //If we are just loading zero, then we can just zero out the destination register
++                if (currentMIR->dalvikInsn.arg[0] == 0 && currentMIR->dalvikInsn.arg[1] == 0
++                        && currentMIR->dalvikInsn.arg[2] == 0 && currentMIR->dalvikInsn.arg[3] == 0)
++                {
++                    infoArray[0].refCount = 2;
++                }
++                else
++                {
++                    infoArray[0].refCount = 1;
++                }
++
++                return 1;
++            }
++            case kMirOpMove128b:
++            {
++                const int sourceXmm = PhysicalReg_StartOfXmmMarker + currentMIR->dalvikInsn.vB;
++                const int destXmm = PhysicalReg_StartOfXmmMarker + currentMIR->dalvikInsn.vA;
++
++                infoArray[0].regNum = sourceXmm;
++                infoArray[0].refCount = 1;
++                infoArray[0].physicalType = LowOpndRegType_xmm | LowOpndRegType_hard;
++
++                infoArray[1].regNum = destXmm;
++                infoArray[1].refCount = 1;
++                infoArray[1].physicalType = LowOpndRegType_xmm | LowOpndRegType_hard;
++
++                return 2;
++            }
++            case kMirOpPackedMultiply:
++            case kMirOpPackedAddition:
++            {
++                const int sourceXmm = PhysicalReg_StartOfXmmMarker + currentMIR->dalvikInsn.vB;
++                const int destXmm = PhysicalReg_StartOfXmmMarker + currentMIR->dalvikInsn.vA;
++
++                infoArray[0].regNum = sourceXmm;
++                infoArray[0].refCount = 1;
++                infoArray[0].physicalType = LowOpndRegType_xmm | LowOpndRegType_hard;
++
++                //The destination is used and then defined
++                infoArray[1].regNum = destXmm;
++                infoArray[1].refCount = 2;
++                infoArray[1].physicalType = LowOpndRegType_xmm | LowOpndRegType_hard;
++
++                return 2;
++            }
++            case kMirOpPackedAddReduce:
++            {
++                OpndSize vecUnitSize = static_cast<OpndSize> (currentMIR->dalvikInsn.vC);
++
++                //Determine number of times we need to do horizontal add to fully saturate
++                int times = 0;
++                int width = 16 / vecUnitSize;
++                while (width > 1)
++                {
++                    times++;
++                    width >>= 1;
++                }
++
++                //We will use one xmm for doing the reduction
++                const int reductionXmm = PhysicalReg_StartOfXmmMarker + currentMIR->dalvikInsn.vB;
++                infoArray[0].regNum = reductionXmm;
++                infoArray[0].physicalType = LowOpndRegType_xmm | LowOpndRegType_hard;
++
++                //Basically we will use it and define it for each iteration.
++                //Then we need one reference from transfer from xmm into general purpose register.
++                infoArray[0].refCount = 2 * times + 1;
++
++                //We need a temporary to use for virtual register
++                const int temp1 = 1;
++                infoArray[1].regNum = temp1;
++                infoArray[1].physicalType = LowOpndRegType_gp;
++                //We need one reference for reduction and another for transfer into VR
++                infoArray[1].refCount = 3;
++                infoArray[1].shareWithVR = true;
++
++                //We need a temporary to reduce to
++                const int temp2 = 2;
++                infoArray[2].regNum = temp2;
++                infoArray[2].physicalType = LowOpndRegType_gp;
++                //We need one reference for reduction and another for transfer into VR
++                infoArray[2].refCount = 2;
++
++                return 3;
++            }
++            case kMirOpPackedSet:
++            {
++                const unsigned int operandSize = currentMIR->dalvikInsn.vC;
++
++                //We need a temporary to use for virtual register
++                const int temp1 = 1;
++                infoArray[0].regNum = temp1;
++                infoArray[0].physicalType = LowOpndRegType_gp;
++                //We need one reference for transfer from VR and one for reading when using it
++                infoArray[0].refCount = 2;
++
++                //Check if we need an 8-bit addressable register
++                if (operandSize == sizeof (OpndSize_8))
++                {
++                    infoArray[0].is8Bit = true;
++                }
++
++                const int destXmm = PhysicalReg_StartOfXmmMarker + currentMIR->dalvikInsn.vA;
++
++                //Now set up the destination xmm
++                infoArray[1].regNum = destXmm;
++                infoArray[1].refCount = 3;
++                infoArray[1].physicalType = LowOpndRegType_xmm | LowOpndRegType_hard;
++
++                return 2;
++            }
+             default:
+                 ALOGI("JIT_INFO: Extended MIR not supported in getTempRegInfo");
+                 SET_JIT_ERROR(kJitErrorUnsupportedBytecode);
+diff --git a/vm/compiler/codegen/x86/lightcg/CodegenErrors.cpp b/vm/compiler/codegen/x86/lightcg/CodegenErrors.cpp
+index 1d62643..2843d7d 100644
+--- a/vm/compiler/codegen/x86/lightcg/CodegenErrors.cpp
++++ b/vm/compiler/codegen/x86/lightcg/CodegenErrors.cpp
+@@ -80,10 +80,12 @@ START_ERRORS
+     NEW_ERROR (kJitErrorInvalidOperandSize,             "Invalid Operand Size was encountered.",                        false, false),
+     NEW_ERROR (kJitErrorPlugin,                         "Problem with the plugin system.",                              false, false),
+     NEW_ERROR (kJitErrorConstantFolding,                "Constant folding failed due to unhandled case.",               false, false),
+-    NEW_ERROR (kJitErrorCodegen,                        "Undefined issues in trace formation.",                         false, false),
+     NEW_ERROR (kJitErrorPcgUnknownChainingBlockType,    "Unknown chaining block type seen in PCG GL.",                  false, false),
+-    NEW_ERROR (kJitErrorPcgUnsupportedCallDataType,     "Unsupported call data type in PCG GL.",                        false, false),
+-    NEW_ERROR (kJitErrorPcgUnexpectedDataType,          "Unexpected data type seen in PCG GL.",                         false, false),
++    NEW_ERROR (kJitErrorPcgUnexpectedDataType,          "Unexpected data type in PCG GL.",                              false, false),
++    NEW_ERROR (kJitErrorPcgUnsupportedCallDataType,     "Unsupported call data type seen in PCG GL.",                   false, false),
++    NEW_ERROR (kJitErrorUnsupportedVectorization,       "Requested vectorization is not supported.",                    false, false),
++    NEW_ERROR (kJitErrorUnsupportedInstruction,         "Architecture does not support desired x86 instruction.",       false, false),
++    NEW_ERROR (kJitErrorCodegen,                        "Undefined issues in trace formation.",                         false, false),
+ END_ERRORS
+ 
+ 
+diff --git a/vm/compiler/codegen/x86/lightcg/CodegenErrors.h b/vm/compiler/codegen/x86/lightcg/CodegenErrors.h
+index 95231c6..0173402 100644
+--- a/vm/compiler/codegen/x86/lightcg/CodegenErrors.h
++++ b/vm/compiler/codegen/x86/lightcg/CodegenErrors.h
+@@ -95,6 +95,10 @@ enum JitCompilationErrors {
+     kJitErrorPcgUnexpectedDataType,
+     /** @brief Unsupported call data type in PCG GL */
+     kJitErrorPcgUnsupportedCallDataType,
++    /** @brief Unsupported case for vectorization */
++    kJitErrorUnsupportedVectorization,
++    /** @brief Unsupported x86 instruction on architecture */
++    kJitErrorUnsupportedInstruction,
+ 
+     /* ----- Add more errors above ---------------------------
+      * ----- Don't add new errors beyond this point ----------
+diff --git a/vm/compiler/codegen/x86/lightcg/CodegenInterface.cpp b/vm/compiler/codegen/x86/lightcg/CodegenInterface.cpp
+index 6365709..d3962e5 100644
+--- a/vm/compiler/codegen/x86/lightcg/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/lightcg/CodegenInterface.cpp
+@@ -239,6 +239,18 @@ bool dvmIsOpcodeSupportedByJit(const DecodedInstruction & insn)
+ //! default JIT code cache size used by x86 JIT
+ #define DEFAULT_X86_ATOM_DALVIK_JIT_CODE_CACHE_SIZE 512*1024
+ 
++/**
++ * @brief Does the architecture support SSE41?
++ * @return whether or not the architecture supports SSE41
++ */
++bool dvmCompilerArchitectureSupportsSSE41 (void)
++{
++    const int sse41Mask = 1 << 19;
++    bool supportsSSE41 = ( (gDvmJit.featureInformation[0] & sse41Mask) != 0);
++
++    return supportsSSE41;
++}
++
+ //! Initializes target-specific configuration
+ 
+ //! Configures the jit table size, jit threshold, and jit code cache size
+@@ -253,6 +265,7 @@ bool dvmCompilerArchInit() {
+     unsigned long propertyValue;
+ 
+     // Used to identify cpu
++    int infoRequestType = 0x1;
+     int familyAndModelInformation;
+     const int familyIdMask = 0xF00;
+     const int familyIdShift = 8;
+@@ -338,19 +351,22 @@ bool dvmCompilerArchInit() {
+ 
+     // Now determine machine model
+     asm volatile (
+-            "movl $1, %%eax\n\t"
+-            "pushl %%ebx\n\t"
+-            "cpuid\n\t"
+-            "popl %%ebx\n\t"
+-            "movl %%eax, %0"
+-            : "=r" (familyAndModelInformation)
+-            :
+-            : "eax", "ecx", "edx");
++            "pushl %%ebx\n"
++            "cpuid\n"
++            "popl %%ebx\n"
++            : "=a" (familyAndModelInformation),
++              "=c" (gDvmJit.featureInformation[0]),
++              "=d" (gDvmJit.featureInformation[1])
++            : "a" (infoRequestType)
++          );
+     gDvmJit.cpuFamily = (familyAndModelInformation & familyIdMask) >> familyIdShift;
+     gDvmJit.cpuModel = (((familyAndModelInformation & extendedModelIdMask)
+             >> extendedModelShift) << modelWidth)
+             + ((familyAndModelInformation & modelMask) >> modelShift);
+ 
++    ALOGV ("Processor family:%d model:%d %s SSE4.1", gDvmJit.cpuFamily, gDvmJit.cpuModel,
++            (dvmCompilerArchitectureSupportsSSE41 () == true) ? "supports" : "does not support");
++
+ #if defined(WITH_SELF_VERIFICATION)
+     /* Force into blocking mode */
+     gDvmJit.blockingMode = true;
+@@ -366,6 +382,37 @@ bool dvmCompilerArchInit() {
+     return true;
+ }
+ 
++/**
++ * @brief Check whether architecture supports vectorized packed size in bytes
++ * @details For x86, we check SSE support level because for some sizes we don't have instruction support
++ * @param size The vectorized packed size
++ * @return Returns whether the architecture supports it
++ */
++bool dvmCompilerArchSupportsVectorizedPackedSize (unsigned int size)
++{
++    //Always support size of 2
++    if (size == 2)
++    {
++        return true;
++    }
++
++    //Other sizes require SSE4.1
++    bool supportsSSE41 = dvmCompilerArchitectureSupportsSSE41 ();
++
++    if (supportsSSE41 == false)
++    {
++        return false;
++    }
++
++    //If it's 4, we can do it
++    if (size == 4)
++    {
++        return true;
++    }
++
++    return false;
++}
++
+ void dvmCompilerPatchInlineCache(void)
+ {
+     int i;
+@@ -1468,6 +1515,40 @@ bool handleExtendedMIR (CompilationUnit *cUnit, BasicBlock_O1 *bb, MIR *mir)
+             result = genValidationForPredictedInline (cUnit, mir);
+             break;
+         }
++        case kMirOpMove128b:
++        {
++            gDvm.executionMode = origMode;
++            result = genMove128b (cUnit, mir);
++            break;
++        }
++        case kMirOpPackedAddition:
++        {
++            gDvm.executionMode = origMode;
++            result = genPackedAddition (cUnit, mir);
++            break;
++        }
++        case kMirOpPackedMultiply:
++        {
++            gDvm.executionMode = origMode;
++            result = genPackedMultiply (cUnit, mir);
++            break;
++        }
++        case kMirOpPackedAddReduce:
++        {
++            gDvm.executionMode = origMode;
++            result = genPackedReduce (cUnit, mir);
++            break;
++        }
++        case kMirOpConst128b: {
++            gDvm.executionMode = origMode;
++            result = genMoveData128b (cUnit, mir);
++            break;
++        }
++        case kMirOpPackedSet: {
++            gDvm.executionMode = origMode;
++            result = genPackedSet (cUnit, mir);
++            break;
++        }
+         default:
+         {
+             char * decodedString = dvmCompilerGetDalvikDisassembly(&mir->dalvikInsn, NULL);
+@@ -1875,6 +1956,17 @@ int patchConstToStream(struct ConstInfo *constListTemp, CompilationUnit *cUnit)
+         /* iterate through the generated code to patch constants */
+         iaddr = static_cast<char*>(constListTemp->streamAddr+constListTemp->offsetAddr);
+ 
++        //If the patching address is null, then we can just skip it because we have nothing to update
++        if (iaddr == 0)
++        {
++            //Advance to the next constant that needs handled
++            constListTemp = constListTemp->next;
++
++            //We had no work to do so we succesfully handled this case
++            pResult++;
++            continue;
++        }
++
+         writeval = reinterpret_cast<unsigned int*>(iaddr);
+         unsigned int dispAddr =  getGlobalDataAddr("64bits");
+ 
+@@ -1914,8 +2006,12 @@ int patchConstToStream(struct ConstInfo *constListTemp, CompilationUnit *cUnit)
+  */
+ static bool generateCode (CompilationUnit_O1 *cUnit, BasicBlock *bb, BasicBlock **nextFallThrough)
+ {
+-    ALOGV("Get ready to handle JIT bb %d type %d hidden %d @%p",
+-            bb->id, bb->blockType, bb->hidden, stream);
++    if (cUnit->printMe)
++    {
++        char blockName[BLOCK_NAME_LEN];
++        dvmGetBlockName (bb, blockName);
++        ALOGD ("Get ready to handle BB%d type:%s hidden:%s @%p", bb->id, blockName, bb->hidden ? "yes" : "no", stream);
++    }
+ 
+     /* We want to update the stream start to remember it for future backward chaining cells */
+     BasicBlock_O1 *bbO1 = reinterpret_cast<BasicBlock_O1 *> (bb);
+@@ -2135,6 +2231,7 @@ static void compilerMIR2LIRJit(CompilationUnit_O1 *cUnit, JitTranslationInfo *in
+                 break;
+             case kDalvikByteCode:
+             case kPreBackwardBlock:
++            case kVectorized:
+                 //If hidden, we don't generate code
+                 if (bbO1->hidden == false)
+                 {
+diff --git a/vm/compiler/codegen/x86/lightcg/InstructionGeneration.cpp b/vm/compiler/codegen/x86/lightcg/InstructionGeneration.cpp
+index 2d79514..1a62a32 100644
+--- a/vm/compiler/codegen/x86/lightcg/InstructionGeneration.cpp
++++ b/vm/compiler/codegen/x86/lightcg/InstructionGeneration.cpp
+@@ -352,3 +352,172 @@ bool genRegisterize (CompilationUnit *cUnit, BasicBlock_O1 *bb, MIR *mir)
+     //If we get here, everything was handled
+     return true;
+ }
++
++bool genMove128b (CompilationUnit *cUnit, MIR *mir)
++{
++    const int sourceXmm = PhysicalReg_StartOfXmmMarker + mir->dalvikInsn.vB;
++    const int destXmm = PhysicalReg_StartOfXmmMarker + mir->dalvikInsn.vA;
++
++    //Move from one xmm to the other
++    move_reg_to_reg (OpndSize_128, sourceXmm, true, destXmm, true);
++
++    //No error
++    return true;
++}
++
++bool genPackedSet (CompilationUnit *cUnit, MIR *mir)
++{
++
++    int destXMM = PhysicalReg_StartOfXmmMarker + mir->dalvikInsn.vA;
++
++    int vrNum = mir->dalvikInsn.vB;
++    OpndSize vecUnitSize = static_cast<OpndSize> (mir->dalvikInsn.vC);
++
++    //We use temp1 to keep the virtual register
++    const int temp1 = 1;
++
++    //Get the virtual register which is 32-bit
++    get_virtual_reg (vrNum, OpndSize_32, temp1, false);
++
++    //Move it to the src VR
++    move_gp_to_xmm (temp1, false, destXMM, true);
++
++    //Zero out the shuffle mask
++    unsigned short mask = 0;
++
++    //Do the shuffle
++    bool success = vec_shuffle_reg_reg (destXMM, true, destXMM, true, vecUnitSize, mask);
++
++    return success;
++}
++
++bool genMoveData128b (CompilationUnit *cUnit, MIR *mir)
++{
++
++    int destXMM = PhysicalReg_StartOfXmmMarker + mir->dalvikInsn.vA;
++    int val128 = mir->dalvikInsn.arg[0];
++    int val96 = mir->dalvikInsn.arg[1];
++    int val64 = mir->dalvikInsn.arg[2];
++    int val32 = mir->dalvikInsn.arg[3];
++
++    //If we are just loading zero, then we can just zero out the destination register
++    if (val32 == 0 && val64 == 0 && val96 == 0 && val128 == 0)
++    {
++        //We just do a PXOR on the destination register.
++        dump_reg_reg (Mnemonic_PXOR, ATOM_NORMAL_ALU, OpndSize_64, destXMM, true, destXMM, true, LowOpndRegType_xmm);
++    }
++    else
++    {
++        //The width of instruction for MOVDQA (66 0F 6F) plus one modRM byte
++        const int insWidth = 4;
++
++        //Since const list is always appends to head, we add the second of constant first
++        addNewToConstList (&(cUnit->constListHead), val96, val128, destXMM, false);
++
++        // We want this const value to be ignored. The system should not look for an instruction to patch
++        // So, we put the steam address and ins offset to 0
++        bool stored = saveAddrToConstList (&(cUnit->constListHead), val96, val128, destXMM, 0, 0);
++
++        if (stored == false)
++        {
++            return false;
++        }
++
++        //Now add the first part of constant and ensure to ask for 16-byte alignment
++        addNewToConstList (&(cUnit->constListHead), val32, val64, destXMM, true);
++
++        //This is the beginning 64-bits of the const value. The next call to this function puts the other half. We use
++        //the address of this const in our movdqa.
++        stored = saveAddrToConstList (&(cUnit->constListHead), val32, val64, destXMM, stream, insWidth);
++
++        if (stored == false)
++        {
++            return false;
++        }
++
++        //Dummy address so that the constant patching is done on this address
++        int dispAddr = getGlobalDataAddr ("64bits");
++
++        //Now generate the MOVDQA
++        dump_mem_reg(Mnemonic_MOVDQA, ATOM_NORMAL, OpndSize_128, dispAddr, PhysicalReg_Null, true,
++               MemoryAccess_Constants, 0, destXMM, true, LowOpndRegType_xmm, &(cUnit->constListHead));
++    }
++
++    return true;
++}
++
++bool genPackedAddition (CompilationUnit *cUnit, MIR *mir)
++{
++    int dstXmm = mir->dalvikInsn.vA + PhysicalReg_StartOfXmmMarker;
++    int srcXmm = mir->dalvikInsn.vB + PhysicalReg_StartOfXmmMarker;
++    OpndSize vecUnitSize = static_cast<OpndSize> (mir->dalvikInsn.vC);
++
++    //Do the vector add now
++    bool success = vec_add_reg_reg (srcXmm, true, dstXmm, true, vecUnitSize);
++    return success;
++}
++
++bool genPackedMultiply (CompilationUnit *cUnit, MIR *mir)
++{
++    int dstXmm = mir->dalvikInsn.vA + PhysicalReg_StartOfXmmMarker;
++    int srcXmm = mir->dalvikInsn.vB + PhysicalReg_StartOfXmmMarker;
++    OpndSize vecUnitSize = static_cast<OpndSize> (mir->dalvikInsn.vC);
++
++    //Do the vector multiply now
++    bool success = vec_mul_reg_reg (srcXmm, true, dstXmm, true, vecUnitSize);
++    return success;
++}
++
++bool genPackedReduce (CompilationUnit *cUnit, MIR *mir)
++{
++    int dstVr = mir->dalvikInsn.vA;
++    int srcXmm = mir->dalvikInsn.vB + PhysicalReg_StartOfXmmMarker;
++    OpndSize vecUnitSize = static_cast<OpndSize> (mir->dalvikInsn.vC);
++
++    if (vecUnitSize > OpndSize_32)
++    {
++        //We are extracting to a GP and thus cannot hold more than 4 bytes
++        return false;
++    }
++
++    //Now determine number of times we need to do the horizontal add to fully saturate
++    const unsigned int vectorBytes = 16;
++    int width = vectorBytes / vecUnitSize;
++
++    //Create the right number of horizontal adds
++    while (width > 1)
++    {
++        bool success = vec_horizontal_add_reg_reg (srcXmm, true, srcXmm, true, vecUnitSize);
++
++        if (success == false)
++        {
++            //Just pass the error message
++            return false;
++        }
++
++        width >>= 1;
++    }
++
++    //We will use temp2 to extract to. And temp 1 for VR
++    const int temp1 = 1;
++    const int temp2 = 2;
++
++    //Now do the actual extraction
++    bool extracted = vec_extract_imm_reg_reg (0, srcXmm, true, temp2, false, vecUnitSize);
++
++    if (extracted == false)
++    {
++        //Just pass the error message
++        return false;
++    }
++
++    //Get virtual register
++    get_virtual_reg (dstVr, OpndSize_32, temp1, false);
++
++    //Now add the reduction result to VR
++    alu_binary_reg_reg (OpndSize_32, add_opc, temp2, false, temp1, false);
++
++    //Now alias the destination VR to the temp where we figured out result
++    set_virtual_reg (dstVr, OpndSize_32, temp1, false);
++    return true;
++}
+diff --git a/vm/compiler/codegen/x86/lightcg/InstructionGeneration.h b/vm/compiler/codegen/x86/lightcg/InstructionGeneration.h
+index cfc19c7..99598a6 100644
+--- a/vm/compiler/codegen/x86/lightcg/InstructionGeneration.h
++++ b/vm/compiler/codegen/x86/lightcg/InstructionGeneration.h
+@@ -97,4 +97,54 @@ bool genValidationForPredictedInline (CompilationUnit *cUnit, MIR *mir);
+  * @return Returns whether or not it successfully handled the request
+  */
+ bool genRegisterize (CompilationUnit *cUnit, BasicBlock_O1 *bb, MIR *mir);
++
++/**
++ * @brief Generate a move instruction for double-quadword register
++ * @param cUnit The CompilationUnit
++ * @param mir The MIR containing the source and destination reg numbers
++ * @return whether the operation was successful
++ */
++bool genMove128b (CompilationUnit *cUnit, MIR *mir);
++
++/**
++ * @brief Generate a packed set of an XMM from a VR
++ * @details Create a 128 bit value, with all 128 / vC values equal to vB
++ * @param cUnit The CompilationUnit
++ * @param mir The MIR containing the dest XMM and source VR number
++ * @return whether the operation was successful
++ */
++bool genPackedSet (CompilationUnit *cUnit, MIR *mir);
++
++/**
++ * @brief Generate a constant load of double-quadword size to an XMM
++ * @param cUnit The CompilationUnit
++ * @param mir The MIR containing the dest XMM and the data bytes
++ * @return whether the operation was successful
++ */
++bool genMoveData128b (CompilationUnit *cUnit, MIR *mir);
++
++/**
++ * @brief Generate a packed addition between two XMMs
++ * @param cUnit The CompilationUnit
++ * @param mir The MIR containing the dest and source XMM reg numbers
++ * @return whether the operation was successful
++ */
++bool genPackedAddition (CompilationUnit *cUnit, MIR *mir);
++
++/**
++ * @brief Generate a packed multiply between two XMMs
++ * @param cUnit The CompilationUnit
++ * @param mir The MIR containing the dest and source XMM reg numbers
++ * @return whether the operation was successful
++ */
++bool genPackedMultiply (CompilationUnit *cUnit, MIR *mir);
++
++/**
++ * @brief Generate a reduction of XMM to a VR
++ * @details Create a 128 bit value, with all 16 bytes / vC values equal to vB
++ * @param cUnit The CompilationUnit
++ * @param mir The MIR containing the dest VR and source XMM number
++ * @return whether the operation was successful
++ */
++bool genPackedReduce (CompilationUnit *cUnit, MIR *mir);
+ #endif
+diff --git a/vm/compiler/codegen/x86/lightcg/Lower.h b/vm/compiler/codegen/x86/lightcg/Lower.h
+index 14aa6f6..e406c3a 100644
+--- a/vm/compiler/codegen/x86/lightcg/Lower.h
++++ b/vm/compiler/codegen/x86/lightcg/Lower.h
+@@ -319,6 +319,8 @@ struct LowOpndReg {
+ struct LowOpndImm {
+     //! \brief Value of the immediate.
+     s4 value;
++    //! \brief Size of the immediate.
++    OpndSize immediateSize;
+ };
+ 
+ //! \brief Holds information about an immediate operand where the immediate
+@@ -469,6 +471,12 @@ struct LowOpRegReg : LowOp {
+     LowOpndReg regDest;
+ };
+ 
++//! \brief Specialized LowOp for imm + reg to reg
++struct LowOpImmRegReg : LowOpRegReg {
++    //! \brief The third imm operand other than src and dest reg
++    LowOpndImm imm;
++};
++
+ //! \brief Specialized LowOp for memory to register.
+ struct LowOpMemReg : LowOp {
+     //! \brief Memory as source.
+@@ -846,6 +854,15 @@ void moves_mem_disp_scale_to_reg(OpndSize size,
+ void moves_reg_to_reg(OpndSize size,
+                       int reg, bool isPhysical,
+                       int reg2, bool isPhysical2);
++
++//! \brief Performs a move from a GPR to XMM
++//!
++//! \param sourceReg source general purpose register
++//! \param isSourcePhysical if sourceReg is a physical register
++//! \param destReg destination XMM register
++//! \param isDestPhysical if destReg is a physical register
++void move_gp_to_xmm (int sourceReg, bool isSourcePhysical, int destReg, bool isDestPhysical);
++
+ void move_reg_to_reg(OpndSize size,
+                       int reg, bool isPhysical,
+                       int reg2, bool isPhysical2);
+@@ -1296,7 +1313,7 @@ LowOpRegReg* dump_movez_reg_reg(Mnemonic m, OpndSize size,
+ LowOpMemReg* dump_mem_reg(Mnemonic m, AtomOpCode m2, OpndSize size,
+                    int disp, int base_reg, bool isBasePhysical,
+                    MemoryAccessType mType, int mIndex,
+-                   int reg, bool isPhysical, LowOpndRegType type);
++                   int reg, bool isPhysical, LowOpndRegType type, ConstInfo** listPtr = 0);
+ LowOpMemReg* dump_mem_reg_noalloc(Mnemonic m, OpndSize size,
+                            int disp, int base_reg, bool isBasePhysical,
+                            MemoryAccessType mType, int mIndex,
+@@ -1318,6 +1335,9 @@ LowOpRegMem* dump_reg_mem_noalloc(Mnemonic m, OpndSize size,
+                            MemoryAccessType mType, int mIndex, LowOpndRegType type);
+ LowOpImmReg* dump_imm_reg(Mnemonic m, AtomOpCode m2, OpndSize size,
+                    int imm, int reg, bool isPhysical, LowOpndRegType type, bool chaining, SwitchInfoScheduler * switchInfoScheduler);
++void dump_imm_reg_reg (Mnemonic op, AtomOpCode m2, int imm, OpndSize immediateSize, int sourceReg,
++        bool isSourcePhysical, LowOpndRegType sourcePhysicalType, OpndSize sourceRegSize, int destReg,
++        bool isDestPhysical, LowOpndRegType destPhysicalType, OpndSize destRegSize);
+ 
+ /**
+  * @brief generate a x86 instruction that takes one immediate and one physical reg operand
+@@ -1331,6 +1351,21 @@ LowOpImmReg* dump_imm_reg(Mnemonic m, AtomOpCode m2, OpndSize size,
+  */
+ LowOpImmReg* dump_imm_reg_noalloc(Mnemonic m, OpndSize size, int imm, int reg,
+                    bool isPhysical, LowOpndRegType type);
++
++/**
++ * @brief generate a x86 instruction that takes one immediate and one physical reg operand
++ * @details Differs from @see dump_imm_reg_noalloc in that this uses the ATOM_NORMAL_ALU flag
++ * @param m opcode mnemonic
++ * @param size width of the operand
++ * @param imm immediate value
++ * @param reg register number
++ * @param isPhysical TRUE if reg is a physical register, false otherwise
++ * @param type register type
++ * @return return a LowOp for immediate to register if scheduling is on, otherwise, return NULL
++ */
++LowOpImmReg* dump_imm_reg_noalloc_alu(Mnemonic m, OpndSize size, int imm, int reg,
++                   bool isPhysical, LowOpndRegType type);
++
+ LowOpImmMem* dump_imm_mem(Mnemonic m, AtomOpCode m2, OpndSize size,
+                    int imm,
+                    int disp, int base_reg, bool isBasePhysical,
+@@ -1459,4 +1494,70 @@ void popCallerSavedRegs(void);
+ //Print the emitted code
+ void printEmittedCodeBlock(unsigned char *startAddr, unsigned char *endAddr);
+ 
++/**
++ * @brief Applies the shuffle operation (PSHUF)
++ * @param srcReg The 128-bit register containing the src value
++ * @param isSrcPhysical Whether srcReg is physical
++ * @param destReg The 128-bit register where the result is to be stored
++ * @param isDestPhysical whether destReg is physical
++ * @param vectorUnitSize The size of the shuffle (1-byte / 2-byte etc)
++ * @param mask Up to 16-bits of mask bits
++ * @return whether the operation was successful
++ */
++bool vec_shuffle_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical, OpndSize vectorUnitSize,
++        unsigned short mask);
++
++/**
++ * @brief Applies one of the PADDx operations depending on size
++ * @param srcReg The 128-bit register containing the src value
++ * @param isSrcPhysical Whether srcReg is physical
++ * @param destReg The 128-bit register where the result is to be stored
++ * @param isDestPhysical whether destReg is physical
++ * @param vectorUnitSize The size of the add (1-byte / 2-byte etc)
++ * @return whether the operation was successful
++ */
++bool vec_add_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical, OpndSize vectorUnitSize);
++
++/**
++ * @brief Applies one of the PMULLx operations depending on size
++ * @param srcReg The 128-bit register containing the src value
++ * @param isSrcPhysical Whether srcReg is physical
++ * @param destReg The 128-bit register where the result is to be stored
++ * @param isDestPhysical whether destReg is physical
++ * @param vectorUnitSize The size of the multiplication (1-byte / 2-byte etc)
++ * @return whether the operation was successful
++ */
++bool vec_mul_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical, OpndSize vectorUnitSize);
++
++/**
++ * @brief Applies one of the PHADDx operations depending on size
++ * @param srcReg The 128-bit register containing the src value
++ * @param isSrcPhysical Whether srcReg is physical
++ * @param destReg The 128-bit register where the result is to be stored
++ * @param isDestPhysical whether destReg is physical
++ * @param vectorUnitSize The size of the add (1-byte / 2-byte etc)
++ * @return whether the operation was successful
++ */
++bool vec_horizontal_add_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical,
++        OpndSize vectorUnitSize);
++
++/**
++ * @brief Extracts the "count" indexed portion of the XMM into a GPR
++ * @param index the offset to use to extract from the XMM
++ * @param srcReg The 128-bit register containing the src value
++ * @param isSrcPhysical Whether srcReg is physical
++ * @param destReg The 128-bit register where the result is to be stored
++ * @param isDestPhysical whether destReg is physical
++ * @param vectorUnitSize The size of the chunk to extract (1-byte / 2-byte etc)
++ * @return whether the operation was successful
++ */
++bool vec_extract_imm_reg_reg (int index, int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical,
++        OpndSize vectorUnitSize);
++
++/**
++ * @brief Does the architecture support SSE41?
++ * @return whether or not the architecture supports SSE41
++ */
++bool dvmCompilerArchitectureSupportsSSE41 (void);
++
+ #endif
+diff --git a/vm/compiler/codegen/x86/lightcg/LowerHelper.cpp b/vm/compiler/codegen/x86/lightcg/LowerHelper.cpp
+index f2abace..b883320 100644
+--- a/vm/compiler/codegen/x86/lightcg/LowerHelper.cpp
++++ b/vm/compiler/codegen/x86/lightcg/LowerHelper.cpp
+@@ -142,7 +142,16 @@ void set_mem_opnd_scale(LowOpndMem* mem, int base, bool isPhysical, int disp,
+ //! depending on operand size.
+ //! \param size
+ inline LowOpndRegType getTypeFromIntSize(OpndSize size) {
+-    return size == OpndSize_64 ? LowOpndRegType_xmm : LowOpndRegType_gp;
++    //If we can fit in 32-bit, then assume we will use a GP register
++    if (size <= OpndSize_32)
++    {
++        return LowOpndRegType_gp;
++    }
++    //Otherwise we must use an xmm register
++    else
++    {
++        return LowOpndRegType_xmm;
++    }
+ }
+ 
+ //! \brief Thin layer over encoder that makes scheduling decision and
+@@ -982,30 +991,53 @@ OpndSize minSizeForImm(int imm) {
+     return OpndSize_32;
+ }
+ 
++/**
++ * @brief Determines if x86 mnemonic is shift or rotate
++ * @param m The x86 mnemonic
++ * @return Returns whether we have a shift/rotate instruction
++ */
++static bool isShiftMnemonic (Mnemonic m)
++{
++    return (m == Mnemonic_SAL || m == Mnemonic_SHR || m == Mnemonic_SHL || m == Mnemonic_SAR || m == Mnemonic_ROR
++            || m == Mnemonic_PSLLD || m == Mnemonic_PSLLQ || m == Mnemonic_PSLLW || m == Mnemonic_PSRAD
++            || m == Mnemonic_PSRAW || m == Mnemonic_PSRLQ);
++}
++
+ //!update fields of LowOp and generate a x86 instruction that takes one immediate and one reg operand
+ 
+ //!The reg operand is allocated already
+ LowOpImmReg* lower_imm_to_reg(Mnemonic m, AtomOpCode m2, OpndSize size, int imm,
+-        int reg, bool isPhysical, LowOpndRegType type, bool chaining, SwitchInfoScheduler *switchInfoScheduler) {
+-    // size of opnd1 can be different from size of opnd2:
+-    OpndSize overridden_size = size;
+-    if (m == Mnemonic_SAL || m == Mnemonic_SHR || m == Mnemonic_SHL
+-                    || m == Mnemonic_SAR || m == Mnemonic_ROR) {
+-                    overridden_size = OpndSize_8;
++        int reg, bool isPhysical, LowOpndRegType type, bool chaining, SwitchInfoScheduler *switchInfoScheduler)
++{
++    //Start off with assumption that the immediate and register sizes match
++    OpndSize immediateSize = size;
++
++    //Now check if the immediate actually should be a different size
++    if (isShiftMnemonic (m) == true)
++    {
++        immediateSize = OpndSize_8;
+     }
+-    else if (mnemonicSignExtendsImm(m)) {
+-        overridden_size = minSizeForImm(imm);
++    else if (mnemonicSignExtendsImm (m))
++    {
++        immediateSize = minSizeForImm (imm);
+     }
+-    if (!gDvmJit.scheduling) {
+-        stream = encoder_imm_reg_diff_sizes(m, overridden_size, imm, size, reg, isPhysical, type, stream);
++
++    //If scheduling is disabled, call encoder directly
++    if (gDvmJit.scheduling == false)
++    {
++        stream = encoder_imm_reg_diff_sizes (m, immediateSize, imm, size, reg, isPhysical, type, stream);
+         return NULL;
+     }
+ 
+-    if (!isPhysical) {
+-        ALOGI("JIT_INFO: Operand register not physical in lower_imm_to_reg");
+-        SET_JIT_ERROR(kJitErrorInsScheduling);
++    //We must have already done register allocation by this point
++    if (isPhysical == false)
++    {
++        ALOGI ("JIT_INFO: Operand register not physical in lower_imm_to_reg");
++        SET_JIT_ERROR (kJitErrorInsScheduling);
+         return NULL;
+     }
++
++    //Create the LIR representation
+     LowOpImmReg* op = singletonPtr<Scheduler>()->allocateNewEmptyLIR<LowOpImmReg>();
+ 
+     op->opCode = m;
+@@ -1013,7 +1045,7 @@ LowOpImmReg* lower_imm_to_reg(Mnemonic m, AtomOpCode m2, OpndSize size, int imm,
+     op->opndDest.size = size;
+     op->opndDest.type = LowOpndType_Reg;
+     op->numOperands = 2;
+-    op->opndSrc.size = overridden_size;
++    op->opndSrc.size = immediateSize;
+     op->opndSrc.type = chaining ? LowOpndType_Chain : LowOpndType_Imm;
+     set_reg_opnd(&(op->regDest), reg, isPhysical, type);
+     op->immSrc.value = imm;
+@@ -1050,30 +1082,145 @@ LowOpImmReg* dump_imm_reg(Mnemonic m, AtomOpCode m2, OpndSize size, int imm,
+     return NULL;
+ }
+ 
++//! \brief Three operand instruction with an imm and two regs
++//! \param m The mnemonic
++//! \param m2 The ATOM mnemonic type
++//! \param imm The immediate operand
++//! \param immediateSize the size of the imm operand
++//! \param sourceReg The source register
++//! \param sourceRegSize Size of the sourceReg operand
++//! \param sourcePhysicalType The physical type of the sourceReg
++//! \param destReg The destination register
++//! \param destRegSize Size of the destReg operand
++//! \param destPhysicalType The physical type of the destReg
++//! \return The generated LowOp
++static LowOpImmRegReg *lower_imm_reg_reg (Mnemonic m, AtomOpCode m2, int imm, OpndSize immediateSize, int sourceReg,
++        OpndSize sourceRegSize, LowOpndRegType sourcePhysicalType, int destReg, OpndSize destRegSize,
++        LowOpndRegType destPhysicalType)
++{
++    if (gDvmJit.scheduling == false)
++    {
++        stream = encoder_imm_reg_reg (m, imm, immediateSize, sourceReg, sourceRegSize, destReg, destRegSize, stream);
++        return 0;
++    }
++
++    LowOpImmRegReg* op = singletonPtr<Scheduler> ()->allocateNewEmptyLIR<LowOpImmRegReg> ();
++
++    //Set up opcode
++    op->opCode = m;
++    op->opCode2 = m2;
++
++    //Set up destination register
++    op->opndDest.size = destRegSize;
++    op->opndDest.type = LowOpndType_Reg;
++
++    //Set up source register
++    op->opndSrc.size = sourceRegSize;
++    op->opndSrc.type = LowOpndType_Reg;
++
++    //Finally set up the immediate value
++    op->imm.value = imm;
++    op->imm.immediateSize = immediateSize;
++
++    //We have 3 operands
++    op->numOperands = 3;
++
++    //Now set up information about register operands
++    set_reg_opnd(&(op->regDest), destReg, true, destPhysicalType);
++    set_reg_opnd(&(op->regSrc), sourceReg, true, sourcePhysicalType);
++
++    //Send it off to scheduler to creade dependency graph
++    singletonPtr<Scheduler> ()->updateUseDefInformation_reg_to_reg (op);
++
++    return op;
++}
++
++void dump_imm_reg_reg (Mnemonic op, AtomOpCode m2, int imm, OpndSize immediateSize, int sourceReg,
++        bool isSourcePhysical, LowOpndRegType sourcePhysicalType, OpndSize sourceRegSize, int destReg,
++        bool isDestPhysical, LowOpndRegType destPhysicalType, OpndSize destRegSize)
++{
++    //Check for NCGO1 mode in case we are supposed to use the register allocator
++    if (gDvm.executionMode == kExecutionModeNcgO1)
++    {
++        //We start generating the actual code at this point so we keep track of it
++        startNativeCode (-1, -1);
++
++        //We are doing register allocation so we need to free anything with no remaining references
++        freeReg (false);
++
++        //Allocate a physical register for the source
++        const int physicalSourceReg = registerAlloc (sourcePhysicalType, sourceReg, isSourcePhysical, false);
++
++        //We cannot spill physical register for source
++        gCompilationUnit->setCanSpillRegister (physicalSourceReg, false);
++
++        //Allocate a physical register for the destination
++        const int physicaldestReg = registerAlloc (destPhysicalType, destReg, isDestPhysical, true);
++
++        //We cannot spill physical register for destination
++        gCompilationUnit->setCanSpillRegister (physicaldestReg, false);
++
++        //Now actually call encoder to do the generation
++        lower_imm_reg_reg (op, m2, imm, immediateSize, physicalSourceReg, sourceRegSize, sourcePhysicalType,
++                physicaldestReg, destRegSize, destPhysicalType);
++
++        //We finished generating native code
++        endNativeCode ();
++    }
++    else
++    {
++        //The registers must be physical
++        assert (isSourcePhysical == true && isDestPhysical == true);
++
++        //Call the encoder
++        lower_imm_reg_reg (op, m2, imm, immediateSize, sourceReg, sourceRegSize, sourcePhysicalType, destReg,
++                destRegSize, destPhysicalType);
++    }
++}
++
+ //!update fields of LowOp and generate a x86 instruction that takes one immediate and one mem operand
+ 
+ //!The mem operand is already allocated
+ LowOpImmMem* lower_imm_to_mem(Mnemonic m, AtomOpCode m2, OpndSize size, int imm,
+         int disp, int base_reg, bool isBasePhysical, MemoryAccessType mType,
+-        int mIndex, bool chaining, SwitchInfoScheduler * switchInfoScheduler) {
+-    if (!gDvmJit.scheduling) {
+-        stream = encoder_imm_mem(m, size, imm, disp, base_reg, isBasePhysical,
+-                stream);
++        int mIndex, bool chaining, SwitchInfoScheduler * switchInfoScheduler)
++{
++    //Start off with assumption that the immediate and register sizes match
++    OpndSize immediateSize = size;
++
++    //Now check if the immediate actually should be a different size
++    if (isShiftMnemonic (m) == true)
++    {
++        immediateSize = OpndSize_8;
++    }
++    else if (mnemonicSignExtendsImm (m))
++    {
++        immediateSize = minSizeForImm (imm);
++    }
++
++    //If scheduling is disabled, call encoder directly
++    if (gDvmJit.scheduling == false)
++    {
++        stream = encoder_imm_mem_diff_sizes (m, immediateSize, imm, size, disp, base_reg, isBasePhysical, stream);
+         return NULL;
+     }
+ 
+-    if (!isBasePhysical) {
++    //We must have already done register allocation by this point
++    if (isBasePhysical == false)
++    {
+         ALOGI("JIT_INFO: Base register not physical in lower_imm_to_mem");
+         SET_JIT_ERROR(kJitErrorInsScheduling);
+         return NULL;
+     }
++
++    //Now create the LIR representation
+     LowOpImmMem* op = singletonPtr<Scheduler>()->allocateNewEmptyLIR<LowOpImmMem>();
+ 
+     op->opCode = m;
+     op->opCode2 = m2;
+     op->opndDest.size = size;
+     op->opndDest.type = LowOpndType_Mem;
+-    op->opndSrc.size = size;
++    op->opndSrc.size = immediateSize;
+     op->opndSrc.type = chaining ? LowOpndType_Chain : LowOpndType_Imm;
+     op->numOperands = 2;
+     set_mem_opnd(&(op->memDest), disp, base_reg, isBasePhysical);
+@@ -2328,7 +2475,19 @@ void move_reg_to_mem_noalloc(OpndSize size,
+ LowOpMemReg* move_mem_to_reg(OpndSize size,
+                       int disp, int base_reg, bool isBasePhysical,
+                       int reg, bool isPhysical) {
+-    Mnemonic m = (size == OpndSize_64) ? Mnemonic_MOVQ : Mnemonic_MOV;
++    //Start off with assuming we will doing an int move
++    Mnemonic m = Mnemonic_MOV;
++
++    //Now really select another mnemonic if size is different
++    if (size == OpndSize_64)
++    {
++        m = Mnemonic_MOVQ;
++    }
++    else if (size == OpndSize_128)
++    {
++        m = Mnemonic_MOVDQA;
++    }
++
+     return dump_mem_reg(m, ATOM_NORMAL, size, disp, base_reg, isBasePhysical, MemoryAccess_Unknown, -1, reg, isPhysical, getTypeFromIntSize(size), NULL);
+ }
+ //!move from memory to reg
+@@ -2407,9 +2566,34 @@ void moves_mem_to_reg(LowOp* op, OpndSize size,
+ void move_reg_to_reg(OpndSize size,
+                       int reg, bool isPhysical,
+                       int reg2, bool isPhysical2) {
+-    Mnemonic m = (size == OpndSize_64) ? Mnemonic_MOVQ : Mnemonic_MOV;
++    //Start off with assuming we will doing an int move
++    Mnemonic m = Mnemonic_MOV;
++
++    //Now really select another mnemonic if size is different
++    if (size == OpndSize_64)
++    {
++        m = Mnemonic_MOVQ;
++    }
++    else if (size == OpndSize_128)
++    {
++        m = Mnemonic_MOVDQA;
++    }
++
+     dump_reg_reg(m, ATOM_NORMAL, size, reg, isPhysical, reg2, isPhysical2, getTypeFromIntSize(size));
+ }
++
++void move_gp_to_xmm (int sourceReg, bool isSourcePhysical, int destReg, bool isDestPhysical)
++{
++    //We are moving a double word from GP to XMM
++    Mnemonic op = Mnemonic_MOVD;
++    OpndSize size = OpndSize_32;
++    LowOpndRegType sourceType = LowOpndRegType_gp;
++    LowOpndRegType destType = LowOpndRegType_xmm;
++
++    //Now generate the move
++    dump_reg_reg_diff_types (op, ATOM_NORMAL, size, sourceReg, isSourcePhysical, sourceType, size, destReg, isDestPhysical, destType);
++}
++
+ //!mov from one reg to another reg
+ 
+ //!Sign extends the value. Only 32-bit support.
+@@ -4316,3 +4500,181 @@ void compareAndExchange(OpndSize size,
+     dump_reg_mem(Mnemonic_CMPXCHG, ATOM_NORMAL, size, reg, isPhysical, disp, base_reg, isBasePhysical, MemoryAccess_Unknown, -1, getTypeFromIntSize(size));
+ }
+ 
++bool vec_shuffle_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical, OpndSize vectorUnitSize,
++        unsigned short mask)
++{
++    Mnemonic opLow = Mnemonic_Null, opHigh = Mnemonic_Null;
++
++    switch (vectorUnitSize)
++    {
++        case OpndSize_16:
++            opLow = Mnemonic_PSHUFLW;
++            //We use a PSHUFD for the high because it will ensure to duplicate the lower half
++            opHigh = Mnemonic_PSHUFD;
++            break;
++        case OpndSize_32:
++            opLow = Mnemonic_PSHUFD;
++            break;
++        default:
++            ALOGD ("JIT_INFO: Cannot support vectorized shuffle for size %d", vectorUnitSize);
++            SET_JIT_ERROR (kJitErrorUnsupportedVectorization);
++            return false;
++            break;
++    }
++
++    //We are applying a vector operation so it must be on xmm
++    OpndSize registerSize = OpndSize_128;
++    LowOpndRegType registerType = LowOpndRegType_xmm;
++
++    //Shuffles take immediate of size 8
++    OpndSize immediateSize = OpndSize_8;
++
++    //Check if we need to shuffle the low 64-bits
++    if (opLow != Mnemonic_Null)
++    {
++        dump_imm_reg_reg (opLow, ATOM_NORMAL_ALU, mask, immediateSize, srcReg, isSrcPhysical, registerType,
++                registerSize, destReg, isDestPhysical, registerType, registerSize);
++    }
++
++    //Now check if we need to shuffle the high 64-bits
++    if (opHigh != Mnemonic_Null)
++    {
++        dump_imm_reg_reg (opHigh, ATOM_NORMAL_ALU, mask, immediateSize, srcReg, isSrcPhysical, registerType,
++                registerSize, destReg, isDestPhysical, registerType, registerSize);
++    }
++
++    //If we get here everything went well
++    return true;
++}
++
++bool vec_add_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical, OpndSize vectorUnitSize)
++{
++    Mnemonic op;
++
++    switch (vectorUnitSize)
++    {
++        case OpndSize_8:
++            op = Mnemonic_PADDB;
++            break;
++        case OpndSize_16:
++            op = Mnemonic_PADDW;
++            break;
++        case OpndSize_32:
++            op = Mnemonic_PADDD;
++            break;
++        case OpndSize_64:
++            op = Mnemonic_PADDQ;
++            break;
++        default:
++            ALOGD ("JIT_INFO: Cannot support vectorized add for size %d", vectorUnitSize);
++            SET_JIT_ERROR (kJitErrorUnsupportedVectorization);
++            return false;
++            break;
++    }
++
++    dump_reg_reg (op, ATOM_NORMAL_ALU, OpndSize_128, srcReg, isSrcPhysical, destReg, isDestPhysical, LowOpndRegType_xmm);
++
++    //If we get here everything went well
++    return true;
++}
++
++bool vec_mul_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical, OpndSize vectorUnitSize)
++{
++    Mnemonic op;
++
++    switch (vectorUnitSize)
++    {
++        case OpndSize_16:
++            op = Mnemonic_PMULLW;
++            break;
++        case OpndSize_32:
++            if (dvmCompilerArchitectureSupportsSSE41 () == false)
++            {
++                ALOGD ("JIT_INFO: Architecture does not have SSE4.1 so there is no pmulld support");
++                SET_JIT_ERROR (kJitErrorUnsupportedInstruction);
++                return false;
++            }
++            op = Mnemonic_PMULLD;
++            break;
++        default:
++            ALOGD ("JIT_INFO: Cannot support vectorized mul for size %d", vectorUnitSize);
++            SET_JIT_ERROR (kJitErrorUnsupportedVectorization);
++            return false;
++            break;
++    }
++
++    dump_reg_reg (op, ATOM_NORMAL_ALU, OpndSize_128, srcReg, isSrcPhysical, destReg, isDestPhysical, LowOpndRegType_xmm);
++
++    //If we get here everything went well
++    return true;
++}
++
++bool vec_horizontal_add_reg_reg (int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical, OpndSize vectorUnitSize)
++{
++    Mnemonic op;
++
++    switch (vectorUnitSize)
++    {
++        case OpndSize_16:
++            op = Mnemonic_PHADDW;
++            break;
++        case OpndSize_32:
++            op = Mnemonic_PHADDD;
++            break;
++        default:
++            ALOGD ("JIT_INFO: Cannot support vectorized horizontal add for size %d", vectorUnitSize);
++            SET_JIT_ERROR (kJitErrorUnsupportedVectorization);
++            return false;
++            break;
++    }
++
++    dump_reg_reg (op, ATOM_NORMAL_ALU, OpndSize_128, srcReg, isSrcPhysical, destReg, isDestPhysical, LowOpndRegType_xmm);
++
++    //If we get here everything went well
++    return true;
++}
++
++bool vec_extract_imm_reg_reg (int count, int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical, OpndSize vectorUnitSize)
++{
++    Mnemonic op;
++
++    switch (vectorUnitSize)
++    {
++        case OpndSize_16:
++            op = Mnemonic_PEXTRW;
++            break;
++        case OpndSize_32:
++            if (dvmCompilerArchitectureSupportsSSE41 () == false)
++            {
++                ALOGD ("JIT_INFO: Architecture does not have SSE4.1 so there is no pextrd support");
++                SET_JIT_ERROR (kJitErrorUnsupportedInstruction);
++                return false;
++            }
++            op = Mnemonic_PEXTRD;
++            break;
++        default:
++            ALOGD ("JIT_INFO: Cannot support vectorized extract for size %d", vectorUnitSize);
++            SET_JIT_ERROR (kJitErrorUnsupportedVectorization);
++            return false;
++            break;
++    }
++
++    //We are applying a vector operation so source must be xmm
++    OpndSize sourceSize = OpndSize_128;
++    LowOpndRegType srcPhysicalType = LowOpndRegType_xmm;
++
++    //However we are extracting to a GP
++    OpndSize destSize = OpndSize_32;
++    LowOpndRegType destPhysicalType = LowOpndRegType_gp;
++
++    //Extract take immediate of size 8
++    OpndSize immediateSize = OpndSize_8;
++
++    //Now generate the extract
++    dump_imm_reg_reg (op, ATOM_NORMAL_ALU, count, immediateSize, srcReg, isSrcPhysical, srcPhysicalType, sourceSize,
++            destReg, isDestPhysical, destPhysicalType, destSize);
++
++    //If we get here everything went well
++    return true;
++}
++
+diff --git a/vm/compiler/codegen/x86/lightcg/RegisterizationBE.cpp b/vm/compiler/codegen/x86/lightcg/RegisterizationBE.cpp
+index edc7f29..4d96441 100644
+--- a/vm/compiler/codegen/x86/lightcg/RegisterizationBE.cpp
++++ b/vm/compiler/codegen/x86/lightcg/RegisterizationBE.cpp
+@@ -1436,8 +1436,12 @@ bool AssociationTable::satisfyBBAssociations (BasicBlock_O1 * parent,
+     childAssociations.findUsedRegisters (childUsedReg);
+ 
+     // 2) We write back anything child wants in memory because this will allow us to have scratch
+-    // registers in case we need to do reg to reg moves.
+-    if (writeBackVirtualRegistersToMemory (actions.virtualRegistersToStore, isBackward == true,
++    // registers in case we need to do reg to reg moves. The function that does the writing has
++    // a flag on whether it is allowed to try to skip a write back. We allow writeback skipping
++    // if we have a loop (isBackward is true or block loops back to itself). The reason we allow
++    // it is because some VRs are not inter-iteration dependent and thus we don't care for them
++    // to be back in memory if we're not going to read them.
++    if (writeBackVirtualRegistersToMemory (actions.virtualRegistersToStore, isBackward == true || parent == child,
+             parent->requestWriteBack, &childUsedReg) == false)
+     {
+         return false;
+diff --git a/vm/compiler/codegen/x86/lightcg/Scheduler.cpp b/vm/compiler/codegen/x86/lightcg/Scheduler.cpp
+index f5efb1b..307a307 100644
+--- a/vm/compiler/codegen/x86/lightcg/Scheduler.cpp
++++ b/vm/compiler/codegen/x86/lightcg/Scheduler.cpp
+@@ -119,9 +119,17 @@ struct MachineModelEntry {
+ //! imm, reg and mem respectively
+ //! - If a Mnemonic has two operands, the last 5 entries are valid, for operand types
+ //! imm_to_reg, imm_to_mem, reg_to_reg, mem_to_reg and reg_to_mem
++//! - If a Mnemonic has three operands imm_reg_reg, we use the same slot as the reg_to_reg
++//! field for two operands.
+ //!
+ //! This table matches content from Intel 64 and IA-32 Architectures Optimization
+ //! Reference Manual (April 2012), Section 13.4
++//!
++//! This table contains SSE4 instructions not supported on Saltwell. For example, PEXTRD is not
++//! supported. This table is commonly used for all Atom even though some don't have same ISA support.
++//! In case of PEXTRD for this table we just used PEXTRW data (because it is supported on Saltwell).
++//! At some point, it makes sense separating different processors into different models with separate tables.
++//!
+ //! \warning This table is not complete and if new mnemonics are used that do not have an
+ //! entry, then the schedule selection will not be optimal.
+ MachineModelEntry atomMachineModel[Mnemonic_Count*6] = {
+@@ -345,6 +353,27 @@ MachineModelEntry atomMachineModel[Mnemonic_Count*6] = {
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //SCAS
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //STOS
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //WAIT
++
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //PADDB
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //PADDW
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //PADDD
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT0,5},{PORT0,4},{INVP,INVN}, //PMULLW
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT0,5},{PORT0,4},{INVP,INVN}, //PMULLD - SSE4.1 instruction
++    {INVP,INVN},{PORT0,1},{INVP,INVN},{BOTH_PORTS,2},{BOTH_PORTS,3},{INVP,INVN}, //PSLLW
++    {INVP,INVN},{PORT0,1},{INVP,INVN},{BOTH_PORTS,2},{BOTH_PORTS,3},{INVP,INVN}, //PSLLD
++    {INVP,INVN},{PORT0,1},{INVP,INVN},{BOTH_PORTS,2},{BOTH_PORTS,3},{INVP,INVN}, //PSRAW
++    {INVP,INVN},{PORT0,1},{INVP,INVN},{BOTH_PORTS,2},{BOTH_PORTS,3},{INVP,INVN}, //PSRAD
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT0,3},{INVP,INVN},{INVP,INVN}, //PMOVSXBW - SSE4.1 instruction
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT0,1},{INVP,INVN},{INVP,INVN}, //PSHUFD - 3 operand instruction
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT0,1},{INVP,INVN},{INVP,INVN}, //PSHUFW - 3 operand instruction
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT0,1},{INVP,INVN},{INVP,INVN}, //PSHUFLW - 3 operand instruction
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT0,1},{INVP,INVN},{INVP,INVN}, //PSHUFHW - 3 operand instruction
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,7},{BOTH_PORTS,8},{INVP,INVN}, //PHADDSW - SSE3 instruction
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,7},{BOTH_PORTS,8},{INVP,INVN}, //PHADDW - SSE3 instruction
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,3},{BOTH_PORTS,4},{INVP,INVN}, //PHADDD - SSE3 instruction
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,4},{INVP,INVN},{INVP,INVN}, //PEXTRW - 3 operand instruction
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,4},{INVP,INVN},{INVP,INVN}, //PEXTRD - SSE4.1 3 operand instruction
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN}, //MOVDQA
+ };
+ 
+ //! \brief Get issue port for mnemonic with no operands
+@@ -479,8 +508,8 @@ inline const char * getUseDefEntryType(UseDefEntryType type) {
+ 
+ //! \brief Returns true if mnemonic is a variant of MOV.
+ inline bool isMoveMnemonic(Mnemonic m) {
+-    return m == Mnemonic_MOV || m == Mnemonic_MOVQ || m == Mnemonic_MOVSD
+-            || m == Mnemonic_MOVSS || m == Mnemonic_MOVZX || m == Mnemonic_MOVSX;
++    return (m == Mnemonic_MOV || m == Mnemonic_MOVQ || m == Mnemonic_MOVSD || m == Mnemonic_MOVSS || m == Mnemonic_MOVZX
++            || m == Mnemonic_MOVSX || m == Mnemonic_MOVAPD || m == Mnemonic_MOVDQA);
+ }
+ 
+ //! \brief Returns true if mnemonic is used for comparisons.
+@@ -498,6 +527,14 @@ inline bool isConvertMnemonic(Mnemonic m) {
+             || m == Mnemonic_CVTSI2SD || m == Mnemonic_CVTSI2SS;
+ }
+ 
++//! \brief Returns true if the mnemonic is a XMM shuffle operation
++//! \param m The Mnemonic to check
++//! \return whether it is a shuffle operation
++inline bool isShuffleMnemonic (Mnemonic m)
++{
++    return m == Mnemonic_PSHUFD || m == Mnemonic_PSHUFHW || m == Mnemonic_PSHUFLW || m == Mnemonic_PSHUFW;
++}
++
+ //! \brief Returns true if mnemonic uses and then defines the FLAGS register
+ inline bool usesAndDefinesFlags(Mnemonic m) {
+     return m == Mnemonic_ADC || m == Mnemonic_SBB;
+@@ -1135,13 +1172,20 @@ void Scheduler::updateUseDefInformation_reg_to_reg(LowOpRegReg * op) {
+     updateDependencyGraph(UseDefType_Reg, op->regSrc.regNum, op->opndSrc.defuse,
+             Latency_None, op);
+ 
+-    if (isMove || isConvert
+-            || (op->opCode >= Mnemonic_CMOVcc && op->opCode < Mnemonic_CMP))
++    if (isMove == true || isConvert == true || isShuffleMnemonic (op->opCode) == true
++            || (op->opCode >= Mnemonic_CMOVcc && op->opCode < Mnemonic_CMP)
++            || op->opCode == Mnemonic_PEXTRD || op->opCode == Mnemonic_PEXTRW)
++    {
+         op->opndDest.defuse = LowOpndDefUse_Def;
++    }
+     else if (isCompareMnemonic(op->opCode))
++    {
+         op->opndDest.defuse = LowOpndDefUse_Use;
+-    else // ALU ops
++    }
++    else
++    {
+         op->opndDest.defuse = LowOpndDefUse_UseDef;
++    }
+     updateDependencyGraph(UseDefType_Reg, op->regDest.regNum,
+             op->opndDest.defuse, Latency_None, op);
+ 
+@@ -1360,6 +1404,19 @@ void Scheduler::generateAssembly(LowOp * op) {
+                     ((LowOpMem*) op)->memOpnd.m_base.isPhysical, stream);
+         }
+     }
++    //Check if we have 3 operands
++    else if (op->numOperands == 3)
++    {
++        assert (op->opndSrc.type == LowOpndType_Reg && op->opndDest.type == LowOpndType_Reg);
++
++        //We have an instruction with three operands: two reg and one immediate
++        LowOpImmRegReg *immRegRegOp = reinterpret_cast <LowOpImmRegReg *> (op);
++
++        //Now encode it
++        stream = encoder_imm_reg_reg (immRegRegOp->opCode, immRegRegOp->imm.value, immRegRegOp->imm.immediateSize,
++                immRegRegOp->regSrc.regNum, immRegRegOp->opndSrc.size, immRegRegOp->regDest.regNum,
++                immRegRegOp->opndDest.size, stream);
++    }
+     // Number of operands is 2
+     // Handles LowOps coming from  lower_imm_reg, lower_imm_mem,
+     // lower_reg_mem, lower_mem_reg, lower_mem_scale_reg,
+@@ -1392,8 +1449,8 @@ void Scheduler::generateAssembly(LowOp * op) {
+         // region so we need to ensure that now.
+ 
+         // First, dump to code stream but do not update stream pointer
+-        char * newStream = encoder_imm_reg(op->opCode, op->opndDest.size,
+-                ((LowOpImmReg*) op)->immSrc.value,
++        char * newStream = encoder_imm_reg_diff_sizes(op->opCode,op->opndSrc.size,
++                ((LowOpImmReg*) op)->immSrc.value, op->opndDest.size,
+                 ((LowOpImmReg*) op)->regDest.regNum,
+                 ((LowOpImmReg*) op)->regDest.isPhysical,
+                 ((LowOpImmReg*) op)->regDest.regType, stream);
+@@ -1411,8 +1468,8 @@ void Scheduler::generateAssembly(LowOp * op) {
+ 
+         // Now we are ready to do the actual encoding
+         insertChainingWorklist(((LowOpImmReg*) op)->immSrc.value, stream);
+-        stream = encoder_imm_reg(op->opCode, op->opndDest.size,
+-                ((LowOpImmReg*) op)->immSrc.value,
++        stream = encoder_imm_reg_diff_sizes(op->opCode,op->opndSrc.size,
++                ((LowOpImmReg*) op)->immSrc.value, op->opndDest.size,
+                 ((LowOpImmReg*) op)->regDest.regNum,
+                 ((LowOpImmReg*) op)->regDest.isPhysical,
+                 ((LowOpImmReg*) op)->regDest.regType, stream);
+@@ -1427,8 +1484,8 @@ void Scheduler::generateAssembly(LowOp * op) {
+                 switchInfoScheduler->switchInfo->immAddr = stream + offset;
+         }
+ 
+-        stream = encoder_imm_mem(op->opCode, op->opndDest.size,
+-                ((LowOpImmMem*) op)->immSrc.value,
++        stream = encoder_imm_mem_diff_sizes(op->opCode, op->opndSrc.size,
++                ((LowOpImmMem*) op)->immSrc.value, op->opndDest.size,
+                 ((LowOpImmMem*) op)->memDest.m_disp.value,
+                 ((LowOpImmMem*) op)->memDest.m_base.regNum,
+                 ((LowOpImmMem*) op)->memDest.m_base.isPhysical, stream);
+@@ -1438,8 +1495,8 @@ void Scheduler::generateAssembly(LowOp * op) {
+         // region so we need to ensure that now.
+ 
+         // First, dump to code stream but do not update stream pointer
+-        char * newStream = encoder_imm_mem(op->opCode, op->opndDest.size,
+-                ((LowOpImmMem*) op)->immSrc.value,
++        char * newStream = encoder_imm_mem_diff_sizes(op->opCode, op->opndSrc.size,
++                ((LowOpImmMem*) op)->immSrc.value, op->opndDest.size,
+                 ((LowOpImmMem*) op)->memDest.m_disp.value,
+                 ((LowOpImmMem*) op)->memDest.m_base.regNum,
+                 ((LowOpImmMem*) op)->memDest.m_base.isPhysical, stream);
+@@ -1457,8 +1514,8 @@ void Scheduler::generateAssembly(LowOp * op) {
+ 
+         // Now we are ready to do the actual encoding
+         insertChainingWorklist(((LowOpImmMem*) op)->immSrc.value, stream);
+-        stream = encoder_imm_mem(op->opCode, op->opndDest.size,
+-                ((LowOpImmMem*) op)->immSrc.value,
++        stream = encoder_imm_mem_diff_sizes(op->opCode, op->opndSrc.size,
++                ((LowOpImmMem*) op)->immSrc.value, op->opndDest.size,
+                 ((LowOpImmMem*) op)->memDest.m_disp.value,
+                 ((LowOpImmMem*) op)->memDest.m_base.regNum,
+                 ((LowOpImmMem*) op)->memDest.m_base.isPhysical, stream);
+diff --git a/vm/compiler/codegen/x86/lightcg/libenc/enc_base.h b/vm/compiler/codegen/x86/lightcg/libenc/enc_base.h
+index e88443f..fa1062d 100644
+--- a/vm/compiler/codegen/x86/lightcg/libenc/enc_base.h
++++ b/vm/compiler/codegen/x86/lightcg/libenc/enc_base.h
+@@ -294,8 +294,11 @@ public:
+      *
+      * The value was increased from '5155' to '8192' to make it aligned
+      * for faster access in EncoderBase::lookup().
++     *
++     * It was further increased to 16384 as support for 3 operand opcodes
++     * with XMM registers were added
+      */
+-    static const unsigned int               HASH_MAX = 8192; //5155;
++    static const unsigned int               HASH_MAX = 16384; //5155;
+     /**
+      * @brief Empty value, used in hash-to-opcode map to show an empty slot.
+      */
+diff --git a/vm/compiler/codegen/x86/lightcg/libenc/enc_defs_ext.h b/vm/compiler/codegen/x86/lightcg/libenc/enc_defs_ext.h
+index acc61d9..8fe8b17 100644
+--- a/vm/compiler/codegen/x86/lightcg/libenc/enc_defs_ext.h
++++ b/vm/compiler/codegen/x86/lightcg/libenc/enc_defs_ext.h
+@@ -165,14 +165,8 @@ Mnemonic_CVTSI2SS,                      // Convert Doubleword Integer to Scalar
+ Mnemonic_COMISD,                        // Compare Scalar Ordered Double-Precision Floating-Point Values and Set EFLAGS
+ Mnemonic_COMISS,                        // Compare Scalar Ordered Single-Precision Floating-Point Values and Set EFLAGS
+ Mnemonic_DEC,                           // Decrement by 1
+-//Mnemonic_DIV,                         // Unsigned Divide
+ Mnemonic_DIVSD,                         // Divide Scalar Double-Precision Floating-Point Values
+ Mnemonic_DIVSS,                         // Divide Scalar Single-Precision Floating-Point Values
+-
+-#ifdef _HAVE_MMX_
+-Mnemonic_EMMS,                          // Empty MMX Technology State
+-#endif
+-
+ Mnemonic_ENTER,                         // ENTER-Make Stack Frame for Procedure Parameters
+ Mnemonic_FLDCW,                         // Load FPU control word
+ Mnemonic_FADDP,
+@@ -194,7 +188,6 @@ Mnemonic_FRNDINT,
+ Mnemonic_FNSTCW,                        // Store FPU control word
+ Mnemonic_FSTSW,                         // Store FPU status word
+ Mnemonic_FNSTSW,                         // Store FPU status word
+-//Mnemonic_FDECSTP,                     // Decrement Stack-Top Pointer
+ Mnemonic_FILD,                          // Load Integer
+ Mnemonic_FLD,                           // Load Floating Point Value
+ Mnemonic_FLDLG2,
+@@ -204,8 +197,6 @@ Mnemonic_FLD1,
+ Mnemonic_FCLEX,                         // Clear Exceptions
+ Mnemonic_FCHS,                          // Change sign of ST0
+ Mnemonic_FNCLEX,                        // Clear Exceptions
+-
+-//Mnemonic_FINCSTP,                     // Increment Stack-Top Pointer
+ Mnemonic_FIST,                          // Store Integer
+ Mnemonic_FISTP,                         // Store Integer, pop FPU stack
+ Mnemonic_FISTTP,                        // Store Integer with Truncation
+@@ -241,16 +232,15 @@ Mnemonic_LOOPNE, Mnemonic_LOOPNZ = Mnemonic_LOOPNE, // Loop according to ECX
+ Mnemonic_LAHF,                          // Load Flags into AH
+ Mnemonic_MOVD,                          // Move Double word
+ Mnemonic_MOVQ,                          // Move Quadword
+-/*Mnemonic_MOVS,                        // Move Data from String to String*/
+-// MOVS is a special case: see encoding table for more details,
+-Mnemonic_MOVS8, Mnemonic_MOVS16, Mnemonic_MOVS32, Mnemonic_MOVS64,
+-//
+-Mnemonic_MOVAPD,                         // Move Scalar Double-Precision Floating-Point Value
++Mnemonic_MOVS8,
++Mnemonic_MOVS16,
++Mnemonic_MOVS32,
++Mnemonic_MOVS64,
++Mnemonic_MOVAPD,                        // Move Scalar Double-Precision Floating-Point Value
+ Mnemonic_MOVSD,                         // Move Scalar Double-Precision Floating-Point Value
+ Mnemonic_MOVSS,                         // Move Scalar Single-Precision Floating-Point Values
+ Mnemonic_MOVSX,                         // Move with Sign-Extension
+ Mnemonic_MOVZX,                         // Move with Zero-Extend
+-//Mnemonic_MUL,                         // Unsigned Multiply
+ Mnemonic_MULSD,                         // Multiply Scalar Double-Precision Floating-Point Values
+ Mnemonic_MULSS,                         // Multiply Scalar Single-Precision Floating-Point Values
+ Mnemonic_NEG,                           // Two's Complement Negation
+@@ -258,13 +248,10 @@ Mnemonic_NOP,                           // No Operation
+ Mnemonic_NOT,                           // One's Complement Negation
+ Mnemonic_OR,                            // Logical Inclusive OR
+ Mnemonic_PREFETCH,                      // prefetch
+-
+-#if 1 //def _HAVE_MMX_
+-    Mnemonic_PADDQ,                     // Add Packed Quadword Integers
+-    Mnemonic_PAND,                      // Logical AND
+-    Mnemonic_POR,                       // Bitwise Logical OR
+-    Mnemonic_PSUBQ,                     // Subtract Packed Quadword Integers
+-#endif
++Mnemonic_PADDQ,                         // Add Packed Quadword Integers
++Mnemonic_PAND,                          // Logical AND
++Mnemonic_POR,                           // Bitwise Logical OR
++Mnemonic_PSUBQ,                         // Subtract Packed Quadword Integers
+ Mnemonic_PANDN,
+ Mnemonic_PSLLQ,
+ Mnemonic_PSRLQ,
+@@ -335,6 +322,26 @@ Mnemonic_STOS,                          // Store string
+ 
+ //
+ Mnemonic_WAIT,                          // Check pending pending unmasked floating-point exception
++Mnemonic_PADDB,
++Mnemonic_PADDW,
++Mnemonic_PADDD,
++Mnemonic_PMULLW,
++Mnemonic_PMULLD,
++Mnemonic_PSLLW,
++Mnemonic_PSLLD,
++Mnemonic_PSRAW,
++Mnemonic_PSRAD,
++Mnemonic_PMOVSXBW,
++Mnemonic_PSHUFD,
++Mnemonic_PSHUFW,
++Mnemonic_PSHUFLW,
++Mnemonic_PSHUFHW,
++Mnemonic_PHADDSW,
++Mnemonic_PHADDW,
++Mnemonic_PHADDD,
++Mnemonic_PEXTRW,
++Mnemonic_PEXTRD,
++Mnemonic_MOVDQA,
+ //
+ Mnemonic_Count
+ } Mnemonic;
+diff --git a/vm/compiler/codegen/x86/lightcg/libenc/enc_tabl.cpp b/vm/compiler/codegen/x86/lightcg/libenc/enc_tabl.cpp
+index af20bd8..3d9a958 100644
+--- a/vm/compiler/codegen/x86/lightcg/libenc/enc_tabl.cpp
++++ b/vm/compiler/codegen/x86/lightcg/libenc/enc_tabl.cpp
+@@ -1732,6 +1732,135 @@ BEGIN_OPCODES()
+ END_OPCODES()
+ END_MNEMONIC()
+ 
++//Now add all instructions we need for vectorization
++BEGIN_MNEMONIC(PADDB, MF_NONE, DU_U)
++BEGIN_OPCODES()
++    {OpcodeInfo::all, {0x66, 0x0F, 0xFC, _r}, {xmm64, xmm_m64}, DU_U },
++END_OPCODES()
++END_MNEMONIC()
++
++BEGIN_MNEMONIC(PADDW, MF_NONE, DU_U)
++BEGIN_OPCODES()
++    {OpcodeInfo::all, {0x66, 0x0F, 0xFD, _r}, {xmm64, xmm_m64}, DU_U },
++END_OPCODES()
++END_MNEMONIC()
++
++BEGIN_MNEMONIC(PADDD, MF_NONE, DU_U)
++BEGIN_OPCODES()
++    {OpcodeInfo::all, {0x66, 0x0F, 0xFE, _r}, {xmm64, xmm_m64}, DU_U },
++END_OPCODES()
++END_MNEMONIC()
++
++BEGIN_MNEMONIC(PMULLW, MF_NONE, DU_U)
++BEGIN_OPCODES()
++    {OpcodeInfo::all, {0x66, 0x0F, 0xD5, _r}, {xmm64, xmm_m64}, DU_U },
++END_OPCODES()
++END_MNEMONIC()
++
++BEGIN_MNEMONIC(PMULLD, MF_NONE, DU_U)
++BEGIN_OPCODES()
++    {OpcodeInfo::all, {0x66, 0x0F, 0x38, 0x40, _r}, {xmm64, xmm_m64}, DU_U },
++END_OPCODES()
++END_MNEMONIC()
++
++BEGIN_MNEMONIC(PSLLW, MF_NONE, DU_U)
++BEGIN_OPCODES()
++    {OpcodeInfo::all, {0x66, 0x0F, 0xF1, _r}, {xmm64, xmm_m64}, DU_U },
++    {OpcodeInfo::all, {0x66, 0x0F, 0x71, _6, ib}, {xmm64, imm8}, DU_U },
++END_OPCODES()
++END_MNEMONIC()
++
++BEGIN_MNEMONIC(PSLLD, MF_NONE, DU_U)
++BEGIN_OPCODES()
++    {OpcodeInfo::all, {0x66, 0x0F, 0xF2, 0x40, _r}, {xmm64, xmm_m64}, DU_U },
++    {OpcodeInfo::all, {0x66, 0x0F, 0x72, _6, ib}, {xmm64, imm8}, DU_U },
++END_OPCODES()
++END_MNEMONIC()
++
++BEGIN_MNEMONIC(PSRAW, MF_NONE, DU_U)
++BEGIN_OPCODES()
++    {OpcodeInfo::all, {0x66, 0x0F, 0xE1, _r}, {xmm64, xmm_m64}, DU_U },
++    {OpcodeInfo::all, {0x66, 0x0F, 0x71, _4, ib}, {xmm64, imm8}, DU_U },
++END_OPCODES()
++END_MNEMONIC()
++
++BEGIN_MNEMONIC(PSRAD, MF_NONE, DU_U)
++BEGIN_OPCODES()
++    {OpcodeInfo::all, {0x66, 0x0F, 0xE2, 0x40, _r}, {xmm64, xmm_m64}, DU_U },
++    {OpcodeInfo::all, {0x66, 0x0F, 0x72, _4, ib}, {xmm64, imm8}, DU_U },
++END_OPCODES()
++END_MNEMONIC()
++
++BEGIN_MNEMONIC(PMOVSXBW, MF_NONE, DU_U)
++BEGIN_OPCODES()
++    {OpcodeInfo::all, {0x66, 0x0F, 0x38, 0x20, _r}, {xmm64, xmm_m64}, DU_U },
++END_OPCODES()
++END_MNEMONIC()
++
++BEGIN_MNEMONIC(PSHUFD, MF_NONE, D_U_U)
++BEGIN_OPCODES()
++    {OpcodeInfo::all, {0x66, 0x0F, 0x70, _r, ib}, {xmm64, xmm_m64, imm8}, D_U_U },
++END_OPCODES()
++END_MNEMONIC()
++
++BEGIN_MNEMONIC(PSHUFW, MF_NONE, D_U_U)
++BEGIN_OPCODES()
++#ifdef _HAVE_MMX_
++    {OpcodeInfo::all, {0x0F, 0x70, _r, ib}, {mm64, mm_m64, imm8}, D_U_U },
++#endif
++END_OPCODES()
++END_MNEMONIC()
++
++BEGIN_MNEMONIC(PSHUFLW, MF_NONE, D_U_U)
++BEGIN_OPCODES()
++    {OpcodeInfo::all, {0xF2, 0x0F, 0x70, _r, ib}, {xmm64, xmm_m64, imm8}, D_U_U },
++END_OPCODES()
++END_MNEMONIC()
++
++BEGIN_MNEMONIC(PSHUFHW, MF_NONE, D_U_U)
++BEGIN_OPCODES()
++    {OpcodeInfo::all, {0xF3, 0x0F, 0x70, _r, ib}, {xmm64, xmm_m64, imm8}, D_U_U },
++END_OPCODES()
++END_MNEMONIC()
++
++BEGIN_MNEMONIC(PHADDSW, MF_NONE, DU_U)
++BEGIN_OPCODES()
++    {OpcodeInfo::all, {0x66, 0x0F, 0x38, 0x03, _r}, {xmm64, xmm_m64}, DU_U },
++END_OPCODES()
++END_MNEMONIC()
++
++BEGIN_MNEMONIC(PHADDW, MF_NONE, DU_U)
++BEGIN_OPCODES()
++    {OpcodeInfo::all, {0x66, 0x0F, 0x38, 0x01, _r}, {xmm64, xmm_m64}, DU_U },
++END_OPCODES()
++END_MNEMONIC()
++
++BEGIN_MNEMONIC(PHADDD, MF_NONE, DU_U)
++BEGIN_OPCODES()
++    {OpcodeInfo::all, {0x66, 0x0F, 0x38, 0x02, _r}, {xmm64, xmm_m64}, DU_U },
++END_OPCODES()
++END_MNEMONIC()
++
++BEGIN_MNEMONIC(PEXTRW, MF_NONE, D_U_U)
++BEGIN_OPCODES()
++    {OpcodeInfo::all, {0x66, 0x0F, 0xC5, _r, ib}, {r32, xmm64, imm8}, D_U_U },
++END_OPCODES()
++END_MNEMONIC()
++
++BEGIN_MNEMONIC(PEXTRD, MF_NONE, D_U_U)
++BEGIN_OPCODES()
++    {OpcodeInfo::all, {0x66, 0x0F, 0x3A, 0x16, _r, ib}, {r_m32, xmm64, imm8}, D_U_U },
++END_OPCODES()
++END_MNEMONIC()
++
++BEGIN_MNEMONIC(MOVDQA, MF_NONE|MF_SYMMETRIC, D_U)
++BEGIN_OPCODES()
++    {OpcodeInfo::all, {0x66, 0x0F, 0x6F, _r}, {xmm64, xmm_m64}, D_U },
++    //The encoder cannot properly look up when operands are symmetric but opcode is not:
++    //{OpcodeInfo::all, {0x66, 0x0F, 0x7F, _r}, {xmm_m128, xmm128}, D_U },
++END_OPCODES()
++END_MNEMONIC()
++
+ };      // ~masterEncodingTable[]
+ 
+ ENCODER_NAMESPACE_END
+diff --git a/vm/compiler/codegen/x86/lightcg/libenc/enc_wrapper.cpp b/vm/compiler/codegen/x86/lightcg/libenc/enc_wrapper.cpp
+index 49ce6e0..bc20fc3 100644
+--- a/vm/compiler/codegen/x86/lightcg/libenc/enc_wrapper.cpp
++++ b/vm/compiler/codegen/x86/lightcg/libenc/enc_wrapper.cpp
+@@ -97,6 +97,14 @@ static RegName mapFromPhysicalReg (int physicalReg)
+ //getRegSize, getAliasReg:
+ //OpndSize, RegName, OpndExt: enum enc_defs.h
+ inline void add_r(EncoderBase::Operands & args, int physicalReg, OpndSize sz, OpndExt ext = OpndExt_None) {
++    if (sz == OpndSize_128)
++    {
++        //For xmm registers, the encoder table contains them as 64-bit operands. Since semantics are determined
++        //by the encoding of the mnemonic, we change the size to 64-bit to make encoder happy. It will still
++        //generate the code for 128-bit size since for 64-bit all instructions have different encoding to use mmx.
++        sz = OpndSize_64;
++    }
++
+     RegName reg = mapFromPhysicalReg (physicalReg);
+     if (sz != getRegSize(reg)) {
+        reg = getAliasReg(reg, sz);
+@@ -104,6 +112,14 @@ inline void add_r(EncoderBase::Operands & args, int physicalReg, OpndSize sz, Op
+     args.add(EncoderBase::Operand(reg, ext));
+ }
+ inline void add_m(EncoderBase::Operands & args, int baseReg, int disp, OpndSize sz, OpndExt ext = OpndExt_None) {
++    if (sz == OpndSize_128)
++    {
++        //For xmm registers, the encoder table contains them as 64-bit operands. Since semantics are determined
++        //by the encoding of the mnemonic, we change the size to 64-bit to make encoder happy. It will still
++        //generate the code for 128-bit size since for 64-bit all instructions have different encoding to use mmx.
++        sz = OpndSize_64;
++    }
++
+     args.add(EncoderBase::Operand(sz,
+                                   mapFromPhysicalReg (baseReg),
+                                   RegName_Null, 0,
+@@ -111,6 +127,14 @@ inline void add_m(EncoderBase::Operands & args, int baseReg, int disp, OpndSize
+ }
+ inline void add_m_scale(EncoderBase::Operands & args, int baseReg, int indexReg, int scale,
+                         OpndSize sz, OpndExt ext = OpndExt_None) {
++    if (sz == OpndSize_128)
++    {
++        //For xmm registers, the encoder table contains them as 64-bit operands. Since semantics are determined
++        //by the encoding of the mnemonic, we change the size to 64-bit to make encoder happy. It will still
++        //generate the code for 128-bit size since for 64-bit all instructions have different encoding to use mmx.
++        sz = OpndSize_64;
++    }
++
+     args.add(EncoderBase::Operand(sz,
+                                   mapFromPhysicalReg (baseReg),
+                                   mapFromPhysicalReg (indexReg), scale,
+@@ -118,6 +142,14 @@ inline void add_m_scale(EncoderBase::Operands & args, int baseReg, int indexReg,
+ }
+ inline void add_m_disp_scale(EncoderBase::Operands & args, int baseReg, int disp, int indexReg, int scale,
+                         OpndSize sz, OpndExt ext = OpndExt_None) {
++    if (sz == OpndSize_128)
++    {
++        //For xmm registers, the encoder table contains them as 64-bit operands. Since semantics are determined
++        //by the encoding of the mnemonic, we change the size to 64-bit to make encoder happy. It will still
++        //generate the code for 128-bit size since for 64-bit all instructions have different encoding to use mmx.
++        sz = OpndSize_64;
++    }
++
+     args.add(EncoderBase::Operand(sz,
+                                   mapFromPhysicalReg (baseReg),
+                                   mapFromPhysicalReg (indexReg), scale,
+@@ -456,28 +488,33 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_reg_mem(Mnemonic m, OpndSize si
+ #endif
+     return stream;
+ }
+-extern "C" ENCODER_DECLARE_EXPORT char * encoder_imm_reg(Mnemonic m, OpndSize size,
+-                   int imm, int reg, bool isPhysical, LowOpndRegType type, char * stream) {
+-    return encoder_imm_reg_diff_sizes(m, size, imm, size, reg, isPhysical, type, stream);
+-}
+-extern "C" ENCODER_DECLARE_EXPORT char * encoder_imm_reg_diff_sizes(Mnemonic m, OpndSize sizeImm,
+-                   int imm, OpndSize sizeReg, int reg, bool isPhysical, LowOpndRegType type, char * stream) {
++extern "C" ENCODER_DECLARE_EXPORT char * encoder_imm_reg_diff_sizes (Mnemonic m, OpndSize sizeImm, int imm,
++        OpndSize sizeReg, int reg, bool isPhysical, LowOpndRegType type, char * stream)
++{
++    //Create the operands
+     EncoderBase::Operands args;
+-    add_r(args, reg, sizeReg); //dst
+-    if(m == Mnemonic_IMUL) add_r(args, reg, sizeReg); //src CHECK
+-    if(m == Mnemonic_SAL || m == Mnemonic_SHR || m == Mnemonic_SHL
+-       || m == Mnemonic_SAR || m == Mnemonic_ROR || m == Mnemonic_PSLLQ || m == Mnemonic_PSRLQ)  //fix for shift opcodes
+-      add_imm(args, OpndSize_8, imm, true/*is_signed*/);
+-    else
+-      add_imm(args, sizeImm, imm, true/*is_signed*/);
++    //Add destination register
++    add_r (args, reg, sizeReg);
++    //For imul, we need to add implicit register explicitly
++    if (m == Mnemonic_IMUL)
++    {
++        add_r (args, reg, sizeReg);
++    }
++    //Finally add the immediate
++    add_imm (args, sizeImm, imm, true/*is_signed*/);
++
+ #ifdef PRINT_ENCODER_STREAM
+     char* stream_start = stream;
+ #endif
+-    stream = (char *)EncoderBase::encode(stream, m, args);
++
++    //Now do the encoding
++    stream = EncoderBase::encode (stream, m, args);
++
+ #ifdef PRINT_ENCODER_STREAM
+     printEncoderInst(m, args);
+     decodeThenPrint(stream_start);
+ #endif
++
+     return stream;
+ }
+ extern "C" ENCODER_DECLARE_EXPORT char * encoder_update_imm_rm(int imm, char * stream) {
+@@ -496,25 +533,30 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_update_imm_rm(int imm, char * s
+ #endif
+     return stream_next;
+ }
+-extern "C" ENCODER_DECLARE_EXPORT char * encoder_imm_mem(Mnemonic m, OpndSize size,
+-                   int imm,
+-                   int disp, int base_reg, bool isBasePhysical, char * stream) {
++
++extern "C" ENCODER_DECLARE_EXPORT char * encoder_imm_mem_diff_sizes (Mnemonic m, OpndSize immOpndSize, int imm,
++        OpndSize memOpndSize, int disp, int baseRegister, bool isBasePhysical, char * stream)
++{
++    //Add operands
+     EncoderBase::Operands args;
+-    add_m(args, base_reg, disp, size);
+-    if (m == Mnemonic_SAL || m == Mnemonic_SHR || m == Mnemonic_SHL
+-        || m == Mnemonic_SAR || m == Mnemonic_ROR)
+-        size = OpndSize_8;
+-    add_imm(args, size, imm, true);
++    add_m (args, baseRegister, disp, memOpndSize);
++    add_imm (args, immOpndSize, imm, true);
++
+ #ifdef PRINT_ENCODER_STREAM
+     char* stream_start = stream;
+ #endif
+-    stream = (char *)EncoderBase::encode(stream, m, args);
++
++    //Do the encoding
++    stream = EncoderBase::encode (stream, m, args);
++
+ #ifdef PRINT_ENCODER_STREAM
+     printEncoderInst(m, args);
+     decodeThenPrint(stream_start);
+ #endif
++
+     return stream;
+ }
++
+ extern "C" ENCODER_DECLARE_EXPORT char * encoder_fp_mem(Mnemonic m, OpndSize size, int reg,
+                   int disp, int base_reg, bool isBasePhysical, char * stream) {
+     EncoderBase::Operands args;
+@@ -643,6 +685,34 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_moves_reg_to_reg(OpndSize size,
+     return stream;
+ }
+ 
++extern "C" ENCODER_DECLARE_EXPORT char * encoder_imm_reg_reg (Mnemonic m, int imm, OpndSize immediateSize,
++        int sourceReg, OpndSize sourceRegSize, int destReg, OpndSize destRegSize, char * stream)
++{
++    EncoderBase::Operands args;
++
++    //Add the source and destination registers
++    add_r (args, destReg, destRegSize);
++    add_r (args, sourceReg, sourceRegSize);
++
++    //Now add the immediate. We expect in three operand situation that immediate is last argument
++    add_imm (args, immediateSize, imm, true/*is_signed*/);
++
++#ifdef PRINT_ENCODER_STREAM
++    char* stream_start = stream;
++#endif
++
++    //Do the actual encoding
++    stream = EncoderBase::encode (stream, m, args);
++
++#ifdef PRINT_ENCODER_STREAM
++    printEncoderInst (m, args);
++    decodeThenPrint (stream_start);
++#endif
++
++    //Return the updated stream pointer
++    return stream;
++}
++
+ /**
+  * @brief Generates variable sized nop instructions.
+  * @param numBytes Number of bytes for the nop instruction. If this value is
+diff --git a/vm/compiler/codegen/x86/lightcg/libenc/enc_wrapper.h b/vm/compiler/codegen/x86/lightcg/libenc/enc_wrapper.h
+index 727159d..f107ddf 100644
+--- a/vm/compiler/codegen/x86/lightcg/libenc/enc_wrapper.h
++++ b/vm/compiler/codegen/x86/lightcg/libenc/enc_wrapper.h
+@@ -240,14 +240,11 @@ ENCODER_DECLARE_EXPORT char* encoder_reg_mem_disp_scale(Mnemonic m, OpndSize siz
+ ENCODER_DECLARE_EXPORT char* encoder_reg_mem(Mnemonic m, OpndSize size,
+                    int reg, bool isPhysical,
+                    int disp, int base_reg, bool isBasePhysical, LowOpndRegType type, char* stream);
+-ENCODER_DECLARE_EXPORT char* encoder_imm_reg(Mnemonic m, OpndSize size,
+-                   int imm, int reg, bool isPhysical, LowOpndRegType type, char* stream);
+ ENCODER_DECLARE_EXPORT char * encoder_imm_reg_diff_sizes(Mnemonic m, OpndSize sizeImm,
+                    int imm, OpndSize sizeReg, int reg, bool isPhysical, LowOpndRegType type, char * stream);
+ ENCODER_DECLARE_EXPORT char * encoder_update_imm_rm(int imm, char * stream);
+-ENCODER_DECLARE_EXPORT char* encoder_imm_mem(Mnemonic m, OpndSize size,
+-                   int imm,
+-                   int disp, int base_reg, bool isBasePhysical, char* stream);
++ENCODER_DECLARE_EXPORT char * encoder_imm_mem_diff_sizes (Mnemonic m, OpndSize immOpndSize, int imm,
++                   OpndSize memOpndSize, int disp, int baseRegister, bool isBasePhysical, char * stream);
+ ENCODER_DECLARE_EXPORT char* encoder_fp_mem(Mnemonic m, OpndSize size, int reg,
+                   int disp, int base_reg, bool isBasePhysical, char* stream);
+ ENCODER_DECLARE_EXPORT char* encoder_mem_fp(Mnemonic m, OpndSize size,
+@@ -267,6 +264,9 @@ ENCODER_DECLARE_EXPORT char * encoder_movez_reg_to_reg(OpndSize size,
+ ENCODER_DECLARE_EXPORT char * encoder_moves_reg_to_reg(OpndSize size,
+                       int reg, bool isPhysical, int reg2,
+                       bool isPhysical2, LowOpndRegType type, char * stream);
++ENCODER_DECLARE_EXPORT char * encoder_imm_reg_reg (Mnemonic m, int imm, OpndSize immediateSize,
++                      int sourceReg, OpndSize sourceRegSize, int destReg,
++                      OpndSize destRegSize, char * stream);
+ ENCODER_DECLARE_EXPORT char * encoder_nops(unsigned numBytes, char * stream);
+ ENCODER_DECLARE_EXPORT int decodeThenPrint(char* stream_start);
+ ENCODER_DECLARE_EXPORT char* decoder_disassemble_instr(char* stream, char* strbuf, unsigned int len);
+-- 
+1.7.4.1
+

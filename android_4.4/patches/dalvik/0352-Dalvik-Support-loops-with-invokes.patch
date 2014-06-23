@@ -1,0 +1,1733 @@
+From 31a4bb0dc00c1559c918362ed1eba8108377e19e Mon Sep 17 00:00:00 2001
+From: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Date: Sun, 21 Jul 2013 13:33:12 -0700
+Subject: Dalvik: Support loops with invokes
+
+BZ: 124838
+
+The loop framework no longer rejects loops with invokes. Due to this enhancement,
+the method inlining has been moved to a separate pass because it is no longer
+required as part of the loop building. An additional pass has been added to
+ensure that before CFG is passed to backend, all remaining invokes have a
+Singleton or Predicted chaining cell which can be used during code generation.
+
+In order to assist PCG with understanding that block after invoke is a possible
+entry, a fromInterpreter block has been added as that block's predecessor.
+However, when using the PCG backend, loops with invokes expose a bug and thus
+after inlining we check if there are any remaining invokes in loops.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Ie09f1788be492118bd2c521704e3d773b538a419
+Orig-MCG-Change-Id: Ie5137c8d57f67425812bda9440f0993b3416c8bc
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Reviewed-on: http://android.intel.com:8080/119814
+Reviewed-by: Beyler, Jean Christophe <jean.christophe.beyler@intel.com>
+Reviewed-by: Popov, Ivan G <ivan.g.popov@intel.com>
+Reviewed-by: Hartley, Timothy D <timothy.d.hartley@intel.com>
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: Banerji, Udayan <udayan.banerji@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/BBOptimization.cpp                    |  105 ++++++++++-
+ vm/compiler/BBOptimization.h                      |   18 ++
+ vm/compiler/Compiler.h                            |   22 +--
+ vm/compiler/CompilerIR.h                          |    8 -
+ vm/compiler/Frontend.cpp                          |  226 ++-------------------
+ vm/compiler/InlineTransformation.cpp              |   59 ++++--
+ vm/compiler/IntermediateRep.cpp                   |   30 ++-
+ vm/compiler/Loop.cpp                              |   83 +-------
+ vm/compiler/LoopInformation.cpp                   |   14 +-
+ vm/compiler/LoopOpt.cpp                           |   53 +++++
+ vm/compiler/LoopOpt.h                             |   19 ++-
+ vm/compiler/Pass.h                                |    6 +
+ vm/compiler/SSATransformation.cpp                 |    4 +
+ vm/compiler/Utility.cpp                           |  206 +++++++++++++++++++
+ vm/compiler/Utility.h                             |   23 ++
+ vm/compiler/codegen/x86/lightcg/CodegenErrors.cpp |    1 +
+ vm/compiler/codegen/x86/lightcg/CodegenErrors.h   |    2 +
+ vm/compiler/codegen/x86/pcg/CodeGeneration.cpp    |   46 +----
+ vm/compiler/codegen/x86/pcg/LowerCall.cpp         |  117 ++++++-----
+ vm/compiler/codegen/x86/pcg/LowerCall.h           |   12 +-
+ vm/compiler/codegen/x86/pcg/PcgInterface.cpp      |    5 +
+ vm/compiler/codegen/x86/pcg/UtilityPCG.cpp        |   76 +++++++
+ vm/compiler/codegen/x86/pcg/UtilityPCG.h          |   17 ++
+ 23 files changed, 693 insertions(+), 459 deletions(-)
+
+diff --git a/vm/compiler/BBOptimization.cpp b/vm/compiler/BBOptimization.cpp
+index 29dfd9f..f4d9dc1 100644
+--- a/vm/compiler/BBOptimization.cpp
++++ b/vm/compiler/BBOptimization.cpp
+@@ -278,8 +278,7 @@ void dvmCompilerFormOldLoop (CompilationUnit *cUnit, Pass *pass)
+         }
+ 
+         //Put a backward chaining cell between the predecessor and the entry block
+-        BasicBlock *backward = dvmCompilerNewBB(kChainingCellBackwardBranch, cUnit->numBlocks++);
+-        dvmInsertGrowableList(&cUnit->blockList, (intptr_t) backward);
++        BasicBlock *backward = dvmCompilerNewBBinCunit (cUnit, kChainingCellBackwardBranch);
+         backward->startOffset = bb->startOffset;
+ 
+         //Backward will fall through to the current BasicBlock directly
+@@ -999,6 +998,108 @@ bool dvmCompilerConvert2addr (CompilationUnit *cUnit, BasicBlock *bb)
+     return result;
+ }
+ 
++bool dvmCompilerAddInvokeSupportBlocks (CompilationUnit *cUnit, BasicBlock *bb)
++{
++    bool updatedCFG = false;
++
++    //Iterate through MIRs to find invoke
++    for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        int flags = dvmCompilerGetOpcodeFlags (mir->dalvikInsn.opcode);
++
++        //In case we don't have an invoke we have no work to do
++        if ((flags & kInstrInvoke) == 0)
++        {
++            continue;
++        }
++
++        //Check if invoke is last MIR in its BB
++        if (mir->next != 0)
++        {
++            assert (mir != bb->lastMIRInsn);
++
++            if (cUnit->printPass == true)
++            {
++                ALOGD ("JIT_INFO: Had to split invoke block to add chaining cell");
++            }
++
++            //We need to split the block because we are appending chaining cells to the block the invoke is in
++            dvmCompilerSplitBlock(&cUnit->blockList, mir->next, bb, 0);
++
++            updatedCFG = true;
++        }
++
++        //Now we need to add a fromInterp node but we will only do it if the fallthrough block exists
++        //and has only a single predecessor (namely the bb in which the invoke lives)
++        if (bb->fallThrough == 0 || dvmCountSetBits (bb->fallThrough->predecessors) != 1)
++        {
++            if (cUnit->printPass == true)
++            {
++                ALOGD ("JIT_INFO: Could not add fromInterpreter block for block post invoke because CFG is complicated");
++            }
++
++            //The CFG is too complicated and cannot easily insert a fromInterp node
++            cUnit->quitLoopMode = true;
++            return updatedCFG;
++        }
++        else
++        {
++            //Only add the fromInterp node if the fallthrough is not a chaining cell
++            if (static_cast<int> (bb->fallThrough->blockType) > kChainingCellLast)
++            {
++                //Add the fromInterp node now
++                BasicBlock *fromInterp = dvmCompilerNewBBinCunit (cUnit, kFromInterpreter);
++
++                //Make the fallthrough of the fromInterp node be the block following block holding invoke
++                dvmCompilerReplaceChildBasicBlock (bb->fallThrough, fromInterp, kChildTypeFallthrough);
++            }
++        }
++
++        if (bb->taken != 0
++                && (bb->taken->blockType == kChainingCellInvokePredicted
++                        || bb->taken->blockType == kChainingCellInvokeSingleton))
++        {
++            //This invoke already has a chaining cell
++            continue;
++        }
++
++        //When we get here, we know we need to add a chaining cell.
++        //Check if we can figure out the method being called by this invoke.
++        const Method *callee = dvmCompilerCheckResolvedMethod (cUnit->method, &mir->dalvikInsn);
++
++        BasicBlock *invokeCC = 0;
++
++        //Create chaining cells if needed. If we know the method we create a Singleton CC.
++        //Otherwise we create a Predicted CC.
++        if (callee != 0)
++        {
++            if (dvmIsNativeMethod(callee) == false)
++            {
++                invokeCC = dvmCompilerNewBBinCunit (cUnit, kChainingCellInvokeSingleton);
++                invokeCC->containingMethod = callee;
++            }
++            else
++            {
++                //Native JNI call does not need chaining cell
++            }
++        }
++        else
++        {
++            invokeCC = dvmCompilerNewBBinCunit (cUnit, kChainingCellInvokePredicted);
++        }
++
++        if (invokeCC != 0)
++        {
++            //Add chaining cell as taken branch for invoke BB
++            dvmCompilerReplaceChildBasicBlock (invokeCC, bb, kChildTypeTaken);
++
++            updatedCFG = true;
++        }
++    }
++
++    return updatedCFG;
++}
++
+ bool dvmCompilerFixChainingCellPredecessors (CompilationUnit *cUnit, BasicBlock *bb)
+ {
+     //Is this block a chaining cell?
+diff --git a/vm/compiler/BBOptimization.h b/vm/compiler/BBOptimization.h
+index a180f0c..af573a2 100644
+--- a/vm/compiler/BBOptimization.h
++++ b/vm/compiler/BBOptimization.h
+@@ -80,6 +80,24 @@ void dvmCompilerReorder (CompilationUnit *cUnit, Pass *pass);
+ bool dvmCompilerConvert2addr (CompilationUnit *cUnit, BasicBlock *bb);
+ 
+ /**
++ * @brief Goes through the basic block and ensures that for all invokes there is a Singleton/Predicted
++ * chaining cell on taken branch.
++ * @details May split basic block so therefore it is necessary to use an "all nodes and new" approach
++ * @param cUnit The compilation unit
++ * @param bb The basic block through which to look for invokes
++ * @return Returns true if the CFG was at all updated
++ */
++bool dvmCompilerAddInvokeSupportBlocks (CompilationUnit *cUnit, BasicBlock *bb);
++
++/**
++ * @brief Goes through the given basic blocks and try to inline invokes
++ * @param cUnit The compilation unit
++ * @param bb The basic block through which to look for invokes
++ * @return Returns true if any method inlining was done
++ */
++bool dvmCompilerMethodInlining (CompilationUnit *cUnit, BasicBlock *bb);
++
++/**
+  * @brief Ensures that each chaining cell has only one predecessor.
+  * @param cUnit the CompilationUnit.
+  * @param bb The BasicBlock to look at. Anything other than chaining cells is ignored.
+diff --git a/vm/compiler/Compiler.h b/vm/compiler/Compiler.h
+index 43b2962..46eee57 100644
+--- a/vm/compiler/Compiler.h
++++ b/vm/compiler/Compiler.h
+@@ -218,17 +218,6 @@ CompilerMethodStats *dvmCompilerAnalyzeMethodBody(const Method *method,
+                                                   bool isCallee);
+ 
+ /**
+- * @brief Checks if bytecodes in method reference fully resolved classes, methods, and fields.
+- * @details Since we are including instructions from possibly a cold method into the current trace,
+- * we need to make sure that all the associated information with the callee is properly initialized.
+- * @param method The method that contains the bytecode
+- * @param insn The decoded instruction that we are examining
+- * @param tryToResolve In case it hasn't been resolved, try to resolve it now.
+- * @return Returns whether class/method/field is fully resolved.
+- */
+-bool dvmCompilerCheckResolvedReferences (const Method *method, const DecodedInstruction *insn, bool tryToResolve = false);
+-
+-/**
+  * @brief Used to split a basic block into two, thus creating a new BB in the cUnit.
+  * @param blockList The list of basic blocks to update
+  * @param mirToSplitAt The mir at which the split should happen. This MIR becomes part of newly
+@@ -263,10 +252,13 @@ void dvmJitScanAllClassPointers(void (*callback)(void *ptr));
+ void dvmCompilerSortAndPrintTraceProfiles(void);
+ void dvmCompilerPerformSafePointChecks(void);
+ 
+-/* Handle the inlining of a given MIR, returns whether it was inlined */
+-bool dvmCompilerHandleInlining (CompilationUnit *cUnit, JitTranslationInfo *info, BasicBlock *bb, MIR *mir);
+-void dvmCompilerInlineMIR(struct CompilationUnit *cUnit,
+-                          JitTranslationInfo *info);
++/**
++ * @brief Walks through the basic blocks looking for BB's with instructions in order to try to possibly inline an invoke
++ * @param cUnit The compilation unit
++ * @param info The description of the trace
++ */
++void dvmCompilerInlineMIR (CompilationUnit *cUnit, JitTranslationInfo *info);
++
+ void dvmInitializeSSAConversion(struct CompilationUnit *cUnit);
+ int dvmConvertSSARegToDalvik(const struct CompilationUnit *cUnit, int ssaReg);
+ //Extract the subscript from a SSA register
+diff --git a/vm/compiler/CompilerIR.h b/vm/compiler/CompilerIR.h
+index 82b3f48..56e549d 100644
+--- a/vm/compiler/CompilerIR.h
++++ b/vm/compiler/CompilerIR.h
+@@ -473,14 +473,6 @@ typedef struct CompilationUnit {
+ #endif
+ 
+ /**
+- * @brief Used to create a new basic block.
+- * @param blockType The block type to create.
+- * @param blockId The block id for this new block.
+- * @return Returns the newly created block.
+- */
+-BasicBlock *dvmCompilerNewBB (BBType blockType, int blockId);
+-
+-/**
+  * @brief Creates a new block and adds its to the block list.
+  * @details If a cUnit block list is provided, this function does not ensure to update cUnit->numBlocks.
+  * @param blockList The block list to which we should add to.
+diff --git a/vm/compiler/Frontend.cpp b/vm/compiler/Frontend.cpp
+index 4bc62e4..1600cbe 100644
+--- a/vm/compiler/Frontend.cpp
++++ b/vm/compiler/Frontend.cpp
+@@ -24,6 +24,7 @@
+ #include "LoopOpt.h"
+ #include "LoopInformation.h"
+ #include "RegisterizationME.h"
++#include "Utility.h"
+ 
+ #define BYTECODE_FILTER
+ 
+@@ -439,217 +440,6 @@ static bool filterMethodByCallGraph(Thread *thread, const char *curMethodName)
+ }
+ 
+ /**
+- * Checks if bytecodes in method reference fully resolved classes, methods, and fields
+- * @see Compiler.h
+- */
+-bool dvmCompilerCheckResolvedReferences (const Method *method, const DecodedInstruction *insn, bool tryToResolve)
+-{
+-    switch (insn->opcode)
+-    {
+-        case OP_NEW_INSTANCE:
+-        case OP_CHECK_CAST:
+-        {
+-            ClassObject *classPtr = dvmDexGetResolvedClass (method->clazz->pDvmDex, insn->vB);
+-
+-            if (tryToResolve == true && classPtr == 0)
+-            {
+-                classPtr = dvmResolveClass (method->clazz, insn->vB, false);
+-            }
+-
+-            if (classPtr == 0)
+-            {
+-                return false;
+-            }
+-
+-            break;
+-        }
+-        case OP_SGET:
+-        case OP_SGET_WIDE:
+-        case OP_SGET_OBJECT:
+-        case OP_SGET_BOOLEAN:
+-        case OP_SGET_BYTE:
+-        case OP_SGET_CHAR:
+-        case OP_SGET_SHORT:
+-        case OP_SPUT:
+-        case OP_SPUT_WIDE:
+-        case OP_SPUT_OBJECT:
+-        case OP_SPUT_BOOLEAN:
+-        case OP_SPUT_BYTE:
+-        case OP_SPUT_CHAR:
+-        case OP_SPUT_SHORT:
+-        {
+-            u4 ref = insn->vB;
+-            StaticField *sField =
+-                    reinterpret_cast<StaticField*> (dvmDexGetResolvedField (method->clazz->pDvmDex, ref));
+-
+-            if (tryToResolve == true && sField == 0)
+-            {
+-                sField = dvmResolveStaticField (method->clazz, ref);
+-            }
+-
+-            if (sField == 0)
+-            {
+-                return false;
+-            }
+-
+-            break;
+-        }
+-        case OP_INVOKE_SUPER:
+-        case OP_INVOKE_SUPER_RANGE:
+-        {
+-            //We need to determine the method to call
+-            const Method *methodToCall = 0;
+-
+-            //Reference is in vB
+-            u4 ref = insn->vB;
+-
+-            //Get the base method
+-            Method *baseMethod = dvmDexGetResolvedMethod (method->clazz->pDvmDex, ref);
+-
+-            //Try to resolve the base method if needed
+-            if (tryToResolve == true && baseMethod == 0)
+-            {
+-                baseMethod = dvmResolveMethod (method->clazz, ref, METHOD_VIRTUAL);
+-            }
+-
+-            //If we resolve the base method and we can find the index in the super vtable, then we try it
+-            if (baseMethod != 0 && baseMethod->methodIndex < method->clazz->super->vtableCount)
+-            {
+-                //Get the method to call from the super vtable
+-                methodToCall = method->clazz->super->vtable[baseMethod->methodIndex];
+-            }
+-
+-            if (methodToCall == 0)
+-            {
+-                return false;
+-            }
+-
+-            break;
+-        }
+-        case OP_INVOKE_SUPER_QUICK:
+-        case OP_INVOKE_SUPER_QUICK_RANGE:
+-        {
+-            const Method *calleeMethod = method->clazz->super->vtable[insn->vB];
+-
+-            if (calleeMethod == 0)
+-            {
+-                return false;
+-            }
+-
+-            break;
+-        }
+-        case OP_INVOKE_STATIC:
+-        case OP_INVOKE_STATIC_RANGE:
+-        {
+-            const Method *calleeMethod = dvmDexGetResolvedMethod (method->clazz->pDvmDex, insn->vB);
+-
+-            if (tryToResolve == true && calleeMethod == 0)
+-            {
+-                calleeMethod = dvmResolveMethod (method->clazz, insn->vB, METHOD_STATIC);
+-            }
+-
+-            if (calleeMethod == 0)
+-            {
+-                return false;
+-            }
+-
+-            break;
+-        }
+-        case OP_INVOKE_DIRECT:
+-        case OP_INVOKE_DIRECT_RANGE:
+-        {
+-            const Method *calleeMethod = dvmDexGetResolvedMethod (method->clazz->pDvmDex, insn->vB);
+-
+-            if (tryToResolve == true && calleeMethod == 0)
+-            {
+-                calleeMethod = dvmResolveMethod (method->clazz, insn->vB, METHOD_DIRECT);
+-            }
+-
+-            if (calleeMethod == 0)
+-            {
+-                return false;
+-            }
+-
+-            break;
+-        }
+-        case OP_CONST_CLASS:
+-        {
+-            ClassObject *classPtr = dvmDexGetResolvedClass (method->clazz->pDvmDex, insn->vB);
+-
+-            if (tryToResolve == true && classPtr == 0)
+-            {
+-                classPtr = dvmResolveClass(method->clazz, insn->vB, true);
+-            }
+-
+-            if (classPtr == 0)
+-            {
+-                return false;
+-            }
+-
+-            break;
+-        }
+-        case OP_CONST_STRING_JUMBO:
+-        case OP_CONST_STRING:
+-        {
+-            StringObject *strPtr = dvmDexGetResolvedString (method->clazz->pDvmDex, insn->vB);
+-
+-            if (tryToResolve == true && strPtr == 0)
+-            {
+-                strPtr = dvmResolveString (method->clazz, insn->vB);
+-            }
+-
+-            if (strPtr == 0)
+-            {
+-                return false;
+-            }
+-
+-            break;
+-        }
+-        case OP_IGET:
+-        case OP_IGET_WIDE:
+-        case OP_IGET_OBJECT:
+-        case OP_IGET_BOOLEAN:
+-        case OP_IGET_BYTE:
+-        case OP_IGET_CHAR:
+-        case OP_IGET_SHORT:
+-        case OP_IPUT:
+-        case OP_IPUT_WIDE:
+-        case OP_IPUT_OBJECT:
+-        case OP_IPUT_BOOLEAN:
+-        case OP_IPUT_BYTE:
+-        case OP_IPUT_CHAR:
+-        case OP_IPUT_SHORT:
+-        {
+-            u4 ref = insn->vC;
+-            InstField *iField = reinterpret_cast <InstField*> (dvmDexGetResolvedField(method->clazz->pDvmDex, ref));
+-
+-            if (tryToResolve == true && iField == 0)
+-            {
+-                iField = dvmResolveInstField(method->clazz, ref);
+-            }
+-
+-            if (iField == 0)
+-            {
+-                return false;
+-            }
+-
+-            break;
+-        }
+-        case OP_NEW_ARRAY:
+-        case OP_FILLED_NEW_ARRAY:
+-        case OP_FILLED_NEW_ARRAY_RANGE:
+-        case OP_INSTANCE_OF:
+-            //TODO Add support for these to resolve fields
+-            return false;
+-        default:
+-            break;
+-    }
+-
+-    //If we get here, everything went okay
+-    return true;
+-}
+-
+-/**
+  * @brief Checks if bytecode in method reference fully resolved classes, methods, and fields.
+  * @details If not resolved, tries to resolve it.
+  * @param method The method that contains the bytecode
+@@ -697,8 +487,18 @@ BasicBlock *dvmCompilerSplitBlock (GrowableList *blockList,
+     /* Create a new block for bottom */
+     BasicBlock *bottomBlock = dvmCompilerNewBBinList (*blockList, kDalvikByteCode);
+ 
++    /* Update the offset for the block */
+     bottomBlock->startOffset = insn->offset;
+ 
++    /*
++     * Copy the write back requests from parent in case they have already been generated.
++     * We simply copy because the new block contains a subset of the origBlock's instructions
++     * and therefore it is okay to request same set for writeback.
++     * TODO: It would be better to actually recalculate the writeback requests at the
++     * end of every pass but registerization currently depends on these requests.
++     */
++    dvmCopyBitVector (bottomBlock->requestWriteBack, origBlock->requestWriteBack);
++
+     /* Move all required mirs to the new block */
+     dvmCompilerMoveLinkedMIRsAfter (bottomBlock, 0, insn);
+ 
+@@ -2763,11 +2563,13 @@ bool dvmCompileTrace(JitTraceDescription *desc, int numMaxInsts,
+     /* Set the instruction set to use (NOTE: later components may change it) */
+     cUnit.instructionSet = dvmCompilerInstructionSet();
+ 
+-    //Try to inline invokes
++#ifndef ARCH_IA32
++    //Try to inline invokes. For x86, the loop framework has inlining pass so we do not do the inlining here.
+     if (cUnit.hasInvoke == true)
+     {
+         dvmCompilerInlineMIR (&cUnit, info);
+     }
++#endif
+ 
+     cUnit.numDalvikRegisters = cUnit.method->registersSize
+             + dvmArchSpecGetNumberOfScratch();
+diff --git a/vm/compiler/InlineTransformation.cpp b/vm/compiler/InlineTransformation.cpp
+index 1cb8e7d..71c3364 100755
+--- a/vm/compiler/InlineTransformation.cpp
++++ b/vm/compiler/InlineTransformation.cpp
+@@ -17,6 +17,7 @@
+ #include "Dalvik.h"
+ #include "Dataflow.h"
+ #include "libdex/DexOpcodes.h"
++#include "Utility.h"
+ 
+ /**
+  * @brief Used to define different failure modes for inlining
+@@ -26,7 +27,6 @@ enum InliningFailure
+     kInliningNoError = 0,                //!< @brief No inlining error
+     kInliningSuccess = kInliningNoError, //!< @brief Inlining success is the same as having no inlining error
+     kInliningMirRemovalFailed,           //!< @brief Used when removal of an MIR fails
+-    kInliningNoPredictedCC,              //!< @brief Used when invoke is predicted but does not have a CC
+     kInliningInvokeBBNoChild,            //!< @brief Used when the invoke's BB does not have a child
+     kInliningOverlapUseWithDef,          //!< @brief Used when there is rewriting and there is overlapping use with def
+     kInliningBadCalleeCFG,               //!< @brief Used when the callee CFG created is bad
+@@ -66,9 +66,6 @@ static const char *getFailureMessage (InliningFailure failure)
+         case kInliningMirRemovalFailed:
+             message = "removing an MIR failed";
+             break;
+-        case kInliningNoPredictedCC:
+-            message = "invoke is virtual but CFG does not have a predicted chaining cell";
+-            break;
+         case kInliningInvokeBBNoChild:
+             message = "invoke's basic block does not have a child basic block";
+             break;
+@@ -564,15 +561,18 @@ static InliningFailure manipulateCFGForPrediction (GrowableList &callerBasicBloc
+     //Now make the fallthrough of BB that holds the invoke have correct fallthrough
+     dvmCompilerReplaceChildBasicBlock (afterInvokeBB, mispredictBB, kChildTypeFallthrough);
+ 
+-    //If we have a move-result, then in order to be able to attach predicted CC to invoke we need to split mispredictBB
+-    if (moveResult != 0)
++    if (predictedCC != 0)
+     {
+-        //Split the mispredictBB so that moveResult ends up in second block
+-        dvmCompilerSplitBlock (&callerBasicBlocks, moveResult, mispredictBB);
+-    }
++        //If we have a move-result, then in order to be able to attach predicted CC to invoke we need to split mispredictBB
++        if (moveResult != 0)
++        {
++            //Split the mispredictBB so that moveResult ends up in second block
++            dvmCompilerSplitBlock (&callerBasicBlocks, moveResult, mispredictBB);
++        }
+ 
+-    //Move the predicted CC to correct place
+-    dvmCompilerReplaceChildBasicBlock (predictedCC, mispredictBB, kChildTypeTaken);
++        //Move the predicted CC to correct place
++        dvmCompilerReplaceChildBasicBlock (predictedCC, mispredictBB, kChildTypeTaken);
++    }
+ 
+     //Everything went well if we get here
+     return kInliningNoError;
+@@ -710,11 +710,6 @@ static InliningFailure insertMethodBodyIntoCFG (GrowableList &callerBasicBlocks,
+     if (isPredicted == true)
+     {
+         predictedCC = detachInvokeCC (invokeBB, kChainingCellInvokePredicted);
+-
+-        if (predictedCC == 0)
+-        {
+-            return kInliningNoPredictedCC;
+-        }
+     }
+ 
+     //Find the singleton CC possibly associated with invoke
+@@ -1148,7 +1143,7 @@ static InliningFailure tryInline (CompilationUnit *cUnit, const Method *calleeMe
+  * @param invoke The invoke to try to inline
+  * @return Returns whether inlining is successful.
+  */
+-bool dvmCompilerHandleInlining (CompilationUnit *cUnit, JitTranslationInfo *info, BasicBlock *bb, MIR *invoke)
++static bool handleInlining (CompilationUnit *cUnit, JitTranslationInfo *info, BasicBlock *bb, MIR *invoke)
+ {
+     //Get the opcode
+     Opcode opcode = invoke->dalvikInsn.opcode;
+@@ -1329,11 +1324,7 @@ bool dvmCompilerHandleInlining (CompilationUnit *cUnit, JitTranslationInfo *info
+     return (inlined == kInliningSuccess);
+ }
+ 
+-/**
+- * @brief Walks through the basic blocks looking for BB's with instructions in order to try to possibly inline an invoke
+- * @param cUnit The compilation unit
+- * @param info The description of the trace
+- */
++/* Walks through the basic blocks looking for BB's with instructions in order to try to possibly inline an invoke */
+ void dvmCompilerInlineMIR (CompilationUnit *cUnit, JitTranslationInfo *info)
+ {
+     const GrowableList *blockList = &cUnit->blockList;
+@@ -1361,8 +1352,30 @@ void dvmCompilerInlineMIR (CompilationUnit *cUnit, JitTranslationInfo *info)
+             if ((flags & kInstrInvoke) != 0)
+             {
+                 //Try to inline the instruction
+-                dvmCompilerHandleInlining (cUnit, info, bb, lastMIRInsn);
++                handleInlining (cUnit, info, bb, lastMIRInsn);
+             }
+         }
+     }
+ }
++
++bool dvmCompilerMethodInlining (CompilationUnit *cUnit, BasicBlock *bb)
++{
++    //Start off with assumption we won't inline anything
++    bool inlined = false;
++
++    //Walk through the MIRs of this BB
++    for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        int flags = dvmCompilerGetOpcodeFlags (mir->dalvikInsn.opcode);
++
++        if ((flags & kInstrInvoke) != 0)
++        {
++            //We have an invoke, let's check if we can inline it
++            bool res = handleInlining (cUnit, 0, bb, mir);
++
++            inlined = inlined || res;
++        }
++    }
++
++    return inlined;
++}
+diff --git a/vm/compiler/IntermediateRep.cpp b/vm/compiler/IntermediateRep.cpp
+index 31ed34a..470c296 100644
+--- a/vm/compiler/IntermediateRep.cpp
++++ b/vm/compiler/IntermediateRep.cpp
+@@ -41,8 +41,15 @@ static void replaceChild (BasicBlock *newChild, BasicBlock *parent, BasicBlock *
+     dvmCompilerUpdatePredecessors (parent, oldChild, newChild);
+ }
+ 
+-/* Allocates a new basic block */
+-BasicBlock *dvmCompilerNewBB(BBType blockType, int blockId)
++/**
++ * @brief Used to create a new basic block.
++ * @param blockType The block type to create.
++ * @param blockId The block id for this new block.
++ * @return Returns the newly created block.
++ * @warning If using this function to create a BB, you must make absolutely sure that there are no
++ * clashes for the blockId if putting the blocks in the same list.
++ */
++static BasicBlock *createNewBB (BBType blockType, int blockId)
+ {
+     //Call the backend, it might want to allocate the BasicBlock itself
+     BasicBlock *bb = dvmCompilerArchSpecificNewBB();
+@@ -69,7 +76,7 @@ BasicBlock *dvmCompilerNewBBinList (GrowableList &blockList, BBType blockType)
+     int blockId = dvmGrowableListSize (&blockList);
+ 
+     //Create the new block
+-    BasicBlock *newBlock = dvmCompilerNewBB (blockType, blockId);
++    BasicBlock *newBlock = createNewBB (blockType, blockId);
+ 
+     //Add it to the block list
+     dvmInsertGrowableList (&blockList, (intptr_t) newBlock);
+@@ -843,7 +850,7 @@ bool dvmCompilerInsertBasicBlockBetween (BasicBlock *newBlock, BasicBlock *paren
+  */
+ BasicBlock *dvmCompilerCopyBasicBlock (CompilationUnit *cUnit, const BasicBlock *old)
+ {
+-    BasicBlock *resultBB = dvmCompilerNewBB (old->blockType, cUnit->numBlocks++);
++    BasicBlock *resultBB = dvmCompilerNewBBinCunit (cUnit, old->blockType);
+ 
+     //We don't do a superficial copy here because it would lead to a lot of things
+     //To clean up. Let us do it by hand instead
+@@ -893,9 +900,6 @@ BasicBlock *dvmCompilerCopyBasicBlock (CompilationUnit *cUnit, const BasicBlock
+         dvmCopyBitVector (resultBB->requestWriteBack, old->requestWriteBack);
+     }
+ 
+-    //Insert it to the cUnit list
+-    dvmInsertGrowableList (&cUnit->blockList, (intptr_t) resultBB);
+-
+     return resultBB;
+ }
+ 
+@@ -1365,6 +1369,18 @@ OpcodeFlags dvmCompilerGetOpcodeFlags (int opcode)
+ 
+         switch (extOp)
+         {
++            case kMirOpPhi:
++            case kMirOpRegisterize:
++                //No branching semantics, always goes to next instruction
++                flags = kInstrCanContinue;
++                break;
++            case kMirOpPunt:
++                //Only branching semantics because it unconditionally punts to interpreter
++                flags = kInstrCanBranch;
++                break;
++            case kMirOpNullNRangeUpCheck:
++            case kMirOpNullNRangeDownCheck:
++            case kMirOpLowerBound:
+             case kMirOpNullCheck:
+             case kMirOpBoundCheck:
+                 //Instruction can continue or it may throw
+diff --git a/vm/compiler/Loop.cpp b/vm/compiler/Loop.cpp
+index 6d58720..1de6f22 100644
+--- a/vm/compiler/Loop.cpp
++++ b/vm/compiler/Loop.cpp
+@@ -1078,45 +1078,6 @@ static bool clearPredecessorVector(struct CompilationUnit *cUnit,
+ }
+ 
+ /**
+- * @brief Handle fixable opcodes: a fixable opcode means that the function resolved the issue and it can be included into a loop formation
+- * @param cUnit the CompilationUnit
+- * @param bb the BasicBlock
+- * @param mir the MIR instruction
+- * @return whether or not the function fixed the issue
+- */
+-static bool handleFixableOpcodes (CompilationUnit *cUnit, BasicBlock *bb, MIR *mir)
+-{
+-    switch (mir->dalvikInsn.opcode)
+-    {
+-        case OP_INVOKE_VIRTUAL:
+-        case OP_INVOKE_VIRTUAL_RANGE:
+-        case OP_INVOKE_INTERFACE:
+-        case OP_INVOKE_INTERFACE_RANGE:
+-        case OP_INVOKE_OBJECT_INIT_RANGE:
+-        case OP_INVOKE_VIRTUAL_QUICK:
+-        case OP_INVOKE_VIRTUAL_QUICK_RANGE:
+-            //No support for virtual calls for the moment
+-            return false;
+-        case OP_INVOKE_SUPER_RANGE:
+-        case OP_INVOKE_DIRECT_RANGE:
+-        case OP_INVOKE_STATIC_RANGE:
+-        case OP_INVOKE_SUPER_QUICK_RANGE:
+-        case OP_INVOKE_SUPER:
+-        case OP_INVOKE_DIRECT:
+-        case OP_INVOKE_STATIC:
+-        case OP_INVOKE_SUPER_QUICK:
+-            //Return whether the inlining succeeded
+-            return dvmCompilerHandleInlining (cUnit, 0, bb, mir);
+-        default:
+-            //By default, we cannot handle it
+-            return false;
+-    }
+-
+-    //Paranoid: the default case should handle this return anyway
+-    return false;
+-}
+-
+-/**
+  * @brief Check if a BasicBlock has a restricted instruction for a loop
+  *        Certain opcodes cannot be included in a loop formation (in the nonFixableOpcodes array)
+  *        Certain opcodes can be "fixed" if the function handleFixableOpcode returns true and thus won't be cause to reject the loop
+@@ -1138,31 +1099,18 @@ static bool checkBBInstructionsForCFGLoop (CompilationUnit *cUnit, BasicBlock *b
+             OP_NEW_INSTANCE,
+             OP_NEW_ARRAY,
+             OP_THROW,
+-            OP_EXECUTE_INLINE,
+-            OP_EXECUTE_INLINE_RANGE,
+             OP_RETURN_VOID_BARRIER,
+             OP_BREAKPOINT,
+-            OP_THROW_VERIFICATION_ERROR
+-    };
++            OP_THROW_VERIFICATION_ERROR,
+ 
+-    //Fixable opcodes: tested against the bb's MIR instructions
+-    //If present, we call the fixer function, if it fixes it, we move on
+-    static unsigned int fixableOpcodes[] = {
++            //We reject virtual/interface invokes because we have no mechanism yet for method prediction.
++            //Thus we prefer that we get the trace which has the runtime prediction.
+             OP_INVOKE_VIRTUAL,
+-            OP_INVOKE_SUPER,
+-            OP_INVOKE_DIRECT,
+-            OP_INVOKE_STATIC,
+-            OP_INVOKE_INTERFACE,
+             OP_INVOKE_VIRTUAL_RANGE,
+-            OP_INVOKE_SUPER_RANGE,
+-            OP_INVOKE_DIRECT_RANGE,
+-            OP_INVOKE_STATIC_RANGE,
+-            OP_INVOKE_INTERFACE_RANGE,
+-            OP_INVOKE_OBJECT_INIT_RANGE,
+-            OP_INVOKE_SUPER_QUICK,
+             OP_INVOKE_VIRTUAL_QUICK,
+-            OP_INVOKE_SUPER_QUICK_RANGE,
+-            OP_INVOKE_VIRTUAL_QUICK_RANGE
++            OP_INVOKE_VIRTUAL_QUICK_RANGE,
++            OP_INVOKE_INTERFACE,
++            OP_INVOKE_INTERFACE_RANGE,
+     };
+ 
+     //Go through each instruction
+@@ -1178,25 +1126,6 @@ static bool checkBBInstructionsForCFGLoop (CompilationUnit *cUnit, BasicBlock *b
+         }
+     }
+ 
+-    //Now handle the ones we can perhaps fix
+-    nbr = sizeof (fixableOpcodes) / sizeof (fixableOpcodes[0]);
+-    for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
+-    {
+-        //Go through each non supported instructions
+-        for (unsigned int i = 0; i < nbr; i++)
+-        {
+-            //If we don't support it, just quit
+-            if (mir->dalvikInsn.opcode == fixableOpcodes[i])
+-            {
+-                //If we can't fix it, we bail
+-                if (handleFixableOpcodes (cUnit, bb, mir) == false)
+-                {
+-                    return false;
+-                }
+-            }
+-        }
+-    }
+-
+     //If we got here we are good to go
+     return true;
+ }
+diff --git a/vm/compiler/LoopInformation.cpp b/vm/compiler/LoopInformation.cpp
+index ae3b1dd..90587d1 100644
+--- a/vm/compiler/LoopInformation.cpp
++++ b/vm/compiler/LoopInformation.cpp
+@@ -280,11 +280,21 @@ static void getOutsFromLoop (CompilationUnit *cUnit, BitVector *basicBlocks, Bit
+     {
+         if ((cur->taken != 0) && (dvmIsBitSet (basicBlocks, cur->taken->id) == false))
+         {
+-            dvmSetBit (exitBlocks, cur->taken->id);
++            //We skip invoke chaining cells because those don't have control flow semantics
++            if (cur->taken->blockType != kChainingCellInvokeSingleton
++                    && cur->taken->blockType != kChainingCellInvokePredicted)
++            {
++                dvmSetBit (exitBlocks, cur->taken->id);
++            }
+         }
+         if ((cur->fallThrough != 0) && (dvmIsBitSet (basicBlocks, cur->fallThrough->id) == false))
+         {
+-            dvmSetBit (exitBlocks, cur->fallThrough->id);
++            //We skip invoke chaining cells because those don't have control flow semantics
++            if (cur->fallThrough->blockType != kChainingCellInvokeSingleton
++                    && cur->fallThrough->blockType != kChainingCellInvokePredicted)
++            {
++                dvmSetBit (exitBlocks, cur->fallThrough->id);
++            }
+         }
+ 
+         if (cur->successorBlockList.blockListType != kNotUsed) {
+diff --git a/vm/compiler/LoopOpt.cpp b/vm/compiler/LoopOpt.cpp
+index 20ca123..45fe177 100644
+--- a/vm/compiler/LoopOpt.cpp
++++ b/vm/compiler/LoopOpt.cpp
+@@ -62,6 +62,13 @@ START_PASSES
+     //This loop formation is used when the old loop filtering is active
+     NEW_PASS ("Old_Loop_Formation", kAllNodesAndNew, 0, dvmCompilerTraceIsLoopOldSystem,
+                 dvmCompilerFormOldLoop, 0, 0, 0, kOptimizationBasicBlockChange | kLoopStructureChange),
++    //Now check that bytecodes reference fully resolved classes, methods, and fields.
++    //We only do this check for loops because we can bring in parts that are not so hot.
++    NEW_PASS ("Check_References", kAllNodes, 0, dvmCompilerTraceIsLoopNewSystem,
++            0, 0, dvmCompilerCheckReferences, 0, 0),
++    //At this point, we finish with the loops, so to increase optimization scope we start inlining
++    NEW_PASS ("Method_Inlining", kAllNodesAndNew, 0, 0,
++                0, 0, dvmCompilerMethodInlining, 0, kOptimizationBasicBlockChange | kLoopStructureChange),
+     NEW_PASS ("Check_Removal", kPredecessorsFirstTraversal, 0, 0,
+                 dvmCompilerStartCheckRemoval, dvmCompilerEndCheckRemoval, dvmCompilerCheckRemoval, 0, kOptimizationDefUsesChange),
+     //The 2addr pass should come before any pass that need register rewriting.
+@@ -102,8 +109,11 @@ START_PASSES
+     NEW_PASS ("Write_Back_Registers", kAllNodes, 0, 0, 0, 0, dvmCompilerWriteBackAll, 0, 0),
+     NEW_PASS ("Registerization_ME", kAllNodes, 0, dvmCompilerTraceIsLoopNewSystem,
+                 0, dvmCompilerRegisterize, 0, 0, 0),
++    //From here we start preparing the CFG for the backend
+     NEW_PASS ("Fix_Chaining_Cells", kAllNodesAndNew, 0, 0,
+                 0, 0, dvmCompilerFixChainingCellPredecessors, 0, kOptimizationBasicBlockChange | kLoopStructureChange),
++    NEW_PASS ("Add_Invoke_ChainingCells", kAllNodesAndNew, 0, 0,
++                0, 0, dvmCompilerAddInvokeSupportBlocks, 0, kOptimizationBasicBlockChange),
+     NEW_PASS ("Insert_LoopHelper_Blocks", kAllNodesAndNew, 0, 0,
+                     0, dvmCompilerInsertLoopHelperBlocks, 0, 0, kOptimizationBasicBlockChange | kLoopStructureChange),
+     NEW_PASS ("Reorder_Blocks", kBreadthFirstTraversal, 0, 0,
+@@ -501,6 +511,28 @@ bool checkLoopsGate (const CompilationUnit *cUnit, Pass *curPass)
+     return dvmCompilerCheckLoops (cUnit);
+ }
+ 
++bool dvmCompilerCheckReferences (CompilationUnit *cUnit, BasicBlock *bb)
++{
++    //Check all of the MIRs in this basic block
++    for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        bool resolved = dvmCompilerCheckResolvedReferences (cUnit->method, &mir->dalvikInsn,
++                false /*tryToResolve*/);
++
++        if (resolved == false)
++        {
++            //We found an unresolved reference
++            cUnit->quitLoopMode = true;
++
++            //We have not changed the BB
++            return false;
++        }
++    }
++
++    //All references checked are resolved but we have not updated the BB
++    return false;
++}
++
+ //Get a given pass
+ Pass *dvmCompilerGetPass (const char *name)
+ {
+@@ -678,6 +710,27 @@ bool dvmCompilerReplaceGate (const char *name, bool (*gate) (const CompilationUn
+     return true;
+ }
+ 
++bool dvmCompilerReplaceEnd (const char *name, void (*endWork) (CompilationUnit *, Pass*))
++{
++    //Find the pass
++    Pass *curPass = dvmCompilerGetPass (name);
++
++    //Paranoid: didn't find the name
++    if (curPass == 0)
++    {
++        ALOGI ("Pass Modification could not find the reference pass name, here is what you provided %s", name);
++        ALOGI ("\t- Here are the loop passes for reference:");
++        dvmCompilerPrintPassNames ();
++        return false;
++    }
++
++    //Set the end work function
++    curPass->setEndWork (endWork);
++
++    //Report success
++    return true;
++}
++
+ //Handle a user plugin
+ void dvmCompilerHandleUserPlugin (const char *fileName)
+ {
+diff --git a/vm/compiler/LoopOpt.h b/vm/compiler/LoopOpt.h
+index 0740ae6..d7b3cbd 100644
+--- a/vm/compiler/LoopOpt.h
++++ b/vm/compiler/LoopOpt.h
+@@ -96,6 +96,15 @@ void dvmCompilerPrintIgnorePasses (void);
+ bool dvmCompilerCheckLoops (const CompilationUnit *cUnit);
+ 
+ /**
++ * @brief Used to check whether instructions in basic block have resolved references.
++ * @details If unresolved references have been found then cUnit->quitLoopMode is set to true.
++ * @param cUnit The compilation unit
++ * @param bb The basic block whose instructions to check
++ * @return Always returns false because the CFG is not updated
++ */
++bool dvmCompilerCheckReferences (CompilationUnit *cUnit, BasicBlock *bb);
++
++/**
+  * @brief Verify that hoisted checks optimization is applicable
+  * @param cUnit the CompilationUnit
+  * @param curPass the Pass
+@@ -118,7 +127,7 @@ bool dvmCompilerRemovePass (const char *name);
+ Pass *dvmCompilerGetPass (const char *name);
+ 
+ /**
+- * @brief Get an optimization pass
++ * @brief Used to replace the gate of an optimization pass
+  * @param name the name of the Pass
+  * @param gate the new gate
+  * @return whether the gate replacement was successful
+@@ -126,6 +135,14 @@ Pass *dvmCompilerGetPass (const char *name);
+ bool dvmCompilerReplaceGate (const char *name, bool (*gate) (const CompilationUnit *, Pass*));
+ 
+ /**
++ * @brief Used to replace the end work function of a pass
++ * @param name The name of the Pass to update
++ * @param endWork The new end work function to use
++ * @return Returns true if replacement was successful
++ */
++bool dvmCompilerReplaceEnd (const char *name, void (*endWork) (CompilationUnit *, Pass*));
++
++/**
+  * @brief Insert the user pass
+  * @param newPass the Pass information we want to add/modify
+  * @param name the name of the current pass we want to be adding/modifying
+diff --git a/vm/compiler/Pass.h b/vm/compiler/Pass.h
+index d1f5924..1fcfa18 100644
+--- a/vm/compiler/Pass.h
++++ b/vm/compiler/Pass.h
+@@ -217,6 +217,12 @@ class Pass
+         void setGate (bool (*newGate) (const CompilationUnit *cUnit, Pass *curPass)) {gatePtr = newGate;}
+ 
+         /**
++         * @brief Set end work function
++         * @param newEndWorkFunc the new function to be run at end of pass
++         */
++        void setEndWork (void (*newEndWorkFunc) (CompilationUnit *cUnit, Pass *curPass)) {endPtr = newEndWorkFunc;}
++
++        /**
+          * @brief Get the gate
+          * @return the gate pointer
+          */
+diff --git a/vm/compiler/SSATransformation.cpp b/vm/compiler/SSATransformation.cpp
+index ed61c30..6c65030 100644
+--- a/vm/compiler/SSATransformation.cpp
++++ b/vm/compiler/SSATransformation.cpp
+@@ -1002,6 +1002,10 @@ void clearPHIInformation (CompilationUnit *cUnit)
+  */
+ bool dvmCompilerCalculateBasicBlockInformation (CompilationUnit *cUnit, bool filter, bool buildLoopInfo)
+ {
++    //New blocks may have been inserted so the first thing we do is ensure that the cUnit's number of blocks
++    //matches the actual count of basic blocks.
++    cUnit->numBlocks = dvmGrowableListSize (&(cUnit->blockList));
++
+     //Clear SSA information
+     clearPHIInformation (cUnit);
+ 
+diff --git a/vm/compiler/Utility.cpp b/vm/compiler/Utility.cpp
+index 0402c92..c5a34d3 100644
+--- a/vm/compiler/Utility.cpp
++++ b/vm/compiler/Utility.cpp
+@@ -677,3 +677,209 @@ void dvmCompilerFindEntries (CompilationUnit *cUnit, GrowableList *list)
+         }
+     }
+ }
++
++/**
++ * Checks if invoke calls fully resolved method
++ * @see Utility.h
++ */
++const Method *dvmCompilerCheckResolvedMethod (const Method *methodContainingInvoke,
++        const DecodedInstruction *invokeInstr, bool tryToResolve)
++{
++    const Method *callee = 0;
++    u4 methodIdx = invokeInstr->vB;
++
++    switch (invokeInstr->opcode)
++    {
++        case OP_INVOKE_SUPER:
++        case OP_INVOKE_SUPER_RANGE:
++        {
++            //Get the base method
++            Method *baseMethod = dvmDexGetResolvedMethod (methodContainingInvoke->clazz->pDvmDex, methodIdx);
++
++            //Try to resolve the base method if needed
++            if (tryToResolve == true && baseMethod == 0)
++            {
++                baseMethod = dvmResolveMethod (methodContainingInvoke->clazz, methodIdx, METHOD_VIRTUAL);
++            }
++
++            //If we resolve the base method and we can find the index in the super vtable, then we try it
++            if (baseMethod != 0 && baseMethod->methodIndex < methodContainingInvoke->clazz->super->vtableCount)
++            {
++                //Get the method to call from the super vtable
++                callee = methodContainingInvoke->clazz->super->vtable[baseMethod->methodIndex];
++            }
++
++            break;
++        }
++        case OP_INVOKE_SUPER_QUICK:
++        case OP_INVOKE_SUPER_QUICK_RANGE:
++            callee = methodContainingInvoke->clazz->super->vtable[methodIdx];
++            break;
++        case OP_INVOKE_STATIC:
++        case OP_INVOKE_STATIC_RANGE:
++            callee = dvmDexGetResolvedMethod (methodContainingInvoke->clazz->pDvmDex, methodIdx);
++
++            if (tryToResolve == true && callee == 0)
++            {
++                callee = dvmResolveMethod (methodContainingInvoke->clazz, methodIdx, METHOD_STATIC);
++            }
++
++            break;
++        case OP_INVOKE_DIRECT:
++        case OP_INVOKE_DIRECT_RANGE:
++            callee = dvmDexGetResolvedMethod (methodContainingInvoke->clazz->pDvmDex, methodIdx);
++
++            if (tryToResolve == true && callee == 0)
++            {
++                callee = dvmResolveMethod (methodContainingInvoke->clazz, methodIdx, METHOD_DIRECT);
++            }
++
++            break;
++        default:
++            //For virtual invokes we cannot figure out method callee without access to the this pointer
++            break;
++    }
++
++    return callee;
++}
++
++/**
++ * Checks if bytecodes in method reference fully resolved classes, methods, and fields
++ * @see Utility.h
++ */
++bool dvmCompilerCheckResolvedReferences (const Method *method, const DecodedInstruction *insn, bool tryToResolve)
++{
++    assert (insn != 0);
++
++    switch (insn->opcode)
++    {
++        case OP_NEW_INSTANCE:
++        case OP_CHECK_CAST:
++        case OP_FILLED_NEW_ARRAY:
++        case OP_FILLED_NEW_ARRAY_RANGE:
++        case OP_CONST_CLASS:
++        case OP_NEW_ARRAY:
++        case OP_INSTANCE_OF:
++        {
++            bool fromUnverifiedSource = false;
++            u4 classIdx = insn->vB;
++
++            if (insn->opcode == OP_CONST_CLASS || insn->opcode == OP_INSTANCE_OF)
++            {
++                fromUnverifiedSource = true;
++            }
++
++            if (insn->opcode == OP_NEW_ARRAY || insn->opcode == OP_INSTANCE_OF)
++            {
++                classIdx = insn->vC;
++            }
++
++            ClassObject *classPtr = dvmDexGetResolvedClass (method->clazz->pDvmDex, classIdx);
++
++            if (tryToResolve == true && classPtr == 0)
++            {
++                classPtr = dvmResolveClass (method->clazz, classIdx, fromUnverifiedSource);
++            }
++
++            if (classPtr == 0)
++            {
++                return false;
++            }
++
++            break;
++        }
++        case OP_SGET:
++        case OP_SGET_WIDE:
++        case OP_SGET_OBJECT:
++        case OP_SGET_BOOLEAN:
++        case OP_SGET_BYTE:
++        case OP_SGET_CHAR:
++        case OP_SGET_SHORT:
++        case OP_SPUT:
++        case OP_SPUT_WIDE:
++        case OP_SPUT_OBJECT:
++        case OP_SPUT_BOOLEAN:
++        case OP_SPUT_BYTE:
++        case OP_SPUT_CHAR:
++        case OP_SPUT_SHORT:
++        {
++            u4 ref = insn->vB;
++            StaticField *sField =
++                    reinterpret_cast<StaticField*> (dvmDexGetResolvedField (method->clazz->pDvmDex, ref));
++
++            if (tryToResolve == true && sField == 0)
++            {
++                sField = dvmResolveStaticField (method->clazz, ref);
++            }
++
++            if (sField == 0)
++            {
++                return false;
++            }
++
++            break;
++        }
++        case OP_CONST_STRING_JUMBO:
++        case OP_CONST_STRING:
++        {
++            StringObject *strPtr = dvmDexGetResolvedString (method->clazz->pDvmDex, insn->vB);
++
++            if (tryToResolve == true && strPtr == 0)
++            {
++                strPtr = dvmResolveString (method->clazz, insn->vB);
++            }
++
++            if (strPtr == 0)
++            {
++                return false;
++            }
++
++            break;
++        }
++        case OP_IGET:
++        case OP_IGET_WIDE:
++        case OP_IGET_OBJECT:
++        case OP_IGET_BOOLEAN:
++        case OP_IGET_BYTE:
++        case OP_IGET_CHAR:
++        case OP_IGET_SHORT:
++        case OP_IPUT:
++        case OP_IPUT_WIDE:
++        case OP_IPUT_OBJECT:
++        case OP_IPUT_BOOLEAN:
++        case OP_IPUT_BYTE:
++        case OP_IPUT_CHAR:
++        case OP_IPUT_SHORT:
++        {
++            u4 ref = insn->vC;
++            InstField *iField = reinterpret_cast <InstField*> (dvmDexGetResolvedField(method->clazz->pDvmDex, ref));
++
++            if (tryToResolve == true && iField == 0)
++            {
++                iField = dvmResolveInstField(method->clazz, ref);
++            }
++
++            if (iField == 0)
++            {
++                return false;
++            }
++
++            break;
++        }
++        default:
++            break;
++    }
++
++    //Check if we have an invoke
++    if ((dvmCompilerGetOpcodeFlags (insn->opcode) & kInstrInvoke) != 0)
++    {
++        //Check if we can resolve callee
++        const Method *callee = dvmCompilerCheckResolvedMethod (method, insn, tryToResolve);
++
++        //If callee is resolved, it is non-null
++        return (callee != 0);
++    }
++
++    //If we get here, everything went okay
++    return true;
++}
+diff --git a/vm/compiler/Utility.h b/vm/compiler/Utility.h
+index 23b705b..7137793 100644
+--- a/vm/compiler/Utility.h
++++ b/vm/compiler/Utility.h
+@@ -36,4 +36,27 @@ void dvmCompilerFindEntries (CompilationUnit *cUnit, GrowableList *list);
+  */
+ BasicBlock *dvmCompilerGetNextBasicBlockViaBitVector (BitVectorIterator &bvIterator, const GrowableList &blockList);
+ 
++/**
++ * @brief Checks if invoke calls fully resolved method.
++ * @details Since we are including instructions from possibly a cold method into the current trace,
++ * we need to make sure that all the associated information with the callee is properly initialized.
++ * @param methodContainingInvoke The method that contains the invoke bytecode
++ * @param invokeInstr The decoded instruction of invoke that we are examining
++ * @param tryToResolve In case it hasn't been resolved, try to resolve it now. (Default: false)
++ * @return Returns the resolved method or null if cannot resolve or has not been resolved
++ */
++const Method *dvmCompilerCheckResolvedMethod (const Method *methodContainingInvoke,
++        const DecodedInstruction *invokeInstr, bool tryToResolve = false);
++
++/**
++ * @brief Checks if bytecodes in method reference fully resolved classes, methods, and fields.
++ * @details Since we are including instructions from possibly a cold method into the current trace,
++ * we need to make sure that all the associated information with the callee is properly initialized.
++ * @param method The method that contains the bytecode
++ * @param insn The decoded instruction that we are examining
++ * @param tryToResolve In case it hasn't been resolved, try to resolve it now. (Default: false)
++ * @return Returns whether class/method/field is fully resolved.
++ */
++bool dvmCompilerCheckResolvedReferences (const Method *method, const DecodedInstruction *insn, bool tryToResolve = false);
++
+ #endif
+diff --git a/vm/compiler/codegen/x86/lightcg/CodegenErrors.cpp b/vm/compiler/codegen/x86/lightcg/CodegenErrors.cpp
+index 2843d7d..2be1d23 100644
+--- a/vm/compiler/codegen/x86/lightcg/CodegenErrors.cpp
++++ b/vm/compiler/codegen/x86/lightcg/CodegenErrors.cpp
+@@ -83,6 +83,7 @@ START_ERRORS
+     NEW_ERROR (kJitErrorPcgUnknownChainingBlockType,    "Unknown chaining block type seen in PCG GL.",                  false, false),
+     NEW_ERROR (kJitErrorPcgUnexpectedDataType,          "Unexpected data type in PCG GL.",                              false, false),
+     NEW_ERROR (kJitErrorPcgUnsupportedCallDataType,     "Unsupported call data type seen in PCG GL.",                   false, false),
++    NEW_ERROR (kJitErrorPcgPostInvokeEntryNotFound,     "Post-invoke entry block was not found.",                       false, false),
+     NEW_ERROR (kJitErrorUnsupportedVectorization,       "Requested vectorization is not supported.",                    false, false),
+     NEW_ERROR (kJitErrorUnsupportedInstruction,         "Architecture does not support desired x86 instruction.",       false, false),
+     NEW_ERROR (kJitErrorCodegen,                        "Undefined issues in trace formation.",                         false, false),
+diff --git a/vm/compiler/codegen/x86/lightcg/CodegenErrors.h b/vm/compiler/codegen/x86/lightcg/CodegenErrors.h
+index 0173402..e5dfc79 100644
+--- a/vm/compiler/codegen/x86/lightcg/CodegenErrors.h
++++ b/vm/compiler/codegen/x86/lightcg/CodegenErrors.h
+@@ -95,6 +95,8 @@ enum JitCompilationErrors {
+     kJitErrorPcgUnexpectedDataType,
+     /** @brief Unsupported call data type in PCG GL */
+     kJitErrorPcgUnsupportedCallDataType,
++    /** @brief The post-invoke entry block was not found */
++    kJitErrorPcgPostInvokeEntryNotFound,
+     /** @brief Unsupported case for vectorization */
+     kJitErrorUnsupportedVectorization,
+     /** @brief Unsupported x86 instruction on architecture */
+diff --git a/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp b/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
+index 637a767..2c9891f 100644
+--- a/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
++++ b/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
+@@ -839,50 +839,8 @@ static bool handleFromInterpreter (CompilationUnitPCG *cUnit, BasicBlockPCG *bb)
+         return true;
+     }
+ 
+-    //Check dataflow info
+-    BasicBlockDataFlow *info = preheader->dataFlowInfo;
+-
+-    assert (info != 0);
+-
+-    //Get entrance
+-    int *dalvikToSSAMapEntrance = info->dalvikToSSAMapEntrance;
+-
+-    //Get its live ins
+-    BitVector *ins = info->liveInV;
+-
+-    //Paranoid
+-    assert (ins != 0);
+-
+-    //Live-ins are a bit over conservative and can contain VRs that don't even exist in the cUnit
+-    BitVector *reallyIns = dvmCompilerAllocBitVector (1, true);
+-    //Intersect now
+-    dvmIntersectBitVectors (reallyIns, ins, cUnit->usedVRs);
+-
+-    //Now iterate on the ins
+-    BitVectorIterator bvIterator;
+-    dvmBitVectorIteratorInit (reallyIns, &bvIterator);
+-
+-    //Now handle each SSA live in
+-    while (true)
+-    {
+-        //Get VR
+-        int vr = dvmBitVectorIteratorNext (&bvIterator);
+-
+-        //If finished, we are done
+-        if (vr == -1)
+-        {
+-            break;
+-        }
+-
+-        //Get combination SSA_Subscript
+-        int ssaCombo = dalvikToSSAMapEntrance[vr];
+-
+-        //Now we only want the SSA number
+-        int ssaNum = DECODE_REG (ssaCombo);
+-
+-        //Handle initial load
+-        dvmCompilerPcgHandleInitialLoad (cUnit, bb, ssaNum, false);
+-    }
++    //Since we have an entry with live-ins, handle those initial loads
++    dvmCompilerPcgLoadLiveInVRs (cUnit, preheader);
+ 
+     //Now jump to preheader
+     dvmCompilerPcgTranslateDirectJumpToBlock (preheader);
+diff --git a/vm/compiler/codegen/x86/pcg/LowerCall.cpp b/vm/compiler/codegen/x86/pcg/LowerCall.cpp
+index 15aaed7..d46dbe1 100644
+--- a/vm/compiler/codegen/x86/pcg/LowerCall.cpp
++++ b/vm/compiler/codegen/x86/pcg/LowerCall.cpp
+@@ -26,6 +26,7 @@
+ #include "PersistentInfo.h"
+ #include "Singleton.h"
+ #include "UtilityPCG.h"
++#include "Utility.h"
+ 
+ CGSymbol dvmCompilerPcgGetInvokeTarget (CompilationUnitPCG *cUnit, const BasicBlockPCG *bb, bool *needsCfgArc)
+ {
+@@ -97,11 +98,10 @@ static void generatePredictedChain (CompilationUnitPCG *cUnit, BasicBlockPCG *bb
+     CGLabel invokeChainLabel = CGCreateLabel ();
+ 
+     // we need to coalesce the fallthrough symbol instruction, because it gets patched in the hot cc
+-    CGLabel fallthroughTargetLabel = CGLabelInvalid;
+     CGInst fallthroughTargetSymbInst = CGInstInvalid;
+ 
+-    // get the fallthrough target instruction and label
+-    fallthroughTargetSymbInst = dvmCompilerPcgGetFallthroughTargetSymbolInst (cUnit, bb, fallthroughTargetLabel);
++    // get the fallthrough target instruction
++    fallthroughTargetSymbInst = dvmCompilerPcgGetFallthroughTargetSymbolInst (cUnit, bb);
+ 
+     // get thisPtr->clazz
+     CGInst clazz = dvmCompilerPcgCreateSimpleLoad (inputReg, OFFSETOF_MEMBER (Object,clazz));
+@@ -286,7 +286,6 @@ static void generatePredictedChain (CompilationUnitPCG *cUnit, BasicBlockPCG *bb
+     takenTarget = CGCreateNewInst ("movltc", "n", dvmCompilerPcgGetInvokeTarget (cUnit, target));
+ 
+     dvmCompilerPcgCommonInvokeMethodJmp (cUnit, bb, ArgsDone_Normal, predictedMethod, fallthroughTargetSymbInst);
+-    dvmCompilerPcgGenerateFallthrough (cUnit, bb, fallthroughTargetLabel);
+ }
+ 
+ void dvmCompilerPcgTranslateInvokeVirtual (CompilationUnitPCG *cUnit, MIR *mir)
+@@ -416,14 +415,10 @@ void dvmCompilerPcgTranslateInvokeStaticSuper (CompilationUnitPCG *cUnit, MIR *m
+ 
+     dvmCompilerPcgStoreInvokeArgs (cUnit, mir);
+ 
+-    CGLabel fallthroughTargetLabel = CGLabelInvalid;
+-
+-    // get the fallthrough target instruction and label
+-    CGInst fallthroughTargetSymbInst = dvmCompilerPcgGetFallthroughTargetSymbolInst (cUnit, bb, fallthroughTargetLabel);
++    // get the fallthrough target instruction
++    CGInst fallthroughTargetSymbInst = dvmCompilerPcgGetFallthroughTargetSymbolInst (cUnit, bb);
+ 
+     dvmCompilerPcgCommonInvokeMethodJmp (cUnit, bb, methodType, methodIl, fallthroughTargetSymbInst);
+-
+-    dvmCompilerPcgGenerateFallthrough (cUnit, bb, fallthroughTargetLabel);
+ }
+ 
+ void dvmCompilerPcgTranslateInvokeInterface (CompilationUnitPCG *cUnit, MIR *mir)
+@@ -484,14 +479,11 @@ void dvmCompilerPcgTranslateInvokeDirect (CompilationUnitPCG *cUnit, MIR *mir)
+     ArgsDoneType methodType = dvmCompilerPcgTranslateConvertCalleeToType (calleeMethod);
+ 
+     dvmCompilerPcgStoreInvokeArgs (cUnit, mir);
+-    CGLabel fallthroughTargetLabel = CGLabelInvalid;
+ 
+-    // get the fallthrough target instruction and label
+-    CGInst fallthroughTargetSymbInst = dvmCompilerPcgGetFallthroughTargetSymbolInst (cUnit, bb, fallthroughTargetLabel);
++    // get the fallthrough target instruction
++    CGInst fallthroughTargetSymbInst = dvmCompilerPcgGetFallthroughTargetSymbolInst (cUnit, bb);
+ 
+     dvmCompilerPcgCommonInvokeMethodJmp (cUnit, bb, methodType, methodIl, fallthroughTargetSymbInst);
+-
+-    dvmCompilerPcgGenerateFallthrough (cUnit, bb, fallthroughTargetLabel);
+ }
+ 
+ void dvmCompilerPcgTranslateReturn (CompilationUnitPCG *cUnit, MIR *mir, bool isVoid)
+@@ -924,33 +916,63 @@ const char *dvmCompilerPcgHandleInvokeArgsHeader (int value)
+     return sectionLabel;
+ }
+ 
+-void dvmCompilerPcgGenerateFallthrough (CompilationUnitPCG *cUnit, BasicBlockPCG *bb, CGLabel fallthroughTargetLabel)
++/**
++ * @brief Used to look for a fromInterpreter node in predecessors of blockPostInvoke
++ * @param cUnit The compilation unit
++ * @param blockPostInvoke The basic block that follows the invoke block
++ * @return Returns the from interpreter node if one is found. Otherwise returns 0.
++ */
++static BasicBlockPCG *findFromInterpNode (CompilationUnitPCG *cUnit, BasicBlock *blockPostInvoke)
+ {
+-    if (fallthroughTargetLabel != CGLabelInvalid)
++    BasicBlockPCG *fromInterp = 0;
++    BitVectorIterator predIter;
++    dvmBitVectorIteratorInit (blockPostInvoke->predecessors, &predIter);
++
++    //Now go through the predecessors
++    for (BasicBlock *predBB = dvmCompilerGetNextBasicBlockViaBitVector (predIter, cUnit->blockList);
++            predBB != 0;
++            predBB = dvmCompilerGetNextBasicBlockViaBitVector (predIter, cUnit->blockList))
+     {
+-        CGBindLabel (fallthroughTargetLabel);
+-        dvmCompilerPcgCreateEntryStub (cUnit);
+-        dvmCompilerPcgTranslateDirectJumpToBlock ((BasicBlockPCG *) bb->fallThrough);
++        if (predBB->blockType == kFromInterpreter)
++        {
++            //We found it
++            fromInterp = reinterpret_cast<BasicBlockPCG *> (predBB);
++            break;
++        }
+     }
++
++    return fromInterp;
+ }
+ 
+-CGInst dvmCompilerPcgGetFallthroughTargetSymbolInst (CompilationUnitPCG *cUnit, BasicBlockPCG *bb, CGLabel &newFallThroughLabel)
++CGInst dvmCompilerPcgGetFallthroughTargetSymbolInst (CompilationUnitPCG *cUnit, BasicBlockPCG *bb)
+ {
+-    bool fallthroughNeedsCfgEdge;
++    bool fallthroughNeedsCfgEdge = false;
+     CGSymbol fallthroughTargetSym = CGSymbolInvalid;
++
++    //Now determine the fallthrough symbol and whether edge is needed
+     BasicBlockPCG *fallthrough = (BasicBlockPCG *) bb->fallThrough;
+     fallthroughTargetSym = dvmCompilerPcgGetInvokeTarget (cUnit, fallthrough, &fallthroughNeedsCfgEdge);
+ 
+-    // Change the taken/fallthrough blocks to point to our new
+-    // intermediary block (see dvmCompilerPcgGenerateFallthrough where we bind it).
++    // If the fallthrough edge is needed, then we need get there via path that will
++    // re-setup any state needed as if block post-invoke is a possible entry.
+     if (fallthroughNeedsCfgEdge == true)
+     {
+-        newFallThroughLabel = CGCreateLabel();
+-        fallthroughTargetSym = cUnit->getBlockSymbol(newFallThroughLabel);
+-    }
+-    else
+-    {
+-        newFallThroughLabel = CGLabelInvalid;
++        //So what we do is that we look for the fromInterpreter node that is guaranteed to exist.
++        BasicBlockPCG *fromInterp = findFromInterpNode (cUnit, fallthrough);
++
++        //In the assert world, we fail because we really expect to find the entry
++        assert (fromInterp != 0);
++
++        //But in case we don't, then we set error and bail out early
++        if (fromInterp == 0)
++        {
++            SET_JIT_ERROR (kJitErrorPcgPostInvokeEntryNotFound);
++            return CGInstInvalid;
++        }
++
++        //Now obtain the target symbol of the fromInterpreter block so we can jump to it when
++        //returning from our invoke
++        fallthroughTargetSym = cUnit->getBlockSymbol (fromInterp->cgLabel);
+     }
+ 
+     // return the CGInst which loads the fallthrough target
+@@ -963,26 +985,20 @@ void dvmCompilerPcgCommonInvokeMethodJmp (CompilationUnitPCG *cUnit, BasicBlockP
+     //  arguments needed in ArgsDone:
+     //      start of HotChainingCell for next bytecode: -4 (%esp)
+     //      start of InvokeSingletonChainingCell for callee: -8 (%esp)
+-    CGSymbol takenTargetSym = 0;
+-    CGLabel newTakenLabel = 0;
+-    bool takenNeedsCfgEdge;
++    CGSymbol takenTargetSym = CGSymbolInvalid;
++    bool takenNeedsCfgEdge = false;
+ 
+-    if (bb->taken != 0)
++    BasicBlockPCG *taken = (BasicBlockPCG *) bb->taken;
++
++    if (taken != 0)
+     {
+-        BasicBlockPCG *taken = (BasicBlockPCG *) bb->taken;
+         takenTargetSym = dvmCompilerPcgGetInvokeTarget (cUnit, taken, &takenNeedsCfgEdge);
+     }
+-    else
+-    {
+-        takenNeedsCfgEdge = false;
+-    }
+ 
+-    if (takenNeedsCfgEdge == true)
+-    {
+-        newTakenLabel = CGCreateLabel();
+-        takenTargetSym = cUnit->getBlockSymbol(newTakenLabel);
+-    }
++    // The taken edge must always be a supporting chaining cell for invoke or it must not exist
++    assert (takenNeedsCfgEdge == false);
+ 
++    // Now generate the necessary writebacks because we are leaving trace
+     dvmCompilerPcgGenerateWritebacks (cUnit, cUnit->getCurrMod ());
+ 
+     // sets up parameters in eax, ebx, ecx, and edx
+@@ -1029,19 +1045,6 @@ void dvmCompilerPcgCommonInvokeMethodJmp (CompilationUnitPCG *cUnit, BasicBlockP
+ 
+     CGSymbol target = singletonPtr<PersistentInfo> ()->getCallBack (targetName);
+     dvmCompilerPcgCreateJsr (target, parms);
+-
+-    // If the taken/fallthrough path have real code following them,
+-    // we need to insert an intermediary block to add new entry code.
+-    // This is because we were required to clean up the stack before
+-    // the invoke, and we may need a new stack for the code
+-    // following the invoke.
+-
+-    if (takenNeedsCfgEdge == true)
+-    {
+-        CGBindLabel (newTakenLabel);
+-        dvmCompilerPcgCreateEntryStub (cUnit);
+-        dvmCompilerPcgTranslateDirectJumpToBlock ((BasicBlockPCG *) bb->taken);
+-    }
+ }
+ 
+ void dvmCompilerPcgStoreInvokeArgs (CompilationUnitPCG *cUnit, MIR *mir)
+diff --git a/vm/compiler/codegen/x86/pcg/LowerCall.h b/vm/compiler/codegen/x86/pcg/LowerCall.h
+index 3e78bd6..02c6910 100644
+--- a/vm/compiler/codegen/x86/pcg/LowerCall.h
++++ b/vm/compiler/codegen/x86/pcg/LowerCall.h
+@@ -90,22 +90,12 @@ void dvmCompilerPcgTranslateMoveResult (CompilationUnitPCG *cUnit, MIR *mir);
+ const char *dvmCompilerPcgHandleInvokeArgsHeader (int value);
+ 
+ /**
+- * @brief Generate a fallthrough to the label passed as a parameter
+- * @param cUnit the CompilationUnitPCG
+- * @param bb the BasicBlockPCG
+- * @param fallthroughTargetLabel the label to which to generate a fallthrough trampoline
+- * @details This function binds the fallthroughTargetLabel, and generates a hard jump to the bb->fallThrough
+- */
+-void dvmCompilerPcgGenerateFallthrough (CompilationUnitPCG *cUnit, BasicBlockPCG *bb, CGLabel fallthroughTargetLabel);
+-
+-/**
+  * @brief Get the fallthrough symbol
+  * @param cUnit the CompilationUnitPCG
+  * @param bb the BasicBlockPCG
+- * @param newFallThroughLabel the label for the newly created fallthrough edge, as decided by dvmCompilerPcgGetInvokeTarget
+  * @return the PCG instruction which is the load of the symbol
+  */
+-CGInst dvmCompilerPcgGetFallthroughTargetSymbolInst (CompilationUnitPCG *cUnit, BasicBlockPCG *bb, CGLabel &newFallThroughLabel);
++CGInst dvmCompilerPcgGetFallthroughTargetSymbolInst (CompilationUnitPCG *cUnit, BasicBlockPCG *bb);
+ 
+ /**
+  * @brief Invoke a method
+diff --git a/vm/compiler/codegen/x86/pcg/PcgInterface.cpp b/vm/compiler/codegen/x86/pcg/PcgInterface.cpp
+index 260d1c9..f53e67a 100644
+--- a/vm/compiler/codegen/x86/pcg/PcgInterface.cpp
++++ b/vm/compiler/codegen/x86/pcg/PcgInterface.cpp
+@@ -259,5 +259,10 @@ extern "C" bool dalvikPluginInit (void)
+     setupPcgJit();
+ 
+     dvmCompilerRemovePass ("Vectorization");
++
++    //Loops with invokes exposes a bug with PCG. Therefore we check after inlining if we have
++    //any remaining invokes that we have not inlined when in loop mode
++    dvmCompilerReplaceEnd ("Method_Inlining", dvmCompilerPcgRejectLoopsWithInvokes);
++
+     return true;
+ }
+diff --git a/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp b/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp
+index 2492806..6f694e1 100644
+--- a/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp
++++ b/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp
+@@ -736,6 +736,56 @@ void dvmCompilerPcgHandleInitialLoad (CompilationUnitPCG *cUnit, BasicBlock *bb,
+     CGAddTempDef (info.parentSSANum, load);
+ }
+ 
++void dvmCompilerPcgLoadLiveInVRs (CompilationUnitPCG *cUnit, BasicBlock *blockGoingTo)
++{
++    assert (blockGoingTo != 0);
++
++    //Check dataflow info
++    BasicBlockDataFlow *info = blockGoingTo->dataFlowInfo;
++
++    assert (info != 0);
++
++    //Get entrance
++    int *dalvikToSSAMapEntrance = info->dalvikToSSAMapEntrance;
++
++    //Get its live ins
++    BitVector *ins = info->liveInV;
++
++    //Paranoid
++    assert (ins != 0);
++
++    //Live-ins are a bit over conservative and can contain VRs that don't even exist in the cUnit
++    BitVector *reallyIns = dvmCompilerAllocBitVector (1, true);
++    //Intersect now
++    dvmIntersectBitVectors (reallyIns, ins, cUnit->usedVRs);
++
++    //Now iterate on the ins
++    BitVectorIterator bvIterator;
++    dvmBitVectorIteratorInit (reallyIns, &bvIterator);
++
++    //Now handle each SSA live in
++    while (true)
++    {
++        //Get VR
++        int vr = dvmBitVectorIteratorNext (&bvIterator);
++
++        //If finished, break out
++        if (vr == -1)
++        {
++            break;
++        }
++
++        //Get combination SSA_Subscript
++        int ssaCombo = dalvikToSSAMapEntrance[vr];
++
++        //Now we only want the SSA number
++        int ssaNum = DECODE_REG (ssaCombo);
++
++        //Handle initial load
++        dvmCompilerPcgHandleInitialLoad (cUnit, blockGoingTo, ssaNum, false);
++    }
++}
++
+ CGInst dvmCompilerPcgResolveClass(CompilationUnitPCG *cUnit, u4 classIdx)
+ {
+     CGInst parms[4];
+@@ -796,3 +846,29 @@ void dvmCompilerPcgRemoveNonPhiNodes (CompilationUnitPCG *cUnit, BitVector *temp
+     }
+     dvmIntersectBitVectors (tempBV, tempBV, phiNodes);
+ }
++
++void dvmCompilerPcgRejectLoopsWithInvokes (CompilationUnit *cUnit, Pass *curPass)
++{
++    //If we are in loop mode, then we need to check if any invokes have been accepted
++    if (dvmCompilerTraceIsLoopNewSystem (cUnit, curPass) == true)
++    {
++        //Create and initialize iterator to navigate the block
++        GrowableListIterator blockIter;
++        dvmGrowableListIteratorInit (&cUnit->blockList, &blockIter);
++
++        for (BasicBlock *bb = reinterpret_cast<BasicBlock *>(dvmGrowableListIteratorNext (&blockIter));
++                bb != NULL;
++                bb = reinterpret_cast<BasicBlock *>(dvmGrowableListIteratorNext (&blockIter)))
++        {
++            //Now walk through the MIRs looking for an invoke
++            for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++            {
++                if ((dvmCompilerGetOpcodeFlags (mir->dalvikInsn.opcode) & kInstrInvoke) != 0)
++                {
++                    //We found an invoke but we want to reject all such loops
++                    cUnit->quitLoopMode = true;
++                }
++            }
++        }
++    }
++}
+diff --git a/vm/compiler/codegen/x86/pcg/UtilityPCG.h b/vm/compiler/codegen/x86/pcg/UtilityPCG.h
+index ff987e7..5ffc433 100644
+--- a/vm/compiler/codegen/x86/pcg/UtilityPCG.h
++++ b/vm/compiler/codegen/x86/pcg/UtilityPCG.h
+@@ -170,6 +170,13 @@ void dvmCompilerPcgCreateEntryStub (CompilationUnitPCG *cUnit);
+ void dvmCompilerPcgHandleInitialLoad (CompilationUnitPCG *cUnit, BasicBlock *bb, int ssaNum, bool considerSpeculative);
+ 
+ /**
++ * @brief Used to handle initial loads for all registers live into the block we are going to
++ * @param cUnit The compilation unit
++ * @param blockGoingTo The block we are entering to
++ */
++void dvmCompilerPcgLoadLiveInVRs (CompilationUnitPCG *cUnit, BasicBlock *blockGoingTo);
++
++/**
+  * @brief Resolve a Class
+  * @param cUnit the CompilationUnitPCG
+  * @param classIdx the class index
+@@ -185,4 +192,14 @@ CGInst dvmCompilerPcgResolveClass(CompilationUnitPCG *cUnit, u4 classIdx);
+  * @details This function removes all of the SSA numbers of the arguments (uses) to the phi nodes from the bv. The phi nodes are found in the loopEntry BB.
+  */
+ void dvmCompilerPcgRemoveNonPhiNodes (CompilationUnitPCG *cUnit, BitVector *bv, BasicBlockPCG *loopEntry);
++
++/**
++ * @brief Used to reject loops with invokes
++ * @details This is used as a temporary solution to allow inlining to do its job
++ * but in case there are any invokes left in a loop, to reject so we can go to trace mode.
++ * @param cUnit The compilation unit
++ * @param curPass The current pass pointer
++ */
++void dvmCompilerPcgRejectLoopsWithInvokes (CompilationUnit *cUnit, Pass *curPass);
++
+ #endif
+-- 
+1.7.4.1
+

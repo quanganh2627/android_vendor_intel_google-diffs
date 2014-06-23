@@ -1,0 +1,188 @@
+From 28ca859dec18575c95c755df959b1ecf7eb3fa08 Mon Sep 17 00:00:00 2001
+From: Johnnie Birch <johnnie.l.birch.jr@intel.com>
+Date: Thu, 6 Dec 2012 10:22:39 -0800
+Subject: Dalvik: Enables fast version of arraycopy in java_lang_system.cpp
+
+BZ: 73296
+
+In GB copy calls in java_lang_system.arraycopy are routed to a fast
+sse3 version that gave us a performance advantage. In ICS google changed
+the call to memcpy if objects in the array are larger than 1byte in size.
+For these arrays, memmove_words is used instead. Their rasoning is that
+memcpy cannot guarantee atomicity but the fast sse3 version is supposed
+to be safe for IA. Note, thanks Tom Carr for finding this issue.
+
+ArrayCopy micro on Medfield avg speedup with patch:
+
+	        Speedup
+Byte 64 KB      0.0482745616
+Short 64 KB     2.5580693816
+Int 64 KB       2.4822721366
+Long 64 KB      2.530102234
+Short 128 KB    2.4520573801
+Int 256 KB      0.8474785576
+Long 512 KB     0.768367243
+
+Passed check in tests.
+Ran Cmark, Quadrant, and Smartbench. Possible some small gain in the
+cmark score on CTP, but overall improvement was not seen in these KPIs.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I5e34f0d54edf2e976d39416c5a1d6658d649d303
+Orig-MCG-Change-Id: I75fd7f74890954f9fbf031beebe5b809344e83ba
+Signed-off-by: Johnnie Birch <johnnie.l.birch.jr@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/native/java_lang_System.cpp |   70 ++++++++++++++++++++++++++++++++++++++++
+ 1 files changed, 70 insertions(+), 0 deletions(-)
+
+diff --git a/vm/native/java_lang_System.cpp b/vm/native/java_lang_System.cpp
+index 1b07f85..261232a 100644
+--- a/vm/native/java_lang_System.cpp
++++ b/vm/native/java_lang_System.cpp
+@@ -47,6 +47,39 @@
+  * element size.
+  */
+ 
++#ifdef ARCH_IA32
++/*
++ * move16 and move32 use a different number of parameters than copy.
++ * keep this define here to alert us when we aren't using copy.
++ */
++#define move16 copy
++#define move32 copy
++static void copy(void *dest, const void *src, size_t n, bool sameArray,
++        size_t elemSize)
++{
++
++    if (sameArray) {
++        /* Might overlap. */
++        if (elemSize == sizeof(Object*)) {
++            /*
++             * In addition to handling overlap properly, bcopy()
++             * guarantees atomic treatment of words. This is needed so
++             * that concurrent threads never see half-formed pointers
++             * or ints. The former is required for proper gc behavior,
++             * and the latter is also required for proper high-level
++             * language support.
++             *
++             * Note: bcopy()'s argument order is different than memcpy().
++             */
++            bcopy(src, dest, n);
++        } else {
++            memmove(dest, src, n);
++        }
++    } else {
++        memcpy(dest, src, n); /* Can't overlap; use faster function. */
++    }
++}
++#else
+ /*
+  * Works like memmove(), except:
+  * - if all arguments are at least 32-bit aligned, we guarantee that we
+@@ -178,6 +211,8 @@ static void memmove_words(void* dest, const void* src, size_t n) {
+ #define move16 memmove_words
+ #define move32 memmove_words
+ 
++#endif /*ARCH_IA32*/
++
+ /*
+  * public static void arraycopy(Object src, int srcPos, Object dest,
+  *      int destPos, int length)
+@@ -224,6 +259,10 @@ static void Dalvik_java_lang_System_arraycopy(const u4* args, JValue* pResult)
+         RETURN_VOID();
+     }
+ 
++#ifdef ARCH_IA32
++    bool sameArray = (srcArray == dstArray);
++#endif
++
+     ClassObject* srcClass = srcArray->clazz;
+     ClassObject* dstClass = dstArray->clazz;
+     char srcType = srcClass->descriptor[1];
+@@ -256,16 +295,29 @@ static void Dalvik_java_lang_System_arraycopy(const u4* args, JValue* pResult)
+         case 'C':
+         case 'S':
+             /* 2 bytes per element */
++#ifdef ARCH_IA32
++            copy((u1*) dstArray->contents + dstPos * 2,
++                (const u1*) srcArray->contents + srcPos * 2,
++                length * 2, sameArray, 2);
++#else
+             move16((u1*) dstArray->contents + dstPos * 2,
+                 (const u1*) srcArray->contents + srcPos * 2,
+                 length * 2);
++#endif
+             break;
+         case 'F':
+         case 'I':
+             /* 4 bytes per element */
++#ifdef ARCH_IA32
++            copy((u1*) dstArray->contents + dstPos * 4,
++                (const u1*) srcArray->contents + srcPos * 4,
++                length * 4, sameArray, 4);
++
++#else
+             move32((u1*) dstArray->contents + dstPos * 4,
+                 (const u1*) srcArray->contents + srcPos * 4,
+                 length * 4);
++#endif
+             break;
+         case 'D':
+         case 'J':
+@@ -273,9 +325,15 @@ static void Dalvik_java_lang_System_arraycopy(const u4* args, JValue* pResult)
+              * 8 bytes per element.  We don't need to guarantee atomicity
+              * of the entire 64-bit word, so we can use the 32-bit copier.
+              */
++#ifdef ARCH_IA32
++            copy((u1*) dstArray->contents + dstPos * 8,
++                (const u1*) srcArray->contents + srcPos * 8,
++                length * 8, sameArray, 8);
++#else
+             move32((u1*) dstArray->contents + dstPos * 8,
+                 (const u1*) srcArray->contents + srcPos * 8,
+                 length * 8);
++#endif
+             break;
+         default:        /* illegal array type */
+             ALOGE("Weird array type '%s'", srcClass->descriptor);
+@@ -299,9 +357,15 @@ static void Dalvik_java_lang_System_arraycopy(const u4* args, JValue* pResult)
+                 dstArray->contents, dstPos * width,
+                 srcArray->contents, srcPos * width,
+                 length * width);
++#ifdef ARCH_IA32
++            copy((u1*)dstArray->contents + dstPos * width,
++                (const u1*)srcArray->contents + srcPos * width,
++                length * width, sameArray, width);
++#else
+             move32((u1*)dstArray->contents + dstPos * width,
+                 (const u1*)srcArray->contents + srcPos * width,
+                 length * width);
++#endif
+             dvmWriteBarrierArray(dstArray, dstPos, dstPos+length);
+         } else {
+             /*
+@@ -344,9 +408,15 @@ static void Dalvik_java_lang_System_arraycopy(const u4* args, JValue* pResult)
+                 dstArray->contents, dstPos * width,
+                 srcArray->contents, srcPos * width,
+                 copyCount, length);
++#ifdef ARCH_IA32
++            copy((u1*)dstArray->contents + dstPos * width,
++                (const u1*)srcArray->contents + srcPos * width,
++                copyCount * width, sameArray, width);
++#else
+             move32((u1*)dstArray->contents + dstPos * width,
+                 (const u1*)srcArray->contents + srcPos * width,
+                 copyCount * width);
++#endif
+             dvmWriteBarrierArray(dstArray, 0, copyCount);
+             if (copyCount != length) {
+                 dvmThrowArrayStoreExceptionIncompatibleArrayElement(srcPos + copyCount,
+-- 
+1.7.4.1
+

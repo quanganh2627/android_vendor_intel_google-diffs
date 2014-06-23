@@ -1,0 +1,326 @@
+From b70b79f3320742ebcbe7945a5db411f2e064789a Mon Sep 17 00:00:00 2001
+From: Serguei Katkov <serguei.i.katkov@intel.com>
+Date: Thu, 24 Oct 2013 12:08:26 +0700
+Subject: Dalvik: Result of loop register usages must be up to date
+
+BZ: 143138
+
+Such passes like Memory Aliasing, Local Value Numbering and Variants
+produces the data which can be invalidated after any change of CFG.
+As a result this data becomes invalid by other optimization are based
+on this data. So this analysis should be repeated after each change
+of CFG.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Idc1bc67258cfe3d75239e35827ea32da7db98648
+Orig-MCG-Change-Id: I1be6f61f979f0d517497e0af5978eeb309e97fb3
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/BBOptimization.cpp    |   16 ++++++++++-
+ vm/compiler/BBOptimization.h      |    4 +--
+ vm/compiler/LoopRegisterUsage.cpp |   50 ++++++++++++++++++++++++------------
+ vm/compiler/LoopRegisterUsage.h   |   16 +----------
+ vm/compiler/PassDriver.cpp        |    8 ------
+ vm/compiler/SSATransformation.cpp |   45 ++++++++++++++++-----------------
+ 6 files changed, 72 insertions(+), 67 deletions(-)
+
+diff --git a/vm/compiler/BBOptimization.cpp b/vm/compiler/BBOptimization.cpp
+index b15f3cc..c77d1be 100644
+--- a/vm/compiler/BBOptimization.cpp
++++ b/vm/compiler/BBOptimization.cpp
+@@ -1429,8 +1429,13 @@ static void handleLocalValueNumbering (MIR *mir,
+     mir->localValueNumber = hash;
+ }
+ 
+-/* Perform local value numbering */
+-bool dvmCompilerLocalValueNumbering (CompilationUnit *cunit, BasicBlock *bb)
++/**
++ * @brief Perform local value numbering
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock
++ * @return returns whether we changed anything in the BasicBlock
++ */
++bool dvmCompilerLocalValueNumbering (CompilationUnit *cUnit, BasicBlock *bb)
+ {
+     //A map for the value numbering hash
+     std::map<SLocalValueNumberingAssociation, unsigned int> localValueNumberingAssociations;
+@@ -1449,6 +1454,13 @@ bool dvmCompilerLocalValueNumbering (CompilationUnit *cunit, BasicBlock *bb)
+     return false;
+ }
+ 
++/* Perform local value numbering */
++void dvmCompilerLocalValueNumbering (CompilationUnit *cUnit)
++{
++    dvmCompilerDataFlowAnalysisDispatcher (cUnit, dvmCompilerLocalValueNumbering, kPredecessorsFirstTraversal, false);
++}
++
++
+ /**
+  * @brief This optimization removes redundant goto and conditional instruction
+  * @details Goto instruction at the end of basic block can be safely removed if it leads
+diff --git a/vm/compiler/BBOptimization.h b/vm/compiler/BBOptimization.h
+index 1f4b8bf..2fe75f6 100644
+--- a/vm/compiler/BBOptimization.h
++++ b/vm/compiler/BBOptimization.h
+@@ -115,10 +115,8 @@ bool dvmCompilerPeel (CompilationUnit *cUnit, LoopInformation *info);
+ /**
+  * @brief Perform local value numbering
+  * @param cUnit the CompilationUnit
+- * @param bb the BasicBlock
+- * @return returns whether we changed anything in the BasicBlock
+  */
+-bool dvmCompilerLocalValueNumbering (CompilationUnit *cUnit, BasicBlock *bb);
++void dvmCompilerLocalValueNumbering (CompilationUnit *cUnit);
+ 
+ /**
+  * @brief Remove the gotos
+diff --git a/vm/compiler/LoopRegisterUsage.cpp b/vm/compiler/LoopRegisterUsage.cpp
+index 8597b9e..a2b93ec 100644
+--- a/vm/compiler/LoopRegisterUsage.cpp
++++ b/vm/compiler/LoopRegisterUsage.cpp
+@@ -612,16 +612,20 @@ static void linkColors (const BasicBlock *bb)
+     }
+ }
+ 
+-//The actual entry function to the memory aliasing pass
+-
++ /**
++  * @brief Memory Aliasing pass: calculates which memory instruction aliases together
++  * @details The basic algorithm is:
++  *   - For each bytecode, use a hash to put Xput instructions with Xget, put them in separate buckets
++  *   - Then, for each color:
++  *      If we can disambiguate (we can't disambiguate easily get/put object bytecodes, see above comment when we try
++  *          Then create a new color
++  *
++  *  We can disambiguate if it's not a get/put object and the constant is different
++  * @param cUnit the CompilationUnit
++  * @param bb the BasicBlock
++  * @return whether the pass changed something in the BasicBlock
++  */
+ /**
+- * The basic algorithm is:
+- *   - For each bytecode, use a hash to put Xput instructions with Xget, put them in separate buckets
+- *   - Then, for each color:
+- *      If we can disambiguate (we can't disambiguate easily get/put object bytecodes, see above comment when we try
+- *          Then create a new color
+- *
+- *  We can disambiguate if it's not a get/put object and the constant is different
+  */
+ bool dvmCompilerMemoryAliasing (CompilationUnit *cUnit, BasicBlock *bb)
+ {
+@@ -673,6 +677,18 @@ bool dvmCompilerMemoryAliasing (CompilationUnit *cUnit, BasicBlock *bb)
+     return false;
+ }
+ 
++//The actual entry function to the memory aliasing pass
++void dvmCompilerMemoryAliasing (CompilationUnit *cUnit)
++{
++    if (dvmCompilerVerySimpleLoopGate (cUnit, 0) == false)
++    {
++        return;
++    }
++
++    dvmCompilerDataFlowAnalysisDispatcher (cUnit, dvmCompilerMemoryAliasing, kPredecessorsFirstTraversal, false);
++}
++
++
+ /**
+  * @brief Helper function handling the BasicBlock of the loop
+  * @param info the LoopInformation
+@@ -748,22 +764,22 @@ static void handleVariantBB (LoopInformation *info, BasicBlock *bb)
+     info->setVariants (variants);
+ }
+ 
+-void dvmCompilerVariant (CompilationUnit *cUnit, Pass *curPass)
++//Entry point to loop invariant detection routine
++void dvmCompilerVariant (CompilationUnit *cUnit)
+ {
++    if (dvmCompilerVerySimpleLoopGate (cUnit, 0) == false)
++    {
++        return;
++    }
++
+     //Get the loop information
+     LoopInformation *info = cUnit->loopInformation;
+-
+-    //Paranoid
+     assert (info != 0);
+ 
++    //It is a simple loop, so only 1 basic block
+     BasicBlock *entry = info->getEntryBlock ();
+-
+-    //Paranoid
+     assert (entry != 0);
+ 
+     //Call helper
+     handleVariantBB (info, entry);
+-
+-    //Unused parameter
+-    (void) curPass;
+ }
+diff --git a/vm/compiler/LoopRegisterUsage.h b/vm/compiler/LoopRegisterUsage.h
+index 6afbd53..abd041e 100644
+--- a/vm/compiler/LoopRegisterUsage.h
++++ b/vm/compiler/LoopRegisterUsage.h
+@@ -19,29 +19,17 @@
+ 
+ //Forward declarations
+ struct CompilationUnit;
+-class Pass;
+ 
+ /**
+  * @brief Memory Aliasing pass: calculates which memory instruction aliases together
+  * @param cUnit the CompilationUnit
+- * @param bb the BasicBlock
+- * @return whether the pass changed something in the BasicBlock
+  */
+-bool dvmCompilerMemoryAliasing (CompilationUnit *cUnit, BasicBlock *bb);
+-
+-/**
+- * @brief Value Numbering pass: calculates whether instructions have the same calculation
+- * @param cUnit the CompilationUnit
+- * @param bb the BasicBlock
+- * @return whether the pass changed something in the BasicBlock
+- */
+-bool dvmCompilerValueNumbering (CompilationUnit *cUnit, BasicBlock *bb);
++void dvmCompilerMemoryAliasing (CompilationUnit *cUnit);
+ 
+ /**
+  * @brief Variant pass: detect which instructions are invariant or not
+  * @param cUnit the CompilationUnit
+- * @param curPass the current Pass
+  */
+-void dvmCompilerVariant (CompilationUnit *cUnit, Pass *curPass);
++void dvmCompilerVariant (CompilationUnit *cUnit);
+ 
+ #endif
+diff --git a/vm/compiler/PassDriver.cpp b/vm/compiler/PassDriver.cpp
+index c7372aa..6016c2b 100644
+--- a/vm/compiler/PassDriver.cpp
++++ b/vm/compiler/PassDriver.cpp
+@@ -81,16 +81,8 @@ START_PASSES
+     NEW_PASS ("Merge_Blocks", kAllNodes, 0, 0,
+                 0, 0, dvmCompilerMergeBasicBlocks, 0,
+                 kOptimizationBasicBlockChange | kLoopStructureChange | kOptimizationNeedIterative),
+-    NEW_PASS ("Memory_Aliasing", kAllNodes, 0, dvmCompilerVerySimpleLoopGate,
+-              0, 0, dvmCompilerMemoryAliasing, 0, 0),
+-    NEW_PASS ("Local_Value_Numbering", kAllNodes, 0, dvmCompilerVerySimpleLoopGate,
+-              0, 0, dvmCompilerLocalValueNumbering, 0, 0),
+-    NEW_PASS ("Variant", kAllNodes, 0, dvmCompilerVerySimpleLoopGate,
+-              0, dvmCompilerVariant, 0, 0, 0),
+     NEW_PASS ("Invariant_Removal", kAllNodes, 0, dvmCompilerInvariantRemovalGate,
+               dvmCompilerInvariantRemoval, 0, 0, 0, kOptimizationBasicBlockChange),
+-    NEW_PASS ("Variant", kAllNodes, 0, dvmCompilerVerySimpleLoopGate,
+-              0, dvmCompilerVariant, 0, 0, 0),
+     NEW_PASS ("Iget_Iput_Removal", kAllNodes, 0, dvmCompilerInvariantRemovalGate,
+               dvmCompilerIgetIputRemoval, 0, 0, 0, kOptimizationBasicBlockChange),
+     NEW_PASS ("Sink_Casts", kAllNodes, 0, dvmCompilerTraceIsLoopNewSystem,
+diff --git a/vm/compiler/SSATransformation.cpp b/vm/compiler/SSATransformation.cpp
+index 2fb4279..1e7d965 100644
+--- a/vm/compiler/SSATransformation.cpp
++++ b/vm/compiler/SSATransformation.cpp
+@@ -14,16 +14,14 @@
+  * limitations under the License.
+  */
+ 
+-//Need it for UINT_MAX
+-#include <limits.h>
+-
+ #include "BBOptimization.h"
+ #include "Dalvik.h"
+ #include "Dataflow.h"
+ #include "Loop.h"
++#include "LoopRegisterUsage.h"
+ #include "libdex/DexOpcodes.h"
+ #include "SSAWalkData.h"
+-#include "BBOptimization.h"
++#include "Utility.h"
+ 
+ /* Enter the node to the dfsOrder list then visit its successors */
+ static void recordDFSPreOrder(CompilationUnit *cUnit, BasicBlock *block)
+@@ -870,22 +868,21 @@ bool dvmCompilerBuildDefUseChain (CompilationUnit *cUnit, BasicBlock *bb)
+     //Get walker data
+     SSAWalkData *data = static_cast<SSAWalkData *> (cUnit->walkData);
+ 
+-    //By default the order is the max accepted
+-    unsigned int currentOrder = UINT_MAX;
++    //By default the order is the min accepted
++    unsigned int currentOrder = 0;
+ 
+     //Get minimum topological order from predecessors
+     BitVectorIterator bvIterator;
+ 
+     dvmBitVectorIteratorInit(bb->predecessors, &bvIterator);
+-    while (true) {
+-        int blockIdx = dvmBitVectorIteratorNext(&bvIterator);
+-        if (blockIdx == -1) break;
+-        BasicBlock *predBB = (BasicBlock *)
+-            dvmGrowableListGetElement(&cUnit->blockList, blockIdx);
++    for (BasicBlock *predBB = dvmCompilerGetNextBasicBlockViaBitVector (bvIterator, cUnit->blockList); predBB != 0;
++                     predBB = dvmCompilerGetNextBasicBlockViaBitVector (bvIterator, cUnit->blockList)) {
+ 
+-        //Paranoid
+-        if (predBB == 0)
++        //If the pred was not handled yet (backward?) then skip it
++        if (predBB->visited == false)
++        {
+             continue;
++        }
+ 
+         //Get order from the entrance of the BB
+         unsigned int order = predBB->topologicalOrder;
+@@ -901,19 +898,12 @@ bool dvmCompilerBuildDefUseChain (CompilationUnit *cUnit, BasicBlock *bb)
+         }
+ 
+         //Compare to actual minimum
+-        if (currentOrder > order)
++        if (currentOrder < order)
+         {
+             currentOrder = order;
+         }
+     }
+ 
+-    //Check if we had at least one hit for the order
+-    if (currentOrder == UINT_MAX)
+-    {
+-        //If not, we reset the counter
+-        currentOrder = 0;
+-    }
+-
+     if (bb->topologicalOrder != currentOrder)
+     {
+         //Set the basic block's order now
+@@ -925,9 +915,9 @@ bool dvmCompilerBuildDefUseChain (CompilationUnit *cUnit, BasicBlock *bb)
+     //We now have the minimum topological order: go through the instructions
+     for (MIR *insn = bb->firstMIRInsn; insn != 0; insn = insn->next)
+     {
+-        //Set and then augment the current topological order
+-        insn->topologicalOrder = currentOrder;
++        //Augment the current topological order and then set
+         currentOrder++;
++        insn->topologicalOrder = currentOrder;
+ 
+         //Now handle use and def chains
+         SSARepresentation *ssaRep = insn->ssaRep;
+@@ -1172,5 +1162,14 @@ bool dvmCompilerCalculateBasicBlockInformation (CompilationUnit *cUnit, bool fil
+     //Finally, find the induction variables
+     dvmCompilerFindInductionVariables (cUnit, cUnit->loopInformation);
+ 
++    //Do memory aliasing
++    dvmCompilerMemoryAliasing (cUnit);
++
++    //Do Local Value Numbering
++    dvmCompilerLocalValueNumbering (cUnit);
++
++    //Do invariant detection in a loop
++    dvmCompilerVariant (cUnit);
++
+     return true;
+ }
+-- 
+1.7.4.1
+

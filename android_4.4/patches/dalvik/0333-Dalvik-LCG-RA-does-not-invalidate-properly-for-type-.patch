@@ -1,0 +1,119 @@
+From 3f61f3021466f9d96b4a5b90a305b6454ada577f Mon Sep 17 00:00:00 2001
+From: Serguei Katkov <serguei.i.katkov@intel.com>
+Date: Wed, 11 Sep 2013 11:36:17 +0700
+Subject: Dalvik: LCG RA does not invalidate properly for type transfers
+
+BZ: 135322
+
+Virtual registers are weakly typed in terms of physical register use to
+represent them. In some cases in the same basic block, the same VR may
+be used in both GP and in XMM register. In order to deal with type
+inconsistencies, transfer points are generated to facilitate the type transfer
+via use of memory. However, the old register association after the type transfer
+is not invalidated. This causes an inconsistency in that a VR may believe that
+it exists in multiple physical registers when in reality only one is updated.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Ie4b40c4d6b9098d76d4661aa2eadb31c0713f43b
+Orig-MCG-Change-Id: I0be1efa4de2f9ef4d56c1779ba178c807c20b34d
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Reviewed-on: http://android.intel.com:8080/132707
+Reviewed-by: Beyler, Jean Christophe <jean.christophe.beyler@intel.com>
+Reviewed-by: lab_aqa <lab_aqa@intel.com>
+Reviewed-by: Banerji, Udayan <udayan.banerji@intel.com>
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: Provodin, Vitaly A <vitaly.a.provodin@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: Hartley, Timothy D <timothy.d.hartley@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp |   28 ++++++++++++++++-------
+ 1 files changed, 19 insertions(+), 9 deletions(-)
+
+diff --git a/vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp b/vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp
+index 0706310..0ad40db 100644
+--- a/vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp
++++ b/vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp
+@@ -1324,7 +1324,7 @@ int collectInfoOfBasicBlock (BasicBlock_O1* bb)
+                             bb->infoBasicBlock[kk].allocConstraintsSorted, true);
+     }
+ #ifdef DEBUG_ALLOC_CONSTRAINT
+-    ALOGI("Sort constraints for BB %d --------", bb->bb_index);
++    ALOGI("Sort constraints for BB %d --------", bb->id);
+ #endif
+     sortAllocConstraint(bb->allocConstraints, bb->allocConstraintsSorted, false);
+     return 0;
+@@ -1475,7 +1475,7 @@ int codeGenBasicBlock(const Method* method, BasicBlock_O1* bb, CompilationUnit_O
+ #endif
+ 
+ #ifdef DEBUG_COMPILE_TABLE
+-    ALOGI("At start of basic block %d (num of VRs %d) -------", bb->bb_index, bb->infoBasicBlock.size ());
++    ALOGI("At start of basic block %d (num of VRs %d) -------", bb->id, bb->infoBasicBlock.size ());
+     dumpCompileTable();
+ #endif
+ 
+@@ -1514,8 +1514,8 @@ int codeGenBasicBlock(const Method* method, BasicBlock_O1* bb, CompilationUnit_O
+         for(k = 0; k <= MAX_SPILL_JIT_IA - 1; k++) spillIndexUsed[k] = 0;
+ 
+ #ifdef DEBUG_COMPILE_TABLE
+-        ALOGI("compile table size after importing temporary info %d", num_compile_entries);
+-        ALOGI("before one bytecode %d (num of VRs %d) -------", bb->bb_index, bb->infoBasicBlock.size ());
++        ALOGI("compile table size after importing temporary info %d", compileTable.size ());
++        ALOGI("before one bytecode %d (num of VRs %d) -------", bb->id, bb->infoBasicBlock.size ());
+ #endif
+         //set isConst to true for CONST & MOVE MOVE_OBJ?
+         //clear isConst to true for MOVE, MOVE_OBJ, MOVE_RESULT, MOVE_EXCEPTION ...
+@@ -1621,7 +1621,7 @@ int codeGenBasicBlock(const Method* method, BasicBlock_O1* bb, CompilationUnit_O
+         freeReg (false);
+ 
+ #ifdef DEBUG_COMPILE_TABLE
+-        ALOGI("After one bytecode BB %d (num of VRs %d)", bb->bb_index, bb->infoBasicBlock.size ());
++        ALOGI("After one bytecode BB %d (num of VRs %d)", bb->id, bb->infoBasicBlock.size ());
+ #endif
+     }//for each bytecode
+ 
+@@ -3204,8 +3204,13 @@ int updateVirtualReg(int reg, LowOpndRegType pType) {
+ #ifdef DEBUG_XFER_POINTS
+                     ALOGI("XFER set_virtual_reg to memory: xmm VR %d", reg);
+ #endif
+-                    PhysicalReg regAll = (PhysicalReg)checkVirtualReg(reg, LowOpndRegType_xmm, 0 /* do not update*/);
+-                    writeBackVR(reg, LowOpndRegType_xmm, regAll);
++                    int index = searchCompileTable(pType | LowOpndRegType_virtual, reg);
++                    if(index < 0) {
++                        ALOGI("JIT_INFO: Cannot find VR %d %d in spillVirtualReg", reg, pType);
++                        SET_JIT_ERROR(kJitErrorRegAllocFailed);
++                        return -1;
++                    }
++                    spillLogicalReg(index, true);
+                 }
+                 if(currentBB->xferPoints[k].vr_gpl >= 0) { //
+                 }
+@@ -3217,11 +3222,16 @@ int updateVirtualReg(int reg, LowOpndRegType pType) {
+                 currentBB->xferPoints[k].xtype == XFER_DEF_TO_GP_MEM)) {
+                 //the defined gp VR already in register
+                 //invalidateXmmVR(currentBB->xferPoints[k].tableIndex);
+-                regAll = (PhysicalReg)checkVirtualReg(reg, pType, 0 /* do not update*/);
+-                writeBackVR(reg, pType, regAll);
+ #ifdef DEBUG_XFER_POINTS
+                 ALOGI("XFER set_virtual_reg to memory: gp VR %d", reg);
+ #endif
++                int index = searchCompileTable(pType | LowOpndRegType_virtual, reg);
++                if(index < 0) {
++                    ALOGI("JIT_INFO: Cannot find VR %d %d in spillVirtualReg", reg, pType);
++                    SET_JIT_ERROR(kJitErrorRegAllocFailed);
++                    return -1;
++                }
++                spillLogicalReg(index, true);
+             }
+             if((pType == LowOpndRegType_fs_s || pType == LowOpndRegType_ss) &&
+                currentBB->xferPoints[k].xtype == XFER_DEF_TO_GP_MEM) {
+-- 
+1.7.4.1
+

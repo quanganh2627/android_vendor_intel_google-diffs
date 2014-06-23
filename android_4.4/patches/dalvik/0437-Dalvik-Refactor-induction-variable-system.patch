@@ -1,0 +1,1354 @@
+From 1445d8b560c20739c4624cc96c570100ba554717 Mon Sep 17 00:00:00 2001
+From: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Date: Wed, 30 Oct 2013 14:26:43 -0700
+Subject: Dalvik: Refactor induction variable system
+
+BZ: 148788
+
+The dependent IV system has been refactored and expanded to capture
+multiplication cases.
+
+Change-Id: I601db327d2ad8575d4167dcfde00f63b0d8ee07d
+Category: device enablement
+Domain: AOSP.Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, need rework
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+---
+ vm/compiler/AccumulationSinking.cpp |   10 +-
+ vm/compiler/Checks.cpp              |    7 +-
+ vm/compiler/Compiler.h              |    2 +-
+ vm/compiler/Dataflow.cpp            |  376 ++++++++++++++++++++--------------
+ vm/compiler/Dataflow.h              |   29 +++-
+ vm/compiler/Loop.cpp                |   64 ++++---
+ vm/compiler/LoopInformation.cpp     |  124 +++++-------
+ vm/compiler/LoopInformation.h       |   19 ++-
+ vm/compiler/SinkCastOpt.cpp         |    2 +-
+ vm/compiler/Utility.cpp             |   62 ++++++
+ vm/compiler/Utility.h               |   26 +++-
+ vm/compiler/Vectorization.cpp       |   10 +-
+ 12 files changed, 448 insertions(+), 283 deletions(-)
+
+diff --git a/vm/compiler/AccumulationSinking.cpp b/vm/compiler/AccumulationSinking.cpp
+index 0b80a48..4ff0ed7 100644
+--- a/vm/compiler/AccumulationSinking.cpp
++++ b/vm/compiler/AccumulationSinking.cpp
+@@ -51,17 +51,17 @@ static int chooseIV (CompilationUnit *cUnit, LoopInformation *info, int &increme
+         }
+ 
+         //Is it a simple induction variable?
+-        if (infoIV->m == 1 && infoIV->basicSSAReg == infoIV->ssaReg)
++        if (infoIV->getMultiplier () == 1 && infoIV->isBasicIV () == true)
+         {
+             //Is the increment 1?
+             //TODO Add support for negative and positive constants.
+-            if (infoIV->inc == 1)
++            if (infoIV->loopIncrement == 1)
+             {
+                 //Get the ssa register for this induction
+                 int ssaReg = infoIV->ssaReg;
+ 
+                 //Get the increment
+-                increment = infoIV->inc;
++                increment = infoIV->loopIncrement;
+ 
+                 //Return the register side
+                 return dvmExtractSSARegister (cUnit, ssaReg);
+@@ -445,7 +445,7 @@ static void filterVRs (CompilationUnit *cUnit, LoopInformation *info, std::vecto
+         }
+ 
+         //Is that register an induction variable?
+-        if (info->isAnInductionVariable (cUnit, vr) == false)
++        if (info->isBasicInductionVariable (cUnit, vr) == false)
+         {
+             MIR *phi = info->getPhiInstruction (cUnit, vr);
+             // If vr is an induction variable, phi cannot be 0
+@@ -918,7 +918,7 @@ static bool compilerSinkAccumulationsGateHelper(const CompilationUnit *cUnit, Lo
+         }
+ 
+         //If more than one IV, we bail
+-        if (info->getNumBasicIV (const_cast<CompilationUnit *> (cUnit)) != 1)
++        if (info->getNumBasicIV (cUnit) != 1)
+         {
+             return false;
+         }
+diff --git a/vm/compiler/Checks.cpp b/vm/compiler/Checks.cpp
+index a6e8dfc..1d67934 100644
+--- a/vm/compiler/Checks.cpp
++++ b/vm/compiler/Checks.cpp
+@@ -18,9 +18,10 @@
+ #include "Dalvik.h"
+ #include "Dataflow.h"
+ #include "Loop.h"
+-#include "PassDriver.h"
+-#include "Pass.h"
+ #include "LoopInformation.h"
++#include "Pass.h"
++#include "PassDriver.h"
++#include "Utility.h"
+ 
+ #include <map>
+ 
+@@ -904,7 +905,7 @@ void handleIndexHoist (CompilationUnit *cUnit, SRemoveData *removeData, MIR *mir
+             int indexSub = DECODE_SUB(subNRegIndex);
+ 
+             //Now whether we can hoist depends first on the index: is it a constant or an invariant
+-            bool canHoist = ( (indexSub == 0) || (dvmIsBitSet (cUnit->isConstantV, indexReg) == true));
++            bool canHoist = ( (indexSub == 0) || (dvmCompilerIsRegConstant (cUnit, indexReg) == true));
+ 
+             //Then the array must be invariant
+             canHoist = (canHoist && arraySub == 0);
+diff --git a/vm/compiler/Compiler.h b/vm/compiler/Compiler.h
+index 1e5e1fa..bc32457 100644
+--- a/vm/compiler/Compiler.h
++++ b/vm/compiler/Compiler.h
+@@ -293,7 +293,7 @@ void dvmCompilerFindInductionVariables(struct CompilationUnit *cUnit,
+ bool dvmCompilerClearVisitedFlag(struct CompilationUnit *cUnit,
+                                  struct BasicBlock *bb);
+ char *dvmCompilerGetDalvikDisassembly(const DecodedInstruction *insn,
+-                                      const char *note);
++                                      const char *note = 0);
+ char *dvmCompilerFullDisassembler(const struct CompilationUnit *cUnit,
+                                   const struct MIR *mir);
+ 
+diff --git a/vm/compiler/Dataflow.cpp b/vm/compiler/Dataflow.cpp
+index de7cb30..38a371a 100644
+--- a/vm/compiler/Dataflow.cpp
++++ b/vm/compiler/Dataflow.cpp
+@@ -284,46 +284,46 @@ long long dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_UA | DF_UB | DF_UC | DF_NULL_N_RANGE_CHECK_1 | DF_IS_SETTER,
+ 
+     // 52 OP_IGET vA, vB, field@CCCC
+-    DF_DA | DF_UB | DF_IS_GETTER | DF_NULL_OBJECT_CHECK_0,
++    DF_DA | DF_UB | DF_C_IS_CONST | DF_IS_GETTER | DF_NULL_OBJECT_CHECK_0,
+ 
+     // 53 OP_IGET_WIDE vA, vB, field@CCCC
+-    DF_DA_WIDE | DF_UB | DF_IS_GETTER | DF_NULL_OBJECT_CHECK_0,
++    DF_DA_WIDE | DF_UB | DF_C_IS_CONST | DF_IS_GETTER | DF_NULL_OBJECT_CHECK_0,
+ 
+     // 54 OP_IGET_OBJECT vA, vB, field@CCCC
+-    DF_DA | DF_UB | DF_IS_GETTER | DF_NULL_OBJECT_CHECK_0,
++    DF_DA | DF_UB | DF_C_IS_CONST | DF_IS_GETTER | DF_NULL_OBJECT_CHECK_0,
+ 
+     // 55 OP_IGET_BOOLEAN vA, vB, field@CCCC
+-    DF_DA | DF_UB | DF_IS_GETTER | DF_NULL_OBJECT_CHECK_0,
++    DF_DA | DF_UB | DF_C_IS_CONST | DF_IS_GETTER | DF_NULL_OBJECT_CHECK_0,
+ 
+     // 56 OP_IGET_BYTE vA , vB, field@CCCC
+-    DF_DA | DF_UB | DF_IS_GETTER | DF_NULL_OBJECT_CHECK_0,
++    DF_DA | DF_UB | DF_C_IS_CONST | DF_IS_GETTER | DF_NULL_OBJECT_CHECK_0,
+ 
+     // 57 OP_IGET_CHAR vA , vB, field@CCCC
+-    DF_DA | DF_UB | DF_IS_GETTER | DF_NULL_OBJECT_CHECK_0,
++    DF_DA | DF_UB | DF_C_IS_CONST | DF_IS_GETTER | DF_NULL_OBJECT_CHECK_0,
+ 
+     // 58 OP_IGET_SHORT vA , vB, field@CCCC
+-    DF_DA | DF_UB | DF_IS_GETTER | DF_NULL_OBJECT_CHECK_0,
++    DF_DA | DF_UB | DF_C_IS_CONST | DF_IS_GETTER | DF_NULL_OBJECT_CHECK_0,
+ 
+     // 59 OP_IPUT vA , vB, field@CCCC
+-    DF_UA | DF_UB | DF_IS_SETTER | DF_NULL_OBJECT_CHECK_1,
++    DF_UA | DF_UB | DF_C_IS_CONST | DF_IS_SETTER | DF_NULL_OBJECT_CHECK_1,
+ 
+     // 5A OP_IPUT_WIDE vA, vB, field@CCCC
+-    DF_UA_WIDE | DF_UB | DF_IS_SETTER | DF_NULL_OBJECT_CHECK_2,
++    DF_UA_WIDE | DF_UB | DF_C_IS_CONST | DF_IS_SETTER | DF_NULL_OBJECT_CHECK_2,
+ 
+     // 5B OP_IPUT_OBJECT vA, vB, field@CCCC
+-    DF_UA | DF_UB | DF_IS_SETTER | DF_NULL_OBJECT_CHECK_1,
++    DF_UA | DF_UB | DF_C_IS_CONST | DF_IS_SETTER | DF_NULL_OBJECT_CHECK_1,
+ 
+     // 5C OP_IPUT_BOOLEAN vA, vB, field@CCCC
+-    DF_UA | DF_UB | DF_IS_SETTER | DF_NULL_OBJECT_CHECK_1,
++    DF_UA | DF_UB | DF_C_IS_CONST | DF_IS_SETTER | DF_NULL_OBJECT_CHECK_1,
+ 
+     // 5D OP_IPUT_BYTE vA, vB, field@CCCC
+-    DF_UA | DF_UB | DF_IS_SETTER | DF_NULL_OBJECT_CHECK_1,
++    DF_UA | DF_UB | DF_C_IS_CONST | DF_IS_SETTER | DF_NULL_OBJECT_CHECK_1,
+ 
+     // 5E OP_IPUT_CHAR vA, vB, field@CCCC
+-    DF_UA | DF_UB | DF_IS_SETTER | DF_NULL_OBJECT_CHECK_1,
++    DF_UA | DF_UB | DF_C_IS_CONST | DF_IS_SETTER | DF_NULL_OBJECT_CHECK_1,
+ 
+     // 5F OP_IPUT_SHORT vA, vB, field@CCCC
+-    DF_UA | DF_UB | DF_IS_SETTER | DF_NULL_OBJECT_CHECK_1,
++    DF_UA | DF_UB | DF_C_IS_CONST | DF_IS_SETTER | DF_NULL_OBJECT_CHECK_1,
+ 
+     // 60 OP_SGET vAA, field@BBBB
+     DF_DA | DF_IS_GETTER,
+@@ -662,61 +662,61 @@ long long dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_DA_WIDE | DF_UA_WIDE | DF_UB_WIDE | DF_FP_A | DF_FP_B | DF_REMAINDER_EXPRESSION,
+ 
+     // D0 OP_ADD_INT_LIT16 vA, vB, #+CCCC
+-    DF_DA | DF_UB | DF_ADD_EXPRESSION,
++    DF_DA | DF_UB | DF_C_IS_CONST | DF_IS_LINEAR | DF_ADD_EXPRESSION,
+ 
+     // D1 OP_RSUB_INT vA, vB, #+CCCC
+-    DF_DA | DF_UB | DF_SUBTRACT_EXPRESSION,
++    DF_DA | DF_UB | DF_C_IS_CONST | DF_SUBTRACT_EXPRESSION,
+ 
+     // D2 OP_MUL_INT_LIT16 vA, vB, #+CCCC
+-    DF_DA | DF_UB | DF_MULTIPLY_EXPRESSION,
++    DF_DA | DF_UB | DF_C_IS_CONST | DF_MULTIPLY_EXPRESSION,
+ 
+     // D3 OP_DIV_INT_LIT16 vA, vB, #+CCCC
+-    DF_DA | DF_UB | DF_DIVIDE_EXPRESSION,
++    DF_DA | DF_UB | DF_C_IS_CONST | DF_DIVIDE_EXPRESSION,
+ 
+     // D4 OP_REM_INT_LIT16 vA, vB, #+CCCC
+-    DF_DA | DF_UB | DF_REMAINDER_EXPRESSION,
++    DF_DA | DF_UB | DF_C_IS_CONST | DF_REMAINDER_EXPRESSION,
+ 
+     // D5 OP_AND_INT_LIT16 vA, vB, #+CCCC
+-    DF_DA | DF_UB | DF_AND_EXPRESSION,
++    DF_DA | DF_UB | DF_C_IS_CONST | DF_AND_EXPRESSION,
+ 
+     // D6 OP_OR_INT_LIT16 vA, vB, #+CCCC
+-    DF_DA | DF_UB | DF_OR_EXPRESSION,
++    DF_DA | DF_UB | DF_C_IS_CONST | DF_OR_EXPRESSION,
+ 
+     // D7 OP_XOR_INT_LIT16 vA, vB, #+CCCC
+-    DF_DA | DF_UB | DF_XOR_EXPRESSION,
++    DF_DA | DF_UB | DF_C_IS_CONST | DF_XOR_EXPRESSION,
+ 
+     // D8 OP_ADD_INT_LIT8 vAA, vBB, #+CC
+-    DF_DA | DF_UB | DF_IS_LINEAR | DF_ADD_EXPRESSION,
++    DF_DA | DF_UB | DF_C_IS_CONST | DF_IS_LINEAR | DF_ADD_EXPRESSION,
+ 
+     // D9 OP_RSUB_INT_LIT8 vAA, vBB, #+CC
+-    DF_DA | DF_UB | DF_SUBTRACT_EXPRESSION,
++    DF_DA | DF_UB | DF_C_IS_CONST | DF_SUBTRACT_EXPRESSION,
+ 
+     // DA OP_MUL_INT_LIT8 vAA, vBB, #+CC
+-    DF_DA | DF_UB | DF_MULTIPLY_EXPRESSION,
++    DF_DA | DF_UB | DF_C_IS_CONST | DF_MULTIPLY_EXPRESSION,
+ 
+     // DB OP_DIV_INT_LIT8 vAA, vBB, #+CC
+-    DF_DA | DF_UB | DF_DIVIDE_EXPRESSION,
++    DF_DA | DF_UB | DF_C_IS_CONST | DF_DIVIDE_EXPRESSION,
+ 
+     // DC OP_REM_INT_LIT8 vAA, vBB, #+CC
+-    DF_DA | DF_UB | DF_REMAINDER_EXPRESSION,
++    DF_DA | DF_UB | DF_C_IS_CONST | DF_REMAINDER_EXPRESSION,
+ 
+     // DD OP_AND_INT_LIT8 vAA, vBB, #+CC
+-    DF_DA | DF_UB | DF_AND_EXPRESSION,
++    DF_DA | DF_UB | DF_C_IS_CONST | DF_AND_EXPRESSION,
+ 
+     // DE OP_OR_INT_LIT8 vAA, vBB, #+CC
+-    DF_DA | DF_UB | DF_OR_EXPRESSION,
++    DF_DA | DF_UB | DF_C_IS_CONST | DF_OR_EXPRESSION,
+ 
+     // DF OP_XOR_INT_LIT8 vAA, vBB, #+CC
+-    DF_DA | DF_UB | DF_XOR_EXPRESSION,
++    DF_DA | DF_UB | DF_C_IS_CONST | DF_XOR_EXPRESSION,
+ 
+     // E0 OP_SHL_INT_LIT8 vAA, vBB, #+CC
+-    DF_DA | DF_UB | DF_SHL_EXPRESSION,
++    DF_DA | DF_UB | DF_C_IS_CONST | DF_SHL_EXPRESSION,
+ 
+     // E1 OP_SHR_INT_LIT8 vAA, vBB, #+CC
+-    DF_DA | DF_UB | DF_SHR_EXPRESSION,
++    DF_DA | DF_UB | DF_C_IS_CONST | DF_SHR_EXPRESSION,
+ 
+     // E2 OP_USHR_INT_LIT8 vAA, vBB, #+CC
+-    DF_DA | DF_UB | DF_USHR_EXPRESSION,
++    DF_DA | DF_UB | DF_C_IS_CONST | DF_USHR_EXPRESSION,
+ 
+     // E3 OP_IGET_VOLATILE
+     DF_DA | DF_UB,
+@@ -1018,7 +1018,7 @@ char *dvmCompilerGetDalvikDisassembly(const DecodedInstruction *insn,
+         if (dfAttributes & DF_C_IS_REG) {
+             snprintf(buffer + len, left, ", v%d", insn->vC);
+         }
+-        else if ((int)opcode < (int)kMirOpFirst) {
++        else if ((int)opcode < (int)kMirOpFirst || (dfAttributes & DF_C_IS_CONST) != 0) {
+             snprintf(buffer + len, left, ", (#%d)", insn->vC);
+         }
+     }
+@@ -2496,9 +2496,10 @@ bool dvmCompilerFindInductionVariables(struct CompilationUnit *cUnit,
+ 
+                     ivInfo->ssaReg = mir->ssaRep->uses[0];
+                     ivInfo->basicSSAReg = mir->ssaRep->uses[0];
+-                    ivInfo->m = 1;         // always 1 to basic iv
+-                    ivInfo->c = 0;         // N/A to basic iv
+-                    ivInfo->inc = deltaValue;
++                    //A basic IV has form i = 1*i + d
++                    ivInfo->multiplier = 1;
++                    ivInfo->constant = deltaValue;
++                    ivInfo->loopIncrement = deltaValue;
+                     dvmInsertGrowableList(ivList, (intptr_t) ivInfo);
+                     cUnit->loopAnalysis->numBasicIV++;
+                     break;
+@@ -2529,25 +2530,25 @@ bool dvmCompilerFindInductionVariables(struct CompilationUnit *cUnit,
+                                                         mir->ssaRep->defs[0]);
+ 
+             bool cIsConstant = false;
+-            int c = 0;
++            int constant = 0;
+ 
+             switch (mir->dalvikInsn.opcode) {
+                 case OP_ADD_INT:
+                     if (dvmIsBitSet(isConstantV,
+                                     mir->ssaRep->uses[1])) {
+-                        c = (*cUnit->constantValues)[mir->ssaRep->uses[1]];
++                        constant = (*cUnit->constantValues)[mir->ssaRep->uses[1]];
+                         cIsConstant = true;
+                     }
+                     break;
+                 case OP_SUB_INT:
+                     if (dvmIsBitSet(isConstantV,
+                                     mir->ssaRep->uses[1])) {
+-                        c = -(*cUnit->constantValues)[mir->ssaRep->uses[1]];
++                        constant = -(*cUnit->constantValues)[mir->ssaRep->uses[1]];
+                         cIsConstant = true;
+                     }
+                     break;
+                 case OP_ADD_INT_LIT8:
+-                    c = mir->dalvikInsn.vC;
++                    constant = mir->dalvikInsn.vC;
+                     cIsConstant = true;
+                     break;
+                 default:
+@@ -2578,9 +2579,9 @@ bool dvmCompilerFindInductionVariables(struct CompilationUnit *cUnit,
+ 
+                 ivInfo->ssaReg = mir->ssaRep->defs[0];
+                 ivInfo->basicSSAReg = ivInfoOld->basicSSAReg;
+-                ivInfo->m = ivInfoOld->m;
+-                ivInfo->c = c + ivInfoOld->c;
+-                ivInfo->inc = ivInfoOld->inc;
++                ivInfo->multiplier = ivInfoOld->multiplier;
++                ivInfo->constant = constant + ivInfoOld->constant;
++                ivInfo->loopIncrement = ivInfoOld->loopIncrement;
+                 dvmInsertGrowableList(ivList, (intptr_t) ivInfo);
+             }
+         }
+@@ -2916,7 +2917,6 @@ bool detectAndInitializeBasicIV(CompilationUnit *cUnit,
+     //If we found a candidate, check that it matches criteria for basic IV
+     if (candidate != 0)
+     {
+-        BitVector *isConstantV = cUnit->isConstantV;
+         bool deltaIsConstant = false;
+         int deltaValue;
+ 
+@@ -2926,7 +2926,7 @@ bool detectAndInitializeBasicIV(CompilationUnit *cUnit,
+         {
+             case OP_ADD_INT:
+             case OP_ADD_INT_2ADDR:
+-                if (dvmIsBitSet(isConstantV, candidate->ssaRep->uses[1]))
++                if (dvmCompilerIsRegConstant (cUnit, candidate->ssaRep->uses[1]))
+                 {
+                     deltaValue = (*cUnit->constantValues)[candidate->ssaRep->uses[1]];
+                     deltaIsConstant = true;
+@@ -2934,7 +2934,7 @@ bool detectAndInitializeBasicIV(CompilationUnit *cUnit,
+                 break;
+             case OP_SUB_INT:
+             case OP_SUB_INT_2ADDR:
+-                if (dvmIsBitSet(isConstantV, candidate->ssaRep->uses[1]))
++                if (dvmCompilerIsRegConstant (cUnit, candidate->ssaRep->uses[1]))
+                 {
+                     deltaValue = - (*cUnit->constantValues)[candidate->ssaRep->uses[1]];
+                     deltaIsConstant = true;
+@@ -2955,17 +2955,25 @@ bool detectAndInitializeBasicIV(CompilationUnit *cUnit,
+             if (deltaValue >= 0 || wentThrough == false)
+             {
+                 GrowableList & ivList = info->getInductionVariableList();
+-                InductionVariableInfo *ivInfo = static_cast<InductionVariableInfo *> (
+-                        dvmCompilerNew (sizeof (*ivInfo), false));
+ 
+-                ivInfo->ssaReg = candidate->ssaRep->uses[0];
++                void *space = dvmCompilerNew (sizeof (InductionVariableInfo), true);
++                InductionVariableInfo *ivInfo = new (space) InductionVariableInfo;
++
++                ivInfo->ssaReg = candidate->ssaRep->defs[0];
+                 ivInfo->basicSSAReg = candidate->ssaRep->uses[0];
+-                ivInfo->m = 1;         // always 1 to basic iv
+-                ivInfo->c = 0;         // N/A to basic iv
+-                ivInfo->inc = deltaValue;
++                ivInfo->multiplier = 1;         // always 1 to basic iv
++                ivInfo->constant = 0;         // N/A to basic iv
++                ivInfo->loopIncrement = deltaValue;
++                ivInfo->isBasic = true;
++                ivInfo->linearMir = candidate;
++                ivInfo->phiMir = phi;
++                ivInfo->multiplierMir = 0; //always null for basic iv
+                 dvmInsertGrowableList (&ivList, (intptr_t) ivInfo);
+-                info->setSSABIV(candidate->ssaRep->defs[0]);
+ 
++                //FIXME The loop system relies on the IV detection to set the loop's BIV.
++                //And there are users of this variable whenever a loop is found with a single BIV.
++                //But this is not the correct way to detect this scenario.
++                info->setSSABIV(candidate->ssaRep->defs[0]);
+                 foundBasicIV = true;
+             }
+         }
+@@ -2975,6 +2983,163 @@ bool detectAndInitializeBasicIV(CompilationUnit *cUnit,
+ }
+ 
+ /**
++ * @brief Used to detect and initialize dependent IVs
++ * @param cUnit The compilation unit
++ * @param loopInfo The loop information for which we want to find dependent IVs
++ */
++static void detectAndInitializeDependentIVs (CompilationUnit *cUnit, LoopInformation *loopInfo)
++{
++    //Used to keep the dependent IVs we need to insert
++    std::set<InductionVariableInfo *> toInsert;
++
++    //Get the induction variable list and create an iterator for it
++    GrowableList &ivList = loopInfo->getInductionVariableList ();
++    GrowableListIterator iter;
++    dvmGrowableListIteratorInit (&ivList, &iter);
++
++    while (true)
++    {
++        //Get the IV information
++        InductionVariableInfo *ivInfo = reinterpret_cast<InductionVariableInfo *> (dvmGrowableListIteratorNext (&iter));
++
++        //Break out if there is no more information
++        if (ivInfo == 0)
++        {
++            break;
++        }
++
++        //Keep looking if this one is not a basic IV
++        if (ivInfo->isBasicIV () == false)
++        {
++            continue;
++        }
++
++        //Keep track of candidates for dependent IV
++        std::set<MIR *> candidates;
++
++        //Create set of mirs that are associate with this IV
++        //TODO Might make sense to also include any casting MIRs
++        std::set<MIR *> mirsForIV;
++        mirsForIV.insert (ivInfo->linearMir);
++        mirsForIV.insert (ivInfo->phiMir);
++
++        //Walk through all of the MIRs associated with this BIV
++        for (std::set<MIR *>::const_iterator mirIter = mirsForIV.begin (); mirIter != mirsForIV.end (); mirIter++)
++        {
++            const MIR *mir = *mirIter;
++
++            //Paranoid
++            if (mir == 0 || mir->ssaRep == 0)
++            {
++                continue;
++            }
++
++            //Walk through the defines of this MIR to find users
++            for (int def = 0; def < mir->ssaRep->numDefs; def++)
++            {
++                //Walk through the uses and save them as candidates
++                for (SUsedChain *userChain = mir->ssaRep->usedNext[def]; userChain != 0; userChain = userChain->nextUse)
++                {
++                    assert (userChain->mir != 0);
++                    candidates.insert (userChain->mir);
++                }
++            }
++        }
++
++        //TODO This logic does not detect cases of j = m * i + c. It detects solely: j = m * i and j = i + c
++        for (std::set<MIR *>::iterator candIter = candidates.begin (); candIter != candidates.end (); candIter++)
++        {
++            MIR *candidate = *candIter;
++
++            //If this user is not inside the loop, then do not consider it as a dependent IV for the loop
++            if (loopInfo->contains (candidate->bb) == false)
++            {
++                continue;
++            }
++
++            bool constantIsMultiplier = false;
++            bool constantSignMustFlip = false;
++            bool noMatch = false;
++
++            switch (candidate->dalvikInsn.opcode)
++            {
++                case OP_ADD_INT:
++                case OP_ADD_INT_LIT8:
++                case OP_ADD_INT_LIT16:
++                    break;
++                case OP_SUB_INT:
++                    constantSignMustFlip = true;
++                    break;
++                case OP_MUL_INT:
++                case OP_MUL_INT_LIT8:
++                case OP_MUL_INT_LIT16:
++                    constantIsMultiplier = true;
++                    break;
++                default:
++                    noMatch = true;
++                    break;
++            }
++
++            if (noMatch == true)
++            {
++                continue;
++            }
++
++            int constant = 0;
++            bool foundConst = dvmCompilerGetFirstConstantUsed (cUnit, candidate, constant);
++
++            if (foundConst == false)
++            {
++                //We expect to find a constant if this is a dependent IV
++                continue;
++            }
++
++            if (constantSignMustFlip == true)
++            {
++                constant = -constant;
++            }
++
++            void *space = dvmCompilerNew (sizeof(InductionVariableInfo), true);
++            InductionVariableInfo *depIVInfo = new (space) InductionVariableInfo;
++
++            depIVInfo->ssaReg = candidate->ssaRep->defs[0];
++            depIVInfo->basicSSAReg = ivInfo->basicSSAReg;
++            depIVInfo->loopIncrement = ivInfo->loopIncrement;
++            depIVInfo->isBasic = false;
++
++            //There cannot be a phi node because the DevIV is not used in its own calculation
++            depIVInfo->phiMir = 0;
++
++            if (constantIsMultiplier == true)
++            {
++                depIVInfo->multiplier = constant;
++                depIVInfo->constant = 0;
++                depIVInfo->linearMir = 0;
++                depIVInfo->multiplierMir = candidate;
++            }
++            else
++            {
++                depIVInfo->multiplier = 1;
++                depIVInfo->constant = constant;
++                depIVInfo->linearMir = candidate;
++                depIVInfo->multiplierMir = 0;
++            }
++
++            toInsert.insert (depIVInfo);
++        }
++    }
++
++    //Iterate through all of the dependent IVs that we need to insert
++    for (std::set<InductionVariableInfo *>::iterator iter = toInsert.begin (); iter != toInsert.end (); iter++)
++    {
++        InductionVariableInfo *depIVInfo = *iter;
++
++        //Insert into the official IV list
++        dvmInsertGrowableList (&ivList, (intptr_t) depIVInfo);
++    }
++}
++
++/**
+  * @brief Looks through loop structure to find induction variables.
+  * @param cUnit The compilation unit
+  * @param info The loop information for current loop.
+@@ -3031,107 +3196,8 @@ bool dvmCompilerFindInductionVariablesHelper(CompilationUnit *cUnit,
+         }
+     }
+ 
+-    /* Find dependent induction variable now */
+-    GrowableListIterator iterator;
+-    dvmGrowableListIteratorInit(&cUnit->blockList, &iterator);
+-    BasicBlock * bb;
+-    for (bb = (BasicBlock *) (dvmGrowableListIteratorNext(&iterator));
+-        bb != NULL;
+-        bb = (BasicBlock *) (dvmGrowableListIteratorNext(&iterator)))
+-    {
+-        for (MIR* mir = bb->firstMIRInsn; mir; mir = mir->next)
+-        {
+-            long long dfAttributes =
+-                dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
+-
+-            if ((dfAttributes & DF_IS_LINEAR) == 0) {
+-                continue;
+-            }
+-
+-            /* Skip already identified induction variables */
+-            if (info->isAnInductionVariable(cUnit, mir->ssaRep->defs[0], true) == true) {
+-                continue;
+-            }
+-
+-            /* dependent IVs have 1 or 2 uses dependent on add/sub bytecode used */
+-            assert (mir->ssaRep->numUses == 1 || mir->ssaRep->numUses == 2);
+-
+-            /*
+-             * For a dependent induction variable:
+-             *  1) use[0] should be an induction variable (basic/dependent)
+-             *  2) operand2 should be a constant
+-             */
+-
+-            if (info->isAnInductionVariable(cUnit, mir->ssaRep->uses[0], true) == true)
+-            {
+-                int srcDalvikReg = dvmConvertSSARegToDalvik(cUnit,
+-                                                            mir->ssaRep->uses[0]);
+-                int dstDalvikReg = dvmConvertSSARegToDalvik(cUnit,
+-                                                            mir->ssaRep->defs[0]);
+-
+-                bool cIsConstant = false;
+-                int c = 0;
+-
+-                switch (mir->dalvikInsn.opcode) {
+-                    case OP_ADD_INT:
+-                        if (dvmIsBitSet(cUnit->isConstantV,
+-                                        mir->ssaRep->uses[1])) {
+-                            c = -(*cUnit->constantValues)[mir->ssaRep->uses[1]];
+-                            cIsConstant = true;
+-                        }
+-                        break;
+-                    case OP_SUB_INT:
+-                        if (dvmIsBitSet(cUnit->isConstantV,
+-                                        mir->ssaRep->uses[1])) {
+-                            c = (*cUnit->constantValues)[mir->ssaRep->uses[1]];
+-                            cIsConstant = true;
+-                        }
+-                        break;
+-                    case OP_ADD_INT_LIT8:
+-                        c = mir->dalvikInsn.vC;
+-                        cIsConstant = true;
+-                        break;
+-                    default:
+-                        break;
+-                }
+-
+-                /* Ignore the update to the basic induction variable itself */
+-                if (DECODE_REG(srcDalvikReg) == DECODE_REG(dstDalvikReg))  {
+-                    info->setSSABIV(mir->ssaRep->defs[0]);
+-                    continue;
+-                }
+-
+-                if (cIsConstant == true) {
+-                    unsigned int i;
+-                    // in the new framework we don't use bit vector but liner scan on the ivList instead
+-                    InductionVariableInfo *ivInfo = NULL;
+-                    InductionVariableInfo *ivInfoOld = NULL;
+-
+-                    for (i = 0; i < ivList.numUsed; i++) {
+-                        ivInfoOld = (InductionVariableInfo *) ivList.elemList[i];
+-                        if (ivInfoOld->ssaReg == mir->ssaRep->uses[0]) {
+-                            break;
+-                        }
+-                    }
+-
+-                    /* Guaranteed to find an element */
+-                    /* Paranoid */
+-                    if (ivInfoOld == NULL) {
+-                        continue;
+-                    }
+-
+-                    ivInfo = (InductionVariableInfo *) dvmCompilerNew(sizeof(InductionVariableInfo), false);
+-
+-                    ivInfo->ssaReg = mir->ssaRep->defs[0];
+-                    ivInfo->basicSSAReg = ivInfoOld->basicSSAReg;
+-                    ivInfo->m = ivInfoOld->m;
+-                    ivInfo->c = c + ivInfoOld->c;
+-                    ivInfo->inc = ivInfoOld->inc;
+-                    dvmInsertGrowableList(&ivList, (intptr_t) ivInfo);
+-                }
+-            }
+-        }
+-    }
++    //Now look for the dependent IVs
++    detectAndInitializeDependentIVs (cUnit, info);
+ 
+     return true;
+ }
+diff --git a/vm/compiler/Dataflow.h b/vm/compiler/Dataflow.h
+index 35365e1..a7d3d4b 100644
+--- a/vm/compiler/Dataflow.h
++++ b/vm/compiler/Dataflow.h
+@@ -45,6 +45,7 @@ typedef enum DataFlowAttributePos {
+     kFPA,
+     kFPB,
+     kFPC,
++    kConstC,             //!< Used to determine whether vC is a constant
+     kGetter,
+     kSetter,
+     kCall,
+@@ -88,6 +89,7 @@ typedef enum DataFlowAttributePos {
+ #define DF_FP_A                 (1LL << kFPA)
+ #define DF_FP_B                 (1LL << kFPB)
+ #define DF_FP_C                 (1LL << kFPC)
++#define DF_C_IS_CONST           (1LL << kConstC)
+ #define DF_IS_GETTER            (1LL << kGetter)
+ #define DF_IS_SETTER            (1LL << kSetter)
+ #define DF_IS_CALL              (1LL << kCall)
+@@ -118,6 +120,8 @@ typedef enum DataFlowAttributePos {
+                                  DF_NULL_OBJECT_CHECK_1 | \
+                                  DF_NULL_OBJECT_CHECK_2)
+ 
++#define DF_HAS_CONSTANTS        (DF_C_IS_CONST)
++
+ #define DF_A_IS_REG             (DF_UA | DF_UA_WIDE | DF_DA | DF_DA_WIDE)
+ #define DF_A_IS_USED_REG        (DF_UA | DF_UA_WIDE)
+ #define DF_A_IS_DEFINED_REG     (DF_DA | DF_DA_WIDE)
+@@ -180,11 +184,26 @@ typedef struct SSARepresentation {
+  * induction variable.
+  */
+ typedef struct InductionVariableInfo {
+-    int ssaReg;
+-    int basicSSAReg;
+-    int m;      // multiplier
+-    int c;      // constant
+-    int inc;    // loop incriment
++    int ssaReg;         //!< The ssa register defined by expression for IV
++    int basicSSAReg;    //!< The basic ssa register involved
++    int multiplier;     //!< Multiplier. For basic IV it is always 1.
++    int constant;       //!< Constant. For basic IV is it always 0.
++    int loopIncrement;  //!< Loop increment. Only relevant for basic IV to keep the loop increment/decrement.
++    bool isBasic;       //!< Whether the induction variable is basic
++    MIR *linearMir;     //!< MIR associated with the linear operation.
++    MIR *multiplierMir; //!< MIR associated with the multiplication operation. Always null for Basic IV.
++    MIR *phiMir;        //!< MIR associated with the phi node. May be null but never for Basic IV.
++
++    int getMultiplier () const { return multiplier; }
++
++    int getLoopIncrement () const { return loopIncrement; }
++
++    int getConstant () const { return constant; }
++
++    bool isBasicIV () const { return isBasic == true; }
++
++    bool isDependentIV () const { return isBasic == false; }
++
+ } InductionVariableInfo;
+ 
+ typedef struct ArrayAccessInfo {
+diff --git a/vm/compiler/Loop.cpp b/vm/compiler/Loop.cpp
+index 484bb71..d3fbe8d 100644
+--- a/vm/compiler/Loop.cpp
++++ b/vm/compiler/Loop.cpp
+@@ -18,6 +18,7 @@
+ #include "CompilerInternals.h"
+ #include "Dataflow.h"
+ #include "Loop.h"
++#include "Utility.h"
+ 
+ #ifdef ARCH_IA32
+ #include "PassDriver.h"
+@@ -123,10 +124,10 @@ static bool isSimpleCountedLoop(CompilationUnit *cUnit)
+         /* Count up or down loop? */
+         if (ivInfo->ssaReg == ivInfo->basicSSAReg) {
+             /* Infinite loop */
+-            if (ivInfo->inc == 0) {
++            if (ivInfo->loopIncrement == 0) {
+                 return false;
+             }
+-            loopAnalysis->isCountUpLoop = ivInfo->inc > 0;
++            loopAnalysis->isCountUpLoop = ivInfo->loopIncrement > 0;
+             break;
+         }
+     }
+@@ -259,11 +260,11 @@ static void updateRangeCheckInfo(CompilationUnit *cUnit, int arrayReg,
+                                ArrayAccessInfo*,
+                                j);
+                 if (existingArrayAccessInfo->arrayReg == arrayReg) {
+-                    if (ivInfo->c > existingArrayAccessInfo->maxC) {
+-                        existingArrayAccessInfo->maxC = ivInfo->c;
++                    if (ivInfo->constant > existingArrayAccessInfo->maxC) {
++                        existingArrayAccessInfo->maxC = ivInfo->constant;
+                     }
+-                    if (ivInfo->c < existingArrayAccessInfo->minC) {
+-                        existingArrayAccessInfo->minC = ivInfo->c;
++                    if (ivInfo->constant < existingArrayAccessInfo->minC) {
++                        existingArrayAccessInfo->minC = ivInfo->constant;
+                     }
+                     arrayAccessInfo = existingArrayAccessInfo;
+                     break;
+@@ -275,9 +276,9 @@ static void updateRangeCheckInfo(CompilationUnit *cUnit, int arrayReg,
+                                                       false);
+                 arrayAccessInfo->ivReg = ivInfo->basicSSAReg;
+                 arrayAccessInfo->arrayReg = arrayReg;
+-                arrayAccessInfo->maxC = (ivInfo->c > 0) ? ivInfo->c : 0;
+-                arrayAccessInfo->minC = (ivInfo->c < 0) ? ivInfo->c : 0;
+-                arrayAccessInfo->inc = ivInfo->inc;
++                arrayAccessInfo->maxC = (ivInfo->constant > 0) ? ivInfo->constant : 0;
++                arrayAccessInfo->minC = (ivInfo->constant < 0) ? ivInfo->constant : 0;
++                arrayAccessInfo->loopIncrement = ivInfo->loopIncrement;
+                 dvmInsertGrowableList(loopAnalysis->arrayAccessInfo,
+                                       (intptr_t) arrayAccessInfo);
+             }
+@@ -401,7 +402,7 @@ static void genHoistedChecks(CompilationUnit *cUnit)
+         rangeCheckMIR->dalvikInsn.arg[0] = arrayAccessInfo->maxC;
+         rangeCheckMIR->dalvikInsn.arg[1] = arrayAccessInfo->minC;
+         rangeCheckMIR->dalvikInsn.arg[2] = loopAnalysis->loopBranchOpcode;
+-        rangeCheckMIR->dalvikInsn.arg[3] = arrayAccessInfo->inc;
++        rangeCheckMIR->dalvikInsn.arg[3] = arrayAccessInfo->loopIncrement;
+         // set offset to the start offset of entry block
+         // this will set rPC in case of bail to interpreter
+         rangeCheckMIR->offset = entry->startOffset;
+@@ -572,12 +573,12 @@ static bool isSimpleCountedLoop(CompilationUnit *cUnit)
+ 
+         ivInfo = GET_ELEM_N(ivList, InductionVariableInfo*, i);
+         /* Count up or down loop? */
+-        if (ivInfo->ssaReg == ivInfo->basicSSAReg) {
++        if (ivInfo->isBasicIV () == true) {
+             /* Infinite loop */
+-            if (ivInfo->inc == 0) {
++            if (ivInfo->loopIncrement == 0) {
+                 return false;
+             }
+-            loopInfo->setCountUpLoop(ivInfo->inc > 0);
++            loopInfo->setCountUpLoop(ivInfo->loopIncrement > 0);
+             break;
+         }
+     }
+@@ -665,7 +666,7 @@ static bool isSimpleCountedLoop(CompilationUnit *cUnit)
+          * - It is reloaded with a constant
+          */
+         if ((DECODE_SUB(endDalvikReg) != 0) &&
+-            dvmIsBitSet(cUnit->isConstantV, endSSAReg) == false) {
++                dvmCompilerIsRegConstant (cUnit, endSSAReg) == false) {
+             return false;
+         }
+     } else {
+@@ -747,11 +748,11 @@ static void updateRangeCheckInfo(CompilationUnit *cUnit, int arrayReg,
+                                ArrayAccessInfo*,
+                                j);
+                 if (existingArrayAccessInfo->arrayReg == arrayReg) {
+-                    if (ivInfo->c > existingArrayAccessInfo->maxC) {
+-                        existingArrayAccessInfo->maxC = ivInfo->c;
++                    if (ivInfo->constant > existingArrayAccessInfo->maxC) {
++                        existingArrayAccessInfo->maxC = ivInfo->constant;
+                     }
+-                    if (ivInfo->c < existingArrayAccessInfo->minC) {
+-                        existingArrayAccessInfo->minC = ivInfo->c;
++                    if (ivInfo->constant < existingArrayAccessInfo->minC) {
++                        existingArrayAccessInfo->minC = ivInfo->constant;
+                     }
+                     arrayAccessInfo = existingArrayAccessInfo;
+                     break;
+@@ -763,9 +764,9 @@ static void updateRangeCheckInfo(CompilationUnit *cUnit, int arrayReg,
+                                                       false);
+                 arrayAccessInfo->ivReg = ivInfo->basicSSAReg;
+                 arrayAccessInfo->arrayReg = arrayReg;
+-                arrayAccessInfo->maxC = (ivInfo->c > 0) ? ivInfo->c : 0;
+-                arrayAccessInfo->minC = (ivInfo->c < 0) ? ivInfo->c : 0;
+-                arrayAccessInfo->inc = ivInfo->inc;
++                arrayAccessInfo->maxC = (ivInfo->constant > 0) ? ivInfo->constant : 0;
++                arrayAccessInfo->minC = (ivInfo->constant < 0) ? ivInfo->constant : 0;
++                arrayAccessInfo->inc = ivInfo->loopIncrement;
+                 dvmInsertGrowableList(cUnit->loopInformation->getArrayAccessInfo(),
+                                       (intptr_t) arrayAccessInfo);
+             }
+@@ -908,16 +909,21 @@ static void dvmDumpHoistedRangeCheckInfo(CompilationUnit* cUnit)
+ 
+     /* dump IV info */
+     ALOGD("BASIC_IV_NUMBER_INFO: number of basic IV: %d", loopInfo->getNumBasicIV(cUnit));
+-    for (i = 0; i < ivList->numUsed; i++) {
++    for (i = 0; i < ivList->numUsed; i++)
++    {
+         ivInfo = GET_ELEM_N(ivList, InductionVariableInfo*, i);
+-        if (ivInfo->ssaReg == ivInfo->basicSSAReg) {
++
++        if (ivInfo->isBasicIV () == true)
++        {
+             /* Basic IV */
+-            ALOGD("BASIC_IV_INFO: ssaReg: %d, basicSSAReg: %d, inc: %d, VR: %d_%dn", ivInfo->ssaReg, ivInfo->basicSSAReg, ivInfo->inc,
++            ALOGD("BASIC_IV_INFO: ssaReg: %d, basicSSAReg: %d, inc: %d, VR: %d_%dn", ivInfo->ssaReg, ivInfo->basicSSAReg, ivInfo->loopIncrement,
+                                dvmExtractSSARegister (cUnit, ivInfo->ssaReg), dvmExtractSSASubscript (cUnit, ivInfo->ssaReg));
+-        } else {
++        }
++        else
++        {
+             /* Dependent IV */
+-            ALOGD("DEPENDENT_IV_INFO: ssaReg: %d, depSSAReg: %d, inc: %d, VR: %d_%d c=%d\n", ivInfo->ssaReg, ivInfo->basicSSAReg, ivInfo->inc,
+-                               dvmExtractSSARegister (cUnit, ivInfo->ssaReg), dvmExtractSSASubscript (cUnit, ivInfo->ssaReg), ivInfo->c);
++            ALOGD("DEPENDENT_IV_INFO: ssaReg: %d, depSSAReg: %d, inc: %d, VR: %d_%d c=%d\n", ivInfo->ssaReg, ivInfo->basicSSAReg, ivInfo->loopIncrement,
++                               dvmExtractSSARegister (cUnit, ivInfo->ssaReg), dvmExtractSSASubscript (cUnit, ivInfo->ssaReg), ivInfo->constant);
+         }
+     }
+ 
+@@ -1793,7 +1799,7 @@ static void dumpIVList(CompilationUnit *cUnit)
+             ALOGE("BIV %d: s%d(v%d_%d) + %d", i,
+                  ivInfo->ssaReg,
+                  DECODE_REG(iv), DECODE_SUB(iv),
+-                 ivInfo->inc);
++                 ivInfo->loopIncrement);
+         /* Dependent IV */
+         } else {
+             int biv = dvmConvertSSARegToDalvik(cUnit, ivInfo->basicSSAReg);
+@@ -1804,7 +1810,7 @@ static void dumpIVList(CompilationUnit *cUnit)
+                  ivInfo->m,
+                  ivInfo->basicSSAReg,
+                  DECODE_REG(biv), DECODE_SUB(biv),
+-                 ivInfo->c);
++                 ivInfo->constant);
+         }
+     }
+ }
+diff --git a/vm/compiler/LoopInformation.cpp b/vm/compiler/LoopInformation.cpp
+index 64fe4b5..5d8d1c6 100644
+--- a/vm/compiler/LoopInformation.cpp
++++ b/vm/compiler/LoopInformation.cpp
+@@ -885,15 +885,15 @@ bool LoopInformation::executedPerIteration (const CompilationUnit *cUnit, const
+     return executedPerIteration (cUnit, current);
+ }
+ 
+-int LoopInformation::getInductionIncrement (const CompilationUnit *cUnit, unsigned int reg, bool isSSA)
++InductionVariableInfo *LoopInformation::getInductionVariableInfo (const CompilationUnit *cUnit, int reg, bool isSSA)
+ {
+     //Go through the induction variable list
+     GrowableListIterator iterator;
+-    dvmGrowableListIteratorInit(&inductionVariableList, &iterator);
++    dvmGrowableListIteratorInit (&inductionVariableList, &iterator);
+ 
+     while (true)
+     {
+-        InductionVariableInfo *info = (InductionVariableInfo *) (dvmGrowableListIteratorNext(&iterator));
++        InductionVariableInfo *info = (InductionVariableInfo *) (dvmGrowableListIteratorNext (&iterator));
+ 
+         //Bail at the end
+         if (info == 0)
+@@ -901,17 +901,27 @@ int LoopInformation::getInductionIncrement (const CompilationUnit *cUnit, unsign
+             break;
+         }
+ 
+-        //Get the ssa register for this induction
+-        unsigned int ssaReg = info->ssaReg;
++        //Check if we have a basic IV. If we do, then we can simply look up by dalvik register.
++        if (info->isBasicIV () == true)
++        {
++            //Convert them both to dalvik register.
++            int ivDalvikReg = dvmExtractSSARegister (cUnit, info->ssaReg);
++            int regToCheck = (isSSA == true) ? dvmExtractSSARegister (cUnit, reg) : reg;
+ 
+-        //Is it a match?
+-        if (isSSA == false) {
+-            if (dvmExtractSSARegister (cUnit, ssaReg) == reg) {
+-                return info->inc;
++            //Return true if they match, otherwise continue to the next
++            if (regToCheck == ivDalvikReg)
++            {
++                return info;
+             }
+-        } else {
+-            if (ssaReg == reg) {
+-                return info->inc;
++        }
++        else
++        {
++            //We have a dependent IV. It does not make sense to look up by dalvik register
++            //and thus we first check that the provided reg is in ssa form and only if it
++            //we check whether we found a matching entry in the IV list
++            if (isSSA == true && reg == info->ssaReg)
++            {
++                return info;
+             }
+         }
+     }
+@@ -920,74 +930,40 @@ int LoopInformation::getInductionIncrement (const CompilationUnit *cUnit, unsign
+     return 0;
+ }
+ 
+-bool LoopInformation::isAnInductionVariable (const CompilationUnit *cUnit, unsigned int reg, bool isSSA)
++int LoopInformation::getInductionIncrement (const CompilationUnit *cUnit, unsigned int reg, bool isSSA)
+ {
+-    //Go through the induction variable list
+-    GrowableListIterator iterator;
+-    dvmGrowableListIteratorInit(&inductionVariableList, &iterator);
++    InductionVariableInfo *info = getInductionVariableInfo (cUnit, reg, isSSA);
+ 
+-    while (true)
++    if (info == 0)
+     {
+-        InductionVariableInfo *info = (InductionVariableInfo *) (dvmGrowableListIteratorNext(&iterator));
+-
+-        //Bail at the end
+-        if (info == 0)
+-        {
+-            break;
+-        }
+-
+-        //Get the ssa register for this induction
+-        unsigned int ssaReg = info->ssaReg;
+-
+-        //Is it a match?
+-        if (isSSA == false) {
+-            if (dvmExtractSSARegister (cUnit, ssaReg) == reg) {
+-                return true;
+-            }
+-        } else {
+-            if (ssaReg == reg) {
+-                return true;
+-            }
+-        }
++        return 0;
+     }
+ 
+-    //Did not find it
+-    return false;
++    return info->loopIncrement;
+ }
+ 
+-bool LoopInformation::isAnBasicInductionVariable (const CompilationUnit *cUnit, unsigned int reg, bool isSSA)
++bool LoopInformation::isBasicInductionVariable (const CompilationUnit *cUnit, unsigned int reg, bool isSSA)
+ {
+-    //Go through the induction variable list
+-    GrowableListIterator iterator;
+-    dvmGrowableListIteratorInit(&inductionVariableList, &iterator);
++    InductionVariableInfo *info = getInductionVariableInfo (cUnit, reg, isSSA);
+ 
+-    while (true)
+-   {
+-        InductionVariableInfo *info = (InductionVariableInfo *) (dvmGrowableListIteratorNext(&iterator));
++    if (info == 0)
++    {
++        return false;
++    }
+ 
+-        //Bail at the end
+-        if (info == 0)
+-        {
+-            break;
+-        }
++    return info->isBasicIV ();
++}
+ 
+-        //Get the ssa register for this induction
+-        unsigned int basicSSAReg = info->basicSSAReg;
++bool LoopInformation::isAnInductionVariable (const CompilationUnit *cUnit, unsigned int reg, bool isSSA)
++{
++    InductionVariableInfo *info = getInductionVariableInfo (cUnit, reg, isSSA);
+ 
+-        //Is it a match?
+-        if (isSSA == false) {
+-            if (dvmExtractSSARegister (cUnit, basicSSAReg) == reg) {
+-                return true;
+-            }
+-        } else {
+-           if (basicSSAReg == reg) {
+-                return true;
+-            }
+-        }
++    if (info == 0)
++    {
++        return false;
+     }
+ 
+-    //Did not find it
+-    return false;
++    return true;
+ }
+ 
+ MIR *LoopInformation::getPhiInstruction (const CompilationUnit *cUnit, unsigned int vr) const
+@@ -1393,7 +1369,7 @@ bool LoopInformation::hasInvoke (const CompilationUnit *cUnit) const
+ }
+ 
+ /* Get number of basic IVs */
+-int LoopInformation::getNumBasicIV(CompilationUnit* cUnit)
++int LoopInformation::getNumBasicIV (const CompilationUnit* cUnit)
+ {
+     InductionVariableInfo *ivInfo;
+     //Get the IV list
+@@ -1402,7 +1378,7 @@ int LoopInformation::getNumBasicIV(CompilationUnit* cUnit)
+     unsigned int number = 0;
+     for (i = 0; i < ivList->numUsed; i++) {
+         ivInfo = GET_ELEM_N(ivList, InductionVariableInfo*, i);
+-        if (ivInfo->ssaReg == ivInfo->basicSSAReg) {
++        if (ivInfo->isBasicIV ()) {
+             number++;
+         }
+     }
+@@ -1433,13 +1409,13 @@ bool LoopInformation::getCountUpLoop(void)
+         }
+ 
+         //Only look at basic induction variables
+-        if (ivInfo->ssaReg == ivInfo->basicSSAReg)
++        if (ivInfo->isBasicIV () == true)
+         {
+             number++;
+ 
+             //If we have a BIV with 0 increment, then assume we don't have a count up loop.
+             //We possibly have an infinite loop.
+-            if (ivInfo->inc == 0)
++            if (ivInfo->loopIncrement == 0)
+             {
+                countUpLoop = false;
+                break;
+@@ -1454,7 +1430,7 @@ bool LoopInformation::getCountUpLoop(void)
+             }
+ 
+             //We have a count up loop if the increment is greater than 0
+-            countUpLoop = (ivInfo->inc > 0);
++            countUpLoop = (ivInfo->loopIncrement > 0);
+         }
+     }
+ 
+@@ -1715,7 +1691,7 @@ void LoopInformation::invalidatePeeling (void)
+     iterate (invalidatePeelingHelper);
+ }
+ 
+-bool LoopInformation::isUniqueIVIncrementingBy1 (void)
++bool LoopInformation::isUniqueIVIncrementingBy1 ()
+ {
+     GrowableList* ivList = & (getInductionVariableList ());
+     unsigned int number = 0;
+@@ -1727,13 +1703,13 @@ bool LoopInformation::isUniqueIVIncrementingBy1 (void)
+         ivInfo = GET_ELEM_N (ivList, InductionVariableInfo*, i);
+ 
+         //Is it a basic IV?
+-        if (ivInfo->ssaReg == ivInfo->basicSSAReg)
++        if (ivInfo->isBasicIV () == true)
+         {
+             //Increment count
+             number++;
+ 
+             //Is the increment not 1?
+-            if (ivInfo->inc != 1)
++            if (ivInfo->loopIncrement != 1)
+             {
+                 return false;
+             }
+diff --git a/vm/compiler/LoopInformation.h b/vm/compiler/LoopInformation.h
+index a0796cf..a977980 100644
+--- a/vm/compiler/LoopInformation.h
++++ b/vm/compiler/LoopInformation.h
+@@ -22,6 +22,7 @@
+ //Forward declarations
+ struct BasicBlock;
+ struct BitVector;
++struct InductionVariableInfo;
+ class CompilationUnit;
+ class Pass;
+ 
+@@ -335,7 +336,17 @@ class LoopInformation
+           * @param isSSA if the reg is SSA or Virtual register
+           * @return whether reg is an basic induction variable
+           */
+-         bool isAnBasicInductionVariable (const CompilationUnit *cUnit, unsigned int reg, bool isSSA = false);
++         bool isBasicInductionVariable (const CompilationUnit *cUnit, unsigned int reg, bool isSSA = false);
++
++         /**
++          * @brief Used to get the induction variable information for a requested register
++          * @param cUnit The compilation unit
++          * @param reg Register in ssa form or dalvik virtual register
++          * @param isSSA Whether the reg is represented with the ssa number
++          * @return Returns the IV info if found, otherwise returns 0.
++          */
++         InductionVariableInfo *getInductionVariableInfo (const CompilationUnit *cUnit, int reg,
++                 bool isSSA = false);
+ 
+          /**
+           * @brief Get the increment for an induction variable
+@@ -532,7 +543,7 @@ class LoopInformation
+           * @brief get number of basic IV
+           * @return number of basic IV
+           */
+-         int getNumBasicIV (CompilationUnit* cUnit);
++         int getNumBasicIV (const CompilationUnit* cUnit);
+ 
+          /**
+           * @brief Check if the loop is counted up/down
+@@ -550,7 +561,7 @@ class LoopInformation
+           * @brief set if the loop is counted up/down and return countUpLoop
+           * @return True if the loop is counted up, false - otherwise
+           */
+-         bool getCountUpLoop (void);
++         bool getCountUpLoop ();
+ 
+          /**
+           * @brief Get loop condition end reg
+@@ -580,7 +591,7 @@ class LoopInformation
+           * @brief Does the loop only have a single basic induction variable and is it incremented by 1?
+           * @return whether it does or does not
+           */
+-         bool isUniqueIVIncrementingBy1 (void);
++         bool isUniqueIVIncrementingBy1 ();
+ 
+          /**
+           * @brief Add the instructions to every loop exit
+diff --git a/vm/compiler/SinkCastOpt.cpp b/vm/compiler/SinkCastOpt.cpp
+index 937aa0a..7b8b98d 100644
+--- a/vm/compiler/SinkCastOpt.cpp
++++ b/vm/compiler/SinkCastOpt.cpp
+@@ -170,7 +170,7 @@ static bool checkValidCastingForIV(CompilationUnit *cUnit, LoopInformation *info
+     }
+ 
+     // return false if vA is not an induction variable
+-    if (info->isAnInductionVariable(cUnit, vA) == false)
++    if (info->isBasicInductionVariable (cUnit, vA) == false)
+     {
+         SINK_CAST_LOG (cUnit, "The VR we are considering must be an induction variable", reportSinkCastFailure);
+         return false;
+diff --git a/vm/compiler/Utility.cpp b/vm/compiler/Utility.cpp
+index 9f2c59a..1eb8504 100644
+--- a/vm/compiler/Utility.cpp
++++ b/vm/compiler/Utility.cpp
+@@ -17,6 +17,7 @@
+ #include "Dalvik.h"
+ #include "Dataflow.h"
+ #include "CompilerInternals.h"
++#include "Dataflow.h"
+ #include "Utility.h"
+ 
+ static ArenaMemBlock *arenaHead, *currentArena;
+@@ -1164,3 +1165,64 @@ bool dvmCompilerFillUsedVector (CompilationUnit *cUnit, BasicBlock *bb)
+     //Function did not instructions in the BB
+     return false;
+ }
++
++bool dvmCompilerIsRegConstant (const CompilationUnit *cUnit, int ssaReg)
++{
++    //Paranoid
++    if (cUnit->isConstantV == 0)
++    {
++        return false;
++    }
++
++    return dvmIsBitSet (cUnit->isConstantV, ssaReg);
++}
++
++bool dvmCompilerGetFirstConstantUsed (const CompilationUnit *cUnit, const MIR *mir, int &constantValue)
++{
++    long long dfFlags = dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
++
++    //First check if the bytecode itself has constants encoded
++    if ((dfFlags & DF_HAS_CONSTANTS) != 0)
++    {
++        if ((dfFlags & DF_C_IS_CONST) != 0)
++        {
++            constantValue = mir->dalvikInsn.vC;
++            return true;
++        }
++    }
++
++    //No constants were found in encoding but it is possible that constant propagation
++    //has identified ssa registers that are constants.
++    if (mir == 0 || mir->ssaRep == 0 || mir->ssaRep->uses == 0)
++    {
++        return false;
++    }
++
++    //Look for the first ssa register that is constant
++    int ssaReg = -1;
++    for (int use = 0; use < mir->ssaRep->numUses; use++)
++    {
++        int regToCheck = mir->ssaRep->uses[use];
++
++        if (dvmCompilerIsRegConstant (cUnit, regToCheck) == true)
++        {
++            //Found constant register so return it
++            ssaReg = regToCheck;
++            break;
++        }
++    }
++
++    //Has an ssa register been found yet?
++    if (ssaReg != -1)
++    {
++        //Paranoid
++        if (cUnit->constantValues != 0)
++        {
++            constantValue = (*(cUnit->constantValues))[ssaReg];
++            return true;
++        }
++    }
++
++    //Did not find any constants
++    return false;
++}
+diff --git a/vm/compiler/Utility.h b/vm/compiler/Utility.h
+index 8fbfa9c..f33c39c 100644
+--- a/vm/compiler/Utility.h
++++ b/vm/compiler/Utility.h
+@@ -20,6 +20,7 @@
+ //Forward declarations
+ struct CompilationUnit;
+ struct GrowableList;
++struct SSARepresentation;
+ 
+ /**
+  * @brief Find the entry points of the CompilationUnit
+@@ -107,7 +108,11 @@ void dvmCompilerCommitPendingScratch (CompilationUnit *cUnit);
+  */
+ bool dvmCompilerDoesContainLoop (GrowableList &blockList, BasicBlock *entry);
+ 
+-/* Reset optimization flags for all MIRs in BasicBlock */
++/**
++ * @brief Resets optimization flags for all MIRs in BasicBlock
++ * @param bb The basic block to act on
++ * @param resetFlags The flags to use for the reset
++ */
+ void dvmCompilerResetOptimizationFlags (const BasicBlock *bb, int resetFlags);
+ 
+ /**
+@@ -126,4 +131,23 @@ bool dvmCompilerRemoveUnreachableBlocks (CompilationUnit *cUnit, BasicBlock *bb)
+  */
+ bool dvmCompilerFillUsedVector (CompilationUnit *cUnit, BasicBlock *bb);
+ 
++/**
++ * @brief Checks if an ssa register is a constant value
++ * @param cUnit The compilation unit
++ * @param ssaReg The ssa register to check for constantness
++ * @return Returns true if the register holds a constant value
++ */
++bool dvmCompilerIsRegConstant (const CompilationUnit *cUnit, int ssaReg);
++
++/**
++ * @brief Used to obtain the first 32-bit constant used by the MIR
++ * @details First looks if the MIR uses hardcoded constants encoded in instruction.
++ * Then looks through each use in order to find the first VR use that is constant.
++ * @param cUnit The compilation unit
++ * @param mir The mir to look into for constants.
++ * @param constantValue Updated by function to contain constant value if one is found
++ * @return Returns whether or not a constant was found for the MIR.
++ */
++bool dvmCompilerGetFirstConstantUsed (const CompilationUnit *cUnit, const MIR *mir, int &constantValue);
++
+ #endif
+diff --git a/vm/compiler/Vectorization.cpp b/vm/compiler/Vectorization.cpp
+index 1064199..0a2729c 100644
+--- a/vm/compiler/Vectorization.cpp
++++ b/vm/compiler/Vectorization.cpp
+@@ -608,7 +608,7 @@ static bool fillVectorizationInformation (const CompilationUnit * const cUnit, L
+     }
+ 
+     unsigned int vrIV = dvmExtractSSARegister (cUnit, ivInfo->basicSSAReg);
+-    int increment = ivInfo->inc;
++    int increment = ivInfo->loopIncrement;
+ 
+     //It is a count up loop so this should not happen
+     if (increment < 0)
+@@ -1010,7 +1010,7 @@ static void hoistSetup (CompilationUnit *cUnit, LoopInformation *loopInfo, Vecto
+             dvmCompilerAppendMIR (bb, mir);
+ 
+             //If we have an induction variable, we have a bit more work
+-            if (loopInfo->isAnInductionVariable (cUnit, vr) == true)
++            if (loopInfo->isBasicInductionVariable (cUnit, vr) == true)
+             {
+                 handleInductionVariable (cUnit, loopInfo, info, bb, vr, mir);
+             }
+@@ -1437,7 +1437,7 @@ static bool vectorizationGate (const CompilationUnit * const cUnit, LoopInformat
+     }
+ 
+     //We can only handle loops with an increment of 1 to the IV
+-    if (loopInfo->isUniqueIVIncrementingBy1() == false)
++    if (loopInfo->isUniqueIVIncrementingBy1 () == false)
+     {
+         VECTORIZATION_LOG (cUnit, "Not an increment by 1 loop", reportFailure);
+         return false;
+@@ -1571,7 +1571,7 @@ static BasicBlock *createMainTest (CompilationUnit *cUnit, LoopInformation *loop
+     MIR *constMIR = 0;
+ 
+     //Is it the IV?
+-    if (loopInfo->isAnInductionVariable (cUnit, vA) == true)
++    if (loopInfo->isBasicInductionVariable (cUnit, vA) == true)
+     {
+         //Paranoid
+         assert (ssaRep->numUses > 1);
+@@ -1752,7 +1752,7 @@ static void handleAluLiteral (CompilationUnit *cUnit, LoopInformation *loopInfor
+     Opcode opcode = mir->dalvikInsn.opcode;
+ 
+     //Let's see if this is a basic IV
+-    if (loopInformation->isAnBasicInductionVariable (cUnit, mir->dalvikInsn.vA) == true)
++    if (loopInformation->isBasicInductionVariable (cUnit, mir->dalvikInsn.vA) == true)
+     {
+         MIR *vectorizedIV = dvmCompilerNewMIR ();
+ 
+-- 
+1.7.4.1
+

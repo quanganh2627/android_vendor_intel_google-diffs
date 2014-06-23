@@ -1,0 +1,319 @@
+From 80988ce7905372a8d7bcdb43f40cc5819ae6804c Mon Sep 17 00:00:00 2001
+From: David L Kreitzer <david.l.kreitzer@intel.com>
+Date: Fri, 6 Sep 2013 15:45:41 -0700
+Subject: Dalvik: Add support for nested loops in the PCG backend
+
+BZ: 136779
+
+Enabled support for multiple and/or nested loops in a single trace.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Ic5730d3984422a11f73080972ffc2f1552e55701
+Orig-MCG-Change-Id: Ic3f985487007f0d163363e0598e8b70f2611a589
+Signed-off-by: Kreitzer, David L <david.l.kreitzer@intel.com>
+Reviewed-on: http://android.intel.com:8080/130614
+Reviewed-by: Beyler, Jean Christophe <jean.christophe.beyler@intel.com>
+Reviewed-by: lab_aqa <lab_aqa@intel.com>
+Reviewed-by: Popov, Ivan G <ivan.g.popov@intel.com>
+Reviewed-by: Hartley, Timothy D <timothy.d.hartley@intel.com>
+Reviewed-by: Lupusoru, Razvan A <razvan.a.lupusoru@intel.com>
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/codegen/x86/pcg/Analysis.cpp           |  133 ++++++++++----------
+ .../codegen/x86/pcg/ChainingCellException.cpp      |    9 +-
+ vm/compiler/codegen/x86/pcg/CodeGeneration.cpp     |    7 +-
+ vm/compiler/codegen/x86/pcg/UtilityPCG.cpp         |   43 -------
+ 4 files changed, 81 insertions(+), 111 deletions(-)
+
+diff --git a/vm/compiler/codegen/x86/pcg/Analysis.cpp b/vm/compiler/codegen/x86/pcg/Analysis.cpp
+index 4c2b489..b3610c7 100644
+--- a/vm/compiler/codegen/x86/pcg/Analysis.cpp
++++ b/vm/compiler/codegen/x86/pcg/Analysis.cpp
+@@ -167,6 +167,61 @@ static void pcgRef (CompilationUnitPCG *cUnit, int ssaNum, pcgDtype dtype, bool
+ }
+ 
+ /**
++ * @brief Merge SSA numbers
++ * @details This routine gets called when two SSA numbers must be merged into
++ *  the same CGTemp.  That happens when we see a PHI, e.g.
++ *      kMirOpPhi v0_1 = (v0_0, v0_2)
++ *  In this case, v0_0, v0_1, and v0_2 must all use the same CGTemp, must all
++ *  share the same dtype, must have the same pair, if applicable, and must all
++ *  be registerized or not registerized together.  To implement that, v0_1 is
++ *  used as the "parent" ssa number.  All the information associated with the
++ *  unified CGTemp are stored in v0_1's SSANumInfo record.  v0_0 and v0_2 refer
++ *  to their parent, v0_1, via the parentSSANum field.  This routine creates
++ *  the child-parent tree structure and merges the information from the child
++ *  ssa number into the parent.  If any conflicts are detected, registerization
++ *  is disabled for the parent.
++ * @param cUnit the CompilationUnitPCG
++ * @param childNum the child SSA Number
++ * @param parentNum the parent SSA Number
++ */
++static void pcgMergeSSANums (CompilationUnitPCG *cUnit, int childNum, int parentNum)
++{
++    //Get local child and parent information
++    SSANumInfo &child = cUnit->getRootSSANumInformation (childNum);
++    SSANumInfo &parent = cUnit->getRootSSANumInformation (parentNum);
++
++    // Compute the combined dtype.  It will be NOreg for inconsistent types.
++    parent.dtype = pcgMergeDtypes (parent.dtype, child.dtype);
++
++    // If we detected a type inconsistency or if one of the SSA numbers already
++    // has registerization disabled, disable registerization now.  There is no
++    // need to physically do the merge in this case.
++    if (parent.dtype == NOreg || parent.registerize == false ||
++        child.registerize == false)
++    {
++        pcgDisableRegisterizationForSSANum(cUnit, parent.parentSSANum);
++        pcgDisableRegisterizationForSSANum(cUnit, child.parentSSANum);
++        return;
++    }
++
++    // Physically merge them.
++    child.parentSSANum = parent.parentSSANum;
++
++    // Merge the child pair with the parent pair, if necessary.
++    if (child.pairSSANum != 0)
++    {
++        if (parent.pairSSANum == 0)
++        {
++            parent.pairSSANum = child.pairSSANum;
++        }
++        else if (parent.pairSSANum != child.pairSSANum)
++        {
++            pcgMergeSSANums (cUnit, child.pairSSANum, parent.pairSSANum);
++        }
++    }
++}
++
++/**
+  * @brief Handle the pairing of two SSA numbers.  An SSA number pair is used to associate the two halves of an 8-byte value.
+  * @param cUnit the CompilationUnitPCG
+  * @param ssaNum1 the lower half of the 8-byte value
+@@ -179,20 +234,22 @@ static void pcgCreatePair (CompilationUnitPCG *cUnit, int ssaNum1, int ssaNum2)
+     int pairSSANum1 = info1.pairSSANum;
+     int pairSSANum2 = info2.pairSSANum;
+ 
+-    // Registerization is only supported for 8-byte temps when there is a 1-1
+-    // match for the two halves.  If we are attempting to pair an SSANum when it
+-    // already has an existing but different pair, disable registerization for
+-    // the existing pair, the new pair, and the SSANum itself.
++    // In order to create a valid pair, both members of the pair must be
++    // registerized.
++    if (info1.registerize == false || info2.registerize == false) {
++        pcgDisableRegisterizationForSSANum(cUnit, info1.parentSSANum);
++        pcgDisableRegisterizationForSSANum(cUnit, info2.parentSSANum);
++        return;
++    }
++
++    // If either SSANum has an existing pair, it needs to be merged with the
++    // new one, because each SSANum can only have one pair.
+     if (pairSSANum1 != 0) {
+         SSANumInfo &currPairInfo = cUnit->getRootSSANumInformation (pairSSANum1);
+         int currPairSSANum = currPairInfo.parentSSANum;
+ 
+         if (currPairSSANum != info2.parentSSANum) {
+-            // Setting info1.registerize to false will cause registerization
+-            // to be disabled for ssaNum1 and ssaNum2 below.  Explicitly disable
+-            // registerization for ssaNum1's current pair.
+-            info1.registerize = false;
+-            pcgDisableRegisterizationForSSANum(cUnit, currPairSSANum);
++            pcgMergeSSANums (cUnit, info2.parentSSANum, currPairSSANum);
+         }
+     }
+     if (pairSSANum2 != 0) {
+@@ -200,67 +257,13 @@ static void pcgCreatePair (CompilationUnitPCG *cUnit, int ssaNum1, int ssaNum2)
+         int currPairSSANum = currPairInfo.parentSSANum;
+ 
+         if (currPairSSANum != info1.parentSSANum) {
+-            // Setting info2.registerize to false will cause registerization
+-            // to be disabled for ssaNum1 and ssaNum2 below.  Explicitly disable
+-            // registerization for ssaNum2's current pair.
+-            info2.registerize = false;
+-            pcgDisableRegisterizationForSSANum(cUnit, currPairSSANum);
++            pcgMergeSSANums (cUnit, info1.parentSSANum, currPairSSANum);
+         }
+     }
+ 
++    // Physically create the pair.
+     info1.pairSSANum = info2.parentSSANum;
+     info2.pairSSANum = info1.parentSSANum;
+-
+-    if (info1.registerize == false || info2.registerize == false) {
+-        pcgDisableRegisterizationForSSANum(cUnit, info1.parentSSANum);
+-        pcgDisableRegisterizationForSSANum(cUnit, info2.parentSSANum);
+-    }
+-}
+-
+-/**
+- * @brief Merge SSA numbers
+- * @details This routine gets called when two SSA numbers must be merged into
+- *  the same CGTemp.  That happens when we see a PHI, e.g.
+- *      kMirOpPhi v0_1 = (v0_0, v0_2)
+- *  In this case, v0_0, v0_1, and v0_2 must all use the same CGTemp, must all
+- *  share the same dtype, must have the same pair, if applicable, and must all
+- *  be registerized or not registerized together.  To implement that, v0_1 is
+- *  used as the "parent" ssa number.  All the information associated with the
+- *  unified CGTemp are stored in v0_1's SSANumInfo record.  v0_0 and v0_2 refer
+- *  to their parent, v0_1, via the parentSSANum field.  This routine creates
+- *  the child-parent tree structure and merges the information from the child
+- *  ssa number into the parent.  If any conflicts are detected, registerization
+- *  is disabled for the parent.
+- * @param cUnit the CompilationUnitPCG
+- * @param childNum the child SSA Number
+- * @param parentNum the parent SSA Number
+- */
+-static void pcgMergeSSANums (CompilationUnitPCG *cUnit, int childNum, int parentNum)
+-{
+-    //Get local child and parent information
+-    SSANumInfo &child = cUnit->getSSANumInformation (childNum);
+-    SSANumInfo &parent = cUnit->getSSANumInformation (parentNum);
+-
+-    //Update them
+-    child.parentSSANum = parentNum;
+-    parent.dtype = pcgMergeDtypes (parent.dtype, child.dtype);
+-
+-    // Capture the pair SSANum in the parent, if one exists.  If the child &
+-    // parent both have a valid but different pair SSANum, do nothing.  There
+-    // is a subtle assumption that the child & parent pair SSANums will
+-    // eventually have the same parent SSANum.  In other words, if there is a
+-    // PHI to merge the low half of an 8-byte value, there must also be a PHI
+-    // to merge the high half.
+-    if (child.pairSSANum != 0 && parent.pairSSANum == 0) {
+-        parent.pairSSANum = child.pairSSANum;
+-    }
+-
+-    // Disable registerization if we were not able to successfully merge.
+-    if (parent.dtype == NOreg || child.registerize == false)
+-    {
+-        parent.dtype = NOreg;
+-        pcgDisableRegisterizationForSSANum(cUnit, parentNum);
+-    }
+ }
+ 
+ /**
+diff --git a/vm/compiler/codegen/x86/pcg/ChainingCellException.cpp b/vm/compiler/codegen/x86/pcg/ChainingCellException.cpp
+index 1e83dec..2a9fada 100644
+--- a/vm/compiler/codegen/x86/pcg/ChainingCellException.cpp
++++ b/vm/compiler/codegen/x86/pcg/ChainingCellException.cpp
+@@ -590,9 +590,14 @@ static uint8_t* dvmCompilerPcgEmitBackwardBranchChainingCell (CompilationUnitPCG
+ 
+     if (loopInfo != 0)
+     {
+-        BasicBlockPCG *bb = (BasicBlockPCG *) loopInfo->getEntryBlock ();
++        loopInfo = loopInfo->getLoopInformationByEntry (bb->fallThrough);
+ 
+-        loopHeader = (BasicBlockPCG *) (bb);
++        if (loopInfo != 0)
++        {
++            BasicBlockPCG *bb = (BasicBlockPCG *) loopInfo->getEntryBlock ();
++
++            loopHeader = (BasicBlockPCG *) (bb);
++        }
+ 
+         //Paranoid
+         assert (loopHeader != 0);
+diff --git a/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp b/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
+index 81f2065..637a767 100644
+--- a/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
++++ b/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
+@@ -949,7 +949,12 @@ static void handlePreBackwardBlock (CompilationUnitPCG *cUnit, BasicBlockPCG *bb
+ 
+     if (loopInfo != 0)
+     {
+-        loopHeader = (BasicBlockPCG *) loopInfo->getEntryBlock ();
++        loopInfo = loopInfo->getLoopInformationByEntry (bwccBlock->fallThrough);
++
++        if (loopInfo != 0)
++        {
++            loopHeader = (BasicBlockPCG *) loopInfo->getEntryBlock ();
++        }
+     }
+ 
+     if (loopHeader != 0)
+diff --git a/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp b/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp
+index bc5192d..2492806 100644
+--- a/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp
++++ b/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp
+@@ -438,43 +438,12 @@ bool dvmCompilerPcgSupportTrace (CompilationUnit *cUnit)
+     bool traceOk = true;
+     int usePcg;
+     int bytecodeCount = 0;
+-    int bwcc = 0;
+ 
+     //First check if we have a loop
+     LoopInformation *info = cUnit->loopInformation;
+ 
+     if (info != 0)
+     {
+-        //First step is: PCG right now does not support nested loops or branches, what does gDvmJit have set?
+-        bool acceptance = ( (gDvmJit.branchLoops == true) || (gDvmJit.nestedLoops == true));
+-
+-        //Reset them here
+-        if (acceptance == true)
+-        {
+-            gDvmJit.branchLoops = false;
+-            gDvmJit.nestedLoops = false;
+-        }
+-
+-        //Because PCG returns to entry after backward chaining, we need to ensure
+-        //that we only accept cases where the entry is the preheader so that it
+-        //is semantically correct.
+-
+-        //For the moment PCG refuses nested loops
+-        if (info->getNested () != 0)
+-        {
+-            return false;
+-        }
+-
+-        //Last step is: was acceptance true?
+-        if (acceptance == true)
+-        {
+-            //If so, we might have accepted something we don't want to, let's see
+-            if (dvmCompilerCheckLoops (cUnit) == false)
+-            {
+-                return false;
+-            }
+-        }
+-
+         int tmp = 0;
+         //Let us see what we have in the backend options concerning optimizations
+         bool res = dvmExtractBackendOption ("OptimizationLevel", &tmp);
+@@ -499,11 +468,6 @@ bool dvmCompilerPcgSupportTrace (CompilationUnit *cUnit)
+     {
+         BasicBlockPCG* bb = (BasicBlockPCG *) blockList->elemList[i];
+ 
+-        if (bb->blockType == kChainingCellBackwardBranch)
+-        {
+-            bwcc++;
+-        }
+-
+         for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
+         {
+             Opcode dalvikOpCode = mir->dalvikInsn.opcode;
+@@ -559,13 +523,6 @@ bool dvmCompilerPcgSupportTrace (CompilationUnit *cUnit)
+         }
+     }
+ 
+-    //If more than one BWCC, bail
+-    if (bwcc > 1)
+-    {
+-        ALOGI("\n::::: Not using PCG - multiple BWCC ::::\n");
+-        return false;
+-    }
+-
+     //If the count is over what we really can handle
+     int zexpCount = 0;
+     if (traceOk == true && dvmExtractBackendOption ("zexpCount", &zexpCount))
+-- 
+1.7.4.1
+

@@ -1,0 +1,597 @@
+From ba2494331e9991ad5e0da9b7c6929995b28c2ee3 Mon Sep 17 00:00:00 2001
+From: Du Chenyang <chenyang.du@intel.com>
+Date: Mon, 24 Sep 2012 18:36:08 +0800
+Subject: [PORT FROM MAIN] Bionic: Adding more heap debug functions to dlmalloc
+
+BZ: 55824
+
+This change has been reworked according to the orginal patch.
+1. Replace the log functions with the NON-MALLOC version newly added by AOSP;
+2. Remove the uint to char function;
+3. Retain change: oldmem passed to USAGE_ERROR_ACTION should be replaced
+by oldp in realloc();
+4. Retain change: import error log functions into dlmalloc;
+5. Avoid calling abort before setting deadhead in heap_usage_error function.
+
+Change-Id: I51eb7f8c0984ee783136acc92e24a67ea29e09b9
+Orig-Change-Id: I55c68a4919056cec4ebe8febc07b3ce80aeb9253
+Signed-off-by: Du Chenyang <chenyang.du@intel.com>
+Signed-off-by: Yin Fengwei <fengwei.yin@intel.com>
+---
+ libc/bionic/dlmalloc.c          |  161 ++++++++++++++++++++++++++++++++++++++-
+ libc/upstream-dlmalloc/malloc.c |   85 ++++++++++++++++++---
+ 2 files changed, 231 insertions(+), 15 deletions(-)
+
+diff --git a/libc/bionic/dlmalloc.c b/libc/bionic/dlmalloc.c
+index 51c62a7..2ebfeae 100644
+--- a/libc/bionic/dlmalloc.c
++++ b/libc/bionic/dlmalloc.c
+@@ -19,22 +19,177 @@
+ #include "private/libc_logging.h"
+ 
+ // Send dlmalloc errors to the log.
++static void __log_alloc_size(size_t size);
++static void __bionic_heap_state_debug(void* m_ori, void* p_ori, int line);
+ static void __bionic_heap_corruption_error(const char* function);
+ static void __bionic_heap_usage_error(const char* function, void* address);
+ #define PROCEED_ON_ERROR 0
++#define PRINT_SIZE(size) __log_alloc_size((size))
++#define DUMP_HEAP_BEFORE_ERROR_ACTION(m, p) \
++  __bionic_heap_state_debug((void*)(m), (void*)(p), __LINE__)
+ #define CORRUPTION_ERROR_ACTION(m) __bionic_heap_corruption_error(__FUNCTION__)
+-#define USAGE_ERROR_ACTION(m,p) __bionic_heap_usage_error(__FUNCTION__, p)
++#define USAGE_ERROR_ACTION(m,p) \
++  do { \
++      DUMP_HEAP_BEFORE_ERROR_ACTION(m, p); \
++      __bionic_heap_usage_error(__FUNCTION__, p); \
++  } while(0)
+ 
+ // Ugly inclusion of C file so that bionic specific #defines configure dlmalloc.
+ #include "../upstream-dlmalloc/malloc.c"
+ 
++static void __log_alloc_size(size_t size) {
++  __libc_format_log(ANDROID_LOG_FATAL,"libc", "malloc size: %d", size);
++}
++
++#define STR_DUMPING_HEAP "*** *** *** *** *** *** *** HEAP INFO *** *** *** *** *** *** ***\n"
++static void __bionic_heap_state_dump(mchunkptr p, char *tag) {
++  __libc_format_log(ANDROID_LOG_FATAL, "libc",
++                    "chunk ptr 0x%08x(%s), cinuse(%d), pinuse(%d), chunksize(%d)",
++                    (unsigned int)p, tag, !!cinuse(p), !!pinuse(p), chunksize(p));
++  __libc_format_log(ANDROID_LOG_FATAL, "libc",
++                    "\t%x:  %08x  prev_foot\n"
++                    "\t%x:  %08x  head\n"
++                    "\t%x:  %08x  fd\n"
++                    "\t%x:  %08x  bk",
++                    (unsigned int)&(p->prev_foot),
++                    (unsigned int)p->prev_foot,
++                    (unsigned int)&(p->head),
++                    (unsigned int)p->head,
++                    (unsigned int)&(p->fd),
++                    (unsigned int)p->fd,
++                    (unsigned int)&(p->bk),
++                    (unsigned int)p->bk);
++
++  //Dump heap treebin info for large chunk
++  if ((chunksize(p) >> SMALLBIN_SHIFT) >= NSMALLBINS) {
++    tbinptr q = (tbinptr)p;
++    __libc_format_log(ANDROID_LOG_FATAL, "libc",
++                      "\t%x:  %08x  child[0]\n"
++                      "\t%x:  %08x  child[1]\n"
++                      "\t%x:  %08x  parent",
++                      (unsigned int)&(q->child[0]),
++                      (unsigned int)q->child[0],
++                      (unsigned int)&(q->child[1]),
++                      (unsigned int)q->child[1],
++                      (unsigned int)&(q->parent),
++                      (unsigned int)q->parent);
++  }
++}
++
++static void __bionic_heap_state_debug(void* m_ori, void* p_ori, int line) {
++  mstate m = (mstate)m_ori;
++  mchunkptr p = (mchunkptr)p_ori;
++  __libc_format_log(ANDROID_LOG_FATAL, "libc", "FATAL ERROR occurring at line: %d\n"
++                    "least_addr: 0x%08x, mchunkptr: 0x%08x. Segment Infomation:",
++                    line, (unsigned int)m->least_addr, (unsigned int)p);
++
++  msegmentptr sp = &m->seg;
++  for (int i = 0; sp != NULL; i++) {
++    __libc_format_log(ANDROID_LOG_FATAL, "libc",
++                      "\t    base    :  size\n"
++                      "\t%03d %08x:  %d",
++                      i, (unsigned int)sp->base, sp->size);
++    sp = sp->next;
++  }
++
++  __libc_format_log(ANDROID_LOG_FATAL, "libc", STR_DUMPING_HEAP);
++  if (segment_holding(m, (char*)p) != 0
++      && segment_holding(m, ((char *)p + sizeof(mchunk) - 1)) != 0) {
++    __bionic_heap_state_dump(p,"p");
++
++    __libc_format_log(ANDROID_LOG_FATAL, "libc", STR_DUMPING_HEAP);
++    if (segment_holding(m, (char*)p->fd) != 0
++        && segment_holding(m, ((char *)p->fd + sizeof(mchunk) - 1)) != 0) {
++      __bionic_heap_state_dump(p->fd, "p->fd");
++    }
++    else {
++      __libc_format_log(ANDROID_LOG_FATAL, "libc",
++                        "chunk ptr p->fd is invalid with any segment");
++    }
++
++    __libc_format_log(ANDROID_LOG_FATAL, "libc", STR_DUMPING_HEAP);
++    if (segment_holding(m, (char*)(p->bk)) != 0
++        && segment_holding(m, ((char *)p->bk + sizeof(mchunk) - 1)) != 0)
++      __bionic_heap_state_dump(p->bk, "p->bk");
++    else  {
++      __libc_format_log(ANDROID_LOG_FATAL, "libc",
++                        "chunk ptr p->bk is invalid with any segment");
++    }
++
++    //prev chunk adjacent
++    __libc_format_log(ANDROID_LOG_FATAL, "libc", STR_DUMPING_HEAP);
++    if (!pinuse(p)) {
++      size_t prevsize = p->prev_foot;
++      mchunkptr prev = chunk_minus_offset(p, prevsize);
++      if (segment_holding(m, (char*)prev) != 0
++          && segment_holding(m, ((char *)prev + sizeof(mchunk) - 1)) != 0) {
++        __bionic_heap_state_dump(prev, "prev");
++      } else {
++        __libc_format_log(ANDROID_LOG_FATAL, "libc",
++                          "chunk ptr \"prev\" is invalid with any segment");
++      }
++    }
++    else {
++      __libc_format_log(ANDROID_LOG_FATAL, "libc",
++                        "chunk ptr \"prev\" is inuse");
++    }
++
++    //next chunk adjacent
++    __libc_format_log(ANDROID_LOG_FATAL, "libc", STR_DUMPING_HEAP);
++    size_t psize = chunksize(p);
++    mchunkptr next = chunk_plus_offset(p, psize);
++    if ((char*)p < (char*)next && segment_holding(m, (char*)next) != 0
++        && segment_holding(m, ((char *)next + sizeof(mchunk) - 1)) != 0)
++      __bionic_heap_state_dump(next, "next");
++    else {
++      __libc_format_log(ANDROID_LOG_FATAL, "libc",
++                        "chunk ptr \"next\" is invalid with any segment");
++    }
++
++    //Dump heap treebin info if large chunk
++    if((psize >> SMALLBIN_SHIFT) >= NSMALLBINS) {
++      tbinptr q = (tbinptr)p;
++      __libc_format_log(ANDROID_LOG_FATAL, "libc", STR_DUMPING_HEAP);
++      if (segment_holding(m, (char*)(q->child[0])) != 0
++          && segment_holding(m, ((char *)q->child[0] + sizeof(tchunk) - 1)) != 0)
++        __bionic_heap_state_dump((mchunkptr)q->child[0], "p->child[0]");
++      else {
++        __libc_format_log(ANDROID_LOG_FATAL, "libc",
++                          "chunk ptr p->child[0] is invalid with any segment");
++      }
++
++      __libc_format_log(ANDROID_LOG_FATAL, "libc", STR_DUMPING_HEAP);
++      if (segment_holding(m, (char*)(q->child[1])) != 0
++          && segment_holding(m, ((char *)q->child[1] + sizeof(tchunk) - 1)) != 0)
++        __bionic_heap_state_dump((mchunkptr)q->child[1], "p->child[1]");
++      else {
++        __libc_format_log(ANDROID_LOG_FATAL, "libc",
++                          "chunk ptr p->child[1] is invalid with any segment");
++      }
++
++      __libc_format_log(ANDROID_LOG_FATAL, "libc", STR_DUMPING_HEAP);
++      if (segment_holding(m, (char*)(q->parent)) != 0
++          && segment_holding(m, ((char *)q->parent + sizeof(tchunk) - 1)) != 0)
++        __bionic_heap_state_dump((mchunkptr)q->parent, "p->parent");
++      else {
++        __libc_format_log(ANDROID_LOG_FATAL, "libc",
++                          "chunk ptr p->parent is invalid with any segment");
++      }
++    }
++  }
++  else {
++    __libc_format_log(ANDROID_LOG_FATAL, "libc", "chunk ptr \"p\" is invalid with any segment\n");
++  }
++}
++
+ static void __bionic_heap_corruption_error(const char* function) {
+   __libc_fatal("@@@ ABORTING: heap corruption detected by %s", function);
+ }
+ 
+ static void __bionic_heap_usage_error(const char* function, void* address) {
+-  __libc_fatal("@@@ ABORTING: invalid address or address of corrupt block %p passed to %s",
+-               address, function);
++  __libc_format_log(ANDROID_LOG_FATAL, "libc",
++                    "@@@ ABORTING: invalid address or address of corrupt block %p passed to %s",
++                    address, function);
+   // So that we can get a memory dump around the specific address.
+   *((int**) 0xdeadbaad) = (int*) address;
+ }
+diff --git a/libc/upstream-dlmalloc/malloc.c b/libc/upstream-dlmalloc/malloc.c
+index 3ef9b61..53a6047 100644
+--- a/libc/upstream-dlmalloc/malloc.c
++++ b/libc/upstream-dlmalloc/malloc.c
+@@ -2770,11 +2770,21 @@ int malloc_corruption_error_count;
+ /* default corruption action */
+ static void reset_on_error(mstate m);
+ 
++#define PRINT_SIZE(size)
++#define DUMP_HEAP_BEFORE_ERROR_ACTION(m, p)
+ #define CORRUPTION_ERROR_ACTION(m)  reset_on_error(m)
+ #define USAGE_ERROR_ACTION(m, p)
+ 
+ #else /* PROCEED_ON_ERROR */
+ 
++#ifndef PRINT_SIZE
++#define PRINT_SIZE(size)
++#endif
++
++#ifndef DUMP_HEAP_BEFORE_ERROR_ACTION
++#define DUMP_HEAP_BEFORE_ERROR_ACTION(m, p)
++#endif /* DUMP_HEAP_BEFORE_ERROR_ACTION */
++
+ #ifndef CORRUPTION_ERROR_ACTION
+ #define CORRUPTION_ERROR_ACTION(m) ABORT
+ #endif /* CORRUPTION_ERROR_ACTION */
+@@ -3591,6 +3601,7 @@ static void internal_malloc_stats(mstate m) {
+   else if (RTCHECK(ok_address(M, B->fd)))\
+     F = B->fd;\
+   else {\
++    DUMP_HEAP_BEFORE_ERROR_ACTION(M, B);\
+     CORRUPTION_ERROR_ACTION(M);\
+   }\
+   B->fd = P;\
+@@ -3617,10 +3628,12 @@ static void internal_malloc_stats(mstate m) {
+       B->fd = F;\
+     }\
+     else {\
++      DUMP_HEAP_BEFORE_ERROR_ACTION(M, P);\
+       CORRUPTION_ERROR_ACTION(M);\
+     }\
+   }\
+   else {\
++    DUMP_HEAP_BEFORE_ERROR_ACTION(M, P);\
+     CORRUPTION_ERROR_ACTION(M);\
+   }\
+ }
+@@ -3639,6 +3652,7 @@ static void internal_malloc_stats(mstate m) {
+     B->fd = F;\
+   }\
+   else {\
++    DUMP_HEAP_BEFORE_ERROR_ACTION(M, P);\
+     CORRUPTION_ERROR_ACTION(M);\
+   }\
+ }
+@@ -3688,6 +3702,7 @@ static void internal_malloc_stats(mstate m) {
+           break;\
+         }\
+         else {\
++          DUMP_HEAP_BEFORE_ERROR_ACTION(M, T);\
+           CORRUPTION_ERROR_ACTION(M);\
+           break;\
+         }\
+@@ -3702,6 +3717,7 @@ static void internal_malloc_stats(mstate m) {
+           break;\
+         }\
+         else {\
++          DUMP_HEAP_BEFORE_ERROR_ACTION(M, T);\
+           CORRUPTION_ERROR_ACTION(M);\
+           break;\
+         }\
+@@ -3729,30 +3745,36 @@ static void internal_malloc_stats(mstate m) {
+ 
+ #define unlink_large_chunk(M, X) {\
+   tchunkptr XP = X->parent;\
++  tchunkptr RPBK;\
+   tchunkptr R;\
+   if (X->bk != X) {\
+     tchunkptr F = X->fd;\
++    RPBK = X;\
+     R = X->bk;\
+     if (RTCHECK(ok_address(M, F) && F->bk == X && R->fd == X)) {\
+       F->bk = R;\
+       R->fd = F;\
+     }\
+     else {\
++      DUMP_HEAP_BEFORE_ERROR_ACTION(M, X);\
+       CORRUPTION_ERROR_ACTION(M);\
+     }\
+   }\
+   else {\
+     tchunkptr* RP;\
++    RPBK = X;\
+     if (((R = *(RP = &(X->child[1]))) != 0) ||\
+         ((R = *(RP = &(X->child[0]))) != 0)) {\
+       tchunkptr* CP;\
+       while ((*(CP = &(R->child[1])) != 0) ||\
+              (*(CP = &(R->child[0])) != 0)) {\
++        RPBK = R;\
+         R = *(RP = CP);\
+       }\
+       if (RTCHECK(ok_address(M, RP)))\
+         *RP = 0;\
+       else {\
++        DUMP_HEAP_BEFORE_ERROR_ACTION(M, RPBK);\
+         CORRUPTION_ERROR_ACTION(M);\
+       }\
+     }\
+@@ -3769,8 +3791,10 @@ static void internal_malloc_stats(mstate m) {
+       else \
+         XP->child[1] = R;\
+     }\
+-    else\
++    else {\
++      DUMP_HEAP_BEFORE_ERROR_ACTION(M, X);\
+       CORRUPTION_ERROR_ACTION(M);\
++    }\
+     if (R != 0) {\
+       if (RTCHECK(ok_address(M, R))) {\
+         tchunkptr C0, C1;\
+@@ -3780,20 +3804,26 @@ static void internal_malloc_stats(mstate m) {
+             R->child[0] = C0;\
+             C0->parent = R;\
+           }\
+-          else\
++          else {\
++            DUMP_HEAP_BEFORE_ERROR_ACTION(M, X);\
+             CORRUPTION_ERROR_ACTION(M);\
++          }\
+         }\
+         if ((C1 = X->child[1]) != 0) {\
+           if (RTCHECK(ok_address(M, C1))) {\
+             R->child[1] = C1;\
+             C1->parent = R;\
+           }\
+-          else\
++          else {\
++            DUMP_HEAP_BEFORE_ERROR_ACTION(M, X);\
+             CORRUPTION_ERROR_ACTION(M);\
++          }\
+         }\
+       }\
+-      else\
++      else {\
++        DUMP_HEAP_BEFORE_ERROR_ACTION(M, RPBK);\
+         CORRUPTION_ERROR_ACTION(M);\
++      }\
+     }\
+   }\
+ }
+@@ -4384,6 +4414,7 @@ static int sys_trim(mstate m, size_t pad) {
+ */
+ static void dispose_chunk(mstate m, mchunkptr p, size_t psize) {
+   mchunkptr next = chunk_plus_offset(p, psize);
++  mchunkptr errptr = p;
+   if (!pinuse(p)) {
+     mchunkptr prev;
+     size_t prevsize = p->prev_foot;
+@@ -4407,6 +4438,7 @@ static void dispose_chunk(mstate m, mchunkptr p, size_t psize) {
+       }
+     }
+     else {
++      DUMP_HEAP_BEFORE_ERROR_ACTION(m, errptr);
+       CORRUPTION_ERROR_ACTION(m);
+       return;
+     }
+@@ -4446,6 +4478,7 @@ static void dispose_chunk(mstate m, mchunkptr p, size_t psize) {
+     insert_chunk(m, p, psize);
+   }
+   else {
++    DUMP_HEAP_BEFORE_ERROR_ACTION(m, errptr);
+     CORRUPTION_ERROR_ACTION(m);
+   }
+ }
+@@ -4455,6 +4488,8 @@ static void dispose_chunk(mstate m, mchunkptr p, size_t psize) {
+ /* allocate a large request from the best fitting chunk in a treebin */
+ static void* tmalloc_large(mstate m, size_t nb) {
+   tchunkptr v = 0;
++  tchunkptr vBK = 0;
++  tchunkptr tBK = 0;
+   size_t rsize = -nb; /* Unsigned negation */
+   tchunkptr t;
+   bindex_t idx;
+@@ -4463,19 +4498,26 @@ static void* tmalloc_large(mstate m, size_t nb) {
+     /* Traverse tree for this bin looking for node with size == nb */
+     size_t sizebits = nb << leftshift_for_tree_index(idx);
+     tchunkptr rst = 0;  /* The deepest untaken right subtree */
++    tchunkptr rstBK = 0;
++    tBK = 0;
+     for (;;) {
+       tchunkptr rt;
+       size_t trem = chunksize(t) - nb;
+       if (trem < rsize) {
++        vBK = tBK;
+         v = t;
+         if ((rsize = trem) == 0)
+           break;
+       }
+       rt = t->child[1];
++      tBK = t;
+       t = t->child[(sizebits >> (SIZE_T_BITSIZE-SIZE_T_ONE)) & 1];
+-      if (rt != 0 && rt != t)
++      if (rt != 0 && rt != t) {
++        rstBK = tBK;
+         rst = rt;
++      }
+       if (t == 0) {
++        tBK = rstBK;
+         t = rst; /* set t to least subtree holding sizes > nb */
+         break;
+       }
+@@ -4488,6 +4530,7 @@ static void* tmalloc_large(mstate m, size_t nb) {
+       bindex_t i;
+       binmap_t leastbit = least_bit(leftbits);
+       compute_bit2idx(leastbit, i);
++      tBK = 0;
+       t = *treebin_at(m, i);
+     }
+   }
+@@ -4496,8 +4539,10 @@ static void* tmalloc_large(mstate m, size_t nb) {
+     size_t trem = chunksize(t) - nb;
+     if (trem < rsize) {
+       rsize = trem;
++      vBK = tBK;
+       v = t;
+     }
++    tBK = t;
+     t = leftmost_child(t);
+   }
+ 
+@@ -4518,6 +4563,7 @@ static void* tmalloc_large(mstate m, size_t nb) {
+         return chunk2mem(v);
+       }
+     }
++    DUMP_HEAP_BEFORE_ERROR_ACTION(m, vBK);
+     CORRUPTION_ERROR_ACTION(m);
+   }
+   return 0;
+@@ -4526,17 +4572,20 @@ static void* tmalloc_large(mstate m, size_t nb) {
+ /* allocate a small request from the best fitting chunk in a treebin */
+ static void* tmalloc_small(mstate m, size_t nb) {
+   tchunkptr t, v;
++  tchunkptr tBK, vBK;
+   size_t rsize;
+   bindex_t i;
+   binmap_t leastbit = least_bit(m->treemap);
+   compute_bit2idx(leastbit, i);
+   v = t = *treebin_at(m, i);
++  vBK = 0;
+   rsize = chunksize(t) - nb;
+ 
+-  while ((t = leftmost_child(t)) != 0) {
++  while (tBK = t, (t = leftmost_child(t)) != 0) {
+     size_t trem = chunksize(t) - nb;
+     if (trem < rsize) {
+       rsize = trem;
++      vBK = tBK;
+       v = t;
+     }
+   }
+@@ -4557,6 +4606,7 @@ static void* tmalloc_small(mstate m, size_t nb) {
+     }
+   }
+ 
++  DUMP_HEAP_BEFORE_ERROR_ACTION(m, vBK);
+   CORRUPTION_ERROR_ACTION(m);
+   return 0;
+ }
+@@ -4693,9 +4743,12 @@ void* dlmalloc(size_t bytes) {
+ 
+   postaction:
+     POSTACTION(gm);
++    if (mem == NULL)
++        PRINT_SIZE(bytes);
+     return mem;
+   }
+ 
++  PRINT_SIZE(bytes);
+   return 0;
+ }
+ 
+@@ -4710,6 +4763,7 @@ void dlfree(void* mem) {
+ 
+   if (mem != 0) {
+     mchunkptr p  = mem2chunk(mem);
++    mchunkptr errptr = p;
+ #if FOOTERS
+     mstate fm = get_mstate_for(p);
+     if (!ok_magic(fm)) {
+@@ -4735,6 +4789,7 @@ void dlfree(void* mem) {
+           else {
+             mchunkptr prev = chunk_minus_offset(p, prevsize);
+             psize += prevsize;
++            errptr = p;
+             p = prev;
+             if (RTCHECK(ok_address(fm, prev))) { /* consolidate backward */
+               if (p != fm->dv) {
+@@ -4800,7 +4855,7 @@ void dlfree(void* mem) {
+         }
+       }
+     erroraction:
+-      USAGE_ERROR_ACTION(fm, p);
++      USAGE_ERROR_ACTION(fm, errptr);
+     postaction:
+       POSTACTION(fm);
+     }
+@@ -4904,7 +4959,8 @@ static mchunkptr try_realloc_chunk(mstate m, mchunkptr p, size_t nb,
+     }
+   }
+   else {
+-    USAGE_ERROR_ACTION(m, chunk2mem(p));
++    PRINT_SIZE(nb);
++    USAGE_ERROR_ACTION(m, p);
+   }
+   return newp;
+ }
+@@ -5146,6 +5202,7 @@ static size_t internal_bulk_free(mstate m, void* array[], size_t nelem) {
+             dispose_chunk(m, p, psize);
+         }
+         else {
++          DUMP_HEAP_BEFORE_ERROR_ACTION(m, p);
+           CORRUPTION_ERROR_ACTION(m);
+           break;
+         }
+@@ -5211,6 +5268,7 @@ void* dlrealloc(void* oldmem, size_t bytes) {
+   }
+   else if (bytes >= MAX_REQUEST) {
+     MALLOC_FAILURE_ACTION;
++    PRINT_SIZE(bytes);
+   }
+ #ifdef REALLOC_ZERO_BYTES_FREES
+   else if (bytes == 0) {
+@@ -5225,7 +5283,7 @@ void* dlrealloc(void* oldmem, size_t bytes) {
+ #else /* FOOTERS */
+     mstate m = get_mstate_for(oldp);
+     if (!ok_magic(m)) {
+-      USAGE_ERROR_ACTION(m, oldmem);
++      USAGE_ERROR_ACTION(m, oldp);
+       return 0;
+     }
+ #endif /* FOOTERS */
+@@ -5243,6 +5301,8 @@ void* dlrealloc(void* oldmem, size_t bytes) {
+           memcpy(mem, oldmem, (oc < bytes)? oc : bytes);
+           internal_free(m, oldmem);
+         }
++        else
++          PRINT_SIZE(bytes);
+       }
+     }
+   }
+@@ -5254,6 +5314,7 @@ void* dlrealloc_in_place(void* oldmem, size_t bytes) {
+   if (oldmem != 0) {
+     if (bytes >= MAX_REQUEST) {
+       MALLOC_FAILURE_ACTION;
++      PRINT_SIZE(bytes);
+     }
+     else {
+       size_t nb = request2size(bytes);
+@@ -5263,7 +5324,7 @@ void* dlrealloc_in_place(void* oldmem, size_t bytes) {
+ #else /* FOOTERS */
+       mstate m = get_mstate_for(oldp);
+       if (!ok_magic(m)) {
+-        USAGE_ERROR_ACTION(m, oldmem);
++        USAGE_ERROR_ACTION(m, oldp);
+         return 0;
+       }
+ #endif /* FOOTERS */
+@@ -5777,7 +5838,7 @@ void* mspace_realloc(mspace msp, void* oldmem, size_t bytes) {
+ #else /* FOOTERS */
+     mstate m = get_mstate_for(oldp);
+     if (!ok_magic(m)) {
+-      USAGE_ERROR_ACTION(m, oldmem);
++      USAGE_ERROR_ACTION(m, oldp);
+       return 0;
+     }
+ #endif /* FOOTERS */
+@@ -5816,7 +5877,7 @@ void* mspace_realloc_in_place(mspace msp, void* oldmem, size_t bytes) {
+       mstate m = get_mstate_for(oldp);
+       (void)msp; /* placate people compiling -Wunused */
+       if (!ok_magic(m)) {
+-        USAGE_ERROR_ACTION(m, oldmem);
++        USAGE_ERROR_ACTION(m, oldp);
+         return 0;
+       }
+ #endif /* FOOTERS */
+-- 
+1.7.4.1
+

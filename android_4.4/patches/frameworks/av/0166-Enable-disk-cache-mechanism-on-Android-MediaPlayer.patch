@@ -1,0 +1,261 @@
+From d30f2e59d7228c24e60effc020fca9b86f8e7559 Mon Sep 17 00:00:00 2001
+From: Junchao Han <junchao.han@intel.com>
+Date: Thu, 1 Aug 2013 16:47:04 +0800
+Subject: Enable disk cache mechanism on Android MediaPlayer
+
+BZ: 121187
+
+Enabling disk cache mechanism is aimed to avoiding
+duplicated downloading media files and saving energy
+consumption.
+libstatefright(MediaPlayer) uses libchromium_net as
+network transaction. Cache mechanism is implemented
+in libchromium_net, but not enabled. This patch turns
+on the feature.
+Power of downloading throught Wifi/3G is about 500mW
+and power of writing cache to disk is about <5mW.
+Though the cache media files may not be reused
+everytime, the total power benefit will be positive.
+With our prototype experiment, avoding downloading
+a 4MB mp3 files under 5.5Mbps Wifi will save 5200mW*s
+energy, which is equal to 5.4min standby time
+(standby power is 16mW).
+The optimization is only happen to audio file
+(mp3,aac,m4a,flac,mid,ota,ogg,wav,xmf,mxmf,rttl,rtx,imy).
+
+Category: AOSP Improvement
+Domain: AOSP.Optimization-Browser
+Oigin: Internal
+Upstream-Candidate: no, key fix
+
+Issue: http://shilc211.sh.intel.com:41006/show_bug.cgi?id=121187
+Change-Id: I5a817e6cfd204b7a57a11f31c514169d7a903219
+Orig-MCG-Change-Id: Ie4752d9aad5e3dbdd4c7d398ee5022c0e90aa6a5
+Signed-off-by: Junchao Han <junchao.han@intel.com>
+---
+ media/libstagefright/chromium_http/support.cpp |  136 +++++++++++++++++++++---
+ media/libstagefright/chromium_http/support.h   |    2 +-
+ 2 files changed, 123 insertions(+), 15 deletions(-)
+
+diff --git a/media/libstagefright/chromium_http/support.cpp b/media/libstagefright/chromium_http/support.cpp
+index 0a8e3e3..0e04773 100644
+--- a/media/libstagefright/chromium_http/support.cpp
++++ b/media/libstagefright/chromium_http/support.cpp
+@@ -23,6 +23,9 @@
+ #include "support.h"
+ 
+ #include "android/net/android_network_library_impl.h"
++#include "base/file_path.h"
++#include "base/file_util.h"
++#include "base/path_service.h"
+ #include "base/logging.h"
+ #include "base/threading/thread.h"
+ #include "net/base/cert_verifier.h"
+@@ -36,16 +39,25 @@
+ #include "include/ChromiumHTTPDataSource.h"
+ 
+ #include <cutils/log.h>
++#include <cutils/properties.h>
+ #include <media/stagefright/MediaErrors.h>
+ #include <media/stagefright/Utils.h>
+ #include <string>
++#include <ctype.h>
+ 
+ namespace android {
+ 
+ static Mutex gNetworkThreadLock;
+ static base::Thread *gNetworkThread = NULL;
++static Mutex gCacheThreadLock;
++static base::Thread *gCacheThread = NULL;
+ static scoped_refptr<SfRequestContext> gReqContext;
++static scoped_refptr<SfRequestContext> gReqContextCache;
+ static scoped_ptr<net::NetworkChangeNotifier> gNetworkChangeNotifier;
++static char gCacheFilePath[PROPERTY_VALUE_MAX];
++static bool gCacheEnable;
++static bool gCacheBootClear;
++static int gCacheMaxBytes;
+ 
+ bool logMessageHandler(
+         int severity,
+@@ -92,6 +104,68 @@ private:
+     DISALLOW_EVIL_CONSTRUCTORS(AutoPrioritySaver);
+ };
+ 
++static void MY_LOGI(const char *s) {
++    LOG_PRI(ANDROID_LOG_INFO, LOG_TAG, "%s", s);
++}
++
++static void MY_LOGV(const char *s) {
++#if !defined(LOG_NDEBUG) || LOG_NDEBUG == 0
++    LOG_PRI(ANDROID_LOG_VERBOSE, LOG_TAG, "%s", s);
++#endif
++}
++
++static int GetIntProperty(const char *prop_name, const int default_value) {
++    char prop_buf[PROPERTY_VALUE_MAX];
++    char default_buf[PROPERTY_VALUE_MAX];
++    sprintf(default_buf, "%d", default_value);
++    property_get(prop_name, prop_buf, default_buf);
++    if (isdigit(prop_buf[0])) {
++        return atoi(prop_buf);
++    }
++    else {
++        return default_value;
++    }
++}
++
++static void LoadCacheProperties() {
++    property_get("persist.mediacache.filepath", gCacheFilePath, "/data/media/cache");
++    gCacheEnable = GetIntProperty("persist.mediacache.enable", 1) ? true : false;
++    gCacheBootClear = GetIntProperty("persist.mediacache.bootclear", 1) ? true : false;
++    gCacheMaxBytes = GetIntProperty("persist.mediacache.maxbytes", 0);
++    gCacheMaxBytes = gCacheMaxBytes>0 ? gCacheMaxBytes : 0;
++    MY_LOGI(StringPrintf(
++                "Cache enable=%s filepath=%s clearonboot=%s maxbytes=%d",
++                gCacheEnable ? "true" : "false",
++                gCacheFilePath,
++                gCacheBootClear ? "true" : "false",
++                gCacheMaxBytes).c_str());
++}
++
++static void DeleteCacheDirectory() {
++    FilePath fp(gCacheFilePath);
++    file_util::Delete(fp, true);
++}
++
++static void InitializeCacheDirectoryIfNecessary() {
++    FilePath fp(gCacheFilePath);
++    if (!file_util::DirectoryExists(fp)) {
++        MY_LOGI("cache directory not exist, try to create");
++        if (!file_util::CreateDirectory(fp))
++            MY_LOGI("cache directory create error");
++    }
++}
++
++static void InitializeCacheThreadIfNecessary() {
++    Mutex::Autolock autoLock(gCacheThreadLock);
++
++    if (gCacheThread == NULL) {
++        gCacheThread = new base::Thread("cache");
++        base::Thread::Options options;
++        options.message_loop_type = MessageLoop::TYPE_IO;
++        CHECK(gCacheThread->StartWithOptions(options));
++    }
++}
++
+ static void InitializeNetworkThreadIfNecessary() {
+     Mutex::Autolock autoLock(gNetworkThreadLock);
+ 
+@@ -105,7 +179,20 @@ static void InitializeNetworkThreadIfNecessary() {
+         options.message_loop_type = MessageLoop::TYPE_IO;
+         CHECK(gNetworkThread->StartWithOptions(options));
+ 
+-        gReqContext = new SfRequestContext;
++        gReqContext = new SfRequestContext(false);
++
++        LoadCacheProperties();
++        if (gCacheEnable) {
++            if (gCacheBootClear) {
++                DeleteCacheDirectory();
++            }
++            InitializeCacheThreadIfNecessary();
++            InitializeCacheDirectoryIfNecessary();
++            gReqContextCache = new SfRequestContext(true);
++        }
++        else {
++            gReqContextCache = NULL;
++        }
+ 
+         gNetworkChangeNotifier.reset(net::NetworkChangeNotifier::Create());
+ 
+@@ -115,16 +202,6 @@ static void InitializeNetworkThreadIfNecessary() {
+     }
+ }
+ 
+-static void MY_LOGI(const char *s) {
+-    LOG_PRI(ANDROID_LOG_INFO, LOG_TAG, "%s", s);
+-}
+-
+-static void MY_LOGV(const char *s) {
+-#if !defined(LOG_NDEBUG) || LOG_NDEBUG == 0
+-    LOG_PRI(ANDROID_LOG_VERBOSE, LOG_TAG, "%s", s);
+-#endif
+-}
+-
+ SfNetLog::SfNetLog()
+     : mNextID(1) {
+ }
+@@ -155,7 +232,7 @@ net::NetLog::LogLevel SfNetLog::GetLogLevel() const {
+ 
+ ////////////////////////////////////////////////////////////////////////////////
+ 
+-SfRequestContext::SfRequestContext() {
++SfRequestContext::SfRequestContext(bool bCacheEnable) {
+     mUserAgent = MakeUserAgent().c_str();
+ 
+     set_net_log(new SfNetLog());
+@@ -184,7 +261,10 @@ SfRequestContext::SfRequestContext() {
+             net::HttpAuthHandlerFactory::CreateDefault(host_resolver()),
+             network_delegate(),
+             net_log(),
+-            NULL));  // backend_factory
++            bCacheEnable ? new net::HttpCache::DefaultBackend(net::DISK_CACHE,
++                                                                FilePath(gCacheFilePath),
++                                                                gCacheMaxBytes,
++                                                                gCacheThread->message_loop_proxy()) : NULL));
+ 
+     set_cookie_store(new net::CookieMonster(NULL, NULL));
+ }
+@@ -494,7 +574,35 @@ void SfDelegate::onInitiateConnection(
+         mURLRequest->SetExtraRequestHeaders(headers);
+     }
+ 
+-    mURLRequest->set_context(gReqContext);
++    bool bCacheType = false;
++    if (gCacheEnable) {
++        const std::string aAudioExtension[] = {"mp3","aac","m4a","flac","mid","ota","ogg","wav","xmf","mxmf","rttl","rtx","imy",""}; // last empty string for termination
++        std::string sFileName = url.ExtractFileName();
++        int iDotPos = sFileName.rfind(".");
++        std::string sExtension = "";
++        if (iDotPos != std::string::npos) {
++            sExtension = sFileName.substr(iDotPos+1);
++            std::transform(sExtension.begin(),sExtension.end(),sExtension.begin(),::tolower);
++        }
++
++        if (!sExtension.empty()) {
++            int i = 0;
++            while (!aAudioExtension[i].empty()) {
++                if (!sExtension.compare(aAudioExtension[i])) {
++                    bCacheType = true;
++                    break;
++                }
++                i++;
++            }
++        }
++    }
++
++    if (bCacheType && gReqContextCache) {
++        mURLRequest->set_context(gReqContextCache);
++    }
++    else {
++        mURLRequest->set_context(gReqContext);
++    }
+ 
+     mURLRequest->Start();
+ }
+diff --git a/media/libstagefright/chromium_http/support.h b/media/libstagefright/chromium_http/support.h
+index 975a1d3..15ef5a9 100644
+--- a/media/libstagefright/chromium_http/support.h
++++ b/media/libstagefright/chromium_http/support.h
+@@ -56,7 +56,7 @@ private:
+ };
+ 
+ struct SfRequestContext : public net::URLRequestContext {
+-    SfRequestContext();
++    SfRequestContext(bool bCacheEnable);
+ 
+     virtual const std::string &GetUserAgent(const GURL &url) const;
+ 
+-- 
+1.7.4.1
+

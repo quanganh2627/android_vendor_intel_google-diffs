@@ -1,0 +1,434 @@
+From cf2b3f2f5af9ce698171d55b723bcc93fe2b857b Mon Sep 17 00:00:00 2001
+From: Serguei Katkov <serguei.i.katkov@intel.com>
+Date: Tue, 3 Sep 2013 13:45:41 +0700
+Subject: Dalvik: Merge block optimization should not merge any loop helpers
+
+BZ: 135091
+
+There are several loop helpers basic blocks like pre-header/backward/exit.
+Merge optimization should not merge them because they are expected to be by
+different optimizations.
+
+For example, In the bug above the peel loop requires
+a loop exit block as a separate one.
+
+The patch fixes Merge optimization to avoid merging of loop helpers.
+As a bonus, patch also:
+  - Add a support of switch basic block to dvmCompilerCopyBasicBlock
+    and peel loop
+  - Clean up LoopInformation to avoid redundant usage of iterators and
+    eliminates compilation warning
+  - Clean up Sink Cast to eliminate compilation warnings
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Icd458becaeb58ff3301eaa3c46d4de7241e1d16e
+Orig-MCG-Change-Id: I0cfd531dfb96fbf4d926b5d04dbde13cf537994b
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+Reviewed-on: http://android.intel.com:8080/130337
+Reviewed-by: Beyler, Jean Christophe <jean.christophe.beyler@intel.com>
+Reviewed-by: lab_aqa <lab_aqa@intel.com>
+Reviewed-by: Popov, Ivan G <ivan.g.popov@intel.com>
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: Lupusoru, Razvan A <razvan.a.lupusoru@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+---
+ vm/compiler/BBOptimization.cpp  |   20 +++--
+ vm/compiler/IntermediateRep.cpp |   21 +++++
+ vm/compiler/LoopInformation.cpp |  160 ++++++++++++--------------------------
+ vm/compiler/LoopInformation.h   |   15 ++--
+ vm/compiler/SinkCastOpt.cpp     |    8 +--
+ 5 files changed, 95 insertions(+), 129 deletions(-)
+
+diff --git a/vm/compiler/BBOptimization.cpp b/vm/compiler/BBOptimization.cpp
+index 29e2b7d..ed9ce71 100644
+--- a/vm/compiler/BBOptimization.cpp
++++ b/vm/compiler/BBOptimization.cpp
+@@ -24,14 +24,14 @@
+ 
+ /**
+  * @brief Helper function to dvmCompilerMergeBasicBlocks
+- *        to check whether a BB a pre-header of any loop
++ *        to check whether a BB a pre-header/Backward/Exit of any loop
+  * @param info loop information to check
+  * @param data BB to check.
+- * @return false if BB is a pre header
++ * @return false if BB is a loop helper
+  */
+-static bool isBBnotPreHeader (LoopInformation *info, void *data)
++static bool isBBnotLoopHelper (LoopInformation *info, void *data)
+ {
+-    return info->getPreHeader () != static_cast<BasicBlock*>(data);
++    return info->isBasicBlockALoopHelper (static_cast<BasicBlock*>(data)) == false;
+ }
+ 
+ bool dvmCompilerMergeBasicBlocks (CompilationUnit *cUnit, BasicBlock *bb)
+@@ -81,11 +81,17 @@ bool dvmCompilerMergeBasicBlocks (CompilationUnit *cUnit, BasicBlock *bb)
+         return false;
+     }
+ 
+-    // If child a pre-loop BB we must not merge it even if it is empty!
++    // If child or bb is a loop formation helper BB we must not merge them even if any of them are empty!
+     if (cUnit->loopInformation != 0)
+     {
+-        bool childIsNotPreHeader = cUnit->loopInformation->iterate (isBBnotPreHeader, child);
+-        if (childIsNotPreHeader == false)
++        bool childIsNotLoopHelper = cUnit->loopInformation->iterate (isBBnotLoopHelper, child);
++        if (childIsNotLoopHelper == false)
++        {
++            //No change to the BasicBlock
++            return false;
++        }
++        bool bbIsNotLoopHelper = cUnit->loopInformation->iterate (isBBnotLoopHelper, bb);
++        if (bbIsNotLoopHelper == false)
+         {
+             //No change to the BasicBlock
+             return false;
+diff --git a/vm/compiler/IntermediateRep.cpp b/vm/compiler/IntermediateRep.cpp
+index cff8843..30efd84 100644
+--- a/vm/compiler/IntermediateRep.cpp
++++ b/vm/compiler/IntermediateRep.cpp
+@@ -852,6 +852,27 @@ BasicBlock *dvmCompilerCopyBasicBlock (CompilationUnit *cUnit, const BasicBlock
+     resultBB->fallThrough = old->fallThrough;
+     resultBB->taken = old->taken;
+ 
++    //Copy successor links if needed
++    resultBB->successorBlockList.blockListType = old->successorBlockList.blockListType;
++    if (resultBB->successorBlockList.blockListType != kNotUsed) {
++        dvmInitGrowableList(&resultBB->successorBlockList.blocks,
++                dvmGrowableListSize (&old->successorBlockList.blocks));
++
++        GrowableListIterator iterator;
++        dvmGrowableListIteratorInit(&(((BasicBlock*) old)->successorBlockList.blocks), &iterator);
++        while (true) {
++            SuccessorBlockInfo *successorBlockInfoOld = (SuccessorBlockInfo *) dvmGrowableListIteratorNext(&iterator);
++            if (successorBlockInfoOld == 0)
++            {
++                break;
++            }
++
++            SuccessorBlockInfo *successorBlockInfoNew = (SuccessorBlockInfo *) dvmCompilerNew(sizeof(SuccessorBlockInfo), false);
++            memcpy (successorBlockInfoNew, successorBlockInfoOld, sizeof(SuccessorBlockInfo));
++            dvmInsertGrowableList(&resultBB->successorBlockList.blocks, (intptr_t) successorBlockInfoNew);
++        }
++    }
++
+     //Copy offset, method
+     resultBB->startOffset = old->startOffset;
+     resultBB->containingMethod = old->containingMethod;
+diff --git a/vm/compiler/LoopInformation.cpp b/vm/compiler/LoopInformation.cpp
+index 9cbb0b6..475a83c 100644
+--- a/vm/compiler/LoopInformation.cpp
++++ b/vm/compiler/LoopInformation.cpp
+@@ -604,6 +604,18 @@ LoopInformation *LoopInformation::getLoopInformationByEntry (const BasicBlock *e
+     return 0;
+ }
+ 
++bool LoopInformation::isBasicBlockALoopHelper (const BasicBlock *bb)
++{
++    if (bb == 0)
++    {
++        return false;
++    }
++
++    return preHeader == bb
++        || (exitLoop != 0 && dvmIsBitSet (exitLoop, bb->id) == true)
++        || (backward != 0 && dvmIsBitSet (backward, bb->id) == true);
++}
++
+ BasicBlock *LoopInformation::getExitBlock (const CompilationUnit *cUnit)
+ {
+     //Check if we have the exitLoop BitVector
+@@ -620,13 +632,10 @@ BasicBlock *LoopInformation::getExitBlock (const CompilationUnit *cUnit)
+         return 0;
+     }
+ 
+-    //Get the basic block
+-    BitVectorIterator bvIterator;
+-    dvmBitVectorIteratorInit (exitLoop, &bvIterator);
+-
+-    BasicBlock *bb = dvmCompilerGetNextBasicBlockViaBitVector (bvIterator, cUnit->blockList);
++    //It is alone, so just take it
++    int idx = dvmHighestBitSet (exitLoop);
+ 
+-    return bb;
++    return (BasicBlock *) dvmGrowableListGetElement (&cUnit->blockList, idx);
+ }
+ 
+ BitVector *LoopInformation::getPostExitLoops (const CompilationUnit *cUnit)
+@@ -669,13 +678,9 @@ BasicBlock *LoopInformation::getPostExitBlock (const CompilationUnit *cUnit)
+         return 0;
+     }
+ 
+-    //Get the basic block
+-    BitVectorIterator bvIterator;
+-    dvmBitVectorIteratorInit (postExitBlocks, &bvIterator);
+-
+-    BasicBlock *bb = dvmCompilerGetNextBasicBlockViaBitVector (bvIterator, cUnit->blockList);
+-
+-    return bb;
++    //It is alone, so just take it
++    int idx = dvmHighestBitSet (postExitBlocks);
++    return (BasicBlock *) dvmGrowableListGetElement (&cUnit->blockList, idx);
+ }
+ 
+ BasicBlock *LoopInformation::getBackwardBranchBlock (const CompilationUnit *cUnit)
+@@ -694,11 +699,9 @@ BasicBlock *LoopInformation::getBackwardBranchBlock (const CompilationUnit *cUni
+         return 0;
+     }
+ 
+-    //Get the basic block
+-    BitVectorIterator bvIterator;
+-    dvmBitVectorIteratorInit(backward, &bvIterator);
+-
+-    BasicBlock *bb = dvmCompilerGetNextBasicBlockViaBitVector (bvIterator, cUnit->blockList);
++    //It is alone, so just take it
++    int idx = dvmHighestBitSet (backward);
++    BasicBlock *bb = (BasicBlock *) dvmGrowableListGetElement (&cUnit->blockList, idx);
+ 
+     //Make sure it is a backward branch (Paranoid)
+     if (bb == 0 || bb->blockType != kChainingCellBackwardBranch)
+@@ -1356,7 +1359,7 @@ bool LoopInformation::getCountUpLoop(void)
+     GrowableList* ivList = &inductionVariableList;
+     unsigned int number = 0;
+ 
+-   for (int i = 0; i < ivList->numUsed; i++)
++   for (unsigned int i = 0; i < ivList->numUsed; i++)
+    {
+         InductionVariableInfo *ivInfo;
+ 
+@@ -1462,48 +1465,6 @@ void LoopInformation::handlePredecessor (CompilationUnit *cUnit, std::map<BasicB
+ 
+ }
+ 
+-// Handle the new copies: link any copy going to a BWCC to the preheader
+-void LoopInformation::handleBWCC (std::map<BasicBlock*, BasicBlock *> &associations)
+-{
+-    //Get the preheader
+-    BasicBlock *preheader = getPreHeader ();
+-
+-    //Walk the BasicBlocks
+-    for (std::map<BasicBlock *, BasicBlock *>::iterator it = associations.begin (); it != associations.end (); it++)
+-    {
+-        BasicBlock *orig = it->first;
+-        BasicBlock *copy = it->second;
+-
+-        //Because we might have 0, 0 in the map, check here but we should never have (!0), 0 in the map
+-        assert (it->first == 0 || (it->first != 0 && copy != 0));
+-
+-        if (copy == 0)
+-        {
+-            continue;
+-        }
+-
+-        //Is taken a BackWard Chaining Cell?
+-        bool isTakenBWCC = (orig->taken != 0 && orig->taken->blockType == kChainingCellBackwardBranch);
+-
+-        //Does it go to a BWCC
+-        if (isTakenBWCC == true)
+-        {
+-            //Link it to predecessor then
+-            copy->taken = preheader;
+-        }
+-
+-        //Same for fallthrough
+-        bool isFallThroughBWCC = (orig->fallThrough != 0 && orig->fallThrough->blockType == kChainingCellBackwardBranch);
+-
+-        //Does it go to a BWCC
+-        if (isFallThroughBWCC == true)
+-        {
+-            //Link it to predecessor then
+-            copy->fallThrough = preheader;
+-        }
+-    }
+-}
+-
+ /**
+  * @brief Peel a loop
+  */
+@@ -1543,7 +1504,7 @@ void LoopInformation::peelLoopHelper (CompilationUnit *cUnit)
+         associations[bb] = copy;
+     }
+ 
+-    //Ok we copied everything , now through them again and link them together
++    //Ok we copied everything, now through them again and update child links
+     for (std::map<BasicBlock *, BasicBlock *>::iterator it = associations.begin (); it != associations.end (); it++)
+     {
+         BasicBlock *copy = it->second;
+@@ -1551,67 +1512,48 @@ void LoopInformation::peelLoopHelper (CompilationUnit *cUnit)
+         //Because we might have 0, 0 in the map, check here but we should never have (!0), 0 in the map
+         assert (it->first == 0 || (it->first != 0 && copy != 0));
+ 
+-        if (copy == 0)
++        //Now we should update all out links, rules are as follows:
++        //    if child is backward - copied bb should point to pre-header
++        //    if child is exit     - copied bb should point to newly created block (copy of that exit)
++        //    if child is in loop  - copied bb should point to copied child
++        //    otherwise something went wrong
++        ChildBlockIterator childIter (copy);
++        for (BasicBlock **childPtr = childIter.getNextChildPtr ();
++                childPtr != 0;
++                childPtr = childIter.getNextChildPtr ())
+         {
+-            continue;
+-        }
++            //Get the child
++            BasicBlock *child = *childPtr;
+ 
+-        //Get copy's taken and fallthrough
+-        BasicBlock *taken = copy->taken;
+-        BasicBlock *fallThrough = copy->fallThrough;
++            //ChildBlockIterator should not return 0
++            assert (child != 0);
+ 
+-        //Transform the taken and fallthrough using the associations
+-        if (taken != 0)
+-        {
+-            //Update the association if we have one
+-            if (associations.count (taken) > 0)
++            if (associations.count (child) > 0)
+             {
+-                //Now update the link
+-                copy->taken = associations[taken];
++                *childPtr = associations[child];
++                continue;
+             }
+-            else
+-            {
+-                //It should be a loop exit block then. Copy and replace
+-                if (dvmIsBitSet (getExitLoops (), taken->id) == true)
+-                {
+-                    BasicBlock *loopExitCopy = dvmCompilerNewBBinCunit(cUnit, taken->blockType);
+-                    loopExitCopy->taken = taken->taken;
+-                    loopExitCopy->fallThrough = taken->fallThrough;
+-                    copy->taken = loopExitCopy;
+-                }
+-            }
+-
+-        }
+ 
+-        if (fallThrough != 0)
+-        {
+-            //Update the association if we have one
+-            if (associations.count (fallThrough) > 0)
++            if (dvmIsBitSet (getExitLoops (), child->id) == true)
+             {
+-                //Now update the link
+-                copy->fallThrough = associations[fallThrough];
++                BasicBlock *loopExitCopy = dvmCompilerNewBBinCunit(cUnit, child->blockType);
++                loopExitCopy->taken = child->taken;
++                loopExitCopy->fallThrough = child->fallThrough;
++                *childPtr = loopExitCopy;
++                continue;
+             }
+-            else
++
++            if (dvmIsBitSet (getBackwardBranches (), child->id) == true)
+             {
+-                //It should be a loop exit block then. Copy and replace
+-                if (dvmIsBitSet (getExitLoops (), fallThrough->id) == true)
+-                {
+-                    BasicBlock *loopExitCopy = dvmCompilerNewBBinCunit(cUnit, fallThrough->blockType);
+-                    loopExitCopy->taken = fallThrough->taken;
+-                    loopExitCopy->fallThrough = fallThrough->fallThrough;
+-                    copy->fallThrough = loopExitCopy;
+-                }
++                *childPtr = getPreHeader ();
++                continue;
+             }
+         }
+     }
+ 
+-    //All copies are linked together, now we need to link the copies correctly
+-
+-    //First attach the entry block on top of the preheader of the loop
++    //All children are updated
++    //Now we need to attach the copied entry block on top of the preheader of the loop
+     handlePredecessor (cUnit, associations);
+-
+-    //Second attach all BBs that go to a BWCC to the current preheader
+-    handleBWCC (associations);
+ }
+ 
+ //Count the instructions
+diff --git a/vm/compiler/LoopInformation.h b/vm/compiler/LoopInformation.h
+index 7f8ae8f..7856a1c 100644
+--- a/vm/compiler/LoopInformation.h
++++ b/vm/compiler/LoopInformation.h
+@@ -111,12 +111,6 @@ class LoopInformation
+         void peelLoopHelper (CompilationUnit *cUnit);
+ 
+         /**
+-         * @brief Handle the new copies: link any copy going to a BWCC to the preheader
+-         * @param associations the associations between original and copy BasicBlock
+-         */
+-        void handleBWCC (std::map<BasicBlock*, BasicBlock *> &associations);
+-
+-        /**
+          * @brief Handle the new copies: link any block to preheader to the entry's copy
+          * @param cUnit the CompilationUnit
+          * @param associations the associations between original and copy BasicBlock
+@@ -230,6 +224,14 @@ class LoopInformation
+         LoopInformation *getLoopInformationByEntry (const BasicBlock *entry);
+ 
+         /**
++         * @brief Check whether BB is a helper BB for this loop.
++         * @details helper BBs are pre-header, backward branch and exit of the loop
++         * @param bb the BasicBlock to check
++         * @return true if bb is a pre-header, backward branch or exit of the loop
++         */
++        bool isBasicBlockALoopHelper (const BasicBlock *bb);
++
++        /**
+          * @brief Does the Loop contain a given BasicBlock ?
+          */
+         bool contains (const BasicBlock *bb) const;
+@@ -472,6 +474,7 @@ class LoopInformation
+ 
+          /**
+           * @brief Helper to peel the inner loop
++          * @details After peeling a loop, loop and Dataflow information are borken
+           * @param cUnit the CompilationUnit
+           * @return whether the peeling succeeded
+           */
+diff --git a/vm/compiler/SinkCastOpt.cpp b/vm/compiler/SinkCastOpt.cpp
+index b4fab54..78d28c5 100644
+--- a/vm/compiler/SinkCastOpt.cpp
++++ b/vm/compiler/SinkCastOpt.cpp
+@@ -223,9 +223,6 @@ static void sinkCastByteCodes (CompilationUnit *cUnit, LoopInformation *info, MI
+     //If the casted VR is used, we have work to do
+     if (usedChain != 0)
+     {
+-        // Get basic block of current mir
+-        const BasicBlock *const currentBB = mir->bb;
+-
+         //Walk the def-use chain
+         for (; usedChain != 0; usedChain = usedChain->nextUse)
+         {
+@@ -233,9 +230,6 @@ static void sinkCastByteCodes (CompilationUnit *cUnit, LoopInformation *info, MI
+             //Get the MIR
+             MIR *next = usedChain->mir;
+ 
+-            // Get the basic block of the use mir
+-            const BasicBlock *const nextBB = next->bb;
+-
+             //It must the PHI node or an IF
+             if (next->dalvikInsn.opcode != static_cast<Opcode> (kMirOpPhi) && (dvmCompilerIsMIRConditional (next) == false))
+             {
+@@ -255,7 +249,7 @@ static void sinkCastByteCodes (CompilationUnit *cUnit, LoopInformation *info, MI
+     }
+ 
+     //Check if we can peel the loop
+-    bool result = info->peelLoop (cUnit);
++    bool result = dvmCompilerPeel (cUnit, info);
+ 
+     //Always peel first for the moment because peeling isn't that smart
+     if (result == false)
+-- 
+1.7.4.1
+

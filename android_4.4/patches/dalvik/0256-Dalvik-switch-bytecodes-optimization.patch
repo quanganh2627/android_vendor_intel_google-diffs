@@ -1,0 +1,1956 @@
+From e64c5a47de5c028ed881de776955500166c465fe Mon Sep 17 00:00:00 2001
+From: Yixin Shou <yixin.shou@intel.com>
+Date: Tue, 18 Jun 2013 09:15:04 -0700
+Subject: Dalvik: switch bytecodes optimization
+
+BZ: 121083
+
+Add chaining support for packed-switch and sparse-switch bytecode.
+
+current switch bytecodes implementation do not chain the target trace
+to current trace. The execution will jump to interpreter for each
+switch case handling to find the target trace or keep executing next
+bytecode in interpreter. Normal chaining cells created for switch bytecode
+are not utilized.
+
+This patch add chaining support for switch bytecodes by creating
+a switch table followed normal chaining cell section of switch bytecode.
+Switch table provide a place for each normal chaining cell to patch
+target trace address in the table to enable chaining functionality.
+
+This patch improved AndeBench performance with 3% on BayLake and 18% on CTP.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME; AOSP-Dalvik-Interpreter
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I70bb7f20c2d4d6a56d2a889102a21d767b11aecc
+Orig-MCG-Change-Id: Ic512e480da3907ab0c3f85987fdef9e45e7bae77
+Signed-off-by: Yixin Shou <yixin.shou@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Reviewed-on: http://android.intel.com:8080/123666
+Reviewed-by: Popov, Ivan G <ivan.g.popov@intel.com>
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/Frontend.cpp                           |   24 ++
+ vm/compiler/Loop.cpp                               |   23 ++
+ vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp     |   45 +--
+ vm/compiler/codegen/x86/lightcg/AnalysisO1.h       |   32 ++-
+ .../codegen/x86/lightcg/BytecodeVisitor.cpp        |   92 ++++-
+ .../codegen/x86/lightcg/CodegenInterface.cpp       |  215 ++++++++++-
+ vm/compiler/codegen/x86/lightcg/CompilationUnit.h  |   27 ++
+ vm/compiler/codegen/x86/lightcg/Lower.cpp          |   16 +-
+ vm/compiler/codegen/x86/lightcg/Lower.h            |   27 +-
+ vm/compiler/codegen/x86/lightcg/LowerHelper.cpp    |   68 ++--
+ vm/compiler/codegen/x86/lightcg/LowerJump.cpp      |  402 +++++++++++++++++---
+ vm/compiler/codegen/x86/lightcg/NcgHelper.cpp      |   65 +++-
+ vm/compiler/codegen/x86/lightcg/NcgHelper.h        |    8 +-
+ vm/compiler/codegen/x86/lightcg/Scheduler.cpp      |   23 ++
+ vm/mterp/out/InterpAsm-x86.S                       |   16 +
+ vm/mterp/x86/footer.S                              |   16 +
+ 16 files changed, 909 insertions(+), 190 deletions(-)
+
+diff --git a/vm/compiler/Frontend.cpp b/vm/compiler/Frontend.cpp
+index cd87bfb..2665a18 100644
+--- a/vm/compiler/Frontend.cpp
++++ b/vm/compiler/Frontend.cpp
+@@ -2593,15 +2593,39 @@ bool dvmCompileTrace(JitTraceDescription *desc, int numMaxInsts,
+                     (lastInsn->dalvikInsn.opcode == OP_PACKED_SWITCH ?
+                      2 : size * 2));
+ 
++            //initialize successorBlockList type
++            curBB->successorBlockList.blockListType =
++               (lastInsn->dalvikInsn.opcode == OP_PACKED_SWITCH) ? kPackedSwitch : kSparseSwitch;
++            dvmInitGrowableList(&curBB->successorBlockList.blocks, size);
++
++
+             /* One chaining cell for the first MAX_CHAINED_SWITCH_CASES cases */
+             for (i = 0; i < maxChains; i++) {
+                 BasicBlock *caseChain = dvmCompilerNewBBinList (*blockList, kChainingCellNormal);
+                 caseChain->startOffset = lastInsn->offset + targets[i];
++
++                // create successor and set precedessor for each normal chaining cell for switch cases
++                SuccessorBlockInfo *successorBlockInfo =
++                   (SuccessorBlockInfo *) dvmCompilerNew(sizeof(SuccessorBlockInfo), false);
++                successorBlockInfo->block = caseChain;
++                dvmInsertGrowableList(&curBB->successorBlockList.blocks,
++                              (intptr_t) successorBlockInfo);
++                dvmCompilerSetBit(caseChain->predecessors, curBB->id);
++
+             }
+ 
+             /* One more chaining cell for the default case */
+             BasicBlock *caseChain = dvmCompilerNewBBinList (*blockList, kChainingCellNormal);
+             caseChain->startOffset = lastInsn->offset + lastInsn->width;
++
++            // create successor for default case and set predecessor for default case chaining cell block
++            SuccessorBlockInfo *successorBlockInfo =
++               (SuccessorBlockInfo *) dvmCompilerNew(sizeof(SuccessorBlockInfo), false);
++            successorBlockInfo->block = caseChain;
++            dvmInsertGrowableList(&curBB->successorBlockList.blocks,
++                          (intptr_t) successorBlockInfo);
++            dvmCompilerSetBit(caseChain->predecessors, curBB->id);
++
+         /* Fallthrough block not included in the trace */
+         } else if (!isUnconditionalBranch(lastInsn) &&
+                    curBB->fallThrough == NULL) {
+diff --git a/vm/compiler/Loop.cpp b/vm/compiler/Loop.cpp
+index da39068..324d052 100644
+--- a/vm/compiler/Loop.cpp
++++ b/vm/compiler/Loop.cpp
+@@ -1582,6 +1582,29 @@ static bool calculatePredecessorsHelper (CompilationUnit *cUnit, BasicBlock *bb)
+         dvmCompilerSetBit (bb->fallThrough->predecessors, bb->id);
+     }
+ 
++    // Go through successor blocks of bb which contains switch bytecode
++    if (bb->successorBlockList.blockListType == kPackedSwitch ||
++        bb->successorBlockList.blockListType == kSparseSwitch) {
++
++        GrowableListIterator iterator;
++        dvmGrowableListIteratorInit(&bb->successorBlockList.blocks, &iterator);
++
++        // set predecessor info for successor blocks of current bb
++        while (true) {
++            SuccessorBlockInfo *successorBlockInfo =
++              (SuccessorBlockInfo *)dvmGrowableListIteratorNext(&iterator);
++            if (successorBlockInfo == NULL) {
++                break;
++            }
++
++            BasicBlock *succBlock = successorBlockInfo->block;
++
++            if (succBlock != 0) {
++                dvmCompilerSetBit (succBlock->predecessors, bb->id);
++            }
++        }
++    }
++
+     //We did change something but not our own basic block
+     return false;
+ }
+diff --git a/vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp b/vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp
+index 84809b6..4968d50 100644
+--- a/vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp
++++ b/vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp
+@@ -244,7 +244,15 @@ int createCFG(Method* method);
+ void dumpVirtualInfoOfBasicBlock(BasicBlock_O1* bb);
+ void setTypeOfVR();
+ void dumpVirtualInfoOfMethod();
+-int codeGenBasicBlock(const Method* method, BasicBlock_O1* bb);
++
++/**
++ * @brief entry point to generate native code for a O1 basic block
++ * @param method the method that compiled trace belong to
++ * @param bb current O1 basic block
++ * @param cUnit current O1 compilation unit
++ * @return 0 if generate code successfully, return value < 0 if error occured
++ */
++int codeGenBasicBlock(const Method* method, BasicBlock_O1* bb, CompilationUnit_O1* cUnit);
+ 
+ //used in collectInfoOfBasicBlock: getVirtualRegInfo
+ int mergeEntry2 (BasicBlock_O1* bb, VirtualRegInfo &currentInfo);
+@@ -1204,7 +1212,8 @@ void startOfTraceO1(const Method* method, int exceptionBlockId, CompilationUnit
+    We have two data structures for a basic block:
+        BasicBlock defined in vm/compiler by JIT
+        BasicBlock_O1 defined in o1 */
+-int codeGenBasicBlockJit(const Method* method, BasicBlock* bb) {
++int codeGenBasicBlockJit(const Method* method, BasicBlock* bb, CompilationUnit_O1* cUnit) {
++
+     // For x86, the BasicBlock should be the specialized one
+     currentBB = reinterpret_cast<BasicBlock_O1 *> (bb);
+ 
+@@ -1220,7 +1229,7 @@ int codeGenBasicBlockJit(const Method* method, BasicBlock* bb) {
+     currentBB->associationTable.finalize ();
+ 
+     // Generate code for this basic block
+-    int result = codeGenBasicBlock (method, currentBB);
++    int result = codeGenBasicBlock (method, currentBB, cUnit);
+ 
+     // End of managed basic block means end of native basic block
+     if (gDvmJit.scheduling)
+@@ -1404,7 +1413,7 @@ static bool shouldRejectBasicBlock(BasicBlock_O1* bb) {
+     Before lowering each bytecode, compileTable is updated with infoByteCodeTemp;
+     At end of the basic block, right before the jump instruction, handles constant VRs and GG VRs
+ */
+-int codeGenBasicBlock(const Method* method, BasicBlock_O1* bb)
++int codeGenBasicBlock(const Method* method, BasicBlock_O1* bb, CompilationUnit_O1* cUnit)
+ {
+     //Eagerly set retCode to 0 since most likely everything will be okay
+     int retCode = 0;
+@@ -1487,7 +1496,7 @@ int codeGenBasicBlock(const Method* method, BasicBlock_O1* bb)
+         }
+ 
+         //before handling a bytecode, import info of temporary registers to compileTable including refCount
+-        num_temp_regs_per_bytecode = getTempRegInfo(infoByteCodeTemp, mir);
++        num_temp_regs_per_bytecode = getTempRegInfo(infoByteCodeTemp, mir, rPC);
+         for(k = 0; k < num_temp_regs_per_bytecode; k++) {
+             if(infoByteCodeTemp[k].versionNum > 0) continue;
+             insertFromTempInfo (infoByteCodeTemp[k]);
+@@ -1548,7 +1557,7 @@ int codeGenBasicBlock(const Method* method, BasicBlock_O1* bb)
+             }
+             else
+             {
+-                notHandled = lowerByteCodeJit(method, mir, rPC);
++                notHandled = lowerByteCodeJit(method, mir, rPC, cUnit);
+             }
+ 
+             if(gDvmJit.codeCacheByteUsed + (stream - streamStart) +
+@@ -4819,30 +4828,6 @@ int touchEdx() {
+     return 0;
+ }
+ 
+-#ifdef HACK_FOR_DEBUG
+-//for debugging purpose, instructions are added at a certain place
+-bool hacked = false;
+-void hackBug() {
+-  if(!hacked && iget_obj_inst == 13) {
+-#if 0
+-    move_reg_to_reg_noalloc(OpndSize_32, PhysicalReg_EBX, true, PhysicalReg_ECX, true);
+-    //move from ebx to ecx & update compileTable for v3
+-    int tIndex = searchCompileTable(LowOpndRegType_virtual | LowOpndRegType_gp, 3);
+-    if(tIndex < 0) ALOGE("hack can't find VR3");
+-    compileTable[tIndex].physicalReg = PhysicalReg_ECX;
+-#else
+-    move_reg_to_mem_noalloc(OpndSize_32, PhysicalReg_EBX, true, 12, PhysicalReg_FP, true);
+-#endif
+-  }
+-}
+-void hackBug2() {
+-  if(!hacked && iget_obj_inst == 13) {
+-    dump_imm_mem_noalloc(Mnemonic_MOV, OpndSize_32, 0, 12, PhysicalReg_FP, true);
+-    hacked = true;
+-  }
+-}
+-#endif
+-
+ //! this function is called before calling a helper function or a vm function
+ int beforeCall(const char* target) { //spill all live registers
+     if(currentBB == NULL) return -1;
+diff --git a/vm/compiler/codegen/x86/lightcg/AnalysisO1.h b/vm/compiler/codegen/x86/lightcg/AnalysisO1.h
+index 93e20ee..7a35399 100644
+--- a/vm/compiler/codegen/x86/lightcg/AnalysisO1.h
++++ b/vm/compiler/codegen/x86/lightcg/AnalysisO1.h
+@@ -356,12 +356,42 @@ extern ConstVRInfo constVRTable[MAX_CONST_REG];
+  */
+ OpndSize getRegSize (int type);
+ 
++/**
++ * @class SwitchNormalCCInfo
++ * @brief Data structure that contains related info of each normal chaining cell for switch bytecode
++ */
++typedef struct SwitchNormalCCInfo {
++    char *patchAddr;                 /**< @brief  address in normal CC where codePtr in normal CC stored */
++    char *normalCCAddr;                     /**< @brief  start address of a normal CC for switch bytcode */
++} SwitchNormalCCInfo;
++
++/**
++ * @class SwitchInfo
++ * @brief Information related to switch bytecode lowering
++ */
++typedef struct SwitchInfo {
++    char *immAddr;           /**< @brief  address of the imm location in the first move instruction which pass in switch table address */
++    char *immAddr2;          /**< @brief  address of the imm location in the second move instruction which pass in switch table address */
++    u2 tSize;                /**< @brief  size of the switch case */
++    std::vector<SwitchNormalCCInfo> switchNormalCCList; /**< @brief list that contains all normal chaining cell info for a switch bytecode */
++} SwitchInfo;
++
++/**
++ * @class SwitchInfoScheduler
++ * @brief Data structure that contains related switchInfo to pass to instruction scheduler
++ */
++typedef struct SwitchInfoScheduler {
++    bool isFirst; /**< @brief TRUE for first move instruction which pass in switch table address*/
++    int offset;   /**< @brief offset need to be added from the start of instruction */
++    SwitchInfo * switchInfo; /**< @brief switch info for current switch bytecode */
++} SwitchInfoScheduler;
++
+ void forwardAnalysis(int type);
+ 
+ //functions in bc_visitor.c
+ int getConstInfo(BasicBlock_O1* bb, const MIR * currentMIR);
+ int getVirtualRegInfo(VirtualRegInfo* infoArray, const MIR * currentMIR, bool updateBBConstraints = false);
+-int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR);
++int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR, const u2* dalvikPC);
+ int createCFGHandler(Method* method);
+ 
+ int findVirtualRegInTable(int vA, LowOpndRegType type);
+diff --git a/vm/compiler/codegen/x86/lightcg/BytecodeVisitor.cpp b/vm/compiler/codegen/x86/lightcg/BytecodeVisitor.cpp
+index 2342613..670fe6a 100644
+--- a/vm/compiler/codegen/x86/lightcg/BytecodeVisitor.cpp
++++ b/vm/compiler/codegen/x86/lightcg/BytecodeVisitor.cpp
+@@ -1951,7 +1951,6 @@ int getVirtualRegInfo (VirtualRegInfo* infoArray, const MIR * currentMIR, bool u
+         if (updateBBConstraints == true)
+         {
+             updateCurrentBBWithConstraints (PhysicalReg_EAX);
+-            updateCurrentBBWithConstraints (PhysicalReg_EDX);
+         }
+         num_regs_per_bytecode = 1;
+         break;
+@@ -3600,7 +3599,7 @@ int iget_obj_inst = -1;
+ //! This function updates infoArray with temporaries accessed when lowering the bytecode
+ 
+ //! returns the number of temporaries
+-int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns an array of TempRegInfo
++int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR, const u2* dalvikPC) { //returns an array of TempRegInfo
+     int k;
+     int numTmps;
+     for(k = 0; k < MAX_TEMP_REG_PER_BYTECODE; k++) {
+@@ -4200,22 +4199,79 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+         return 0;
+     case OP_PACKED_SWITCH: //jump common_backwardBranch, which calls common_periodicChecks_entry, then jump_reg %eax
+     case OP_SPARSE_SWITCH: //%edx, %eax
+-        infoArray[0].regNum = 1;
+-        infoArray[0].refCount = 2; //DU
+-        infoArray[0].physicalType = LowOpndRegType_gp;
+-        infoArray[1].regNum = PhysicalReg_EDX;
+-        infoArray[1].refCount = 6;
+-        infoArray[1].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
+-        infoArray[2].regNum = PhysicalReg_EAX; //return by dvm helper
+-        infoArray[2].refCount = 2+1; //2 uses
+-        infoArray[2].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
+-        infoArray[3].regNum = 1;
+-        infoArray[3].refCount = 2;
+-        infoArray[3].physicalType = LowOpndRegType_scratch;
+-        infoArray[4].regNum = 2;
+-        infoArray[4].refCount = 2;
+-        infoArray[4].physicalType = LowOpndRegType_scratch;
+-        return 5;
++        u2 tSize;
++        u2* switchData;
++
++        //get the inlined switch data offset in dex file
++        vB = currentMIR->dalvikInsn.vB;
++        switchData = const_cast<u2*>(dalvikPC) + (s4)vB;
++        switchData++;
++
++        // get the size of switch bytecode cases
++        tSize = *switchData;
++
++        // if number of switch bytecode cases is within the range of MAX_CHAINED_SWITCH_CASES(64)
++        if (tSize <= MAX_CHAINED_SWITCH_CASES) {
++
++            // for packed-switch lowering implementation
++            if (inst_op == OP_PACKED_SWITCH) {
++
++                infoArray[0].regNum = 1;
++                infoArray[0].refCount = 5; //DU
++                infoArray[0].shareWithVR = false;
++                infoArray[0].physicalType = LowOpndRegType_gp;
++                infoArray[1].regNum = 2;
++                infoArray[1].refCount = 5; //DU
++                infoArray[1].physicalType = LowOpndRegType_gp;
++                return 2;
++            }
++
++            // for sparse-switch lowering implementation
++            else {
++                infoArray[0].regNum = 1;
++                infoArray[0].refCount = 2; //DU
++                infoArray[0].physicalType = LowOpndRegType_gp;
++                infoArray[1].regNum = PhysicalReg_EAX; //return by dvm helper
++                infoArray[1].refCount = 2; //2 uses
++                infoArray[1].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++                infoArray[2].regNum = 1;
++                infoArray[2].refCount = 2;
++                infoArray[2].physicalType = LowOpndRegType_scratch;
++                return 3;
++            }
++        }
++
++        // if number of switch bytecode cases is bigger than MAX_CHAINED_SWITCH_CASES(64)
++        // set temporary register info separately for sparse and packed switch bytecode lowering implementation
++        else {
++            infoArray[0].regNum = 1;
++            if (inst_op == OP_PACKED_SWITCH) {
++                infoArray[0].refCount = 9;
++                infoArray[0].shareWithVR = false;
++            }
++            else {
++                infoArray[0].refCount = 2;
++            }
++            infoArray[0].physicalType = LowOpndRegType_gp;
++            infoArray[1].regNum = 2;
++            infoArray[1].refCount = 6;
++            infoArray[1].physicalType = LowOpndRegType_gp;
++            infoArray[2].regNum = PhysicalReg_EAX;
++            if (inst_op == OP_PACKED_SWITCH) {
++                infoArray[2].refCount = 4;
++            }
++            else {
++                infoArray[2].refCount = 10;
++            }
++            infoArray[2].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++            infoArray[3].regNum = 1;
++            infoArray[3].refCount = 2;
++            infoArray[3].physicalType = LowOpndRegType_scratch;
++            infoArray[4].regNum = 2;
++            infoArray[4].refCount = 2;
++            infoArray[4].physicalType = LowOpndRegType_scratch;
++            return 5;
++        }
+ 
+     case OP_AGET:
+     case OP_AGET_OBJECT:
+diff --git a/vm/compiler/codegen/x86/lightcg/CodegenInterface.cpp b/vm/compiler/codegen/x86/lightcg/CodegenInterface.cpp
+index 36db7e6..77da115 100644
+--- a/vm/compiler/codegen/x86/lightcg/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/lightcg/CodegenInterface.cpp
+@@ -805,12 +805,13 @@ struct __attribute__ ((packed)) BackwardBranchChainingCellContents
+     }
+ };
+ 
+-#define BYTES_OF_NORMAL_CHAINING 13
++#define BYTES_OF_NORMAL_CHAINING 17
+ #define BYTES_OF_HOT_CHAINING 17
+-#define BYTES_OF_SINGLETON_CHAINING 13
++#define BYTES_OF_SINGLETON_CHAINING 17
+ #define BYTES_OF_PREDICTED_CHAINING 20
+ #define OFFSET_OF_PATCHADDR 9 // offset in chaining cell to the field for the location to be patched
+-#define OFFSET_OF_ISMOVEFLAG 13  // offset in hot chaining cell to the ismove_flag field
++#define OFFSET_OF_ISMOVEFLAG 13  // offset in hot chaining cell to the isMove field
++#define OFFSET_OF_ISSWITCH 13  // offset in normal chaining cell to the isSwitch field
+ #define BYTES_OF_32BITS 4
+ /*
+  * Unchain a trace given the starting address of the translation
+@@ -845,10 +846,17 @@ u4* dvmJitUnchain(void* codeAddr)
+                call imm32
+                rPC
+                codePtr (offset address of jmp/jcc)
++               isSwitch
+            after chaining:
+-               codePtr is filled with a relative offset to the target
++               if (isSwitch)
++                 codePtr is filled with absolute address to the target
++               else
++                 codePtr is filled with a relative offset to the target
+            after unchaining:
+-              codePtr is filled with original relative offset to the chaining cell
++               if (isSwitch)
++                 codePtr is filled with absolute adress of the chaining cell
++               else
++                 codePtr is filled with original relative offset to the chaining cell
+ 
+            for backward chaining:
+                call imm32
+@@ -905,13 +913,22 @@ u4* dvmJitUnchain(void* codeAddr)
+         for (j = 0; j < pChainCellCounts->u.count[i]; j++) {
+             switch(i) {
+                 case kChainingCellNormal:
++                    int isSwitch;
++
+                     COMPILER_TRACE_CHAINING(
+                         ALOGI("Jit Runtime: unchaining of normal"));
+                     elemSize = BYTES_OF_NORMAL_CHAINING;
+                     patchAddr = (u1 *)(*(int *)((char*)pChainCells + OFFSET_OF_PATCHADDR));
+-                    relativeNCG = (pChainCells - patchAddr) - BYTES_OF_32BITS;
+-                    if (patchAddr)
+-                        updateCodeCache(*(int*)patchAddr, relativeNCG);
++                    isSwitch = *(int *)((char*)pChainCells + OFFSET_OF_ISSWITCH);
++                    if (patchAddr != 0) {
++                        if (isSwitch != 0) {
++                            updateCodeCache(*(int*)patchAddr, (int)pChainCells);
++                        }
++                        else {
++                            relativeNCG = (pChainCells - patchAddr) - BYTES_OF_32BITS;
++                            updateCodeCache(*(int*)patchAddr, relativeNCG);
++                        }
++                    }
+                     break;
+                 case kChainingCellHot:
+                     COMPILER_TRACE_CHAINING(
+@@ -1001,6 +1018,55 @@ void dvmJitUnchainAll()
+     gDvmJit.hasNewChain = false;
+ }
+ 
++/**
++ * @brief check if the predecessor of a normal chaining cell block contains a switch bytecode in the end of block
++ * @param cUnit the compilation unit
++ * @param normalChainingCellBB the normal chaining cell basic block
++ * return true if normal chaining cell block have switch bytecode block as predecessor
++ */
++static bool isSwitchPred(CompilationUnit *cUnit,  BasicBlock_O1 * normalChainingCellBB)
++{
++    BitVectorIterator bvIterator;
++    dvmBitVectorIteratorInit (normalChainingCellBB->predecessors, &bvIterator);
++
++    int blockIdx = dvmBitVectorIteratorNext (&bvIterator);
++
++    // if no predecessor found
++    if (blockIdx == -1) {
++        return false;
++    }
++
++    BasicBlock_O1 *predBB = reinterpret_cast<BasicBlock_O1 *> (dvmGrowableListGetElement (
++                    &cUnit->blockList, blockIdx));
++    if (predBB != 0 &&
++        predBB->blockType == kDalvikByteCode &&
++        predBB->lastMIRInsn != 0 && (
++        predBB->lastMIRInsn->dalvikInsn.opcode == OP_PACKED_SWITCH ||
++        predBB->lastMIRInsn->dalvikInsn.opcode == OP_SPARSE_SWITCH))
++        return true;
++    return false;
++}
++
++/**
++ * @brief fill fields in a switchNormalCCInfo item and insert this item into swithNormalCCList
++ * @param cUnit the compilation unit
++ * @param startOfNormal the start address of the normal chaining cell
++ * @param patchAddr the address for the codePtr field in normal chaining cell
++ */
++static void createSwitchNormalInfo(CompilationUnit_O1 *cUnit, char* startOfNormal, char* patchAddr)
++{
++    SwitchNormalCCInfo switchNormalCCInfo;
++
++    // fill the two address fields
++    switchNormalCCInfo.patchAddr = patchAddr;
++    switchNormalCCInfo.normalCCAddr = startOfNormal;
++
++    assert(cUnit->getSwitchInfo() != 0);
++
++    // insert the new item into the switchNormalCCList
++    cUnit->getSwitchInfo()->switchNormalCCList.push_back(switchNormalCCInfo);
++}
++
+ /* Chaining cell for code that may need warmup. */
+ /* ARM assembly: ldr r0, [r6, #76] (why a single instruction to access member of glue structure?)
+                  blx r0
+@@ -1010,14 +1076,29 @@ void dvmJitUnchainAll()
+                   call imm32 //relative offset to dvmJitToInterpNormal
+                   rPC
+                   codePtr
++                  isSwitch
+ */
+-static int handleNormalChainingCell(CompilationUnit *cUnit, unsigned int offset, int blockId)
++/**
++ * @brief Generates code for normal chaining cell.
++ * @param cUnit the compilation unit
++ * @param offset the target bytecode offset
++ * @param normalChainingCellBB the normal chaining cell handled here
++ * @return return 0
++ */
++static int handleNormalChainingCell(CompilationUnit_O1 *cUnit, unsigned int offset, BasicBlock_O1 *normalChainingCellBB)
+ {
+     ALOGV("In handleNormalChainingCell for method %s block %d BC offset %x NCG offset %x",
+           cUnit->method->name, blockId, offset, stream - streamMethodStart);
+     if(dump_x86_inst)
+         ALOGI("LOWER NormalChainingCell at offsetPC %x offsetNCG %x @%p",
+               offset, stream - streamMethodStart, stream);
++    int isSwitch = 0;
++
++    if (isSwitchPred(cUnit, normalChainingCellBB) == true) {
++        isSwitch = 1;
++    }
++
++    char *startOfNormal = stream;
+ #ifndef WITH_SELF_VERIFICATION
+     call_dvmJitToInterpNormal();
+ #else
+@@ -1025,8 +1106,16 @@ static int handleNormalChainingCell(CompilationUnit *cUnit, unsigned int offset,
+ #endif
+     unsigned int *ptr = (unsigned int*)stream;
+     *ptr++ = (unsigned int)(cUnit->method->insns + offset);
+-    char* codePtr = searchNCGWorklist(blockId);
++
++    char *codePtr = NULL;
++    if (isSwitch == false) {
++        codePtr = searchNCGWorklist(normalChainingCellBB->id);
++    }
++    else {
++        createSwitchNormalInfo(cUnit, startOfNormal, (char*)ptr);
++    }
+     *ptr++ = (unsigned int)codePtr;
++    *ptr++ = (unsigned int)isSwitch;
+     stream = (char*)ptr;
+     return 0;
+ }
+@@ -1048,22 +1137,19 @@ static int handleHotChainingCell(CompilationUnit *cUnit, unsigned int offset, in
+         ALOGI("LOWER HotChainingCell at offsetPC %x offsetNCG %x @%p",
+               offset, stream - streamMethodStart, stream);
+ 
+-    int ismove_flag = 0;
++    int isMove = 0;
+     char* codePtr = searchChainingWorklist(blockId);
+     if (codePtr == NULL) {
+         codePtr = searchNCGWorklist(blockId);
+-        if (codePtr) {
+-            call_dvmJitToInterpNormal();
+-            ismove_flag = 1;
++        if (codePtr != 0) {
++            isMove = 1;
+         }
+-        else call_dvmJitToInterpTraceSelect();
+     }
+-    else
+-        call_dvmJitToInterpTraceSelect();
++    call_dvmJitToInterpTraceSelect();
+     unsigned int *ptr = (unsigned int*)stream;
+     *ptr++ = (unsigned int)(cUnit->method->insns + offset);
+     *ptr++ = (unsigned int)codePtr;
+-    *ptr++ = (unsigned int)ismove_flag;
++    *ptr++ = (unsigned int)isMove;
+     stream = (char*)ptr;
+     return 0;
+ }
+@@ -1238,6 +1324,7 @@ static bool handleBackwardBranchChainingCell (CompilationUnit *cUnit,
+                   call imm32 // relative offset to dvmJitToInterpTraceSelect
+                   rPC
+                   codePtr
++                  flag // dummy flag
+ */
+ static int handleInvokeSingletonChainingCell(CompilationUnit *cUnit,
+                                               const Method *callee, int blockId)
+@@ -1253,6 +1340,7 @@ static int handleInvokeSingletonChainingCell(CompilationUnit *cUnit,
+     *ptr++ = (unsigned int)(callee->insns);
+     char* codePtr = searchChainingWorklist(blockId);
+     *ptr++ = (unsigned int)codePtr;
++    *ptr++ = 0;
+     stream = (char*)ptr;
+     return 0;
+ }
+@@ -1480,6 +1568,8 @@ static void printChainingCellBlocks(char *startAddr, BBType blockType)
+             ALOGD("**  %p: %#x \t// next bytecode PC", (void*)ui_ptr, *ui_ptr);
+             ui_ptr++;
+             ALOGD("**  %p: %#x \t// code address to be patched", (void*)ui_ptr, *ui_ptr);
++            ui_ptr++;
++            ALOGD("**  %p: %d \t// isSwitch flag", (void*)ui_ptr, *ui_ptr);
+             break;
+ 
+         case kChainingCellInvokeSingleton:
+@@ -1488,6 +1578,7 @@ static void printChainingCellBlocks(char *startAddr, BBType blockType)
+             ALOGD("**  %p: %#x \t// next bytecode PC", (void*)ui_ptr, *ui_ptr);
+             ui_ptr++;
+             ALOGD("**  %p: %#x \t// code address to be patched", (void*)ui_ptr, *ui_ptr);
++            ui_ptr++;
+             break;
+ 
+         case kChainingCellHot:
+@@ -1545,7 +1636,7 @@ static void printChainingCellBlocks(char *startAddr, BBType blockType)
+  * @param pCCOffsetSection - pointer to the chaining cell offset header
+  */
+ typedef std::pair<BBType, char*> CodeBlockElem;
+-static void printTrace(CompilationUnit *cUnit, std::vector<CodeBlockElem> &code_block_table,
++static void printTrace(CompilationUnit_O1 *cUnit, std::vector<CodeBlockElem> &code_block_table,
+                        ChainCellCounts &chainCellCounts, int wide_const_count, u2* pCCOffsetSection)
+ {
+     char *code_ptr, *next_code_ptr = 0;
+@@ -1601,6 +1692,20 @@ static void printTrace(CompilationUnit *cUnit, std::vector<CodeBlockElem> &code_
+         return;
+     }
+ 
++    // print switch table section if any
++    if ((cUnit->getSwitchInfo() != 0) && (cUnit->getSwitchInfo()->tSize > 0)) {
++
++        // 4 byte aligned
++        next_code_ptr = reinterpret_cast<char*>((reinterpret_cast<unsigned int>(next_code_ptr) + 3) & ~0x3);
++        ALOGD("** // Switch Table section (4B aligned)");
++        unsigned int *stPtr = (unsigned int *)next_code_ptr;
++        for (int i = 0; i < MIN(cUnit->getSwitchInfo()->tSize, MAX_CHAINED_SWITCH_CASES) + 1; i ++) {
++            ALOGD("**  %p: %#x", (void*) stPtr, *stPtr);
++            stPtr ++;
++        }
++        next_code_ptr = (char*)stPtr;
++    }
++
+     // next_code_ptr should hold the pre-padded address of the chaining cell count section
+     // print the chaining cell count section
+     next_code_ptr = reinterpret_cast<char*>((reinterpret_cast<unsigned int>(next_code_ptr) + 3) & ~0x3);
+@@ -1801,7 +1906,7 @@ int patchConstToStream(struct ConstInfo *constListTemp, CompilationUnit *cUnit)
+  * @param nextFallThrough a pointer to the next fall through BasicBlock
+  * @return whether the generation went well
+  */
+-static bool generateCode (CompilationUnit *cUnit, BasicBlock *bb, BasicBlock **nextFallThrough)
++static bool generateCode (CompilationUnit_O1 *cUnit, BasicBlock *bb, BasicBlock **nextFallThrough)
+ {
+     ALOGV("Get ready to handle JIT bb %d type %d hidden %d @%p",
+             bb->id, bb->blockType, bb->hidden, stream);
+@@ -1815,9 +1920,10 @@ static bool generateCode (CompilationUnit *cUnit, BasicBlock *bb, BasicBlock **n
+     //Generate the loop counter profile code for loop
+     genLoopCounterProfileCode(cUnit, bbO1);
+ #endif
++
+     //Generate the code
+     startOfBasicBlock(bb);
+-    int cg_ret = codeGenBasicBlockJit(cUnit->method, bb);
++    int cg_ret = codeGenBasicBlockJit(cUnit->method, bb, cUnit);
+     endOfBasicBlock(bb);
+ 
+     //Error handling, we return false
+@@ -1838,6 +1944,47 @@ static bool generateCode (CompilationUnit *cUnit, BasicBlock *bb, BasicBlock **n
+     return true;
+ }
+ 
++/**
++ * @brief create a switch table in the end of trace and finish the patching needed in switch bytecode lowered instruction and normal chaining cells
++ * @param cUnit the compilation unit
++ */
++static void createSwitchTable(CompilationUnit_O1 *cUnit)
++{
++    // align switch table start address to 4 byte aligned
++    int padding = (4 - ((u4) stream & 3)) & 3;
++    stream += padding;
++
++    assert(cUnit->getSwitchInfo() != NULL);
++
++    unsigned int *immAddr = reinterpret_cast<unsigned int*>((cUnit->getSwitchInfo())->immAddr);
++    assert(immAddr != NULL);
++
++    // Patched the instruction with the switch table address
++    *immAddr = reinterpret_cast<unsigned int>(stream);
++
++    unsigned int *immAddr2 = reinterpret_cast<unsigned int*>(cUnit->getSwitchInfo()->immAddr2);
++    if (immAddr2 != 0) {
++
++        // Patched the instruction with the switch table address
++        *immAddr2 = reinterpret_cast<unsigned int>(stream);
++    }
++
++    std::vector<SwitchNormalCCInfo> &switchNormalCCList = cUnit->getSwitchInfo()->switchNormalCCList;
++    unsigned int *ptr = reinterpret_cast<unsigned int*>(stream);
++    unsigned int *patchAddr;
++
++    // Initialize switch table in the end of trace with start address of each normal chaining cell and backpatched patchAddr field in normal chaining cell
++    for (unsigned int i = 0; i < switchNormalCCList.size(); i++) {
++        *ptr = reinterpret_cast<unsigned int>(switchNormalCCList[i].normalCCAddr);
++        patchAddr = reinterpret_cast<unsigned int*>(switchNormalCCList[i].patchAddr);
++        *patchAddr = reinterpret_cast<unsigned int>(ptr);
++        ptr ++;
++    }
++
++    // update stream pointer
++    stream = reinterpret_cast<char *>(ptr);
++}
++
+ //! \brief Lower middle-level IR ro low-level IR
+ //!
+ //! \details Entry function to invoke the backend of the JIT compiler
+@@ -2096,7 +2243,7 @@ static void compilerMIR2LIRJit(CompilationUnit_O1 *cUnit, JitTranslationInfo *in
+             switch (chainingBlock->blockType) {
+                 case kChainingCellNormal:
+                     nop_size = handleNormalChainingCell(cUnit,
+-                     chainingBlock->startOffset, blockId);
++                     chainingBlock->startOffset, bbO1);
+                     bbO1->label->lop.generic.offset += nop_size; //skip over nop
+                     break;
+                 case kChainingCellInvokeSingleton:
+@@ -2179,6 +2326,27 @@ static void compilerMIR2LIRJit(CompilationUnit_O1 *cUnit, JitTranslationInfo *in
+         return;
+     }
+ 
++    // create switch table if this trace contains switch bytecode
++    if (cUnit->getSwitchInfo() != 0) {
++
++        // Calculate the stream address after switch table
++        int switchTableSize =  (MIN(cUnit->getSwitchInfo()->tSize, MAX_CHAINED_SWITCH_CASES) + 1) * 4;
++        char * streamAfterSwitchTable = reinterpret_cast<char*>((reinterpret_cast<unsigned int>(stream) + 0x3) & ~0x3);
++        streamAfterSwitchTable =  reinterpret_cast<char*>((reinterpret_cast<unsigned int>(streamAfterSwitchTable) + switchTableSize));
++
++        // if the size of the trace exceeds the code cache limit
++        if(gDvmJit.codeCacheByteUsed +  (streamAfterSwitchTable - streamStart)  + CODE_CACHE_PADDING > gDvmJit.codeCacheSize) {
++            ALOGI("JIT_INFO: Code cache full after switch table section (trace uses %uB)", (stream - streamStart));
++            SET_JIT_ERROR(kJitErrorCodeCacheFull);
++            gDvmJit.codeCacheFull = true;
++            endOfTrace(cUnit);
++            PROTECT_CODE_CACHE(stream, unprotected_code_cache_bytes);
++            code_block_table.clear();
++            return;
++        }
++        createSwitchTable(cUnit);
++    }
++
+     /* dump section for chaining cell counts, make sure it is 4-byte aligned */
+     padding = (4 - ((u4)stream & 3)) & 3;
+     stream += padding;
+@@ -2281,6 +2449,9 @@ static void compilerMIR2LIRJit(CompilationUnit_O1 *cUnit, JitTranslationInfo *in
+         code_block_table.push_back(code_blk_elem);
+         printTrace(cUnit, code_block_table, chainCellCounts, patchCount, pOffset);
+     }
++    if (cUnit->getSwitchInfo() != 0) {
++        cUnit->getSwitchInfo()->switchNormalCCList.clear();
++    }
+     code_block_table.clear();
+     ALOGV("JIT CODE after trace %p to %p size %x START %p", streamMethodStart,
+           (char *) gDvmJit.codeCache + gDvmJit.codeCacheByteUsed,
+diff --git a/vm/compiler/codegen/x86/lightcg/CompilationUnit.h b/vm/compiler/codegen/x86/lightcg/CompilationUnit.h
+index 6e93dc0..9915284 100644
+--- a/vm/compiler/codegen/x86/lightcg/CompilationUnit.h
++++ b/vm/compiler/codegen/x86/lightcg/CompilationUnit.h
+@@ -26,7 +26,34 @@ class CompilationUnit_O1: public CompilationUnit
+         /** @brief Physical registers that should not be spilled */
+         bool canSpillRegister[PhysicalReg_Null];
+ 
++        /** @brief pointer to data structure for switch bytecode lowering*/
++        struct SwitchInfo *switchInfo;
++
+     public:
++
++       /**
++        * @brief Default constructor
++        */
++        CompilationUnit_O1(void) {
++            switchInfo = 0;
++        }
++
++        /**
++         * @brief get switchInfo pointer
++         * @return switchInfo pointer
++         */
++        SwitchInfo * getSwitchInfo(void) const {
++            return switchInfo;
++        }
++
++        /**
++         * @brief set switchInfo pointer
++         * @param switchInformation set switchInfo with switchInformation
++         */
++        void setSwitchInfo(SwitchInfo * switchInformation) {
++            switchInfo = switchInformation;
++        }
++
+         /**
+          * @brief Can we spill a register?
+          * @param reg the register we care about
+diff --git a/vm/compiler/codegen/x86/lightcg/Lower.cpp b/vm/compiler/codegen/x86/lightcg/Lower.cpp
+index 73d22f0..06b9092 100644
+--- a/vm/compiler/codegen/x86/lightcg/Lower.cpp
++++ b/vm/compiler/codegen/x86/lightcg/Lower.cpp
+@@ -440,10 +440,11 @@ ExecutionMode origMode;
+  * @param method parent method of trace
+  * @param mir bytecode representation
+  * @param dalvikPC the program counter of the instruction
++ * @param cUnit O1 CompilationUnit
+  * @return true when NOT handled and false when it IS handled
+  */
+-bool lowerByteCodeJit(const Method* method, const MIR * mir, const u2 * dalvikPC) {
+-    int retCode = lowerByteCodeCanThrowCheck(method, mir, dalvikPC);
++bool lowerByteCodeJit(const Method* method, const MIR * mir, const u2 * dalvikPC, CompilationUnit_O1* cUnit) {
++    int retCode = lowerByteCodeCanThrowCheck(method, mir, dalvikPC, cUnit);
+     freeShortMap();
+     if(retCode >= 0) return false; //handled
+     return true; //not handled
+@@ -533,7 +534,7 @@ void endOfTrace (CompilationUnit *cUnit) {
+     gCompilationUnit = 0;
+ }
+ 
+-int lowerByteCodeCanThrowCheck(const Method* method, const MIR * mir, const u2 * dalvikPC) {
++int lowerByteCodeCanThrowCheck(const Method* method, const MIR * mir, const u2 * dalvikPC, CompilationUnit_O1* cUnit) {
+     bool delay_requested = false;
+ 
+     int flags = dvmCompilerGetOpcodeFlags (mir->dalvikInsn.opcode);
+@@ -582,7 +583,7 @@ int lowerByteCodeCanThrowCheck(const Method* method, const MIR * mir, const u2 *
+         }
+     }
+ 
+-    int retCode = lowerByteCode(method, mir, dalvikPC);
++    int retCode = lowerByteCode(method, mir, dalvikPC, cUnit);
+ 
+     if(delay_requested == true) {
+         bool state_changed = cancelVRFreeDelayRequestAll(VRDELAY_CAN_THROW);
+@@ -605,9 +606,10 @@ int lowerByteCodeCanThrowCheck(const Method* method, const MIR * mir, const u2 *
+  * @param method parent method of trace
+  * @param mir bytecode representation
+  * @param dalvikPC the program counter of the instruction
++ * @param cUnit O1 CompilationUnit
+  * @return 0 or greater when handled
+  */
+-int lowerByteCode(const Method* method, const MIR * mir, const u2 * dalvikPC) {
++int lowerByteCode(const Method* method, const MIR * mir, const u2 * dalvikPC, CompilationUnit_O1* cUnit) {
+     /* offsetPC is used in O1 code generator, where it is defined as the sequence number
+        use a local version to avoid overwriting */
+     int offsetPC = mir->offset; //! \warning When doing method inlining, offsetPC
+@@ -726,9 +728,9 @@ int lowerByteCode(const Method* method, const MIR * mir, const u2 * dalvikPC) {
+     case OP_GOTO_32:
+         return op_goto_32(mir);
+     case OP_PACKED_SWITCH:
+-        return op_packed_switch(mir, dalvikPC);
++        return op_packed_switch(mir, dalvikPC, cUnit);
+     case OP_SPARSE_SWITCH:
+-        return op_sparse_switch(mir, dalvikPC);
++        return op_sparse_switch(mir, dalvikPC, cUnit);
+     case OP_CMPL_FLOAT:
+         return op_cmpl_float(mir);
+     case OP_CMPG_FLOAT:
+diff --git a/vm/compiler/codegen/x86/lightcg/Lower.h b/vm/compiler/codegen/x86/lightcg/Lower.h
+index 44c8923..14aa6f6 100644
+--- a/vm/compiler/codegen/x86/lightcg/Lower.h
++++ b/vm/compiler/codegen/x86/lightcg/Lower.h
+@@ -54,6 +54,7 @@
+ #include "AnalysisO1.h"
+ #include "CompileTable.h"
+ #include "compiler/CompilerIR.h"
++#include "compiler/codegen/CompilerCodegen.h"
+ 
+ //compilation flags for debugging
+ //#define DEBUG_INFO
+@@ -88,6 +89,8 @@
+ // Definitions must be consistent with vm/mterp/x86/header.S
+ #define FRAME_SIZE     124
+ 
++struct SwitchInfoScheduler;
++
+ typedef enum ArgsDoneType {
+     ArgsDone_Normal = 0,
+     ArgsDone_Native,
+@@ -454,6 +457,8 @@ struct LowOpImmReg : LowOp {
+     LowOpndImm immSrc;
+     //! \brief Register as destination.
+     LowOpndReg regDest;
++    //! \brief switchInfo passed to scheduler
++    SwitchInfoScheduler *switchInfoScheduler;
+ };
+ 
+ //! \brief Specialized LowOp for register to register.
+@@ -480,6 +485,8 @@ struct LowOpImmMem : LowOp {
+     LowOpndImm immSrc;
+     //! \brief Memory as destination.
+     LowOpndMem memDest;
++    //! \brief switchInfo passed to scheduler
++    SwitchInfoScheduler *switchInfoScheduler;
+ };
+ 
+ //! \brief Specialized LowOp for register to memory.
+@@ -944,6 +951,7 @@ int call_dvmNcgHandlePackedSwitch();
+ int call_dvmNcgHandleSparseSwitch();
+ int call_dvmJitHandlePackedSwitch();
+ int call_dvmJitHandleSparseSwitch();
++void call_dvmJitLookUpBigSparseSwitch();
+ int call_dvmJitToInterpTraceSelectNoChain();
+ int call_dvmJitToPatchPredictedChain();
+ void call_dvmJitToInterpNormal();
+@@ -1024,9 +1032,9 @@ void sendLabelInfoToVTune(int startStreamPtr, int endStreamPtr, const char* labe
+ #endif
+ 
+ // Delay VRs freeing if bytecode can throw exception, then call lowerByteCode
+-int lowerByteCodeCanThrowCheck(const Method* method, const MIR * mir, const u2 * dalvikPC);
++int lowerByteCodeCanThrowCheck(const Method* method, const MIR * mir, const u2 * dalvikPC, CompilationUnit_O1 *cUnit);
+ //lower a bytecode
+-int lowerByteCode(const Method* method, const MIR * mir, const u2 * dalvikPC);
++int lowerByteCode(const Method* method, const MIR * mir, const u2 * dalvikPC, CompilationUnit_O1 *cUnit);
+ 
+ int op_nop(const MIR * mir);
+ int op_move(const MIR * mir);
+@@ -1069,8 +1077,8 @@ int op_throw_verification_error(const MIR * mir);
+ int op_goto(const MIR * mir);
+ int op_goto_16(const MIR * mir);
+ int op_goto_32(const MIR * mir);
+-int op_packed_switch(const MIR * mir, const u2 * dalvikPC);
+-int op_sparse_switch(const MIR * mir, const u2 * dalvikPC);
++int op_packed_switch(const MIR * mir, const u2 * dalvikPC, CompilationUnit_O1* cUnit);
++int op_sparse_switch(const MIR * mir, const u2 * dalvikPC, CompilationUnit_O1* cUnit);
+ int op_if_ge(const MIR * mir);
+ int op_aget(const MIR * mir);
+ int op_aget_wide(const MIR * mir);
+@@ -1274,7 +1282,7 @@ LowOpReg* dump_reg_noalloc(Mnemonic m, OpndSize size,
+ LowOpImmMem* dump_imm_mem_noalloc(Mnemonic m, OpndSize size,
+                            int imm,
+                            int disp, int base_reg, bool isBasePhysical,
+-                           MemoryAccessType mType, int mIndex);
++                           MemoryAccessType mType, int mIndex, SwitchInfoScheduler *switchInfoScheduler);
+ LowOpRegReg* dump_reg_reg(Mnemonic m, AtomOpCode m2, OpndSize size,
+                    int reg, bool isPhysical,
+                    int reg2, bool isPhysical2, LowOpndRegType type);
+@@ -1309,7 +1317,8 @@ LowOpRegMem* dump_reg_mem_noalloc(Mnemonic m, OpndSize size,
+                            int disp, int base_reg, bool isBasePhysical,
+                            MemoryAccessType mType, int mIndex, LowOpndRegType type);
+ LowOpImmReg* dump_imm_reg(Mnemonic m, AtomOpCode m2, OpndSize size,
+-                   int imm, int reg, bool isPhysical, LowOpndRegType type, bool chaining);
++                   int imm, int reg, bool isPhysical, LowOpndRegType type, bool chaining, SwitchInfoScheduler * switchInfoScheduler);
++
+ /**
+  * @brief generate a x86 instruction that takes one immediate and one physical reg operand
+  * @param m opcode mnemonic
+@@ -1337,9 +1346,9 @@ LowOpLabel* dump_label(Mnemonic m, OpndSize size, int imm,
+                const char* label, bool isLocal);
+ 
+ unsigned getJmpCallInstSize(OpndSize size, JmpCall_type type);
+-bool lowerByteCodeJit(const Method* method, const u2* codePtr, MIR* mir);
++bool lowerByteCodeJit(const Method* method, const u2* codePtr, MIR* mir, CompilationUnit_O1* cUnit);
+ #if defined(WITH_JIT)
+-bool lowerByteCodeJit(const Method* method, const MIR * mir, const u2 * dalvikPC);
++bool lowerByteCodeJit(const Method* method, const MIR * mir, const u2 * dalvikPC, CompilationUnit_O1* cUnit);
+ void startOfBasicBlock(struct BasicBlock* bb);
+ extern struct BasicBlock* traceCurrentBB;
+ extern JitMode traceMode;
+@@ -1368,7 +1377,7 @@ int generateConditionalJumpToTakenBlock (ConditionCode takenCondition);
+ LowOp* jumpToBasicBlock(char* instAddr, int targetId, bool targetIsChainingCell = false);
+ LowOp* condJumpToBasicBlock(char* instAddr, ConditionCode cc, int targetId, bool immediateNeedsAligned = false);
+ bool jumpToException(const char* target);
+-int codeGenBasicBlockJit(const Method* method, BasicBlock* bb);
++int codeGenBasicBlockJit(const Method* method, BasicBlock* bb, CompilationUnit_O1* cUnit);
+ void endOfBasicBlock(struct BasicBlock* bb);
+ 
+ //Used to generate native code the extended MIRs
+diff --git a/vm/compiler/codegen/x86/lightcg/LowerHelper.cpp b/vm/compiler/codegen/x86/lightcg/LowerHelper.cpp
+index 1716771..eee202e 100644
+--- a/vm/compiler/codegen/x86/lightcg/LowerHelper.cpp
++++ b/vm/compiler/codegen/x86/lightcg/LowerHelper.cpp
+@@ -986,7 +986,7 @@ OpndSize minSizeForImm(int imm) {
+ 
+ //!The reg operand is allocated already
+ LowOpImmReg* lower_imm_to_reg(Mnemonic m, AtomOpCode m2, OpndSize size, int imm,
+-        int reg, bool isPhysical, LowOpndRegType type, bool chaining) {
++        int reg, bool isPhysical, LowOpndRegType type, bool chaining, SwitchInfoScheduler *switchInfoScheduler) {
+     // size of opnd1 can be different from size of opnd2:
+     OpndSize overridden_size = size;
+     if (m == Mnemonic_SAL || m == Mnemonic_SHR || m == Mnemonic_SHL
+@@ -1017,6 +1017,7 @@ LowOpImmReg* lower_imm_to_reg(Mnemonic m, AtomOpCode m2, OpndSize size, int imm,
+     op->opndSrc.type = chaining ? LowOpndType_Chain : LowOpndType_Imm;
+     set_reg_opnd(&(op->regDest), reg, isPhysical, type);
+     op->immSrc.value = imm;
++    op->switchInfoScheduler = switchInfoScheduler;
+     singletonPtr<Scheduler>()->updateUseDefInformation_imm_to_reg(op);
+     return op;
+ }
+@@ -1024,27 +1025,27 @@ LowOpImmReg* lower_imm_to_reg(Mnemonic m, AtomOpCode m2, OpndSize size, int imm,
+ LowOpImmReg* dump_imm_reg_noalloc(Mnemonic m, OpndSize size, int imm, int reg,
+         bool isPhysical, LowOpndRegType type) {
+     return lower_imm_to_reg(m, ATOM_NORMAL, size, imm, reg, true /*isPhysical*/,
+-            type, false);
++            type, false, NULL);
+ }
+ 
+ LowOpImmReg* dump_imm_reg_noalloc_alu(Mnemonic m, OpndSize size, int imm, int reg,
+         bool isPhysical, LowOpndRegType type) {
+     return lower_imm_to_reg(m, ATOM_NORMAL_ALU, size, imm, reg, true /*isPhysical*/,
+-            type, false);
++            type, false, NULL);
+ }
+ 
+ //!update fields of LowOp and generate a x86 instruction that takes one immediate and one reg operand
+ 
+ //!
+ LowOpImmReg* dump_imm_reg(Mnemonic m, AtomOpCode m2, OpndSize size, int imm,
+-        int reg, bool isPhysical, LowOpndRegType type, bool chaining) {
++        int reg, bool isPhysical, LowOpndRegType type, bool chaining, SwitchInfoScheduler *switchInfoScheduler) {
+     if (gDvm.executionMode == kExecutionModeNcgO1) {
+         freeReg(false);
+         int regAll = registerAlloc(type, reg, isPhysical, true, true);
+         return lower_imm_to_reg(m, m2, size, imm, regAll, true /*isPhysical*/,
+-                type, chaining);
++                type, chaining, switchInfoScheduler);
+     } else {
+-        return lower_imm_to_reg(m, m2, size, imm, reg, isPhysical, type, chaining);
++        return lower_imm_to_reg(m, m2, size, imm, reg, isPhysical, type, chaining, NULL);
+     }
+     return NULL;
+ }
+@@ -1054,7 +1055,7 @@ LowOpImmReg* dump_imm_reg(Mnemonic m, AtomOpCode m2, OpndSize size, int imm,
+ //!The mem operand is already allocated
+ LowOpImmMem* lower_imm_to_mem(Mnemonic m, AtomOpCode m2, OpndSize size, int imm,
+         int disp, int base_reg, bool isBasePhysical, MemoryAccessType mType,
+-        int mIndex, bool chaining) {
++        int mIndex, bool chaining, SwitchInfoScheduler * switchInfoScheduler) {
+     if (!gDvmJit.scheduling) {
+         stream = encoder_imm_mem(m, size, imm, disp, base_reg, isBasePhysical,
+                 stream);
+@@ -1079,20 +1080,21 @@ LowOpImmMem* lower_imm_to_mem(Mnemonic m, AtomOpCode m2, OpndSize size, int imm,
+     op->immSrc.value = imm;
+     op->memDest.mType = mType;
+     op->memDest.index = mIndex;
++    op->switchInfoScheduler = switchInfoScheduler;
+     singletonPtr<Scheduler>()->updateUseDefInformation_imm_to_mem(op);
+     return op;
+ }
+ 
+ LowOpImmMem* dump_imm_mem_noalloc(Mnemonic m, OpndSize size, int imm, int disp,
+-        int base_reg, bool isBasePhysical, MemoryAccessType mType, int mIndex) {
++        int base_reg, bool isBasePhysical, MemoryAccessType mType, int mIndex, SwitchInfoScheduler *switchInfoScheduler) {
+     return lower_imm_to_mem(m, ATOM_NORMAL, size, imm, disp, base_reg,
+-            true /*isBasePhysical*/, mType, mIndex, false);
++            true /*isBasePhysical*/, mType, mIndex, false, switchInfoScheduler);
+ }
+ 
+ LowOpImmMem* dump_imm_mem_noalloc_alu(Mnemonic m, OpndSize size, int imm, int disp,
+         int base_reg, bool isBasePhysical, MemoryAccessType mType, int mIndex) {
+     return lower_imm_to_mem(m, ATOM_NORMAL_ALU, size, imm, disp, base_reg,
+-            true /*isBasePhysical*/, mType, mIndex, false);
++            true /*isBasePhysical*/, mType, mIndex, false, NULL);
+ }
+ 
+ //!update fields of LowOp and generate a x86 instruction that takes one immediate and one mem operand
+@@ -1112,10 +1114,10 @@ LowOpImmMem* dump_imm_mem(Mnemonic m, AtomOpCode m2, OpndSize size, int imm,
+         int baseAll = registerAlloc(LowOpndRegType_gp, base_reg, isBasePhysical,
+                 true);
+         return lower_imm_to_mem(m, m2, size, imm, disp, baseAll,
+-                true /*isBasePhysical*/, mType, mIndex, chaining);
++                true /*isBasePhysical*/, mType, mIndex, chaining, NULL);
+     } else {
+         return lower_imm_to_mem(m, m2, size, imm, disp, base_reg, isBasePhysical,
+-                mType, mIndex, chaining);
++                mType, mIndex, chaining, NULL);
+     }
+     return NULL;
+ }
+@@ -1410,7 +1412,7 @@ void compare_VR_reg_all(OpndSize size,
+ #ifdef DEBUG_NCG_O1
+                 ALOGI("VR is const and 32 bits in compare_VR_reg");
+ #endif
+-                dump_imm_reg(m, ATOM_NORMAL, size, tmpValue[0], reg, isPhysical, pType, false);
++                dump_imm_reg(m, ATOM_NORMAL, size, tmpValue[0], reg, isPhysical, pType, false, NULL);
+                 return;
+             }
+             else if(size == OpndSize_64) {
+@@ -1622,7 +1624,7 @@ void compare_imm_reg(OpndSize size, int imm,
+         return;
+     }
+     Mnemonic m = Mnemonic_CMP;
+-    dump_imm_reg(m, ATOM_NORMAL, size, imm, reg, isPhysical, getTypeFromIntSize(size), false);
++    dump_imm_reg(m, ATOM_NORMAL, size, imm, reg, isPhysical, getTypeFromIntSize(size), false, NULL);
+ }
+ //! cmp imm mem
+ 
+@@ -1655,7 +1657,7 @@ void compare_imm_VR(OpndSize size, int imm,
+             dump_imm_reg_noalloc(m, size, imm, regAll, true, LowOpndRegType_gp);
+         else
+             dump_imm_mem_noalloc(m, size, imm, 4*vA, PhysicalReg_FP, true,
+-                MemoryAccess_VR, vA);
++                MemoryAccess_VR, vA, NULL);
+         updateRefCount(vA, getTypeFromIntSize(size));
+     } else {
+         dump_imm_mem(m, ATOM_NORMAL, size, imm, 4*vA, PhysicalReg_FP, true, MemoryAccess_VR, vA, false);
+@@ -1743,7 +1745,7 @@ void x86_return() {
+ 
+ //!
+ void test_imm_reg(OpndSize size, int imm, int reg, bool isPhysical) {
+-    dump_imm_reg(Mnemonic_TEST, ATOM_NORMAL, size, imm, reg, isPhysical, getTypeFromIntSize(size), false);
++    dump_imm_reg(Mnemonic_TEST, ATOM_NORMAL, size, imm, reg, isPhysical, getTypeFromIntSize(size), false, NULL);
+ }
+ //!test imm mem
+ 
+@@ -1793,7 +1795,7 @@ void alu_binary_imm_reg(OpndSize size, ALU_Opcode opc, int imm, int reg, bool is
+         m = map_of_64_opcode_2_mnemonic[opc];
+     else
+         m = map_of_alu_opcode_2_mnemonic[opc];
+-    dump_imm_reg(m, ATOM_NORMAL_ALU, size, imm, reg, isPhysical, getTypeFromIntSize(size), false);
++    dump_imm_reg(m, ATOM_NORMAL_ALU, size, imm, reg, isPhysical, getTypeFromIntSize(size), false, NULL);
+ }
+ 
+ /**
+@@ -1911,7 +1913,7 @@ bool alu_imm_to_VR(OpndSize size, ALU_Opcode opc, int srcVR, int destVR, int imm
+                     return setVRToConst(destVR, size, constValue);
+                 }
+                 else if (caseDest == DEST_IN_MEMORY) {
+-                    dump_imm_mem_noalloc(Mnemonic_MOV, size, finalSum, 4*destVR, PhysicalReg_FP, true, MemoryAccess_VR, destVR);
++                    dump_imm_mem_noalloc(Mnemonic_MOV, size, finalSum, 4*destVR, PhysicalReg_FP, true, MemoryAccess_VR, destVR, NULL);
+                     return true; //Successfully updated
+                 }
+                 else if (caseDest == DEST_IS_ALLOCATED) {
+@@ -2167,7 +2169,7 @@ void alu_binary_VR_reg(OpndSize size, ALU_Opcode opc, int vA, int reg, bool isPh
+         if(isConst == 3 && size != OpndSize_64) {
+             //allocate a register for dst
+             dump_imm_reg(m, ATOM_NORMAL_ALU, size, tmpValue[0], reg, isPhysical,
+-                       getTypeFromIntSize(size), false);
++                       getTypeFromIntSize(size), false, NULL);
+             return;
+         }
+         if(isConst == 3 && size == OpndSize_64) {
+@@ -2499,7 +2501,7 @@ void set_VR_to_imm(int vA, OpndSize size, int imm) {
+         freeReg(false);
+         regAll = registerAlloc(LowOpndRegType_virtual | getTypeFromIntSize(size), vA, false/*dummy*/, true, true);
+         if(regAll == PhysicalReg_Null) {
+-            dump_imm_mem_noalloc(m, size, imm, 4*vA, PhysicalReg_FP, true, MemoryAccess_VR, vA);
++            dump_imm_mem_noalloc(m, size, imm, 4*vA, PhysicalReg_FP, true, MemoryAccess_VR, vA, NULL);
+             return;
+         }
+ 
+@@ -2524,11 +2526,11 @@ void set_VR_to_imm_noalloc(int vA, OpndSize size, int imm) {
+         return;
+     }
+     Mnemonic m = (size == OpndSize_64) ? Mnemonic_MOVQ : Mnemonic_MOV;
+-    dump_imm_mem_noalloc(m, size, imm, 4*vA, PhysicalReg_FP, true, MemoryAccess_VR, vA);
++    dump_imm_mem_noalloc(m, size, imm, 4*vA, PhysicalReg_FP, true, MemoryAccess_VR, vA, NULL);
+ }
+ 
+ void move_chain_to_reg(OpndSize size, int imm, int reg, bool isPhysical) {
+-    dump_imm_reg(Mnemonic_MOV, ATOM_NORMAL, size, imm, reg, isPhysical, LowOpndRegType_gp, true);
++    dump_imm_reg(Mnemonic_MOV, ATOM_NORMAL, size, imm, reg, isPhysical, LowOpndRegType_gp, true, NULL);
+ }
+ 
+ //! move an immediate to reg
+@@ -2542,7 +2544,7 @@ void move_imm_to_reg(OpndSize size, int imm, int reg, bool isPhysical) {
+         return;
+     }
+     Mnemonic m = Mnemonic_MOV;
+-    dump_imm_reg(m, ATOM_NORMAL, size, imm, reg, isPhysical, LowOpndRegType_gp, false);
++    dump_imm_reg(m, ATOM_NORMAL, size, imm, reg, isPhysical, LowOpndRegType_gp, false, NULL);
+ }
+ //! move an immediate to reg
+ 
+@@ -2692,7 +2694,7 @@ void get_virtual_reg_all(int vR, OpndSize size, int reg, bool isPhysical, Mnemon
+             }
+             else if(size != OpndSize_64) {
+                 //VR is not mapped to a register
+-                dump_imm_reg(m, ATOM_NORMAL, size, tmpValue[0], reg, isPhysical, pType, false);
++                dump_imm_reg(m, ATOM_NORMAL, size, tmpValue[0], reg, isPhysical, pType, false, NULL);
+                 return;
+             }
+         }
+@@ -3616,7 +3618,7 @@ int call_dvmNcgHandleSparseSwitch() {
+ }
+ 
+ int call_dvmJitHandleSparseSwitch() {
+-    typedef s4 (*vmHelper)(const s4*, u2, s4);
++    typedef s4 (*vmHelper)(const s4*, const s4*, u2, s4);
+     vmHelper funcPtr = dvmJitHandleSparseSwitch;
+     if(gDvm.executionMode == kExecutionModeNcgO1) {
+         beforeCall("dvmJitHandleSparseSwitch");
+@@ -3628,6 +3630,22 @@ int call_dvmJitHandleSparseSwitch() {
+     return 0;
+ }
+ 
++/*
++ * @brief helper function to call dvmJitLookUpBigSparseSwitch
++ */
++void call_dvmJitLookUpBigSparseSwitch(void) {
++    typedef s4 (*vmHelper)(const s4*, u2, s4);
++
++    // get function pointer of dvmJitLookUpBigSparseSwitch
++    vmHelper funcPtr = dvmJitLookUpBigSparseSwitch;
++    if(gDvm.executionMode == kExecutionModeNcgO1) {
++        beforeCall("dvmJitLookUpBigSparseSwitch");
++        callFuncPtr((int)funcPtr, "dvmJitLookUpBigSparseSwitch");
++        afterCall("dvmJitLookUpBigSparseSwitch");
++    } else {
++        callFuncPtr((int)funcPtr, "dvmJitLookUpBigSparseSwitch");
++    }
++}
+ //!generate native code to call dvmCanPutArrayElement
+ 
+ //!
+diff --git a/vm/compiler/codegen/x86/lightcg/LowerJump.cpp b/vm/compiler/codegen/x86/lightcg/LowerJump.cpp
+index b932a4b..9d682cb 100644
+--- a/vm/compiler/codegen/x86/lightcg/LowerJump.cpp
++++ b/vm/compiler/codegen/x86/lightcg/LowerJump.cpp
+@@ -1,3 +1,4 @@
++
+ /*
+  * Copyright (C) 2010-2013 Intel Corporation
+  *
+@@ -19,6 +20,7 @@
+  * @file vm/compiler/codegen/x86/LowerJump.cpp
+  * @brief This file lowers the following bytecodes: IF_XXX, GOTO
+  */
++#include "CompilationUnit.h"
+ #include <math.h>
+ #include "libdex/DexOpcodes.h"
+ #include "libdex/DexFile.h"
+@@ -1653,13 +1655,208 @@ int op_goto_32(const MIR * mir) {
+ }
+ #define P_GPR_1 PhysicalReg_EBX
+ 
++/*
++ * @brief create a switchInfo for a switch bytecode and initialize switchInfo
++   @param tSize the size of switch bytecode
++ */
++static void createSwitchInfo(u2 tSize, CompilationUnit_O1* cUnit)
++{
++    struct SwitchInfo *switchInfo = static_cast<SwitchInfo*>(dvmCompilerNew(sizeof(SwitchInfo), true));
++    assert(switchInfo != 0);
++    switchInfo->tSize = tSize;
++    cUnit->setSwitchInfo(switchInfo);
++}
++
++/*
++ * @brief create a switchInfoScheduler for a move instruction in switch bytecode lowering
++   @param isFirst TRUE for the first move instruction which need to be patched
++   @param offset offset of the immediate value from the start of instruction
++ */
++static SwitchInfoScheduler * createSwitchInfoScheduler(bool isFirst, int offset, CompilationUnit_O1* cUnit)
++{
++    struct SwitchInfoScheduler *switchInfoScheduler = static_cast<SwitchInfoScheduler*>(dvmCompilerNew(sizeof(SwitchInfoScheduler), false));
++    assert(switchInfoScheduler!= 0);
++    switchInfoScheduler->isFirst = isFirst;
++    switchInfoScheduler->offset = offset;
++    switchInfoScheduler->switchInfo = cUnit->getSwitchInfo();
++    return switchInfoScheduler;
++}
++
++/**
++ * @brief fill immediate value in switchInfo
++ * @param immAddr immediate value address which need to be patched
++ * @param isFirst TRUE for the first move instruction which need to be patched
++ * @param cUnit O1 CompilationUnit
++ */
++static void fillSwitchInfo(char *immAddr, bool isFirst, CompilationUnit_O1 * cUnit)
++{
++    assert(cUnit->getSwitchInfo() != NULL);
++
++    if (isFirst == true) {
++        cUnit->getSwitchInfo()->immAddr = immAddr;
++    }
++    else {
++        cUnit->getSwitchInfo()->immAddr2 = immAddr;
++    }
++}
++
++/**
++ * @brief Generate native code for bytecode packed-switch when number of
++ *        switch cases less or equal than MAX_CHAINED_SWITCH_CASES
++ * @param vA switch argument virtual register
++ * @param tSize size of packed switch bytecode switch cases
++ * @param firstKey first case value for packed switch bytecode
++ * @param cUnit O1 CompilationUnit
++ * @return value >=0 if successful code generated
++ */
++static int packedNormal(int vA, u2 tSize, s4 firstKey, CompilationUnit_O1* cUnit)
++{
++    int retCode = 0;
++
++    SwitchInfoScheduler * switchInfoScheduler1 = createSwitchInfoScheduler(true, 1, cUnit);
++
++    // get the switch argument
++    get_virtual_reg(vA, OpndSize_32, 1, false);
++    alu_binary_imm_reg(OpndSize_32, sub_opc, firstKey, 1, false); //idx
++    fillSwitchInfo(stream+1, true, cUnit); // 1 is the offset to the immediate location
++
++    // switch table address will be patched later here
++    dump_imm_reg(Mnemonic_MOV, ATOM_NORMAL, OpndSize_32, 0, 2, false, LowOpndRegType_gp, false, switchInfoScheduler1);
++    compare_imm_reg(OpndSize_32, tSize, 1, false);
++    conditional_jump(Condition_GE, ".switch_default", true);
++    rememberState(1);
++    compare_imm_reg(OpndSize_32, 0, 1, false);
++    transferToState(1);
++    conditional_jump(Condition_L, ".switch_default", true);
++    rememberState(2);
++
++    load_effective_addr_scale(2, false, 1, false, 4, 2, false);
++
++    //We are done using the VRs and it is end of BB, so we handle it right now
++    retCode = handleRegistersEndOfBB (true);
++    if (retCode < 0)
++    {
++        //Just pass along error information
++        return retCode;
++    }
++    dump_mem(Mnemonic_JMP, ATOM_NORMAL, OpndSize_32, 0, 2, false);
++
++    transferToState(1);
++    if (insertLabel(".switch_default", true) == -1) {
++        return -1;
++    }
++
++    //We are done using the VRs and it is end of BB, so we handle it right now
++    retCode = handleRegistersEndOfBB (true);
++    if (retCode < 0)
++    {
++        //Just pass along error information
++        return retCode;
++    }
++
++    // (2, false) hold the switch table address
++    dump_mem(Mnemonic_JMP, ATOM_NORMAL, OpndSize_32, 4*tSize, 2, false);
++    return 0;
++}
++
++/**
++ * @brief Generate native code for bytecode packed-switch when number of
++ *        switch cases greater than MAX_CHAINED_SWITCH_CASES
++ * @param vA switch argument virtual register
++ * @param tSize size of packed switch bytecode switch cases
++ * @param firstKey first case value for packed switch bytecode
++ * @param entries address of case handling offset area
++ * @param dalvikPC program counter for Dalvik bytecode
++ * @param cUnit O1 CompilationUnit
++ * @return value >=0 if successful code generated
++ */
++static int packedBig(int vA, u2 tSize, s4 firstKey, const s4* entries, const u2* dalvikPC, CompilationUnit_O1 *cUnit)
++{
++    int retCode = 0;
++    int maxChains = MIN(tSize, MAX_CHAINED_SWITCH_CASES);
++
++    SwitchInfoScheduler * switchInfoScheduler1 = createSwitchInfoScheduler(true, 1, cUnit);
++    SwitchInfoScheduler * switchInfoScheduler2 = createSwitchInfoScheduler(false, 1, cUnit);
++
++    // get the switch argument
++    get_virtual_reg(vA, OpndSize_32, 1, false);
++    alu_binary_imm_reg(OpndSize_32, sub_opc, firstKey, 1, false); //idx
++    compare_imm_reg(OpndSize_32, tSize, 1, false);
++    conditional_jump(Condition_GE, ".switch_default", true);
++    rememberState(1);
++    compare_imm_reg(OpndSize_32, 0, 1, false);
++    transferToState(1);
++    conditional_jump(Condition_L, ".switch_default", true);
++    compare_imm_reg(OpndSize_32, MAX_CHAINED_SWITCH_CASES, 1, false);
++    conditional_jump(Condition_GE, ".switch_nochain", true);
++    rememberState(2);
++
++    fillSwitchInfo(stream+1, true, cUnit); // 1 is the offset to the immediate location
++
++    // switch table address will be patched later here
++    dump_imm_reg(Mnemonic_MOV, ATOM_NORMAL, OpndSize_32, 0, 2, false, LowOpndRegType_gp, false, switchInfoScheduler1);
++    load_effective_addr_scale(2, false, 1, false, 4, 2, false);
++
++    //We are done using the VRs and it is end of BB, so we handle it right now
++    retCode = handleRegistersEndOfBB (true);
++    if (retCode < 0)
++    {
++        //Just pass along error information
++        return retCode;
++    }
++    dump_mem(Mnemonic_JMP, ATOM_NORMAL, OpndSize_32, 0, 2, false);
++
++    transferToState(1);
++    if (insertLabel(".switch_default", true) == -1) {
++        return -1;
++    }
++
++    fillSwitchInfo(stream+1, false, cUnit); // 1 is the offset to the immediate location
++    dump_imm_reg(Mnemonic_MOV, ATOM_NORMAL, OpndSize_32, 0, 2, false, LowOpndRegType_gp, false, switchInfoScheduler2);
++
++    //We are done using the VRs and it is end of BB, so we handle it right now
++    retCode = handleRegistersEndOfBB (true);
++    if (retCode < 0)
++    {
++        //Just pass along error information
++        return retCode;
++    }
++
++    dump_mem(Mnemonic_JMP, ATOM_NORMAL, OpndSize_32, 4*maxChains, 2, false);
++    goToState(2);
++    if (insertLabel(".switch_nochain", true) == -1) {
++        return -1;
++    }
++
++    // Compute rPC based on matching index
++    alu_binary_imm_reg(OpndSize_32, shl_opc, 2, 1, false);
++    alu_binary_imm_reg(OpndSize_32, add_opc, (int)entries, 1, false);
++    move_mem_to_reg(OpndSize_32, 0, 1, false, PhysicalReg_EAX, true);
++    alu_binary_imm_reg(OpndSize_32, shl_opc, 1, PhysicalReg_EAX, true);
++
++    //We are done using the VRs and it is end of BB, so we handle it right now
++    retCode = handleRegistersEndOfBB (true);
++    if (retCode < 0)
++    {
++        //Just pass along error information
++        return retCode;
++    }
++
++    // save rPC in EAX
++    alu_binary_imm_reg(OpndSize_32, add_opc, (int)dalvikPC, PhysicalReg_EAX, true);
++    scratchRegs[0] = PhysicalReg_SCRATCH_2;
++    jumpToInterpNoChain();
++    return 0;
++}
++
+ /**
+  * @brief Generate native code for bytecode packed-switch
+  * @param mir bytecode representation
+  * @param dalvikPC program counter for Dalvik bytecode
++ * @param cUnit O1 CompilationUnit
+  * @return value >= 0 when handled
+  */
+-int op_packed_switch(const MIR * mir, const u2 * dalvikPC) {
++int op_packed_switch(const MIR * mir, const u2 * dalvikPC, CompilationUnit_O1 *cUnit) {
+     int retCode = 0;
+     assert(mir->dalvikInsn.opcode == OP_PACKED_SWITCH);
+     int vA = mir->dalvikInsn.vA;
+@@ -1684,17 +1881,88 @@ int op_packed_switch(const MIR * mir, const u2 * dalvikPC) {
+     s4* entries = (s4*) switchData;
+     assert(((u4)entries & 0x3) == 0);
+ #endif
++    createSwitchInfo(tSize, cUnit);
++
++    // normal switch case
++    if (tSize <= MAX_CHAINED_SWITCH_CASES) {
++        retCode = packedNormal(vA, tSize, firstKey, cUnit);
++        if (retCode < 0) {
++            return retCode;
++        }
++    }
++
++    // big switch case
++    else {
++        retCode = packedBig(vA, tSize, firstKey, entries, dalvikPC, cUnit);
++        if (retCode < 0) {
++            return retCode;
++        }
++    }
++    return 0;
++}
++#undef P_GPR_1
++
++/**
++ * @brief Generate native code for bytecode sparse-switch when number of
++ *        switch cases greater than MAX_CHAINED_SWITCH_CASES
++ * @param vA switch argument virtual register
++ * @param tSize size of packed switch bytecode switch cases
++ * @param keys case constants area in sparse-switch bytecode
++ * @param entries case offset area in sparse-switch bytecode
++ * @param dalvikPC program counter for Dalvik bytecode
++ * @param cUnit O1 CompilationUnit
++ * @return value >=0 if successful code generated
++ */
++static int sparseBig(int vA, u2 tSize, const s4* keys, const s4* entries, const u2* dalvikPC, CompilationUnit_O1* cUnit)
++{
++    int retCode = 0;
++    int maxChains = MIN(tSize, MAX_CHAINED_SWITCH_CASES);
+ 
++    SwitchInfoScheduler * switchInfoScheduler1 = createSwitchInfoScheduler(true, 1, cUnit);
++    SwitchInfoScheduler * switchInfoScheduler2 = createSwitchInfoScheduler(false, 1, cUnit);
++
++    // get the switch argument
+     get_virtual_reg(vA, OpndSize_32, 1, false);
+-    //dvmNcgHandlePackedSwitch: testVal, size, first_key, targets
+-    load_effective_addr(-16, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
+-    move_imm_to_mem(OpndSize_32, tSize, 8, PhysicalReg_ESP, true);
+-    move_imm_to_mem(OpndSize_32, firstKey, 4, PhysicalReg_ESP, true);
++    load_effective_addr(-12, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++    move_imm_to_mem(OpndSize_32, tSize, 4, PhysicalReg_ESP, true);
++
++    /* "keys" is constant for JIT
++       it is the 1st argument to dvmJitHandleSparseSwitch */
++    move_imm_to_mem(OpndSize_32, (int)keys, 0, PhysicalReg_ESP, true);
++    move_reg_to_mem(OpndSize_32, 1, false, 8, PhysicalReg_ESP, true);
++
++    scratchRegs[0] = PhysicalReg_SCRATCH_1;
++
++    //return index in EAX where keys[index] == switch argument
++    call_dvmJitLookUpBigSparseSwitch();
++    load_effective_addr(12, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
+ 
+-    /* "entries" is constant for JIT
+-       it is the 1st argument to dvmJitHandlePackedSwitch */
+-    move_imm_to_mem(OpndSize_32, (int)entries, 0, PhysicalReg_ESP, true);
+-    move_reg_to_mem(OpndSize_32, 1, false, 12, PhysicalReg_ESP, true);
++    compare_imm_reg(OpndSize_32, tSize, PhysicalReg_EAX, true);
++    conditional_jump(Condition_GE, ".switch_default", true);
++    rememberState(1);
++    compare_imm_reg(OpndSize_32, MAX_CHAINED_SWITCH_CASES, PhysicalReg_EAX, true);
++    conditional_jump(Condition_GE, ".switch_nochain", true);
++    rememberState(2);
++
++    fillSwitchInfo(stream+1, true, cUnit); // 1 is the offset to the immediate location
++    dump_imm_reg(Mnemonic_MOV, ATOM_NORMAL, OpndSize_32, 0, 2, false, LowOpndRegType_gp, false, switchInfoScheduler1);
++    load_effective_addr_scale(2, false, PhysicalReg_EAX, true, 4, 2, false);
++
++    //We are done using the VRs and it is end of BB, so we handle it right now
++    retCode = handleRegistersEndOfBB (true);
++    if (retCode < 0)
++    {
++       //Just pass along error information
++       return retCode;
++    }
++    dump_mem(Mnemonic_JMP, ATOM_NORMAL, OpndSize_32, 0, 2, false);
++
++    goToState(1);
++    if (insertLabel(".switch_default", true) == -1)
++        return -1;
++
++    fillSwitchInfo(stream+1, false, cUnit); // 1 is the offset to the immediate location
++    dump_imm_reg(Mnemonic_MOV, ATOM_NORMAL, OpndSize_32, 0, 2, false, LowOpndRegType_gp, false, switchInfoScheduler2);
+ 
+     //We are done using the VRs and it is end of BB, so we handle it right now
+     retCode = handleRegistersEndOfBB (true);
+@@ -1704,40 +1972,45 @@ int op_packed_switch(const MIR * mir, const u2 * dalvikPC) {
+         return retCode;
+     }
+ 
+-    //if value out of range, fall through (no_op)
+-    //return targets[testVal - first_key]
+-    scratchRegs[0] = PhysicalReg_SCRATCH_1;
+-    call_dvmJitHandlePackedSwitch();
+-    load_effective_addr(16, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++    dump_mem(Mnemonic_JMP, ATOM_NORMAL, OpndSize_32, 4*maxChains, 2, false);
++    goToState(2);
++    if (insertLabel(".switch_nochain", true) == -1)
++        return -1;
+ 
+-    //get rPC, %eax has the relative PC offset
++    // Compute rPC based on matching index
++    alu_binary_imm_reg(OpndSize_32, shl_opc, 2, PhysicalReg_EAX, true);
++    alu_binary_imm_reg(OpndSize_32, add_opc, (int)entries, PhysicalReg_EAX, true);
++    move_mem_to_reg(OpndSize_32, 0, PhysicalReg_EAX, true, PhysicalReg_EAX, true);
++    alu_binary_imm_reg(OpndSize_32, shl_opc, 1, PhysicalReg_EAX, true);
++
++    //We are done using the VRs and it is end of BB, so we handle it right now
++    retCode = handleRegistersEndOfBB (true);
++    if (retCode < 0)
++    {
++        //Just pass along error information
++        return retCode;
++    }
++
++    // save rPC in EAX
+     alu_binary_imm_reg(OpndSize_32, add_opc, (int)dalvikPC, PhysicalReg_EAX, true);
+     scratchRegs[0] = PhysicalReg_SCRATCH_2;
+-#if defined(WITH_JIT_TUNING)
+-    /* Fall back to interpreter after resolving address of switch target.
+-     * Indicate a kSwitchOverflow. Note: This is not an "overflow". But it helps
+-     * count the times we return from a Switch
+-     */
+-    move_imm_to_mem(OpndSize_32, kSwitchOverflow, 0, PhysicalReg_ESP, true);
+-#endif
+     jumpToInterpNoChain();
+     return 0;
+ }
+-#undef P_GPR_1
+-
+-#define P_GPR_1 PhysicalReg_EBX
+ 
+ /**
+  * @brief Generate native code for bytecode sparse-switch
+  * @param mir bytecode representation
+  * @param dalvikPC program counter for Dalvik bytecode
++ * @param cUnit O1 CompilationUnit
+  * @return value >= 0 when handled
+  */
+-int op_sparse_switch(const MIR * mir, const u2 * dalvikPC) {
++int op_sparse_switch(const MIR * mir, const u2 * dalvikPC, CompilationUnit_O1* cUnit) {
+     int retCode = 0;
+     assert(mir->dalvikInsn.opcode == OP_SPARSE_SWITCH);
+     int vA = mir->dalvikInsn.vA;
+     u4 tmp = mir->dalvikInsn.vB;
++
+ #ifdef DEBUG_EACH_BYTECODE
+     u2 tSize = 0;
+     const s4* keys = NULL;
+@@ -1754,50 +2027,55 @@ int op_sparse_switch(const MIR * mir, const u2 * dalvikPC) {
+     u2 tSize = *switchData++;
+     assert(tSize > 0);
+     const s4* keys = (const s4*) switchData;
++    const s4* entries = keys + tSize;
+     assert(((u4)keys & 0x3) == 0);
+     assert((((u4) ((s4*) switchData + tSize)) & 0x3) == 0);
+ #endif
++    createSwitchInfo(tSize, cUnit);
+ 
+-    get_virtual_reg(vA, OpndSize_32, 1, false);
+-    //dvmNcgHandleSparseSwitch: keys, size, testVal
+-    load_effective_addr(-12, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
+-    move_imm_to_mem(OpndSize_32, tSize, 4, PhysicalReg_ESP, true);
++    // normal switch case
++    if (tSize <= MAX_CHAINED_SWITCH_CASES) {
++        SwitchInfoScheduler * switchInfoScheduler = createSwitchInfoScheduler(true, 3, cUnit);
+ 
+-    /* "keys" is constant for JIT
+-       it is the 1st argument to dvmJitHandleSparseSwitch */
+-    move_imm_to_mem(OpndSize_32, (int)keys, 0, PhysicalReg_ESP, true);
+-    move_reg_to_mem(OpndSize_32, 1, false, 8, PhysicalReg_ESP, true);
++        // switch argument
++        get_virtual_reg(vA, OpndSize_32, 1, false);
++        load_effective_addr(-16, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++        move_imm_to_mem(OpndSize_32, tSize, 8, PhysicalReg_ESP, true);
+ 
+-    //We are done using the VRs and it is end of BB, so we handle it right now
+-    retCode = handleRegistersEndOfBB (true);
+-    if (retCode < 0)
+-    {
+-        //Just pass along error information
+-        return retCode;
+-    }
++        /* "keys" is constant for JIT
++           it is the 1st argument to dvmJitHandleSparseSwitch */
++        move_imm_to_mem(OpndSize_32, (int)keys, 4, PhysicalReg_ESP, true);
++        move_reg_to_mem(OpndSize_32, 1, false, 12, PhysicalReg_ESP, true);
++        fillSwitchInfo(stream+3, true, cUnit); // 3 is the offset to the immediate location
++        dump_imm_mem_noalloc(Mnemonic_MOV, OpndSize_32, 0, 0, PhysicalReg_ESP, true, MemoryAccess_Unknown, -1, switchInfoScheduler);
+ 
+-    scratchRegs[0] = PhysicalReg_SCRATCH_1;
+-    //if testVal is in keys, return the corresponding target
+-    //otherwise, fall through (no_op)
+-    call_dvmJitHandleSparseSwitch();
+-    load_effective_addr(12, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++        scratchRegs[0] = PhysicalReg_SCRATCH_1;
+ 
+-    //get rPC, %eax has the relative PC offset
+-    alu_binary_imm_reg(OpndSize_32, add_opc, (int)dalvikPC, PhysicalReg_EAX, true);
+-    scratchRegs[0] = PhysicalReg_SCRATCH_2;
+-#if defined(WITH_JIT_TUNING)
+-    /* Fall back to interpreter after resolving address of switch target.
+-     * Indicate a kSwitchOverflow. Note: This is not an "overflow". But it helps
+-     * count the times we return from a Switch
+-     */
+-    move_imm_to_mem(OpndSize_32, kSwitchOverflow, 0, PhysicalReg_ESP, true);
+-#endif
+-    jumpToInterpNoChain();
++        // call dvmJitHandleSparseSwitch to return the value that the execution will jump to,
++        // either normal chaining cell or target trace
++        call_dvmJitHandleSparseSwitch();
++        load_effective_addr(16, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++
++        //We are done using the VRs and it is end of BB, so we handle it right now
++        retCode = handleRegistersEndOfBB (true);
++        if (retCode < 0)
++        {
++            //Just pass along error information
++            return retCode;
++        }
++        unconditional_jump_reg(PhysicalReg_EAX, true);
++    }
++
++    // big switch case
++    else {
++        int retCode = sparseBig(vA, tSize, keys, entries, dalvikPC, cUnit);
++        if (retCode < 0) {
++            return retCode;
++        }
++    }
+     return 0;
+ }
+ 
+-#undef P_GPR_1
+-
+ #define P_GPR_1 PhysicalReg_EBX
+ 
+ /**
+diff --git a/vm/compiler/codegen/x86/lightcg/NcgHelper.cpp b/vm/compiler/codegen/x86/lightcg/NcgHelper.cpp
+index 739dc2a..d628ee7 100644
+--- a/vm/compiler/codegen/x86/lightcg/NcgHelper.cpp
++++ b/vm/compiler/codegen/x86/lightcg/NcgHelper.cpp
+@@ -43,20 +43,25 @@ s4 dvmNcgHandlePackedSwitch(const s4* entries, s4 firstKey, u2 size, s4 testVal)
+     return s4FromSwitchData(&entries[testVal - firstKey]);
+ 
+ }
+-/* return the number of bytes to increase the bytecode pointer by */
+-s4 dvmJitHandlePackedSwitch(const s4* entries, s4 firstKey, u2 size, s4 testVal)
++
++/*
++ * @brief return a target address stored in switch table based on index value
++ * @param pSwTbl the switch table address
++ * @param firstKey first case value for packed switch
++ * @param size number of cases in switch bytecode
++ * @param testVal switch argument
++ * @return return the target that execution will jump to
++ */
++s4 dvmJitHandlePackedSwitch(const s4* pSwTbl, s4 firstKey, u2 size, s4 testVal)
+ {
+     if (testVal < firstKey || testVal >= firstKey + size) {
+         LOGVV("Value %d not found in switch (%d-%d)",
+             testVal, firstKey, firstKey+size-1);
+-        return 2*3;//bytecode packed_switch is 6(2*3) bytes long
++        return pSwTbl[size]; // default case
+     }
+ 
+-    LOGVV("Value %d found in slot %d (goto 0x%02x)",
+-        testVal, testVal - firstKey,
+-        s4FromSwitchData(&entries[testVal - firstKey]));
+-    return 2*s4FromSwitchData(&entries[testVal - firstKey]); //convert from u2 to byte
+-
++    LOGVV("Value %d found in slot %d", testVal, testVal - firstKey);
++    return pSwTbl[testVal - firstKey];
+ }
+ /*
+  * Find the matching case.  Returns the offset to the handler instructions.
+@@ -83,22 +88,52 @@ s4 dvmNcgHandleSparseSwitch(const s4* keys, u2 size, s4 testVal)
+     LOGVV("Value %d not found in switch", testVal);
+     return kInstrLen;
+ }
+-/* return the number of bytes to increase the bytecode pointer by */
+-s4 dvmJitHandleSparseSwitch(const s4* keys, u2 size, s4 testVal)
++
++/*
++ * @brief return the index if keys[index] == testval
++ * @param keys the start address of the case constants area
++ * @param size number of cases in switch bytecode
++ * @param testVal switch argument
++ * @return return the index if keys[index] == testVal, otherwise, return size
++ */
++s4 dvmJitLookUpBigSparseSwitch(const s4* keys, u2 size, s4 testVal) {
++    int i;
++    for (i = 0; i < size; i++) {
++        s4 k = s4FromSwitchData(&keys[i]);
++        if (k == testVal) {
++            LOGVV("Value %d found in entry %d", testVal, i);
++            return i;
++        } else if (k > testVal) {
++            break;
++        }
++    }
++
++    LOGVV("Value %d not found in switch", testVal);
++    return size; // default case
++}
++
++/*
++ * @brief return a target address stored in switch table based on index value
++ * @param pSwTbl the switch table address
++ * @param keys the start address of the case constants area
++ * @param size number of cases in switch bytecode
++ * @param testVal switch argument
++ * @return return the target that execution will jump to
++ */
++s4 dvmJitHandleSparseSwitch(const s4* pSwTbl, const s4* keys, u2 size, s4 testVal)
+ {
+-    const s4* entries = keys + size;
+     int i;
++
+     for (i = 0; i < size; i++) {
+         s4 k = s4FromSwitchData(&keys[i]);
+         if (k == testVal) {
+-            LOGVV("Value %d found in entry %d (goto 0x%02x)",
+-                testVal, i, s4FromSwitchData(&entries[i]));
+-            return 2*s4FromSwitchData(&entries[i]); //convert from u2 to byte
++            LOGVV("Value %d found in entry %d", testVal, i);
++            return pSwTbl[i];
+         } else if (k > testVal) {
+             break;
+         }
+     }
+ 
+     LOGVV("Value %d not found in switch", testVal);
+-    return 2*3; //bytecode sparse_switch is 6(2*3) bytes long
++    return pSwTbl[size]; // default case
+ }
+diff --git a/vm/compiler/codegen/x86/lightcg/NcgHelper.h b/vm/compiler/codegen/x86/lightcg/NcgHelper.h
+index ec56c85..3cd56ea 100644
+--- a/vm/compiler/codegen/x86/lightcg/NcgHelper.h
++++ b/vm/compiler/codegen/x86/lightcg/NcgHelper.h
+@@ -21,7 +21,13 @@
+ s4 dvmNcgHandlePackedSwitch(const s4*, s4, u2, s4);
+ s4 dvmNcgHandleSparseSwitch(const s4*, u2, s4);
+ extern "C" s4 dvmJitHandlePackedSwitch(const s4*, s4, u2, s4);
+-s4 dvmJitHandleSparseSwitch(const s4*, u2, s4);
++
++/** @brief return a target address stored in switch table based on index value*/
++s4 dvmJitHandleSparseSwitch(const s4*, const s4*, u2, s4);
++
++/** @brief return the index if keys[index] == testval */
++s4 dvmJitLookUpBigSparseSwitch(const s4*, u2, s4);
++
+ extern "C" void dvmNcgInvokeInterpreter(int pc); //interpreter to execute at pc
+ extern "C" void dvmNcgInvokeNcg(int pc);
+ 
+diff --git a/vm/compiler/codegen/x86/lightcg/Scheduler.cpp b/vm/compiler/codegen/x86/lightcg/Scheduler.cpp
+index 0e06436..074b73c 100644
+--- a/vm/compiler/codegen/x86/lightcg/Scheduler.cpp
++++ b/vm/compiler/codegen/x86/lightcg/Scheduler.cpp
+@@ -1365,6 +1365,20 @@ void Scheduler::generateAssembly(LowOp * op) {
+     // lower_reg_mem_scale, lower_reg_reg, lower_fp_mem, and lower_mem_fp
+     else if (op->opndDest.type == LowOpndType_Reg
+             && op->opndSrc.type == LowOpndType_Imm) {
++
++        SwitchInfoScheduler* switchInfoScheduler;
++        switchInfoScheduler = ((LowOpImmReg*)op)->switchInfoScheduler;
++        if (switchInfoScheduler != NULL && switchInfoScheduler->switchInfo){
++                int offset = switchInfoScheduler->offset;
++
++                // update address for immediate location
++                if (switchInfoScheduler->isFirst) {
++                    switchInfoScheduler->switchInfo->immAddr = stream + offset;
++                }
++                else {
++                    switchInfoScheduler->switchInfo->immAddr2 = stream + offset;
++                }
++        }
+         stream = encoder_imm_reg_diff_sizes(op->opCode, op->opndSrc.size,
+                 ((LowOpImmReg*) op)->immSrc.value,
+                 op->opndDest.size,
+@@ -1403,6 +1417,15 @@ void Scheduler::generateAssembly(LowOp * op) {
+                 ((LowOpImmReg*) op)->regDest.regType, stream);
+     } else if (op->opndDest.type == LowOpndType_Mem
+             && op->opndSrc.type == LowOpndType_Imm) {
++        SwitchInfoScheduler* switchInfoScheduler;
++        switchInfoScheduler = ((LowOpImmMem*)op)->switchInfoScheduler;
++        if (switchInfoScheduler != 0 && switchInfoScheduler->switchInfo){
++                int offset = switchInfoScheduler->offset;
++
++                // update address for immediate location
++                switchInfoScheduler->switchInfo->immAddr = stream + offset;
++        }
++
+         stream = encoder_imm_mem(op->opCode, op->opndDest.size,
+                 ((LowOpImmMem*) op)->immSrc.value,
+                 ((LowOpImmMem*) op)->memDest.m_disp.value,
+diff --git a/vm/mterp/out/InterpAsm-x86.S b/vm/mterp/out/InterpAsm-x86.S
+index a59f3e0..8dee933 100644
+--- a/vm/mterp/out/InterpAsm-x86.S
++++ b/vm/mterp/out/InterpAsm-x86.S
+@@ -16745,13 +16745,21 @@ dvmJitToInterpTraceSelect:
+     movl   %eax,offThread_inJitCodeCache(%ecx)  # set inJitCodeCache flag
+     jz     1b                 # no - ask for one
+     movl   %eax,OUT_ARG0(%esp)
++    movl   8(%ebx), %ecx      # get isMove flag
+     movl   4(%ebx), %ebx
+     movl   rINST,OUT_ARG1(%esp)
++    cmp    $0, %ecx
++    jne    1f
+     call   dvmJitChain_staticAddr        # Attempt dvmJitChain_staticAddr(codeAddr,chainAddr)
+     cmpl   $0,%eax           # Success?
+     jz     toInterpreter      # didn't chain - interpret
+     jmp    *%eax
+     # won't return
++1:
++    call        dvmJitChain
++    cmp         $0, %eax
++    je          toInterpreter
++    jmp         *%eax                   #to native address
+ 
+     .global dvmJitToInterpBackwardBranch
+ dvmJitToInterpBackwardBranch:
+@@ -16792,13 +16800,21 @@ dvmJitToInterpNormal:
+     movl        %eax, offThread_inJitCodeCache(%ecx)  # set inJitCodeCache flag
+     cmp         $0, %eax
+     je          toInterpreter
++    movl        8(%ebx), %ecx           # get isSwitch in normal CC
+     movl        4(%ebx), %ebx
+     movl        %ebx, OUT_ARG1(%esp)    # %ebx live thorugh dvmJitGetTraceAddrThread
+     movl        %eax, OUT_ARG0(%esp)    # first argument
++    cmp         $0, %ecx
++    jne         1f
+     call        dvmJitChain
+     cmp         $0, %eax
+     je          toInterpreter
+     jmp         *%eax                   #to native address
++1:
++    call        dvmJitChain_staticAddr
++    cmp         $0, %eax
++    je          toInterpreter
++    jmp         *%eax                   #to native address
+ 
+     .global dvmJitToInterpNoChain
+ dvmJitToInterpNoChain:
+diff --git a/vm/mterp/x86/footer.S b/vm/mterp/x86/footer.S
+index 41e6403..78bb6d0 100644
+--- a/vm/mterp/x86/footer.S
++++ b/vm/mterp/x86/footer.S
+@@ -267,13 +267,21 @@ dvmJitToInterpTraceSelect:
+     movl   %eax,offThread_inJitCodeCache(%ecx)  # set inJitCodeCache flag
+     jz     1b                 # no - ask for one
+     movl   %eax,OUT_ARG0(%esp)
++    movl   8(%ebx), %ecx      # get isMove flag
+     movl   4(%ebx), %ebx
+     movl   rINST,OUT_ARG1(%esp)
++    cmp    $$0, %ecx
++    jne    1f
+     call   dvmJitChain_staticAddr        # Attempt dvmJitChain_staticAddr(codeAddr,chainAddr)
+     cmpl   $$0,%eax           # Success?
+     jz     toInterpreter      # didn't chain - interpret
+     jmp    *%eax
+     # won't return
++1:
++    call        dvmJitChain
++    cmp         $$0, %eax
++    je          toInterpreter
++    jmp         *%eax                   #to native address
+ 
+     .global dvmJitToInterpBackwardBranch
+ dvmJitToInterpBackwardBranch:
+@@ -314,13 +322,21 @@ dvmJitToInterpNormal:
+     movl        %eax, offThread_inJitCodeCache(%ecx)  # set inJitCodeCache flag
+     cmp         $$0, %eax
+     je          toInterpreter
++    movl        8(%ebx), %ecx           # get isSwitch in normal CC
+     movl        4(%ebx), %ebx
+     movl        %ebx, OUT_ARG1(%esp)    # %ebx live thorugh dvmJitGetTraceAddrThread
+     movl        %eax, OUT_ARG0(%esp)    # first argument
++    cmp         $$0, %ecx
++    jne         1f
+     call        dvmJitChain
+     cmp         $$0, %eax
+     je          toInterpreter
+     jmp         *%eax                   #to native address
++1:
++    call        dvmJitChain_staticAddr
++    cmp         $$0, %eax
++    je          toInterpreter
++    jmp         *%eax                   #to native address
+ 
+     .global dvmJitToInterpNoChain
+ dvmJitToInterpNoChain:
+-- 
+1.7.4.1
+

@@ -1,0 +1,169 @@
+From 431ef91bc0010c60a38ae3e71f0732a7d3f45b87 Mon Sep 17 00:00:00 2001
+From: Yixin Shou <yixin.shou@intel.com>
+Date: Fri, 19 Jul 2013 08:42:37 -0700
+Subject: Dalvik: Avoid store/load REHABQ hazard for increment in memory
+
+BZ: 124817
+
+This patch avoids using add/sub instruction in memory and loads VR
+to register first when adding a literal to avoid store/load REHABQ
+hazard due to the dependency on the memory write.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I1863d7fa49ec2d8521682251c82eeeee5cc6246e
+Orig-MCG-Change-Id: I76c96b348779c8dcf3773f30b4d5bfabceb2411f
+Signed-off-by: Yixin Shou <yixin.shou@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/codegen/x86/Lower.h         |    2 +-
+ vm/compiler/codegen/x86/LowerAlu.cpp    |   19 +++++++++--
+ vm/compiler/codegen/x86/LowerHelper.cpp |   55 +++++++++++++++++++++++++++++--
+ 3 files changed, 69 insertions(+), 7 deletions(-)
+
+diff --git a/vm/compiler/codegen/x86/Lower.h b/vm/compiler/codegen/x86/Lower.h
+index 4abff83..84918af 100644
+--- a/vm/compiler/codegen/x86/Lower.h
++++ b/vm/compiler/codegen/x86/Lower.h
+@@ -774,7 +774,7 @@ void alu_binary_imm_mem(OpndSize size, ALU_Opcode opc,
+ void alu_binary_imm_reg(OpndSize size, ALU_Opcode opc, int imm, int reg, bool isPhysical);
+ //Operate on a VR with another VR and an immediate
+ bool alu_imm_to_VR(OpndSize size, ALU_Opcode opc,
+-                         int srcVR, int destVR, int imm, int tempReg, bool isTempPhysical);
++                         int srcVR, int destVR, int imm, int tempReg, bool isTempPhysical, const MIR * mir);
+ void alu_binary_mem_reg(OpndSize size, ALU_Opcode opc,
+                          int disp, int base_reg, bool isBasePhysical,
+                          int reg, bool isPhysical);
+diff --git a/vm/compiler/codegen/x86/LowerAlu.cpp b/vm/compiler/codegen/x86/LowerAlu.cpp
+index d794405..fa3e313 100644
+--- a/vm/compiler/codegen/x86/LowerAlu.cpp
++++ b/vm/compiler/codegen/x86/LowerAlu.cpp
+@@ -1064,7 +1064,7 @@ int op_rem_int_2addr(const MIR * mir) {
+ int common_alu_int_lit(ALU_Opcode opc, int vA, int vB, s2 imm) { //except div and rem
+     // For add and sub, try if we can operate directly on VRs
+     if ((opc == add_opc) || (opc == sub_opc)) {
+-        bool success = alu_imm_to_VR(OpndSize_32, opc, vB, vA, imm, 1, false);
++        bool success = alu_imm_to_VR(OpndSize_32, opc, vB, vA, imm, 1, false, NULL);
+         //If succeeded, we are done
+         if (success == true) {
+             return 0;
+@@ -1077,6 +1077,7 @@ int common_alu_int_lit(ALU_Opcode opc, int vA, int vB, s2 imm) { //except div an
+     set_virtual_reg(vA, OpndSize_32, 1, false);
+     return 0;
+ }
++
+ //! calls common_alu_int_lit
+ int common_shift_int_lit(ALU_Opcode opc, int vA, int vB, s2 imm) {
+     return common_alu_int_lit(opc, vA, vB, imm);
+@@ -1185,8 +1186,20 @@ int op_add_int_lit8(const MIR * mir) {
+     int vA = mir->dalvikInsn.vA;
+     int vB = mir->dalvikInsn.vB;
+     s2 literal = mir->dalvikInsn.vC;
+-    int retval = common_alu_int_lit(add_opc, vA, vB, literal);
+-    return retval;
++
++    //try if we can operate directly on VRs
++    bool success = alu_imm_to_VR(OpndSize_32, add_opc, vB, vA, literal, 1, false, mir);
++
++    //If succeeded, we are done
++    if (success == true) {
++        return 0;
++    }
++
++    //Otherwise, go the normal path
++    get_virtual_reg(vB, OpndSize_32, 1, false);
++    alu_binary_imm_reg(OpndSize_32, add_opc, literal, 1, false);
++    set_virtual_reg(vA, OpndSize_32, 1, false);
++    return 0;
+ }
+ 
+ /**
+diff --git a/vm/compiler/codegen/x86/LowerHelper.cpp b/vm/compiler/codegen/x86/LowerHelper.cpp
+index d6bf14b..1716771 100644
+--- a/vm/compiler/codegen/x86/LowerHelper.cpp
++++ b/vm/compiler/codegen/x86/LowerHelper.cpp
+@@ -50,6 +50,7 @@ When allocating a physical register for an operand, we can't spill the operands
+ #include "Scheduler.h"
+ #include "Singleton.h"
+ #include "ExceptionHandling.h"
++#include "compiler/Dataflow.h"
+ 
+ extern "C" int64_t __divdi3(int64_t, int64_t);
+ extern "C" int64_t __moddi3(int64_t, int64_t);
+@@ -1805,9 +1806,10 @@ void alu_binary_imm_reg(OpndSize size, ALU_Opcode opc, int imm, int reg, bool is
+  * @param imm The literal value to be added to VR value
+  * @param tempReg A temporary register
+  * @param isTempPhysical Whether the tempReg is physical
++ * @param mir current lowered MIR
+  * @return whether we were successful. If false, caller needs to perform get_VR, alu_op, set_VR separately
+  */
+-bool alu_imm_to_VR(OpndSize size, ALU_Opcode opc, int srcVR, int destVR, int imm, int tempReg, bool isTempPhysical) {
++bool alu_imm_to_VR(OpndSize size, ALU_Opcode opc, int srcVR, int destVR, int imm, int tempReg, bool isTempPhysical, const MIR * mir) {
+     const LowOpndRegType pType = getTypeFromIntSize(size); //gp or xmm
+ 
+     //We accept only add_opc and sub_opc for now
+@@ -1922,8 +1924,55 @@ bool alu_imm_to_VR(OpndSize size, ALU_Opcode opc, int srcVR, int destVR, int imm
+ 
+             case SRC_IN_MEMORY:
+                 if (caseDest == DEST_SAME_AS_SRC) {
+-                    dump_imm_mem_noalloc_alu(alu_mn, size, imm, 4*destVR, PhysicalReg_FP, true, MemoryAccess_VR, destVR);
+-                    return true; //Successfully updated
++
++                    // for Silvermont platform
++                    if (strcmp(ARCH_VARIANT, "x86-slm") == 0) {
++
++                        /* Heuristic for inc optimization to avoid store/load REHABQ hazard.
++                           number of adjacent bytecodes which need to be checked for avoiding
++                           store/load REHABQ hazard for increment in memory */
++                        const int incOptMirWindow = 2;
++
++                        // Get SSA representation
++                        SSARepresentation *ssa = mir->ssaRep;
++
++                        // current add/sub mir should only have one def and we
++                        // only care if this def is used
++                        if(ssa != 0 && ssa->numDefs == 1 && ssa->usedNext != 0 &&
++                           ssa->usedNext[0] != 0 && ssa->usedNext[0]->mir != 0) {
++
++                            MIR * mirUse = ssa->usedNext[0]->mir;
++                            MIR * nextMIR = const_cast<MIR*>(mir);
++
++                            // check adjacent mirs window
++                            for (int i = 0; i < incOptMirWindow; i ++) {
++                                if (nextMIR != 0) {
++                                    nextMIR = nextMIR->next;
++
++                                    // if the define variable of mir is used in adjacent mir, return
++                                    // false to avoid add/sub in memory
++                                    if (mirUse == nextMIR) {
++                                        return false;
++                                    }
++                                }
++                            }
++                        }
++
++                        // when we reach here, we can use add/sub on memory directly based
++                        // on the fact that no uses of the mir's def in adjacent mirs window
++                        dump_imm_mem_noalloc_alu(alu_mn, size, imm, 4*destVR, PhysicalReg_FP, true, MemoryAccess_VR, destVR);
++
++                        // Successfully updated
++                        return true;
++                    }
++
++                    // for other platforms
++                    else {
++                        dump_imm_mem_noalloc_alu(alu_mn, size, imm, 4*destVR, PhysicalReg_FP, true, MemoryAccess_VR, destVR);
++
++                        // Successfully updated
++                        return true;
++                    }
+                 }
+                 else if (caseDest == DEST_IN_MEMORY) {
+                     //We can in no way do better than get_VR, add / sub, set_VR
+-- 
+1.7.4.1
+

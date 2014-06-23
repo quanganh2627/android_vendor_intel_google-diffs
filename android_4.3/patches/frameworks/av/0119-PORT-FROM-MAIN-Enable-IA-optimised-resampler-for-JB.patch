@@ -1,0 +1,575 @@
+From 5cde76daf92e62b433d0d8d27cf5bfa04dc8d3aa Mon Sep 17 00:00:00 2001
+From: Arulselvan M <arulselvan.m@intel.com>
+Date: Thu, 30 May 2013 16:37:28 +0530
+Subject: [PORT FROM MAIN]Enable IA optimised resampler for JB
+
+BZ: 53644
+
+This patch contains changes to enable IA optimized SRC.
+
+Signed-off-by: Manjunath <manjunathx.b.s@intel.com>
+
+Change-Id: I3c130e569e73a3135dfbd514a8adb5a40007ba08
+Orig-Change-Id: Ia9198c6779f5a3147ec7239184ca81121f2664b1
+Signed-off-by: Arulselvan M <arulselvan.m@intel.com>
+---
+ services/audioflinger/Android.mk           |    8 +
+ services/audioflinger/AudioFlinger.cpp     |   11 ++-
+ services/audioflinger/AudioMixer.cpp       |   23 +++
+ services/audioflinger/AudioResampler.cpp   |   22 +++
+ services/audioflinger/AudioResampler.h     |   18 ++-
+ services/audioflinger/AudioResamplerIA.cpp |  211 ++++++++++++++++++++++++++++
+ services/audioflinger/AudioResamplerIA.h   |   66 +++++++++
+ services/audioflinger/Threads.cpp          |   35 +++++-
+ 8 files changed, 387 insertions(+), 7 deletions(-)
+ create mode 100644 services/audioflinger/AudioResamplerIA.cpp
+ create mode 100644 services/audioflinger/AudioResamplerIA.h
+
+diff --git a/services/audioflinger/Android.mk b/services/audioflinger/Android.mk
+index 061a079..99722b1 100644
+--- a/services/audioflinger/Android.mk
++++ b/services/audioflinger/Android.mk
+@@ -81,6 +81,14 @@ else
+     LOCAL_CFLAGS += -DANDROID_SMP=0
+ endif
+ 
++ifeq ($(USE_INTEL_SRC),true)
++  LOCAL_CFLAGS += -DUSE_INTEL_SRC
++  LOCAL_C_INCLUDES += $(TARGET_OUT_HEADERS)/libaudioresample
++  LOCAL_SRC_FILES += AudioResamplerIA.cpp
++  LOCAL_SHARED_LIBRARIES += libaudioresample
++endif
++
++
+ include $(BUILD_SHARED_LIBRARY)
+ 
+ #
+diff --git a/services/audioflinger/AudioFlinger.cpp b/services/audioflinger/AudioFlinger.cpp
+index 87eb6aa..02e3e4a 100644
+--- a/services/audioflinger/AudioFlinger.cpp
++++ b/services/audioflinger/AudioFlinger.cpp
+@@ -48,6 +48,10 @@
+ #include "AudioFlinger.h"
+ #include "ServiceUtilities.h"
+ 
++#ifdef USE_INTEL_SRC
++#include "AudioResamplerIA.h"
++#endif
++
+ #include <media/EffectsFactoryApi.h>
+ #include <audio_effects/effect_visualizer.h>
+ #include <audio_effects/effect_ns.h>
+@@ -1621,8 +1625,11 @@ audio_io_handle_t AudioFlinger::openInput(audio_module_handle_t module,
+     // conversion internally, try to open again with the proposed parameters. The AudioFlinger can
+     // resample the input and do mono to stereo or stereo to mono conversions on 16 bit PCM inputs.
+     if (status == BAD_VALUE &&
+-        reqFormat == config.format && config.format == AUDIO_FORMAT_PCM_16_BIT &&
+-        (config.sample_rate <= 2 * reqSamplingRate) &&
++        reqFormat == config.format && config.format == AUDIO_FORMAT_PCM_16_BIT && (
++#ifdef USE_INTEL_SRC
++        AudioResamplerIA::sampleRateSupported(config.sample_rate, reqSamplingRate) ||
++#endif
++        (config.sample_rate <= 2 * reqSamplingRate) ) &&
+         (popcount(config.channel_mask) <= FCC_2) && (popcount(reqChannels) <= FCC_2)) {
+         ALOGV("openInput() reopening with proposed sampling rate and channel mask");
+         inStream = NULL;
+diff --git a/services/audioflinger/AudioMixer.cpp b/services/audioflinger/AudioMixer.cpp
+index 7d38f80..951266e 100644
+--- a/services/audioflinger/AudioMixer.cpp
++++ b/services/audioflinger/AudioMixer.cpp
+@@ -40,6 +40,10 @@
+ 
+ #include "AudioMixer.h"
+ 
++#ifdef USE_INTEL_SRC
++#include "AudioResamplerIA.h"
++#endif
++
+ namespace android {
+ 
+ // ----------------------------------------------------------------------------
+@@ -550,6 +554,14 @@ bool AudioMixer::track_t::setResampler(uint32_t value, uint32_t devSampleRate)
+         if (sampleRate != value) {
+             sampleRate = value;
+             if (resampler == NULL) {
++#ifdef USE_INTEL_SRC
++                if (AudioResamplerIA::sampleRateSupported(sampleRate, devSampleRate)) {
++                    resampler = AudioResampler::create(format, channelCount,
++                                devSampleRate, AudioResampler::INTEL_HIGH_QUALITY);
++                } else {
++                    resampler = AudioResampler::create(format, channelCount, devSampleRate);
++                }
++#else
+                 ALOGV("creating resampler from track %d Hz to device %d Hz", value, devSampleRate);
+                 AudioResampler::src_quality quality;
+                 // force lowest quality level resampler if use case isn't music or video
+@@ -568,7 +580,18 @@ bool AudioMixer::track_t::setResampler(uint32_t value, uint32_t devSampleRate)
+                         downmixerBufferProvider != NULL ? MAX_NUM_CHANNELS : channelCount,
+                         devSampleRate, quality);
+                 resampler->setLocalTimeFreq(sLocalTimeFreq);
++#endif
+             }
++#ifdef USE_INTEL_SRC
++            else {
++                if (resampler->mResType == AudioResampler::INTEL_SRC &&
++                    !AudioResamplerIA::sampleRateSupported(sampleRate, devSampleRate)) {
++                    delete resampler;
++                    resampler = AudioResampler::create(format, channelCount, devSampleRate);
++                }
++            }
++#endif
++
+             return true;
+         }
+     }
+diff --git a/services/audioflinger/AudioResampler.cpp b/services/audioflinger/AudioResampler.cpp
+index 2c3c719..c8fb3b9 100644
+--- a/services/audioflinger/AudioResampler.cpp
++++ b/services/audioflinger/AudioResampler.cpp
+@@ -30,6 +30,10 @@
+ #include <machine/cpu-features.h>
+ #endif
+ 
++#ifdef USE_INTEL_SRC
++#include "AudioResamplerIA.h"
++#endif
++
+ namespace android {
+ 
+ #ifdef __ARM_HAVE_HALFWORD_MULTIPLY // optimized asm option
+@@ -200,7 +204,25 @@ AudioResampler* AudioResampler::create(int bitDepth, int inChannelCount,
+         ALOGV("Create VERY_HIGH_QUALITY sinc Resampler = %d", quality);
+         resampler = new AudioResamplerSinc(bitDepth, inChannelCount, sampleRate, quality);
+         break;
++#ifdef USE_INTEL_SRC
++    case INTEL_LOW_QUALITY:
++    case INTEL_MED_QUALITY:
++    case INTEL_HIGH_QUALITY:
++    case INTEL_VERY_HIGH_QUALITY:
++        LOGV("Create intel  Resampler");
++        resampler = new AudioResamplerIA(bitDepth, inChannelCount, sampleRate);
++        break;
++#endif
++
++    }
++#ifdef USE_INTEL_SRC
++    if (quality == LOW_QUALITY || quality == MED_QUALITY ||
++                            quality == HIGH_QUALITY) {
++        resampler->mResType = AF_DEFAULT_SRC;
++    } else {
++        resampler->mResType = INTEL_SRC;
+     }
++#endif
+ 
+     // initialize resampler
+     resampler->init();
+diff --git a/services/audioflinger/AudioResampler.h b/services/audioflinger/AudioResampler.h
+index 2b8694f..83406a3 100644
+--- a/services/audioflinger/AudioResampler.h
++++ b/services/audioflinger/AudioResampler.h
+@@ -40,7 +40,19 @@ public:
+         MED_QUALITY=2,
+         HIGH_QUALITY=3,
+         VERY_HIGH_QUALITY=4,
++#ifdef USE_INTEL_SRC
++        INTEL_LOW_QUALITY=400,
++        INTEL_MED_QUALITY=401,
++        INTEL_HIGH_QUALITY=402,
++        INTEL_VERY_HIGH_QUALITY=403,
++#endif
+     };
++#ifdef USE_INTEL_SRC
++    enum resampler_type_tag {
++        AF_DEFAULT_SRC=0,
++        INTEL_SRC=1
++    } mResType;
++#endif
+ 
+     static AudioResampler* create(int bitDepth, int inChannelCount,
+             int32_t sampleRate, src_quality quality=DEFAULT_QUALITY);
+@@ -82,9 +94,9 @@ protected:
+ 
+     int64_t calculateOutputPTS(int outputFrameIndex);
+ 
+-    const int32_t mBitDepth;
+-    const int32_t mChannelCount;
+-    const int32_t mSampleRate;
++    int32_t mBitDepth;
++    int32_t mChannelCount;
++    int32_t mSampleRate;
+     int32_t mInSampleRate;
+     AudioBufferProvider::Buffer mBuffer;
+     union {
+diff --git a/services/audioflinger/AudioResamplerIA.cpp b/services/audioflinger/AudioResamplerIA.cpp
+new file mode 100644
+index 0000000..cc19fc8
+--- /dev/null
++++ b/services/audioflinger/AudioResamplerIA.cpp
+@@ -0,0 +1,211 @@
++/*
++ * Copyright (C) 2011 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#define LOG_TAG "AudioResamplerIA"
++//#define LOG_NDEBUG 0
++
++#include <stdlib.h>
++#include <string.h>
++#include "cutils/log.h"
++#include "AudioResamplerIA.h"
++#include "iasrc_resampler.h"
++
++namespace android {
++// ----------------------------------------------------------------------------
++
++
++AudioResamplerIA::AudioResamplerIA(int bitDepth, int inChannelCount, int32_t sampleRate)
++    : AudioResampler(bitDepth, inChannelCount, sampleRate, DEFAULT_QUALITY)
++{
++    /* If samplerate combination is not supported.. behave like passthough */
++    if (!sampleRateSupported(mInSampleRate, mSampleRate)) {
++        mInSampleRate = AUDRESAMPLEIA_SAMPLINGRATE_DEFAULT;
++        mSampleRate = AUDRESAMPLEIA_SAMPLINGRATE_DEFAULT;
++    }
++    iaresamplib_new(&mContext, mChannelCount, mInSampleRate, mSampleRate);
++
++    mFloatInpUnaligned = new float[(mMaxInputBufferSize+64+16)];
++    mFloatInp = (float*) ((int) ((unsigned char*) (mFloatInpUnaligned)+16) & (~0xF));
++    mFloatOut = new float[(mMaxInputBufferSize + 64)*mSampleRate/mInSampleRate + 1];
++    mRemainingOutFrames = 0;
++    memset(&mOutFrameBuffer, 0, sizeof(mOutFrameBuffer));
++    mReinitNeeded = 1;
++}
++
++AudioResamplerIA::~AudioResamplerIA()
++{
++    iaresamplib_delete(&mContext);
++    delete [] mFloatInpUnaligned;
++    delete [] mFloatOut;
++}
++
++void AudioResamplerIA::setSampleRate(int32_t inSampleRate)
++{
++    if (mReinitNeeded == 1 || inSampleRate != mInSampleRate) {
++        iaresamplib_delete(&mContext);
++        /* If samplerate combination is not supported.. behave like passthough */
++        if (sampleRateSupported(inSampleRate, mSampleRate)) {
++            mInSampleRate = inSampleRate;
++        }
++        else {
++            mInSampleRate = AUDRESAMPLEIA_SAMPLINGRATE_DEFAULT;
++            mSampleRate = AUDRESAMPLEIA_SAMPLINGRATE_DEFAULT;
++        }
++
++        iaresamplib_new(&mContext, mChannelCount, mInSampleRate, mSampleRate);
++
++        delete [] mFloatOut;
++        mFloatOut = new float[(mMaxInputBufferSize+64)*mSampleRate/mInSampleRate];
++        mReinitNeeded = 0;
++        LOGD("Create AudioResamplerIA Resampler: Input rate %i, output rate %i",
++             mInSampleRate, mSampleRate);
++    }
++}
++
++int AudioResamplerIA::sampleRateSupported(int inputRate, int outputRate)
++{
++    return iaresamplib_supported_conversion(inputRate, outputRate);
++}
++
++void AudioResamplerIA::init()
++{
++}
++
++void AudioResamplerIA::resample(int32_t* out, size_t outFrameCount,
++                                AudioBufferProvider* provider)
++{
++    // select the appropriate resampler
++    switch (mChannelCount) {
++    case 1:
++        resample<1>(out, outFrameCount, provider);
++        break;
++    case 2:
++        resample<2>(out, outFrameCount, provider);
++        break;
++    }
++}
++
++template<int CHANNELS>
++void AudioResamplerIA::resample(int32_t* out, size_t outFrameCount,
++                                AudioBufferProvider* provider)
++{
++    size_t lcou;
++    size_t inputIndex = mInputIndex;
++    size_t outputIndex = 0;
++    size_t outputSampleCount = outFrameCount * 2;
++    size_t inFrameCount;
++    int16_t *pInp;
++    int32_t *pOut = out;
++    int32_t *pStOut;
++    size_t framesInBuffer;
++    size_t framesToProcess;
++    size_t framesProcessed = 0;
++    size_t framesLeft;
++    size_t curFrameSize;
++    size_t outFrameSize;
++    size_t frameCount;
++    size_t outFramesLeft = outFrameCount;
++    size_t outputChannels = 2;
++
++    inFrameCount = (((outFrameCount-mRemainingOutFrames)*mInSampleRate)/mSampleRate) + 1;
++    // Get input buffer. Could already be partrially used before.
++    AudioBufferProvider::Buffer& buffer(mBuffer);
++
++    size_t framesToCpy = mRemainingOutFrames < outFrameCount ?
++                         mRemainingOutFrames : outFrameCount;
++    if (framesToCpy > 0) {
++        iaresamplib_convert_2_output_format(&mOutFrameBuffer[0], pOut, framesToCpy, CHANNELS, mVolume);
++        pOut += framesToCpy*outputChannels;
++    }
++
++    if (mRemainingOutFrames>framesToCpy) {
++        memcpy((void*) &mOutFrameBuffer[0], (void*) &mOutFrameBuffer[framesToCpy*outputChannels],
++               (mRemainingOutFrames-framesToCpy)*outputChannels*sizeof(float));
++    }
++    mRemainingOutFrames -= framesToCpy;
++    outputIndex += framesToCpy;
++
++    while (outputIndex < outFrameCount) {
++        // buffer is empty, fetch a new one
++        while (buffer.frameCount == 0) {
++            buffer.frameCount = inFrameCount;
++            provider->getNextBuffer(&buffer);
++            if (buffer.raw == NULL) {
++                goto resample_exit;
++            }
++        }
++
++        frameCount = buffer.frameCount;
++
++        // get to the point where we need to start processing.
++        // ASSUME that input is of int16_t
++        // mInputIndex points to the place where we want to read next.
++        pInp = buffer.i16 + inputIndex * CHANNELS;
++
++        framesInBuffer = frameCount - inputIndex;
++
++        // The number of samples that can be processed in the current buffer.
++        framesToProcess = (inFrameCount-framesProcessed) > framesInBuffer ?
++                          framesInBuffer : (inFrameCount-framesProcessed);
++        framesLeft = framesToProcess;
++
++        while (framesLeft > 0) {
++            // What can be processed in the current loop based on input buffer size.
++            curFrameSize = (mMaxInputBufferSize/CHANNELS) < framesLeft ?
++                           mMaxInputBufferSize/CHANNELS : framesLeft;
++
++            // Convert the int16 to float
++            iaresamplib_convert_short_2_float(pInp, mFloatInp, curFrameSize*CHANNELS);
++            // resample
++            iaresamplib_process_float(mContext, mFloatInp, curFrameSize, mFloatOut, &outFrameSize);
++            outputIndex += outFrameSize;
++
++            // convert back to int32. Also converts mono to stereo and applies volume
++            // ASSUMPTION : Volume is in 4.12 format.
++            if (outputIndex>outFrameCount) {
++                iaresamplib_convert_2_output_format(mFloatOut, pOut, outFrameSize-(outputIndex-outFrameCount),
++                                                    CHANNELS, mVolume);
++                mRemainingOutFrames = outputIndex - outFrameCount;
++	        memcpy(&mOutFrameBuffer[0], mFloatOut+(outFrameSize-mRemainingOutFrames)*CHANNELS,
++                       mRemainingOutFrames*CHANNELS*sizeof(float));
++            }
++            else {
++                iaresamplib_convert_2_output_format(mFloatOut, pOut, outFrameSize, CHANNELS, mVolume);
++            }
++
++            // iaresamplib_convert_float_2_short_stereo(mFloatOut, pout, out_n_frames*CHANNELS, CHANNELS, );
++            framesLeft -= curFrameSize;
++            pOut += outFrameSize*outputChannels; // Assuming that output is always stereo.
++            pInp += curFrameSize*CHANNELS;
++        }
++        inputIndex += framesToProcess;
++        framesProcessed += framesToProcess;
++
++        // if done with buffer, save samples
++        if (inputIndex >= frameCount) {
++            inputIndex -= frameCount;
++            provider->releaseBuffer(&buffer);
++        }
++    }
++
++resample_exit:
++    mInputIndex = inputIndex;
++}
++
++
++// ----------------------------------------------------------------------------
++}; // namespace android
++
+diff --git a/services/audioflinger/AudioResamplerIA.h b/services/audioflinger/AudioResamplerIA.h
+new file mode 100644
+index 0000000..37999cf
+--- /dev/null
++++ b/services/audioflinger/AudioResamplerIA.h
+@@ -0,0 +1,66 @@
++/*
++ * Copyright (C) 2011 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef ANDROID_AUDIO_RESAMPLER_IA_H
++#define ANDROID_AUDIO_RESAMPLER_IA_H
++
++#include <stdint.h>
++#include <sys/types.h>
++#include <utils/Log.h>
++
++#include "AudioResampler.h"
++
++namespace android {
++
++#define AUDRESAMPLEIA_SAMPLINGRATE_DEFAULT 44100
++/* -------------------------------------------------------------------------*/
++
++	class AudioResamplerIA : public AudioResampler {
++ public:
++		AudioResamplerIA(int bitDepth, int inChannelCount,
++				 int32_t sampleRate);
++		~AudioResamplerIA();
++
++		virtual void resample(int32_t *out, size_t outFrameCount,
++				      AudioBufferProvider *provider);
++		virtual void setSampleRate(int32_t inSampleRate);
++		static int sampleRateSupported(int inputRate, int outputRate);
++
++ private:
++		void init();
++		template < int CHANNELS >
++		    void resample(int32_t *out, size_t outFrameCount,
++				  AudioBufferProvider *provider);
++		void *mContext;
++
++		static const int16_t mMaxInputBufferSize = 2048;
++		float *mFloatInpUnaligned;
++		float *mFloatInp;
++		float *mFloatOut;
++
++		/* remaining number of output frames that cannot
++		 * fit in the current output buffer
++		 */
++		int mRemainingOutFrames;
++		float mOutFrameBuffer[40] __attribute__ ((aligned(16)));
++		int32_t mReinitNeeded;	/* Flag for reiniting the SRC. */
++	};
++
++/* --------------------------------------------------------------------------*/
++
++};				/* namespace android */
++
++#endif				/*ANDROID_AUDIO_RESAMPLER_IA_H */
+diff --git a/services/audioflinger/Threads.cpp b/services/audioflinger/Threads.cpp
+index b028510..6b6a4ce 100644
+--- a/services/audioflinger/Threads.cpp
++++ b/services/audioflinger/Threads.cpp
+@@ -53,6 +53,10 @@
+ #include "ServiceUtilities.h"
+ #include "SchedulingPolicyService.h"
+ 
++#ifdef USE_INTEL_SRC
++#include "AudioResamplerIA.h"
++#endif
++
+ #undef ADD_BATTERY_DATA
+ 
+ #ifdef ADD_BATTERY_DATA
+@@ -1180,8 +1184,13 @@ sp<AudioFlinger::PlaybackThread::Track> AudioFlinger::PlaybackThread::createTrac
+             }
+         }
+     } else {
++#ifdef USE_INTEL_SRC
++        //check if Intel SRC support this conversion
++        if (!AudioResamplerIA::sampleRateSupported(sampleRate, mSampleRate)) {
++#else
+         // Resampler implementation limits input sampling rate to 2 x output sampling rate.
+         if (sampleRate > mSampleRate*2) {
++#endif
+             ALOGE("Sample rate out of range: %u mSampleRate %u", sampleRate, mSampleRate);
+             lStatus = BAD_VALUE;
+             goto Exit;
+@@ -2736,7 +2745,14 @@ AudioFlinger::PlaybackThread::mixer_state AudioFlinger::MixerThread::prepareTrac
+                 AudioMixer::CHANNEL_MASK, (void *)track->channelMask());
+             // limit track sample rate to 2 x output sample rate, which changes at re-configuration
+             uint32_t maxSampleRate = mSampleRate * 2;
++
+             uint32_t reqSampleRate = track->mServerProxy->getSampleRate();
++#ifdef USE_INTEL_SRC
++            if (!AudioResamplerIA::sampleRateSupported(mSampleRate, reqSampleRate)) {
++                //TODO
++                ALOGW("[INTEL RESAMPLER] unsupported SR");
++            }
++#endif
+             if (reqSampleRate == 0) {
+                 reqSampleRate = mSampleRate;
+             } else if (reqSampleRate > maxSampleRate) {
+@@ -4273,11 +4289,17 @@ bool AudioFlinger::RecordThread::checkForNewParameters_l()
+                 if (status == BAD_VALUE &&
+                     reqFormat == mInput->stream->common.get_format(&mInput->stream->common) &&
+                     reqFormat == AUDIO_FORMAT_PCM_16_BIT &&
++#ifdef USE_INTEL_SRC
++                    (AudioResamplerIA::sampleRateSupported(mSampleRate, mReqSampleRate)) &&
++                    (popcount(mInput->stream->common.get_channels(&mInput->stream->common)) < 3) &&
++                    (reqChannelCount < 3)) {
++#else
+                     (mInput->stream->common.get_sample_rate(&mInput->stream->common)
+                             <= (2 * reqSamplingRate)) &&
+-                    popcount(mInput->stream->common.get_channels(&mInput->stream->common))
+-                            <= FCC_2 &&
++                    (popcount(mInput->stream->common.get_channels(&mInput->stream->common))
++                            <= FCC_2) &&
+                     (reqChannelCount <= FCC_2)) {
++#endif
+                     status = NO_ERROR;
+                 }
+                 if (status == NO_ERROR) {
+@@ -4365,7 +4387,16 @@ void AudioFlinger::RecordThread::readInputParameters()
+         } else {
+             channelCount = 2;
+         }
++#ifdef USE_INTEL_SRC
++        if (AudioResamplerIA::sampleRateSupported(mSampleRate, mReqSampleRate)) {
++            mResampler = AudioResampler::create(16, channelCount,
++                             mReqSampleRate, AudioResampler::INTEL_HIGH_QUALITY);
++        } else {
++            mResampler = AudioResampler::create(16, channelCount, mReqSampleRate);
++        }
++#else
+         mResampler = AudioResampler::create(16, channelCount, mReqSampleRate);
++#endif
+         mResampler->setSampleRate(mSampleRate);
+         mResampler->setVolume(AudioMixer::UNITY_GAIN, AudioMixer::UNITY_GAIN);
+         mRsmpOutBuffer = new int32_t[mFrameCount * 2];
+-- 
+1.7.4.1
+

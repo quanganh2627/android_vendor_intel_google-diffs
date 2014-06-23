@@ -1,0 +1,394 @@
+From 2ea0b274018c07d49000399f7549fe3308c8d926 Mon Sep 17 00:00:00 2001
+From: Paul Naoumenko <paulx.naoumenko@intel.com>
+Date: Fri, 11 Oct 2013 18:20:44 +0200
+Subject: [PORT FROM MAIN] wifi/libwpa_client: Add a reference counter mechanism on control identifiers.
+
+BZ: 120207
+
+This library provides a wpa_ctrl pointer to third parties. This pointer
+is used as a context identifier. But third parties can use this library
+asynchronously. So, if a third party closes a ctrl which is already used
+by an other request (ex: wpa_ctrl_request), then this context will no longer
+be valid, leading to a crash (NULL pointer dereference).
+
+In order to avoid such issue, this patch implements an internal reference
+counter so that a ctrl interface can be freed only if its reference counter
+reaches 0. Moreover, if a third party tries to call a library function with
+an invalid context/pointer, this function will handle this issue by returning
+an error.
+
+This patch is a first step to make this library thread safe.
+
+Change-Id: I5c6817c13910ee6f3387feb19e7b919d14eb35b3
+Orig-Change-Id: Id7c07533c246dda304d55ebe38aed54a89744ce6
+Category: device enablement
+Domain: CWS.WIFI-Common
+Origin: upstream
+Upstream-Candidate: yes
+Signed-off-by: Loic Poulain <loicx.poulain@intel.com>
+---
+ src/common/wpa_ctrl.c     |  217 ++++++++++++++++++++++++++++++++++++++++++---
+ wpa_supplicant/Android.mk |    1 +
+ 2 files changed, 207 insertions(+), 11 deletions(-)
+
+diff --git a/src/common/wpa_ctrl.c b/src/common/wpa_ctrl.c
+index 83788d7..822a91d 100644
+--- a/src/common/wpa_ctrl.c
++++ b/src/common/wpa_ctrl.c
+@@ -1,6 +1,9 @@
+ /*
+  * wpa_supplicant/hostapd control interface library
+  * Copyright (c) 2004-2007, Jouni Malinen <j@w1.fi>
++ * Copyright (c) 2013, Quentin Casasnovas <quentinx.casasnovas@intel.com>
++ *                     Jean-Michel Bachot <jean-michel.bachot@intel.com>
++ *                     Loic Poulain <loicx.poulain@intel.com>
+  *
+  * This software may be distributed under the terms of the BSD license.
+  * See README for more details.
+@@ -25,6 +28,11 @@
+ #include "private/android_filesystem_config.h"
+ #endif /* ANDROID */
+ 
++#ifdef CONFIG_CTRL_REF_COUNT
++#include <pthread.h>
++#include "utils/list.h"
++#endif /* CONFIG_CTRL_REF_COUNT */
++
+ #include "wpa_ctrl.h"
+ #include "common.h"
+ 
+@@ -62,6 +70,103 @@ struct wpa_ctrl {
+ #endif /* CONFIG_CTRL_IFACE_NAMED_PIPE */
+ };
+ 
++#ifdef CONFIG_CTRL_REF_COUNT
++/**
++ * struct wpa_ctrl_meta - Internal meta data associated with a wpa_ctrl
++ */
++struct wpa_ctrl_meta {
++	struct wpa_ctrl *ctrl; /* identifier to associated wpa_ctrl */
++	struct dl_list list;
++	int ref; /* reference counter on wpa_ctrl */
++};
++
++/* Internal protected list of wpa_ctrl_meta */
++static struct dl_list wpa_ctrl_list;
++static pthread_mutex_t list_mutex = PTHREAD_MUTEX_INITIALIZER;
++
++/* Return the meta data associated with a wpa_ctrl, or NULL if unavailable */
++static struct wpa_ctrl_meta * ctrl_to_meta(struct wpa_ctrl *ctrl)
++{
++	struct wpa_ctrl_meta *meta;
++
++	dl_list_for_each(meta, &wpa_ctrl_list, struct wpa_ctrl_meta, list) {
++		if (meta->ctrl == ctrl)
++			return meta;
++	}
++
++	return NULL;
++}
++
++/* Initialize the meta data of the wpa_ctrl and take take reference */
++static int wpa_ctrl_init_meta(struct wpa_ctrl *ctrl)
++{
++	struct wpa_ctrl_meta *meta = os_malloc(sizeof(struct wpa_ctrl_meta));
++
++	if (!meta)
++		return -ENOMEM;
++
++	pthread_mutex_lock(&list_mutex);
++
++	if (!wpa_ctrl_list.next)
++		dl_list_init(&wpa_ctrl_list);
++
++	meta->ctrl = ctrl;
++	meta->ref = 1;
++
++	dl_list_add(&wpa_ctrl_list, &meta->list);
++
++	pthread_mutex_unlock(&list_mutex);
++
++	return 0;
++}
++
++/* Increment the wpa_ctrl reference counter, return 0 on success, -1 on error */
++static int wpa_ctrl_get(struct wpa_ctrl *ctrl)
++{
++	struct wpa_ctrl_meta *meta;
++	int res = 0;
++
++	pthread_mutex_lock(&list_mutex);
++	meta = ctrl_to_meta(ctrl);
++	if (meta)
++		meta->ref++;
++	else
++		res = -1;
++	pthread_mutex_unlock(&list_mutex);
++
++	return res;
++}
++
++/* Release the wpa_ctrl resources */
++static void wpa_ctrl_release(struct wpa_ctrl *ctrl);
++
++/* Decrement the wpa_ctrl reference counter, return 0 on success, -1 on error */
++static int wpa_ctrl_put(struct wpa_ctrl *ctrl)
++{
++	struct wpa_ctrl_meta *meta;
++	int res = 0;
++
++	pthread_mutex_lock(&list_mutex);
++	meta = ctrl_to_meta(ctrl);
++	if (meta) {
++		meta->ref--;
++		if (!meta->ref) {
++			dl_list_del(&meta->list);
++			os_free(meta);
++			wpa_ctrl_release(ctrl);
++		}
++	} else {
++		res = -1;
++	}
++	pthread_mutex_unlock(&list_mutex);
++
++	return res;
++}
++#else /* CONFIG_CTRL_REF_COUNT */
++static int wpa_ctrl_init_meta(struct wpa_ctrl *ctrl) {return 0;}
++static int wpa_ctrl_get(struct wpa_ctrl *ctrl) {return 0;}
++static int wpa_ctrl_put(struct wpa_ctrl *ctrl) {return 0;}
++#endif /* CONFIG_CTRL_REF_COUNT */
+ 
+ #ifdef CONFIG_CTRL_IFACE_UNIX
+ 
+@@ -126,6 +231,13 @@ try_again:
+ 		return NULL;
+ 	}
+ 
++	if (wpa_ctrl_init_meta(ctrl)) {
++		close(ctrl->s);
++		unlink(ctrl->local.sun_path);
++		os_free(ctrl);
++		return NULL;
++	}
++
+ #ifdef ANDROID
+ 	chmod(ctrl->local.sun_path, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+ 	chown(ctrl->local.sun_path, AID_SYSTEM, AID_WIFI);
+@@ -206,8 +318,10 @@ try_again:
+ 
+ void wpa_ctrl_close(struct wpa_ctrl *ctrl)
+ {
+-	if (ctrl == NULL)
+-		return;
++	wpa_ctrl_put(ctrl);
++#ifdef CONFIG_CTRL_REF_COUNT
++} void wpa_ctrl_release(struct wpa_ctrl *ctrl) {
++#endif /* CONFIG_CTRL_REF_COUNT */
+ 	unlink(ctrl->local.sun_path);
+ 	if (ctrl->s >= 0)
+ 		close(ctrl->s);
+@@ -339,6 +453,13 @@ struct wpa_ctrl * wpa_ctrl_open(const char *ctrl_path)
+ 		ctrl->remote_ip = os_strdup("localhost");
+ #endif /* CONFIG_CTRL_IFACE_UDP_REMOTE */
+ 
++	if (wpa_ctrl_init_meta(ctrl)) {
++		close(ctrl->s);
++		os_free(ctrl->remote_ip);
++		os_free(ctrl);
++		return NULL;
++	}
++
+ 	if (connect(ctrl->s, (struct sockaddr *) &ctrl->dest,
+ 		    sizeof(ctrl->dest)) < 0) {
+ 		perror("connect");
+@@ -367,14 +488,25 @@ char * wpa_ctrl_get_remote_ifname(struct wpa_ctrl *ctrl)
+ {
+ #define WPA_CTRL_MAX_PS_NAME 100
+ 	static char ps[WPA_CTRL_MAX_PS_NAME] = {};
++
++	if (wpa_ctrl_get(ctrl))
++		return NULL;
++
+ 	os_snprintf(ps, WPA_CTRL_MAX_PS_NAME, "%s/%s",
+ 		    ctrl->remote_ip, ctrl->remote_ifname);
++
++	wpa_ctrl_put(ctrl);
++
+ 	return ps;
+ }
+ 
+ 
+ void wpa_ctrl_close(struct wpa_ctrl *ctrl)
+ {
++	wpa_ctrl_put(ctrl);
++#ifdef CONFIG_CTRL_REF_COUNT
++} void wpa_ctrl_release(struct wpa_ctrl *ctrl) {
++#endif /* CONFIG_CTRL_REF_COUNT */
+ 	close(ctrl->s);
+ 	os_free(ctrl->cookie);
+ 	os_free(ctrl->remote_ifname);
+@@ -398,13 +530,16 @@ int wpa_ctrl_request(struct wpa_ctrl *ctrl, const char *cmd, size_t cmd_len,
+ 	char *cmd_buf = NULL;
+ 	size_t _cmd_len;
+ 
++	if (wpa_ctrl_get(ctrl))
++		return -EEXIST;
++
+ #ifdef CONFIG_CTRL_IFACE_UDP
+ 	if (ctrl->cookie) {
+ 		char *pos;
+ 		_cmd_len = os_strlen(ctrl->cookie) + 1 + cmd_len;
+ 		cmd_buf = os_malloc(_cmd_len);
+ 		if (cmd_buf == NULL)
+-			return -1;
++			goto error;
+ 		_cmd = cmd_buf;
+ 		pos = cmd_buf;
+ 		os_strlcpy(pos, ctrl->cookie, _cmd_len);
+@@ -443,7 +578,7 @@ retry_send:
+ 		}
+ 	send_err:
+ 		os_free(cmd_buf);
+-		return -1;
++		goto error;
+ 	}
+ 	os_free(cmd_buf);
+ 
+@@ -454,11 +589,11 @@ retry_send:
+ 		FD_SET(ctrl->s, &rfds);
+ 		res = select(ctrl->s + 1, &rfds, NULL, NULL, &tv);
+ 		if (res < 0)
+-			return res;
++			goto exit;
+ 		if (FD_ISSET(ctrl->s, &rfds)) {
+ 			res = recv(ctrl->s, reply, *reply_len, 0);
+ 			if (res < 0)
+-				return res;
++				goto exit;
+ 			if (res > 0 && reply[0] == '<') {
+ 				/* This is an unsolicited message from
+ 				 * wpa_supplicant, not the reply to the
+@@ -477,10 +612,24 @@ retry_send:
+ 			*reply_len = res;
+ 			break;
+ 		} else {
+-			return -2;
++			goto timeout;
+ 		}
+ 	}
+-	return 0;
++
++	res = 0;
++	goto exit;
++
++error:
++	res = -1;
++	goto exit;
++
++timeout:
++	res = -2;
++
++exit:
++	wpa_ctrl_put(ctrl);
++
++	return res;
+ }
+ #endif /* CTRL_IFACE_SOCKET */
+ 
+@@ -518,11 +667,38 @@ int wpa_ctrl_detach(struct wpa_ctrl *ctrl)
+ int wpa_ctrl_recv(struct wpa_ctrl *ctrl, char *reply, size_t *reply_len)
+ {
+ 	int res;
++	fd_set rfds;
++	struct timeval tv;
++
++
++	for (;;) {
++		if (wpa_ctrl_get(ctrl))
++			return -EEXIST;
++
++		tv.tv_sec = 10;
++		tv.tv_usec = 0;
++
++		FD_ZERO(&rfds);
++		FD_SET(ctrl->s, &rfds);
++
++		if ((res = select(ctrl->s + 1, &rfds, NULL, NULL, &tv)) == -1) {
++			wpa_ctrl_put(ctrl);
++			break;
++		}
++
++		if (FD_ISSET(ctrl->s, &rfds)) {
++			res = recv(ctrl->s, reply, *reply_len, 0);
++			wpa_ctrl_put(ctrl);
++			break;
++		}
++
++		wpa_ctrl_put(ctrl);
++	}
+ 
+-	res = recv(ctrl->s, reply, *reply_len, 0);
+ 	if (res < 0)
+ 		return res;
+ 	*reply_len = res;
++
+ 	return 0;
+ }
+ 
+@@ -530,19 +706,38 @@ int wpa_ctrl_recv(struct wpa_ctrl *ctrl, char *reply, size_t *reply_len)
+ int wpa_ctrl_pending(struct wpa_ctrl *ctrl)
+ {
+ 	struct timeval tv;
++	int res;
++
+ 	fd_set rfds;
+ 	tv.tv_sec = 0;
+ 	tv.tv_usec = 0;
+ 	FD_ZERO(&rfds);
++
++	if (wpa_ctrl_get(ctrl))
++		return -EEXIST;
++
+ 	FD_SET(ctrl->s, &rfds);
+ 	select(ctrl->s + 1, &rfds, NULL, NULL, &tv);
+-	return FD_ISSET(ctrl->s, &rfds);
++	res = FD_ISSET(ctrl->s, &rfds);
++
++	wpa_ctrl_put(ctrl);
++
++	return res;
+ }
+ 
+ 
+ int wpa_ctrl_get_fd(struct wpa_ctrl *ctrl)
+ {
+-	return ctrl->s;
++	int fd;
++
++	if (wpa_ctrl_get(ctrl))
++		return -EEXIST;
++
++	fd = ctrl->s;
++
++	wpa_ctrl_put(ctrl);
++
++	return fd;
+ }
+ 
+ #endif /* CTRL_IFACE_SOCKET */
+diff --git a/wpa_supplicant/Android.mk b/wpa_supplicant/Android.mk
+index 5303a43..b8e90d2 100644
+--- a/wpa_supplicant/Android.mk
++++ b/wpa_supplicant/Android.mk
+@@ -1604,6 +1604,7 @@ include $(BUILD_EXECUTABLE)
+ 
+ include $(CLEAR_VARS)
+ LOCAL_MODULE = libwpa_client
++L_CFLAGS += -DCONFIG_CTRL_REF_COUNT
+ LOCAL_CFLAGS = $(L_CFLAGS)
+ LOCAL_SRC_FILES = src/common/wpa_ctrl.c src/utils/os_$(CONFIG_OS).c
+ LOCAL_C_INCLUDES = $(INCLUDES)
+-- 
+1.7.4.1
+

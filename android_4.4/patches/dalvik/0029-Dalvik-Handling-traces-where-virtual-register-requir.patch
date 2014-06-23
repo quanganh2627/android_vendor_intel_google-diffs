@@ -1,0 +1,196 @@
+From d11eeb4002f2ce474e454ad489aaa7ccaf2c2c4a Mon Sep 17 00:00:00 2001
+From: Qiming Shi <qiming.shi@intel.com>
+Date: Sat, 1 Jun 2013 14:46:55 +0800
+Subject: Dalvik: Handling traces where virtual register requirements of a bytecode exceeds allowed limit
+
+BZ: 63968
+
+The maximum number of virtual registers a bytecode can use is set using
+MAX_REG_PER_BYTECODE. Opcodes invoke-virtual/range, invoke-super/range,
+invoke-direct/range, invoke-static/range, invoke-interface/range can
+request for more virtual registers than the allowed limit and a proper
+bounds check is not being performed to reject this bytecode in JIT, thus
+resulting in a crash.
+
+In this patch, we add rejection of these bytecodes into
+dvmIsOpcodeSupportedByJit as a special case when requesting Virtual
+Registers exceeding MAX_REG_PER_BYTECODE.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Ifb55fc2d22247944260c59e649bd08dd9d12306e
+Orig-MCG-Change-Id: Id9f68dbbffc89064735d6cc376541a832a67dd3a
+Signed-off-by: Bijoy Jose <bijoy.a.jose@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/Compiler.h                       |    2 +-
+ vm/compiler/Frontend.cpp                     |   54 ++++++++++++++++++++++++++
+ vm/compiler/codegen/x86/CodegenInterface.cpp |   43 ++++++++++++++++++++-
+ 3 files changed, 97 insertions(+), 2 deletions(-)
+
+diff --git a/vm/compiler/Compiler.h b/vm/compiler/Compiler.h
+index 2c84d8a..6e70378 100644
+--- a/vm/compiler/Compiler.h
++++ b/vm/compiler/Compiler.h
+@@ -262,6 +262,6 @@ u8 dvmGetRegResourceMask(int reg);
+ void dvmDumpCFG(struct CompilationUnit *cUnit, const char *dirPrefix, const char *suffix="");
+ void dvmCompilerDumpBasicBlocks (CompilationUnit *cUnit, const char *dirPrefix, const char *suffix = "");
+ 
+-bool dvmIsOpcodeSupportedByJit(Opcode opcode);
++bool dvmIsOpcodeSupportedByJit(const DecodedInstruction & insn);
+ 
+ #endif  // DALVIK_VM_COMPILER_H_
+diff --git a/vm/compiler/Frontend.cpp b/vm/compiler/Frontend.cpp
+index 52a3dad..089c8a8 100644
+--- a/vm/compiler/Frontend.cpp
++++ b/vm/compiler/Frontend.cpp
+@@ -1733,6 +1733,21 @@ static bool compileLoop(CompilationUnit *cUnit, unsigned int startOffset,
+         changed = exhaustTrace(cUnit, curBlock);
+     } while (changed);
+ 
++#ifdef BYTECODE_FILTER
++    GrowableListIterator iterator;
++    MIR *insn;
++    dvmGrowableListIteratorInit(&cUnit->blockList, &iterator);
++    while (true) {
++        BasicBlock *bbscan = (BasicBlock *) dvmGrowableListIteratorNext(&iterator);
++        if (bbscan == NULL) break;
++        if (bbscan->blockType == kDalvikByteCode) {
++            for (insn = bbscan->firstMIRInsn; insn; insn = insn->next)
++                if (!dvmIsOpcodeSupportedByJit(insn->dalvikInsn))
++                    goto bail;
++        }
++    }
++#endif
++
+     /* Backward chaining block */
+     bb = dvmCompilerNewBB(kChainingCellBackwardBranch, cUnit->numBlocks++);
+     dvmInsertGrowableList(&cUnit->blockList, (intptr_t) bb);
+@@ -2049,6 +2064,45 @@ bool dvmCompileTrace(JitTraceDescription *desc, int numMaxInsts,
+     curBB->fallThrough = entryCodeBB;
+     curBB = entryCodeBB;
+ 
++#ifdef BYTECODE_FILTER
++// disable certain bytecodes
++    while (1) {
++        DecodedInstruction insn;
++        int width = parseInsn(codePtr, &insn, false);
++        if (!dvmIsOpcodeSupportedByJit(insn)) {
++            return false;
++        }
++
++        assert(width);
++        if (--numInsts == 0) {
++            if (currRun->info.frag.runEnd) {
++                break;
++            } else {
++                /* Advance to the next trace description (ie non-meta info) */
++                do {
++                    currRun++;
++                } while (!currRun->isCode);
++
++                /* Dummy end-of-run marker seen */
++                if (currRun->info.frag.numInsts == 0) {
++                    break;
++                }
++
++                curOffset = currRun->info.frag.startOffset;
++                numInsts = currRun->info.frag.numInsts;
++                codePtr = dexCode->insns + curOffset;
++            }
++        } else {
++            curOffset += width;
++            codePtr += width;
++        }
++    }
++    currRun = &desc->trace[0];
++    curOffset = currRun->info.frag.startOffset;
++    numInsts = currRun->info.frag.numInsts;
++    codePtr = dexCode->insns + curOffset;
++#endif
++
+     if (cUnit.printMe) {
+         ALOGD("--------\nCompiler: Building trace for %s, offset %#x",
+              desc->method->name, curOffset);
+diff --git a/vm/compiler/codegen/x86/CodegenInterface.cpp b/vm/compiler/codegen/x86/CodegenInterface.cpp
+index 2934907..8266434 100644
+--- a/vm/compiler/codegen/x86/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/CodegenInterface.cpp
+@@ -28,13 +28,21 @@
+ #include <cutils/properties.h>
+ #endif
+ 
++/* JIT opcode filtering */
++bool jitOpcodeTable[kNumPackedOpcodes];
++Opcode jitNotSupportedOpcode[] = {
++    OP_INVOKE_OBJECT_INIT_RANGE,
++};
++
+ /* Init values when a predicted chain is initially assembled */
+ /* E7FE is branch to self */
+ #define PREDICTED_CHAIN_BX_PAIR_INIT     0xe7fe
+ 
++#if defined(WITH_JIT)
+ /* Target-specific save/restore */
+ extern "C" void dvmJitCalleeSave(double *saveArea);
+ extern "C" void dvmJitCalleeRestore(double *saveArea);
++#endif
+ 
+ /*
+  * Determine the initial instruction set to be used for this trace.
+@@ -54,7 +62,37 @@ JitInstructionSetType dvmCompilerGetInterpretTemplateSet()
+ /* we don't use template for IA32 */
+ void *dvmCompilerGetInterpretTemplate()
+ {
+-      return NULL;
++      return NULL;//(void*) ((int)gDvmJit.codeCache);
++}
++
++/* Initialize the jitOpcodeTable which records what opcodes are supported
++ *  by the JIT compiler.
++ */
++void dvmInitJitOpcodeTable() {
++    unsigned int i;
++    memset(jitOpcodeTable, 1, sizeof(jitOpcodeTable));
++    for (i = 0; i < sizeof(jitNotSupportedOpcode)/sizeof(Opcode); i++) {
++        jitOpcodeTable[((unsigned int)jitNotSupportedOpcode[i])] = false;
++    }
++    for (i = 0; i < sizeof(jitOpcodeTable)/sizeof(bool); i++) {
++        if (jitOpcodeTable[i] == false)
++            LOGV("opcode 0x%x not supported by JIT", i);
++    }
++}
++
++/* Return true if the opcode is supported by the JIT compiler. */
++bool dvmIsOpcodeSupportedByJit(const DecodedInstruction & insn)
++{
++     /* reject traces containing bytecodes requesting virtual registers exceeding allowed limit */
++     if ((insn.opcode == OP_INVOKE_VIRTUAL_RANGE) || (insn.opcode == OP_INVOKE_VIRTUAL_QUICK_RANGE) ||
++         (insn.opcode == OP_INVOKE_SUPER_RANGE) || (insn.opcode == OP_INVOKE_SUPER_QUICK_RANGE) ||
++         (insn.opcode == OP_INVOKE_DIRECT_RANGE) || (insn.opcode == OP_INVOKE_STATIC_RANGE) ||
++         (insn.opcode == OP_INVOKE_INTERFACE_RANGE)){
++        int opcodeArgs = (int) (insn.vA);
++        if (opcodeArgs > MAX_REG_PER_BYTECODE)
++           return false;
++     }
++    return jitOpcodeTable[((int) insn.opcode)];
+ }
+ 
+ /* Track the number of times that the code cache is patched */
+@@ -152,6 +190,9 @@ bool dvmCompilerArchInit() {
+     // Make sure all threads have current values
+     dvmJitUpdateThreadStateAll();
+ 
++    /* Initialize jitOpcodeTable for JIT supported opcode */
++    dvmInitJitOpcodeTable();
++
+     return true;
+ }
+ 
+-- 
+1.7.4.1
+

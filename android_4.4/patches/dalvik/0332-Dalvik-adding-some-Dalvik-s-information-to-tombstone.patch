@@ -1,0 +1,1489 @@
+From d8868458dc71ea25b51bac3322e188b5a213e659 Mon Sep 17 00:00:00 2001
+From: vladimir.a.ivanov <vladimir.a.ivanov@intel.com>
+Date: Fri, 12 Jul 2013 17:39:37 +0700
+Subject: Dalvik: adding some Dalvik's information to tombstones
+
+BZ: 123221
+
+The code from this library should work during tombstone generation.
+One part of code should work from the dalvk's signal handler to collect
+information and store it to the special shared memory buffer.
+The second part of code works as part of debuggerd server. It read memory
+buffer through the ptrace API and store data to tombstone file.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I0d3bfd2bbc7c71551ac109bd77f1d380808e84c6
+Orig-MCG-Change-Id: Ica8f5b121aac5cd46fc67660f88067a45c7e8ea6
+Signed-off-by: vladimir.a.ivanov <vladimir.a.ivanov@intel.com>
+Reviewed-on: http://android.intel.com:8080/118451
+Reviewed-by: Beyler, Jean Christophe <jean.christophe.beyler@intel.com>
+Reviewed-by: Zavjalov, Alexei <alexei.zavjalov@intel.com>
+Reviewed-by: lab_aqa <lab_aqa@intel.com>
+Reviewed-by: Popov, Ivan G <ivan.g.popov@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: Lupusoru, Razvan A <razvan.a.lupusoru@intel.com>
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ Android.mk                |    1 +
+ libcrash/Android.mk       |   48 +++++++
+ libcrash/CompilerInfo.cpp |   35 +++++
+ libcrash/CompilerInfo.h   |   31 +++++
+ libcrash/CrashHandler.cpp |  105 +++++++++++++++
+ libcrash/CrashHandler.h   |   34 +++++
+ libcrash/DbgBridge.cpp    |  171 +++++++++++++++++++++++++
+ libcrash/DbgBridge.h      |   34 +++++
+ libcrash/DbgBuff.cpp      |  245 +++++++++++++++++++++++++++++++++++
+ libcrash/DbgBuff.h        |   78 ++++++++++++
+ libcrash/HeapInfo.cpp     |   38 ++++++
+ libcrash/HeapInfo.h       |   31 +++++
+ libcrash/README.txt       |   41 ++++++
+ libcrash/ThreadInfo.cpp   |  308 +++++++++++++++++++++++++++++++++++++++++++++
+ libcrash/ThreadInfo.h     |   39 ++++++
+ vm/Android.mk             |    4 +
+ vm/Globals.h              |    5 +
+ vm/Init.cpp               |   36 ++++++
+ 18 files changed, 1284 insertions(+), 0 deletions(-)
+ create mode 100644 libcrash/Android.mk
+ create mode 100644 libcrash/CompilerInfo.cpp
+ create mode 100644 libcrash/CompilerInfo.h
+ create mode 100644 libcrash/CrashHandler.cpp
+ create mode 100644 libcrash/CrashHandler.h
+ create mode 100644 libcrash/DbgBridge.cpp
+ create mode 100644 libcrash/DbgBridge.h
+ create mode 100644 libcrash/DbgBuff.cpp
+ create mode 100644 libcrash/DbgBuff.h
+ create mode 100644 libcrash/HeapInfo.cpp
+ create mode 100644 libcrash/HeapInfo.h
+ create mode 100644 libcrash/README.txt
+ create mode 100644 libcrash/ThreadInfo.cpp
+ create mode 100644 libcrash/ThreadInfo.h
+
+diff --git a/Android.mk b/Android.mk
+index 0fa8745..e474671 100644
+--- a/Android.mk
++++ b/Android.mk
+@@ -68,6 +68,7 @@ subdirs := $(addprefix $(LOCAL_PATH)/,$(addsuffix /Android.mk, \
+ 		dx \
+ 		tools \
+ 		unit-tests \
++		libcrash \
+ 	))
+ 
+ ifeq ($(WITH_JIT),true)
+diff --git a/libcrash/Android.mk b/libcrash/Android.mk
+new file mode 100644
+index 0000000..c64a021
+--- /dev/null
++++ b/libcrash/Android.mk
+@@ -0,0 +1,48 @@
++# Copyright (C) 2013 The Android Open Source Project
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++LOCAL_PATH:= $(call my-dir)
++
++include $(CLEAR_VARS)
++
++ifeq ($(TARGET_CPU_SMP),true)
++    LOCAL_CFLAGS += -DANDROID_SMP=1
++else
++    LOCAL_CFLAGS += -DANDROID_SMP=0
++endif
++
++########################################################################
++# this library works as part of dvm. synchronizing options with Dvm.mk
++########################################################################
++include dalvik/vm/Dvm.mk
++
++LOCAL_MODULE    := libcrash
++
++LOCAL_SRC_FILES := \
++    DbgBridge.cpp \
++    DbgBuff.cpp \
++    CrashHandler.cpp \
++    HeapInfo.cpp \
++    CompilerInfo.cpp \
++    ThreadInfo.cpp
++
++LOCAL_SHARED_LIBRARIES += libstlport libdvm liblog libcutils libcorkscrew
++
++LOCAL_C_INCLUDES += \
++    dalvik/vm/interp \
++    external/stlport/stlport \
++    bionic \
++    bionic/libstdc++/include
++
++include $(BUILD_SHARED_LIBRARY)
+diff --git a/libcrash/CompilerInfo.cpp b/libcrash/CompilerInfo.cpp
+new file mode 100644
+index 0000000..7d2f0e7
+--- /dev/null
++++ b/libcrash/CompilerInfo.cpp
+@@ -0,0 +1,35 @@
++/*
++**
++** Copyright 2013, Intel Corporation
++**
++** Licensed under the Apache License, Version 2.0 (the "License");
++** you may not use this file except in compliance with the License.
++** You may obtain a copy of the License at
++**
++**     http://www.apache.org/licenses/LICENSE-2.0
++**
++** Unless required by applicable law or agreed to in writing, software
++** distributed under the License is distributed on an "AS IS" BASIS,
++** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++** See the License for the specific language governing permissions and
++** limitations under the License.
++**
++*/
++
++#include "Dalvik.h"
++#include "Jit.h"
++#include "CompilerInfo.h"
++
++void dvmDumpCompilerInfo(ts_buf *buff)
++{
++#if !defined(WITH_JIT)
++    writeDebugMessage(buff, "\tJIT compiler is not enabled\n");
++#else
++    /* based on vm\compiler\Utility.cpp:dvmCompilerDumpStats() */
++    writeDebugMessage(buff, "\tmemory usage %d bytes\n", gDvmJit.codeCacheByteUsed);
++
++    writeDebugMessage(buff, "\twork queue length is %d/%d\n",
++        gDvmJit.compilerQueueLength, gDvmJit.compilerMaxQueued);
++#endif
++}
++
+diff --git a/libcrash/CompilerInfo.h b/libcrash/CompilerInfo.h
+new file mode 100644
+index 0000000..c152064
+--- /dev/null
++++ b/libcrash/CompilerInfo.h
+@@ -0,0 +1,31 @@
++/*
++**
++** Copyright 2013, Intel Corporation
++**
++** Licensed under the Apache License, Version 2.0 (the "License");
++** you may not use this file except in compliance with the License.
++** You may obtain a copy of the License at
++**
++**     http://www.apache.org/licenses/LICENSE-2.0
++**
++** Unless required by applicable law or agreed to in writing, software
++** distributed under the License is distributed on an "AS IS" BASIS,
++** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++** See the License for the specific language governing permissions and
++** limitations under the License.
++**
++*/
++
++#ifndef CRASH_HANDLER_COMPILER_H_
++#define CRASH_HANDLER_COMPILER_H_
++
++#include "DbgBuff.h"
++
++/*
++ * @brief Dump information about compiler
++ * @param buff pointer to the structure that describes buffer
++ */
++void dvmDumpCompilerInfo(ts_buf* buff);
++
++#endif
++
+diff --git a/libcrash/CrashHandler.cpp b/libcrash/CrashHandler.cpp
+new file mode 100644
+index 0000000..eedbc75
+--- /dev/null
++++ b/libcrash/CrashHandler.cpp
+@@ -0,0 +1,105 @@
++/*
++**
++** Copyright 2013, Intel Corporation
++**
++** Licensed under the Apache License, Version 2.0 (the "License");
++** you may not use this file except in compliance with the License.
++** You may obtain a copy of the License at
++**
++**     http://www.apache.org/licenses/LICENSE-2.0
++**
++** Unless required by applicable law or agreed to in writing, software
++** distributed under the License is distributed on an "AS IS" BASIS,
++** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++** See the License for the specific language governing permissions and
++** limitations under the License.
++**
++*/
++
++#include "Dalvik.h"
++#include "DbgBuff.h"
++#include "HeapInfo.h"
++#include "CompilerInfo.h"
++#include "ThreadInfo.h"
++
++/* List of supported signals */
++#define FATAL_SIGNALS {SIGSEGV, SIGILL, SIGABRT, SIGBUS, SIGIOT, SIGFPE, SIGPIPE}
++
++/*
++ * @brief VM signal handler
++ * @details Signal handler allows to collect an additional information
++ * about current DVM state after crash is happend. After collecting info
++ * function will raised signal to the saved signal handler.
++ * @param signum signal number
++ * @param info signal info
++ * @param ctx saved context of the crashed thread
++ */
++static void handleDvmCrash(int signum, siginfo_t *info, void *ctx)
++{
++    int fatalSignalsList[] = FATAL_SIGNALS;
++
++    ts_buf *buff = getDumpBuff();
++
++    UNUSED_PARAMETER(ctx);
++    UNUSED_PARAMETER(info);
++
++    /* Return old signal handler to avoid reenterability */
++    for (int i = 0; i < NELEM(fatalSignalsList); i++) {
++        sigaction(fatalSignalsList[i], &gDvm.gOldSigAction, NULL);
++    }
++
++    Thread *currentThread = dvmThreadSelf();
++
++    /*
++     * TODO
++     * the method to stop all threads except current one to decrease possible
++     * consequences should be called here. But for now we don't know reliable
++     * mechanism to do it.
++     */
++
++    writeDebugMessage(buff, "\nJava frames:\n");
++    dvmDumpThreadStack(buff, currentThread);
++
++    writeDebugMessage(buff, "\nThreads:\n");
++    dvmDumpThreadList(buff);
++
++    writeDebugMessage(buff, "\nHeap information:\n");
++    dvmDumpHeapInfo(buff);
++
++    writeDebugMessage(buff, "\nCompiler information:\n");
++    dvmDumpCompilerInfo(buff);
++
++    kill(getpid(), signum);
++}
++
++extern "C" void configureSignalsHandler(void)
++{
++    int fatalSignalsList[] = FATAL_SIGNALS;
++
++    ts_buf *buff = getDumpBuff();
++
++    if (buff == 0) {
++        return;
++    }
++
++    static char stack[SIGSTKSZ];
++    stack_t ss;
++    ss.ss_size = SIGSTKSZ;
++    ss.ss_sp = stack;
++    ss.ss_flags = 0;
++
++    struct sigaction sa;
++    sa.sa_sigaction = handleDvmCrash;
++    sa.sa_flags = SA_ONSTACK | SA_SIGINFO;
++
++    sigaltstack(&ss, 0);
++
++    /* Save old signals handler function */
++    sigaction(fatalSignalsList[0], NULL, &gDvm.gOldSigAction);
++
++    /* Install our signals handler */
++    for (int i = 0; i < NELEM(fatalSignalsList); i++) {
++        sigaction(fatalSignalsList[i], &sa, NULL);
++    }
++}
++
+diff --git a/libcrash/CrashHandler.h b/libcrash/CrashHandler.h
+new file mode 100644
+index 0000000..9c325f2
+--- /dev/null
++++ b/libcrash/CrashHandler.h
+@@ -0,0 +1,34 @@
++/*
++**
++** Copyright 2013, Intel Corporation
++**
++** Licensed under the Apache License, Version 2.0 (the "License");
++** you may not use this file except in compliance with the License.
++** You may obtain a copy of the License at
++**
++**     http://www.apache.org/licenses/LICENSE-2.0
++**
++** Unless required by applicable law or agreed to in writing, software
++** distributed under the License is distributed on an "AS IS" BASIS,
++** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++** See the License for the specific language governing permissions and
++** limitations under the License.
++**
++*/
++
++#ifndef CRASH_HANDLER_H_
++#define CRASH_HANDLER_H_
++
++/*
++ * @brief Setup VM signal handler
++ * @details Configure VM signal handler to catch
++ * failure signals before system handler. This is
++ * required to collect additional information to
++ * a tombstone file after a crash happend. Also
++ * this function save the system sig handler
++ * to make it possible to raise signal after the fall.
++ */
++extern "C" void configureSignalsHandler(void);
++
++#endif
++
+diff --git a/libcrash/DbgBridge.cpp b/libcrash/DbgBridge.cpp
+new file mode 100644
+index 0000000..3592581
+--- /dev/null
++++ b/libcrash/DbgBridge.cpp
+@@ -0,0 +1,171 @@
++/*
++**
++** Copyright 2013, Intel Corporation
++**
++** Licensed under the Apache License, Version 2.0 (the "License");
++** you may not use this file except in compliance with the License.
++** You may obtain a copy of the License at
++**
++**     http://www.apache.org/licenses/LICENSE-2.0
++**
++** Unless required by applicable law or agreed to in writing, software
++** distributed under the License is distributed on an "AS IS" BASIS,
++** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++** See the License for the specific language governing permissions and
++** limitations under the License.
++**
++*/
++
++#include <stdio.h>
++#include <stdarg.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <sys/types.h>
++#include <sys/ptrace.h>
++#include <cutils/properties.h>
++
++#include "DbgBridge.h"
++#include "DbgBuff.h"
++
++#define MAX_SIZE_PROPERTY_NAME "system.debug.data.size"
++#define MAX_PRINT_STR_SIZE 1024
++
++/*
++ * @brief Writes the formatted string to tombstone file
++ * @details formatted string is printed to limited size buffer by vsnprintf(...)
++ * Please, refer to documentation for this method for detailed format description.
++ * While internal buffer has limited size output message may be truncated.
++ * @param log pointer to the structure that describes logger
++ * @param inTombstoneOnly true if information should be duplicated to stdout
++ * @param fmt format of message
++ */
++static void logToTombstone(log_t *log, bool inTombstoneOnly, const char *fmt, ...)
++{
++    va_list ap;
++    va_start(ap, fmt);
++
++    /* Formatting output string according required format.
++     * The output string size is limited by buffer size.
++     * Than formatted string is stored to tombstone file.
++     */
++    if (log != 0 && log->tfd >= 0) {
++        char buff[MAX_PRINT_STR_SIZE];
++        memset(buff, 0, sizeof(buff));
++        int len = vsnprintf(buff, sizeof(buff), fmt, ap);
++        if (len > 0) {
++            write(log->tfd, buff, len);
++            fsync(log->tfd);
++        }
++    }
++
++    if (inTombstoneOnly == false && (log != 0 || log->quiet == false)) {
++        vprintf(fmt, ap);
++    }
++
++    va_end(ap);
++}
++
++/*
++ * @brief Writes the provided data to tombstone file 'as is'
++ * @param log pointer to the structure that describes logger
++ * @param data pointer to the data
++ * @param len size of data block to write
++ */
++static void logToTombstoneRaw(log_t *log, char *data, int len)
++{
++    if (log != 0 && log->tfd >= 0 && data != 0 && len > 0) {
++        write(log->tfd, data, len);
++        fsync(log->tfd);
++    }
++}
++
++/*
++ * @brief read system property and return value as maximum size of output data
++ * @return maximum size of output data or ULONG_MAX if no limits defined
++ */
++static unsigned long getSystemAllowedSize(void)
++{
++    /* Used to get global properties */
++    char propertyBuffer[PROPERTY_VALUE_MAX];
++    memset(propertyBuffer, 0, sizeof(propertyBuffer));
++
++    property_get(MAX_SIZE_PROPERTY_NAME, propertyBuffer, 0);
++
++    if (propertyBuffer[0] != 0) {
++        long maxVal = strtol(propertyBuffer, 0, 0);
++        if (maxVal > 0) {
++             return maxVal;
++        }
++    }
++
++    return ULONG_MAX; // unlimited
++}
++
++/*
++ * @brief Writes the data from buffer to tombstone file
++ * @param log pointer to the structure that describes logger
++ * @param tid thread id
++ * @param atFault
++ */
++static void dumpBuffer(log_t *log, pid_t tid, bool atFault)
++{
++    // size of stored data can be limited by system property
++    unsigned long maxAllowedSize = getSystemAllowedSize();
++    char *buff = 0;
++    unsigned long readCount;
++
++    if (maxAllowedSize != ULONG_MAX) {
++        logToTombstone(log, atFault == false, "process's specific data might be truncated according to system settings\n");
++    }
++
++    readCount = readDebugData(tid, &buff, maxAllowedSize);
++
++    if (buff == 0) {
++        logToTombstone(log, atFault == false, "process does not support collection of specific data for tombstones\n");
++        return;
++    }
++
++    if (readCount == 0) {
++        logToTombstone(log, atFault == false, "process does not provide any specific data to store in tombstones\n");
++        return;
++    }
++
++    logToTombstoneRaw(log, buff, readCount);
++
++    free(buff), buff = 0;
++}
++
++/*
++ * @brief Writes the thread information to tombstone file
++ * @param log pointer to the structure that describes logger
++ * @param tid thread id
++ * @param atFault
++ */
++static void dumpThreadInfo(log_t* log, pid_t tid, bool atFault)
++{
++    char path[64];
++    char threadnamebuf[MAX_PRINT_STR_SIZE];
++    char *threadname = 0;
++    FILE *fp;
++
++    snprintf(path, sizeof(path), "/proc/%d/comm", tid);
++    if ((fp = fopen(path, "r"))) {
++        threadname = fgets(threadnamebuf, sizeof(threadnamebuf), fp);
++        fclose(fp), fp = 0;
++        if (threadname != 0) {
++            size_t len = strlen(threadname);
++            if (len != 0 && threadname[len - 1] == '\n') {
++                threadname[len - 1] = '\0';
++            }
++        }
++    }
++    logToTombstone(log, atFault == false, "processing specific data for tid = %d, threadname = %s\n", tid, threadname);
++}
++
++extern "C" void dump_ps_data(log_t *log, pid_t tid, bool atFault)
++{
++    dumpThreadInfo(log, tid, atFault);
++    dumpBuffer(log, tid, atFault);
++}
++
+diff --git a/libcrash/DbgBridge.h b/libcrash/DbgBridge.h
+new file mode 100644
+index 0000000..c6d0dc2
+--- /dev/null
++++ b/libcrash/DbgBridge.h
+@@ -0,0 +1,34 @@
++/*
++**
++** Copyright 2013, Intel Corporation
++**
++** Licensed under the Apache License, Version 2.0 (the "License");
++** you may not use this file except in compliance with the License.
++** You may obtain a copy of the License at
++**
++**     http://www.apache.org/licenses/LICENSE-2.0
++**
++** Unless required by applicable law or agreed to in writing, software
++** distributed under the License is distributed on an "AS IS" BASIS,
++** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++** See the License for the specific language governing permissions and
++** limitations under the License.
++**
++*/
++
++#ifndef CRASH_HANDLER_BRIDGE_H_
++#define CRASH_HANDLER_BRIDGE_H_
++
++#include <sys/types.h>
++#include "../../../system/core/debuggerd/utility.h"
++
++/*
++ * @brief Dump the Dalvik VM's specific information to the tombstone file
++ * @param log pointer to the tombstone file descriptor
++ * @param tid thread ID
++ * @param atFault
++ */
++extern "C" void dump_ps_data(log_t* log, pid_t tid, bool atFault);
++
++#endif
++
+diff --git a/libcrash/DbgBuff.cpp b/libcrash/DbgBuff.cpp
+new file mode 100644
+index 0000000..465faae
+--- /dev/null
++++ b/libcrash/DbgBuff.cpp
+@@ -0,0 +1,245 @@
++/*
++**
++** Copyright 2013, Intel Corporation
++**
++** Licensed under the Apache License, Version 2.0 (the "License");
++** you may not use this file except in compliance with the License.
++** You may obtain a copy of the License at
++**
++**     http://www.apache.org/licenses/LICENSE-2.0
++**
++** Unless required by applicable law or agreed to in writing, software
++** distributed under the License is distributed on an "AS IS" BASIS,
++** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++** See the License for the specific language governing permissions and
++** limitations under the License.
++**
++*/
++
++#include <string>
++#include <sys/types.h>
++#include <sys/ptrace.h>
++#include <sys/mman.h>
++#include <corkscrew/map_info.h>
++
++#include "Dalvik.h"
++#include "DbgBuff.h"
++
++/* 40K for output data is a balance between buffer size and provided information */
++#define CRASH_BUFFER_SZ 40960
++#define CRASH_BUFFER_NAME "dalvik-dump-buffer"
++/* ascii symbols 'MAGK' */
++#define CRASH_BUFFER_MAGIC 0x4D41474B
++
++/**
++ * @class ts_buf
++ * @brief Structure holds start and end pointers to an memory area
++ */
++struct module_addr_t {
++    /** @brief module's start address */
++    char* start;
++    /** @brief module's end address */
++    char* end;
++};
++
++static void initDumpHeap(ts_buf **buff)
++{
++    *buff = static_cast<ts_buf *>(dvmAllocRegion(CRASH_BUFFER_SZ,
++        PROT_READ | PROT_WRITE, CRASH_BUFFER_NAME));
++
++    if (*buff == 0) {
++        ALOGE("Unable to attach shared buffer");
++        return;
++    }
++
++    (*buff)->magic = CRASH_BUFFER_MAGIC;
++    (*buff)->size = CRASH_BUFFER_SZ - sizeof(ts_buf);
++    (*buff)->offset = 0;
++}
++
++ts_buf *getDumpBuff(void)
++{
++    static ts_buf *buff = 0;
++
++    if (buff == 0) {
++        initDumpHeap(&buff);
++    }
++
++    return buff;
++}
++
++
++void writeDebugMessage(ts_buf *buff, const char *format, ...)
++{
++    int bytesWritten;
++
++    if (buff == 0) {
++        return;
++    }
++
++    va_list args;
++    va_start(args, format);
++
++    bytesWritten = vsnprintf(buff->data + buff->offset, buff->size - buff->offset, format, args);
++
++    if (bytesWritten > 0) {
++        buff->offset += bytesWritten;
++    }
++
++    va_end(args);
++}
++
++long writeDebugData(ts_buf *buff, char *msg, long cnt)
++{
++    if (buff == 0 || buff->offset > buff->size || msg == 0 || cnt <= 0) {
++        return 0;
++    }
++
++    if (buff->offset + cnt >= buff->size) {
++        cnt = buff->size - buff->offset;
++    }
++
++    memcpy(buff->data + buff->offset, msg, cnt);
++
++    buff->offset += cnt;
++
++    return cnt;
++}
++
++/*
++ * @brief find start/end addresses of module with specified name
++ * @param memList list of modules in the memory
++ * @param name module name to find
++ * @param addr structure to hold start/end addresses
++ * @return address of module's start or NULL if no module in memory
++ */
++static char *findSharedMemByName(map_info_t *memList, char *name, module_addr_t *addr)
++{
++    if (memList == 0 || name == 0) {
++        return 0;
++    }
++
++    while (memList != 0) {
++        if (memList->name != 0
++            && strlen(memList->name) >= strlen(name)
++            && strstr(memList->name, name) != 0)
++        {
++            addr->start = reinterpret_cast<char *>(memList->start);
++            addr->end   = reinterpret_cast<char *>(memList->end);
++            return reinterpret_cast<char *>(memList->start);
++        }
++        memList = memList->next;
++    }
++
++    return 0;
++}
++
++/*
++ * @brief find the address of buffer with crash information in process address space
++ * @param tid thread id
++ * @param size pointer to store buffer's size according to mapping information
++ * @return pointer to the buffer or NULL if no buffer found
++ */
++static void *getDumpBuffPtrByTid(pid_t tid, long *size)
++{
++    map_info_t *memList;
++    void *buffPtr;
++    module_addr_t addr;
++
++    addr.start = 0;
++    addr.end = 0;
++
++    /* Find the pointer to memory area allocated by the crashed process */
++    memList = load_map_info_list(tid);
++    buffPtr = findSharedMemByName(memList, (char *)CRASH_BUFFER_NAME, &addr);
++
++    if (buffPtr == 0) {
++        return 0;
++    }
++
++    *size = addr.end - addr.start;
++
++    if (*size <= 0) {
++        return 0;
++    }
++
++    /* Check the magic number */
++    unsigned long magic = ptrace(PTRACE_PEEKTEXT, tid, (void *)(buffPtr), 0);
++
++    if (magic != CRASH_BUFFER_MAGIC) {
++        return 0;
++    }
++
++    free_map_info_list(memList), memList = 0;
++
++    return buffPtr;
++}
++
++unsigned long readDebugData(pid_t tid, char **out_dest, unsigned long num)
++{
++    ts_buf buff;
++    long memSize = 0;
++    char *buffPtr;
++
++    if (num == 0) {
++        return 0;
++    }
++
++    char *dest = 0;
++
++    buffPtr = reinterpret_cast<char *>(getDumpBuffPtrByTid(tid, &memSize));
++
++    if (buffPtr == 0) {
++        return 0;
++    }
++
++    /* Read and set all the fields of the ts_buf struct */
++    buff.magic = ptrace(PTRACE_PEEKTEXT, tid, (void *)(buffPtr), 0);
++    buff.size = ptrace(PTRACE_PEEKTEXT, tid, (void *)(buffPtr + 4), 0);
++    buff.offset = ptrace(PTRACE_PEEKTEXT, tid, (void *)(buffPtr + 8), 0);
++
++    if (buff.offset > buff.size ||
++        buff.size > (unsigned long)memSize)
++    {
++        return 0;
++    }
++
++    unsigned long cnt = num & 0xfffffffc; //align it to 4 bytes
++
++    if (buff.offset < cnt) {
++        cnt = buff.offset & 0xfffffffc;
++    }
++
++    /* Allocate the output buffer */
++    dest = static_cast<char *>(malloc(cnt));
++
++    if (dest == 0) {
++        return 0;
++    }
++
++    memset(dest, 0, cnt);
++
++    long *out = reinterpret_cast<long *>(dest);
++    long *endPtr = out + (cnt / sizeof(long));
++    char *targetDataPtr = buffPtr + 12;
++
++    /* Copy data from the buffer to the dest using ptrace */
++    while (out < endPtr) {
++        errno = 0;
++
++        long data = ptrace(PTRACE_PEEKTEXT, tid, targetDataPtr, 0);
++
++        if (errno != 0) {
++            free(dest), dest = 0;
++            return 0;
++        }
++
++        *out = data;
++        targetDataPtr += sizeof(long);
++        out++;
++    }
++    *out_dest = dest;
++
++    return cnt;
++}
++
+diff --git a/libcrash/DbgBuff.h b/libcrash/DbgBuff.h
+new file mode 100644
+index 0000000..8f2c846
+--- /dev/null
++++ b/libcrash/DbgBuff.h
+@@ -0,0 +1,78 @@
++/*
++**
++** Copyright 2013, Intel Corporation
++**
++** Licensed under the Apache License, Version 2.0 (the "License");
++** you may not use this file except in compliance with the License.
++** You may obtain a copy of the License at
++**
++**     http://www.apache.org/licenses/LICENSE-2.0
++**
++** Unless required by applicable law or agreed to in writing, software
++** distributed under the License is distributed on an "AS IS" BASIS,
++** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++** See the License for the specific language governing permissions and
++** limitations under the License.
++**
++*/
++
++#ifndef CRASH_HANDLER_BUF_H_
++#define CRASH_HANDLER_BUF_H_
++
++#include <sys/types.h>
++
++/**
++ * @class ts_buf
++ * @brief This structure holds a pointer to a data which will contain additional information about current DVM state.
++ */
++struct ts_buf {
++    /** @brief used to validate the buffer setted up correctly */
++    unsigned long magic;
++
++    /** @brief size of the allocated buffer */
++    unsigned long size;
++
++    /** @brief current position in the buffer to write */
++    unsigned long offset;
++
++    /** @brief pointer to the buffer content */
++    char data[];
++};
++
++/*
++ * @brief Get a pointer to a dump buffer
++ * @details On the first call this fuction will allocate mem
++ * and store the pointer to it on stack.
++ * @return returns pointer to an allocated buffer
++ */
++ts_buf *getDumpBuff(void);
++
++/*
++ * @brief Writes the C string pointed by format to the buffer
++ * @param buff pointer to the structure that describes buffer
++ * @param format the C string specifying how to interpret the data passed in additional arguments
++ * @param ... additional arguments
++ * @return returns number of characters written successful or 0 if an error occured
++ */
++void writeDebugMessage(ts_buf *buff, const char *format, ...);
++
++/*
++ * @brief Copy pointed bytes to a tail of buffer
++ * @param buff pointer to the structure that describes buffer
++ * @param msg pointer to the C string to write to the buffer
++ * @param cnt size of the passed string
++ * @return returns number of characters written successful or 0 if an error occured
++ */
++long writeDebugData(ts_buf *buff, char *msg, long cnt);
++
++/*
++ * @brief Copy the data from the dump buffer to the necessary memory block
++ * @param pid the ID of the thread to specify the process where buffer is placed
++ * @param dest pointer to the memory area where the content is to be copied
++ * @param num number of bytes to copy
++ * @return returns number of characters was copied
++ */
++unsigned long readDebugData(pid_t tid, char **dest, unsigned long num);
++
++#endif
++
+diff --git a/libcrash/HeapInfo.cpp b/libcrash/HeapInfo.cpp
+new file mode 100644
+index 0000000..06a9e6a
+--- /dev/null
++++ b/libcrash/HeapInfo.cpp
+@@ -0,0 +1,38 @@
++/*
++**
++** Copyright 2013, Intel Corporation
++**
++** Licensed under the Apache License, Version 2.0 (the "License");
++** you may not use this file except in compliance with the License.
++** You may obtain a copy of the License at
++**
++**     http://www.apache.org/licenses/LICENSE-2.0
++**
++** Unless required by applicable law or agreed to in writing, software
++** distributed under the License is distributed on an "AS IS" BASIS,
++** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++** See the License for the specific language governing permissions and
++** limitations under the License.
++**
++*/
++
++#include "Dalvik.h"
++#include "HeapInfo.h"
++
++void dvmDumpHeapInfo(ts_buf *buff) {
++    int vHeapSize  = dvmGetHeapDebugInfo(kVirtualHeapSize);
++    int vHeapAlloc = dvmGetHeapDebugInfo(kVirtualHeapAllocated);
++    int vHeapMax   = dvmGetHeapDebugInfo(kVirtualHeapMaximumSize);
++    int nHeapSize  = dvmGetHeapDebugInfo(kNativeHeapSize);
++    int nHeapAlloc = dvmGetHeapDebugInfo(kNativeHeapAllocated);
++
++    writeDebugMessage(buff, "\tGC heap address: %p\n", gDvm.gcHeap);
++    writeDebugMessage(buff, "\theap max size:   %d (%dK)\n", vHeapMax, (vHeapMax / 1024));
++    writeDebugMessage(buff, "\theap size:       %d (%d%%)\n", vHeapSize, (vHeapSize / (vHeapMax / 100)));
++    writeDebugMessage(buff, "\theap allocated:  %d (%d%%)\n", vHeapAlloc, (vHeapAlloc / (vHeapMax / 100)));
++    if (nHeapSize != -1) { // current GC support this value
++        writeDebugMessage(buff, "\tnative heap size:       %d (%dK)\n", nHeapSize, (nHeapSize / 1024));
++        writeDebugMessage(buff, "\tnative heap allocated:  %d (%dK)\n", nHeapAlloc, (nHeapAlloc / 1024));
++    }
++}
++
+diff --git a/libcrash/HeapInfo.h b/libcrash/HeapInfo.h
+new file mode 100644
+index 0000000..21e92b2
+--- /dev/null
++++ b/libcrash/HeapInfo.h
+@@ -0,0 +1,31 @@
++/*
++**
++** Copyright 2013, Intel Corporation
++**
++** Licensed under the Apache License, Version 2.0 (the "License");
++** you may not use this file except in compliance with the License.
++** You may obtain a copy of the License at
++**
++**     http://www.apache.org/licenses/LICENSE-2.0
++**
++** Unless required by applicable law or agreed to in writing, software
++** distributed under the License is distributed on an "AS IS" BASIS,
++** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++** See the License for the specific language governing permissions and
++** limitations under the License.
++**
++*/
++
++#ifndef CRASH_HANDLER_HEAP_H_
++#define CRASH_HANDLER_HEAP_H_
++
++#include "DbgBuff.h"
++
++/*
++ * @brief Dump some info about current heap state
++ * @param buff pointer to the structure that describes output buffer
++ */
++void dvmDumpHeapInfo(ts_buf* buff);
++
++#endif
++
+diff --git a/libcrash/README.txt b/libcrash/README.txt
+new file mode 100644
+index 0000000..ddabbc1
+--- /dev/null
++++ b/libcrash/README.txt
+@@ -0,0 +1,41 @@
++This directory contains the library to work during tombstone generation.
++The code should works from the dalvik's signal handler to collect
++some information and stores it to the special shared memory buffer.
++The second part of code works as part of debuggerd server. It reads memory
++buffer through the ptrace API  and stores data to tombstone file.
++
++Two system properties were defined to control this process:
++system.debug.plugins - the name of the library where code for data collection
++                       and access is located
++system.debug.data.size - the size of data to store to tombstone file from
++                       target buffer.
++
++Additinonal information for dalvikvm process may looks like this one:
++==============
++dump_specific_ps_info: library name: libcrash.so
++processing specific data for tid = 2155, threadname = dalvikvm
++
++Java frames:
++  at Main.testcrash(Main.java:~33)
++  at Main.main(Main.java:17)
++  at dalvik.system.NativeStart.main(Native Method)
++
++Threads:
++0x8000a280 "main" "main"  2155 obj=0x409cbf80 (stack: 0xbffe0000)
++0x8002e300 "system" "Compiler"  daemon 2161 obj=0x409d6a60 (stack: 0x45981000)
++0x80026e50 "system" "Signal Catcher"  daemon 2160 obj=0x409d6950 (stack: 0x4587c000)
++0x800267d0 "system" "GC"  daemon 2159 obj=0x409d6850 (stack: 0x45777000)
++0x80026360 "system" "FinalizerWatchdogDaemon"  daemon 2158 obj=0x409d6620 (stack: 0x45677000)
++0x8002cc90 "system" "FinalizerDaemon"  daemon 2157 obj=0x409d6350 (stack: 0x45572000)
++0x80028070 "system" "ReferenceQueueDaemon"  daemon 2156 obj=0x409d6060 (stack: 0x4546d000)
++
++Heap information:
++    GC heap address: 0x80008100
++    heap max size:   16777216 (16384K)
++    heap size:       131072 (0%)
++    heap allocated:  121248 (0%)
++
++Compiler information:
++    memory usage 49696 bytes
++    work queue length is 0
++==============
+diff --git a/libcrash/ThreadInfo.cpp b/libcrash/ThreadInfo.cpp
+new file mode 100644
+index 0000000..bccd025
+--- /dev/null
++++ b/libcrash/ThreadInfo.cpp
+@@ -0,0 +1,308 @@
++/*
++**
++** Copyright 2013, Intel Corporation
++**
++** Licensed under the Apache License, Version 2.0 (the "License");
++** you may not use this file except in compliance with the License.
++** You may obtain a copy of the License at
++**
++**     http://www.apache.org/licenses/LICENSE-2.0
++**
++** Unless required by applicable law or agreed to in writing, software
++** distributed under the License is distributed on an "AS IS" BASIS,
++** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++** See the License for the specific language governing permissions and
++** limitations under the License.
++**
++*/
++
++#include "Dalvik.h"
++#include "ThreadInfo.h"
++
++/*
++ * @brief Extract the object that is the target of a monitor-enter instruction
++ * in the top stack frame of "thread".
++ * @details Note: the other thread might be alive, so this has to work carefully.
++ * The thread list lock must be held.
++ * @param thread pointer to the thread object
++ * @param pLockObj
++ * @param pOwner
++ * @return Returns "true" if we successfully recover the object.  "*pOwner" will
++ * be NULL if we can't determine the owner for some reason (e.g. race
++ * condition on ownership transfer).
++ */
++static bool extractMonitorEnterObject(Thread *thread, Object **pLockObj,
++    Thread **pOwner)
++{
++    u4 *framePtr = thread->interpSave.curFrame;
++
++    if (framePtr == 0 || dvmIsBreakFrame(framePtr) == true) {
++        return false;
++    }
++
++    const StackSaveArea *saveArea = SAVEAREA_FROM_FP(framePtr);
++    const Method *method = saveArea->method;
++    const u2 *currentPc = saveArea->xtra.currentPc;
++
++    /* check Method* */
++    if (dvmLinearAllocContains(method, sizeof(Method)) == false) {
++        return false;
++    }
++
++    /* check currentPc */
++    u4 insnsSize = dvmGetMethodInsnsSize(method);
++    if (currentPc < method->insns ||
++        currentPc >= method->insns + insnsSize)
++    {
++        return false;
++    }
++
++    /* check the instruction */
++    if ((*currentPc & 0xff) != OP_MONITOR_ENTER) {
++        return false;
++    }
++
++    /* get and check the register index */
++    unsigned int reg = *currentPc >> 8;
++    if (reg >= method->registersSize) {
++        return false;
++    }
++
++    /* get and check the object in that register */
++    Object *obj = (Object *)framePtr[reg];
++    if (obj != 0 && dvmIsHeapAddress(obj) == false) {
++        return false;
++    }
++    *pLockObj = obj;
++
++    /*
++     * Try to determine the object's lock holder; it's okay if this fails.
++     *
++     * We're assuming the thread list lock is already held by this thread.
++     * If it's not, we may be living dangerously if we have to scan through
++     * the thread list to find a match.  (The VM will generally be in a
++     * suspended state when executing here, so this is a minor concern
++     * unless we're dumping while threads are running, in which case there's
++     * a good chance of stuff blowing up anyway.)
++     */
++    *pOwner = dvmGetObjectLockHolder(obj);
++
++    return true;
++}
++
++/*
++ * @brief Dump stack frames, starting from the specified frame and moving down.
++ * @details Each frame holds a pointer to the currently executing method, and the
++ * saved program counter from the caller ("previous" frame).  This means
++ * we don't have the PC for the current method on the stack, which is
++ * pretty reasonable since it's in the "PC register" for the VM.  Because
++ * exceptions need to show the correct line number we actually *do* have
++ * an updated version in the fame's "xtra.currentPc", but it's unreliable.
++ * Note "framePtr" could be NULL in rare circumstances.
++ * @param buff pointer to the structure that describes output buffer
++ * @param framePtr pointer to the frame stack
++ * @param thread pointer to the thread object
++ */
++static void dumpFrames(ts_buf *buff, void *framePtr, Thread *thread)
++{
++    const StackSaveArea *saveArea;
++    const Method *method;
++    int checkCount = 0;
++    const u2 *currentPc = 0;
++    bool first = true;
++
++    /*
++     * The "currentPc" is updated whenever we execute an instruction that
++     * might throw an exception.  Show it here.
++     */
++    if (framePtr != 0 && dvmIsBreakFrame((u4 *)framePtr) == false) {
++        saveArea = SAVEAREA_FROM_FP(framePtr);
++
++        if (saveArea->xtra.currentPc != 0) {
++            currentPc = saveArea->xtra.currentPc;
++        }
++    }
++
++    while (framePtr != 0) {
++        saveArea = SAVEAREA_FROM_FP(framePtr);
++        method = saveArea->method;
++
++        if (dvmIsBreakFrame((u4 *)framePtr) == false) {
++            int relPc;
++
++            if (currentPc != 0) {
++                relPc = currentPc - saveArea->method->insns;
++            }
++            else {
++                relPc = -1;
++            }
++
++            std::string methodName(dvmHumanReadableMethod(method, false));
++            if (dvmIsNativeMethod(method) == true) {
++                writeDebugMessage(buff, "  at %s(Native Method)\n",
++                        methodName.c_str());
++            } else {
++                writeDebugMessage(buff, "  at %s(%s:%s%d)\n",
++                        methodName.c_str(), dvmGetMethodSourceFile(method),
++                        (relPc >= 0 && first) ? "~" : "",
++                        relPc < 0 ? -1 : dvmLineNumFromPC(method, relPc));
++            }
++
++            if (first == true) {
++                /*
++                 * Decorate WAIT and MONITOR threads with some detail on
++                 * the first frame.
++                 *
++                 * warning: wait status not stable, even in suspend
++                 */
++                if (thread->status == THREAD_WAIT ||
++                    thread->status == THREAD_TIMED_WAIT)
++                {
++                    Monitor *mon = thread->waitMonitor;
++                    Object *obj = dvmGetMonitorObject(mon);
++                    if (obj != 0) {
++                        Thread *joinThread = 0;
++                        if (obj->clazz == gDvm.classJavaLangVMThread) {
++                            joinThread = dvmGetThreadFromThreadObject(obj);
++                        }
++                        writeDebugMessage(buff, "on", obj, joinThread);
++                    }
++                } else if (thread->status == THREAD_MONITOR) {
++                    Object *obj;
++                    Thread *owner;
++                    if (extractMonitorEnterObject(thread, &obj, &owner) == true) {
++                        writeDebugMessage(buff, "to lock", obj, owner);
++                    }
++                }
++            }
++        }
++
++        /*
++         * Get saved PC for previous frame.  There's no savedPc in a "break"
++         * frame, because that represents native or interpreted code
++         * invoked by the VM.  The saved PC is sitting in the "PC register",
++         * a local variable on the native stack.
++         */
++        currentPc = saveArea->savedPc;
++
++        first = false;
++
++        if (saveArea->prevFrame != 0 && saveArea->prevFrame <= framePtr) {
++            writeDebugMessage(buff, "Warning: loop in stack trace at frame %d (%p -> %p)",
++                checkCount, framePtr, saveArea->prevFrame);
++            break;
++        }
++        framePtr = saveArea->prevFrame;
++
++        checkCount++;
++        if (checkCount > 300) {
++            writeDebugMessage(buff,
++                "  ***** printed %d frames, not showing any more\n",
++                checkCount);
++            break;
++        }
++    }
++}
++
++void dvmDumpThreadStack(ts_buf *buff, Thread *thread)
++{
++    dumpFrames(buff, thread->interpSave.curFrame, thread);
++}
++
++/*
++ * @brief Dump thread specific information
++ * @param buff pointer to the structure that describes output buffer
++ * @param thread pointer to the thread object
++ */
++static void dumpThreadInfo(ts_buf *buff, Thread *thread)
++{
++    Object *threadObj;
++    Object *groupObj;
++    StringObject *nameStr;
++    char *threadName = 0;
++    char *groupName = 0;
++    bool isDaemon;
++
++    /*
++     * Get the java.lang.Thread object.  This function gets called from
++     * some weird debug contexts, so it's possible that there's a GC in
++     * progress on some other thread.  To decrease the chances of the
++     * thread object being moved out from under us, we add the reference
++     * to the tracked allocation list, which pins it in place.
++     *
++     * If threadObj is 0, the thread is still in the process of being
++     * attached to the VM, and there's really nothing interesting to
++     * say about it yet.
++     */
++    threadObj = thread->threadObj;
++    if (threadObj == 0) {
++        return;
++    }
++
++    nameStr = (StringObject *) dvmGetFieldObject(threadObj,
++                gDvm.offJavaLangThread_name);
++    threadName = dvmCreateCstrFromString(nameStr);
++
++    isDaemon = dvmGetFieldBoolean(threadObj, gDvm.offJavaLangThread_daemon);
++
++    /* a null value for group is not expected, but deal with it anyway */
++    groupObj = (Object *) dvmGetFieldObject(threadObj,
++                gDvm.offJavaLangThread_group);
++
++    if (groupObj != 0) {
++        nameStr = (StringObject *)
++            dvmGetFieldObject(groupObj, gDvm.offJavaLangThreadGroup_name);
++        groupName = dvmCreateCstrFromString(nameStr);
++    }
++
++    if (groupName == 0) {
++        groupName = strdup("(null; initializing?)");
++    }
++
++    pthread_t handle = thread->handle;
++    size_t stack_size;
++    pthread_attr_t attr;
++    void *stack_addr;
++
++    pthread_getattr_np(handle, &attr);
++    pthread_attr_getstack(&attr, &stack_addr, &stack_size);
++
++    /*
++     *  self        group    name     daemon? sysid    obj              stack        JIT?
++     * 0x5e96d690 "system" "Compiler" daemon  tid=453 obj=0x42082050 (stack: 0x0000) JIT
++     */
++    writeDebugMessage(buff,
++        "%p \"%s\" \"%s\" %s %d obj=%p (stack: %p) %s\n",
++        thread,
++        groupName,
++        threadName,
++        isDaemon ? " daemon" : "",
++        thread->systemTid,
++        thread->threadObj,
++        stack_addr,
++#if defined(WITH_JIT)
++        thread->inJitCodeCache ? " JIT" : ""
++#else
++        ""
++#endif
++        );
++
++    free(threadName), threadName = 0;
++    free(groupName), groupName = 0;
++}
++
++void dvmDumpThreadList(ts_buf *buff)
++{
++    Thread *thread;
++
++    thread = gDvm.threadList;
++    while (thread != 0) {
++        dumpThreadInfo(buff, thread);
++
++        /* verify link */
++        assert(thread->next == 0 || thread->next->prev == thread);
++
++        thread = thread->next;
++    }
++}
++
+diff --git a/libcrash/ThreadInfo.h b/libcrash/ThreadInfo.h
+new file mode 100644
+index 0000000..d363c14
+--- /dev/null
++++ b/libcrash/ThreadInfo.h
+@@ -0,0 +1,39 @@
++/*
++**
++** Copyright 2013, Intel Corporation
++**
++** Licensed under the Apache License, Version 2.0 (the "License");
++** you may not use this file except in compliance with the License.
++** You may obtain a copy of the License at
++**
++**     http://www.apache.org/licenses/LICENSE-2.0
++**
++** Unless required by applicable law or agreed to in writing, software
++** distributed under the License is distributed on an "AS IS" BASIS,
++** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++** See the License for the specific language governing permissions and
++** limitations under the License.
++**
++*/
++
++#ifndef CRASH_HANDLER_THREADINFO_H_
++#define CRASH_HANDLER_THREADINFO_H_
++
++#include "Dalvik.h"
++#include "DbgBuff.h"
++
++/*
++ * @brief Dump the thread stack info into the specified buffer
++ * @param buff pointer to the structure that describes output buffer
++ * @param thread pointer to the thread object
++ */
++void dvmDumpThreadStack(ts_buf *buff, Thread *thread);
++
++/*
++ * @brief Dump information about all the threads were rinning in a process
++ * @param buff pointer to the structure that describes output buffer
++ */
++void dvmDumpThreadList(ts_buf *buff);
++
++#endif
++
+diff --git a/vm/Android.mk b/vm/Android.mk
+index 4883821..20bfeb0 100644
+--- a/vm/Android.mk
++++ b/vm/Android.mk
+@@ -64,6 +64,10 @@ ifeq ($(WITH_JIT),true)
+ endif
+ LOCAL_CFLAGS += $(target_smp_flag)
+ 
++ifeq ($(TARGET_ARCH),x86)
++  LOCAL_REQUIRED_MODULES += libcrash
++endif
++
+ # Define WITH_ADDRESS_SANITIZER to build an ASan-instrumented version of the
+ # library in /system/lib/asan/libdvm.so.
+ ifneq ($(strip $(WITH_ADDRESS_SANITIZER)),)
+diff --git a/vm/Globals.h b/vm/Globals.h
+index 7b3f4f2..928e0d8 100644
+--- a/vm/Globals.h
++++ b/vm/Globals.h
+@@ -733,6 +733,11 @@ struct DvmGlobals {
+ 
+     int kernelGroupScheduling;
+ 
++    /*
++    * Used to store a default VM signal handler
++    */
++    struct sigaction gOldSigAction;
++
+ //#define COUNT_PRECISE_METHODS
+ #ifdef COUNT_PRECISE_METHODS
+     PointerSet* preciseMethods;
+diff --git a/vm/Init.cpp b/vm/Init.cpp
+index 7bdbd2a..7b8073b 100644
+--- a/vm/Init.cpp
++++ b/vm/Init.cpp
+@@ -32,6 +32,11 @@
+ #ifdef HAVE_ANDROID_OS
+ #include <sys/prctl.h>
+ #endif
++#include <dlfcn.h>
++
++#ifdef HAVE_ANDROID_OS
++#include <cutils/properties.h>
++#endif
+ 
+ #include "Dalvik.h"
+ #include "test/Test.h"
+@@ -2010,6 +2015,37 @@ static void blockSignals()
+     cc = sigprocmask(SIG_BLOCK, &mask, NULL);
+     assert(cc == 0);
+ 
++#ifdef HAVE_ANDROID_OS
++    /* Read the system property that holds name of the helper library.
++     * Setup the special signal handler from the provided library.
++     */
++    char propertyBuffer[PROPERTY_VALUE_MAX];
++    memset(propertyBuffer, 0, sizeof(propertyBuffer)); // zero out buffer so we don't use junk
++    property_get("system.debug.plugins", propertyBuffer, NULL);
++    if (propertyBuffer[0] == 0) {
++        ALOGI("No library specified. The standard exception handler will be used");
++    } else {
++        typedef void (*configureSignalsHandlerFunc)(void);
++        void *handle = dlopen(propertyBuffer, RTLD_LAZY);
++        if (handle == 0) {
++            ALOGI("The library has not been opened. The standard exception handler will be used");
++        } else {
++            //reset error
++            dlerror();
++            configureSignalsHandlerFunc configureSignalsHandler =
++                (configureSignalsHandlerFunc)dlsym(handle, "configureSignalsHandler");
++            // check for error code of dlsym
++            const char *error = dlerror();
++            if (error != 0 || configureSignalsHandler == 0) {
++                ALOGE("Failed to find the special signal handler in provided library: %s. The standard one will be used.", error);
++                dlclose(handle), handle = 0;
++            } else {
++                configureSignalsHandler();
++            }
++        }
++    }
++#endif
++
+     if (false) {
+         /* TODO: save the old sigaction in a global */
+         struct sigaction sa;
+-- 
+1.7.4.1
+

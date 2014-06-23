@@ -1,0 +1,661 @@
+From 959c4594d307205f424a2fab213adc1f449ee536 Mon Sep 17 00:00:00 2001
+From: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Date: Wed, 17 Apr 2013 14:59:10 -0700
+Subject: Dalvik: canSpillReg Overflows
+
+BZ: 101442
+
+The array canSpillReg can overflow. The following patch creates a global
+container for the CompilationUnit's specific X86 elements and puts the array
+into it.
+
+Then, all accesses to it are guarded by functions to correctly ensure no
+future overflows will occur.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I051e5aba550b965a26b006dbfa7f2483bf8295bf
+Orig-MCG-Change-Id: Id9e7da600933dd4ac3fbca6583e25656de870473
+Signed-off-by: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/Dvm.mk                                    |    1 +
+ vm/compiler/codegen/x86/AnalysisO1.cpp       |   66 ++++++++--------
+ vm/compiler/codegen/x86/CodegenInterface.cpp |   15 +++-
+ vm/compiler/codegen/x86/CompilationUnit.cpp  |   45 +++++++++++
+ vm/compiler/codegen/x86/CompilationUnit.h    |   53 +++++++++++++
+ vm/compiler/codegen/x86/Lower.cpp            |    6 +-
+ vm/compiler/codegen/x86/Lower.h              |   17 +++-
+ vm/compiler/codegen/x86/LowerHelper.cpp      |  106 ++++++++++++++++++++------
+ 8 files changed, 242 insertions(+), 67 deletions(-)
+ create mode 100644 vm/compiler/codegen/x86/CompilationUnit.cpp
+ create mode 100644 vm/compiler/codegen/x86/CompilationUnit.h
+
+diff --git a/vm/Dvm.mk b/vm/Dvm.mk
+index 6003c11..508d292 100644
+--- a/vm/Dvm.mk
++++ b/vm/Dvm.mk
+@@ -343,6 +343,7 @@ ifeq ($(dvm_arch),x86)
+               compiler/codegen/$(dvm_arch_variant)/LowerJump.cpp \
+               compiler/codegen/$(dvm_arch_variant)/LowerObject.cpp \
+               compiler/codegen/$(dvm_arch_variant)/AnalysisO1.cpp \
++              compiler/codegen/$(dvm_arch_variant)/CompilationUnit.cpp \
+               compiler/codegen/$(dvm_arch_variant)/BytecodeVisitor.cpp \
+               compiler/codegen/$(dvm_arch_variant)/NcgAot.cpp \
+               compiler/codegen/$(dvm_arch_variant)/CodegenInterface.cpp \
+diff --git a/vm/compiler/codegen/x86/AnalysisO1.cpp b/vm/compiler/codegen/x86/AnalysisO1.cpp
+index 625a59e..84d04cc 100644
+--- a/vm/compiler/codegen/x86/AnalysisO1.cpp
++++ b/vm/compiler/codegen/x86/AnalysisO1.cpp
+@@ -18,6 +18,7 @@
+ /*! \file AnalysisO1.cpp
+   \brief This file implements register allocator, constant folding
+ */
++#include "CompilationUnit.h"
+ #include "libdex/DexOpcodes.h"
+ #include "libdex/DexFile.h"
+ #include "Lower.h"
+@@ -226,7 +227,6 @@ int num_bbs_for_method;
+ //! array of basic blocks in a method in program order
+ BasicBlock_O1* method_bbs_sorted[MAX_NUM_BBS_PER_METHOD];
+ 
+-bool canSpillReg[PhysicalReg_Null]; //physical registers that should not be spilled
+ int inGetVR_num = -1;
+ int inGetVR_type;
+ 
+@@ -3311,12 +3311,21 @@ PhysicalReg spillForLogicalReg(int type, int reg, int indexToCompileTable) {
+     int candidates[COMPILE_TABLE_SIZE];
+     int num_cand = 0;
+     for(k = 0; k < num_compile_entries; k++) {
+-        if(matchType(type, compileTable[k].physicalType) &&
+-           compileTable[k].physicalReg != PhysicalReg_Null) {
+-            if(is8Bit && compileTable[k].physicalReg > PhysicalReg_EDX) continue; //not a candidate
+-            if(!canSpillReg[compileTable[k].physicalReg]) continue; //not a candidate
+-            if((compileTable[k].physicalType & LowOpndRegType_hard) == 0 &&
+-               numOfUses[compileTable[k].physicalReg] <= 1) {
++        if(matchType(type, compileTable[k].physicalType) && compileTable[k].physicalReg != PhysicalReg_Null) {
++            //If we care about 8 bits, we can't have a register over EDX
++            if(is8Bit == true && compileTable[k].physicalReg > PhysicalReg_EDX)
++            {
++                continue;
++            }
++
++            //If we can spill it, ignore it
++            if(gCompilationUnit->getCanSpillRegister (compileTable[k].physicalReg) == false)
++            {
++                continue;
++            }
++
++            //If it isn't a hard register or it only a few uses left, it can be a candidate
++            if((compileTable[k].physicalType & LowOpndRegType_hard) == 0 && numOfUses[compileTable[k].physicalReg] <= 1) {
+                 candidates[num_cand++] = k;
+             }
+         }
+@@ -3406,15 +3415,19 @@ int spillLogicalReg(int spill_index, bool updateTable) {
+         //Error trickles down to dvmCompilerMIR2LIR, trace is rejected
+         return -1;
+     }
++
+     int physicalReg = compileTable[spill_index].physicalReg;
+-    if(!canSpillReg[physicalReg]) {
++
++#ifdef PRINT_WARNING
++    //If we can't spill it, print out a warning
++    if(gCompilationUnit->getCanSpillReg (physicalReg) == false) {
+         // This scenario can occur whenever a VR is allocated to the
+         // same physical register as a hardcoded temporary
+-#ifdef PRINT_WARNING
+         ALOGW("Shouldn't spill register %s but going to do it anyway.",
+                 physicalRegToString(static_cast<PhysicalReg>(physicalReg)));
+-#endif
+     }
++#endif
++
+     if(isVirtualReg(compileTable[spill_index].physicalType)) {
+         //spill back to memory
+         writeBackVR(compileTable[spill_index].regNum,
+@@ -4490,39 +4503,28 @@ int getSpillIndex(bool isGLUE, OpndSize size) {
+     SET_JIT_ERROR(kJitErrorRegAllocFailed);
+     return -1;
+ }
+-//!this is called before generating a native code, it sets entries in array canSpillReg to true
+ 
++//!this is called before generating a native code, it resets the spill information
+ //!startNativeCode must be paired with endNativeCode
+ void startNativeCode(int vr_num, int vr_type) {
+-    int k;
+-    for(k = 0; k < PhysicalReg_Null; k++) {
+-        canSpillReg[k] = true;
+-    }
++    //Reset the spilling information
++    gCompilationUnit->resetCanSpillRegisters ();
++
++    //Set the inGetVR_num and type now
+     inGetVR_num = vr_num;
+     inGetVR_type = vr_type;
+ }
++
+ //! called right after generating a native code
++//!It resets the spill information and resets inGetVR_num to -1
++void endNativeCode(void) {
++    //Reset the spilling information
++    gCompilationUnit->resetCanSpillRegisters ();
+ 
+-//!It sets entries in array canSpillReg to true and reset inGetVR_num to -1
+-void endNativeCode() {
+-    int k;
+-    for(k = 0; k < PhysicalReg_Null; k++) {
+-        canSpillReg[k] = true;
+-    }
++    //Reset the inGetVR_num now
+     inGetVR_num = -1;
+ }
+-//! set canSpillReg[physicalReg] to false
+-
+-//!
+-void donotSpillReg(int physicalReg) {
+-    canSpillReg[physicalReg] = false;
+-}
+-//! set canSpillReg[physicalReg] to true
+ 
+-//!
+-void doSpillReg(int physicalReg) {
+-    canSpillReg[physicalReg] = true;
+-}
+ //! touch hardcoded register %ecx and reduce its reference count
+ 
+ //!
+diff --git a/vm/compiler/codegen/x86/CodegenInterface.cpp b/vm/compiler/codegen/x86/CodegenInterface.cpp
+index 2038cc7..0e76ef0 100644
+--- a/vm/compiler/codegen/x86/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/CodegenInterface.cpp
+@@ -14,6 +14,7 @@
+  * limitations under the License.
+  */
+ #include <sys/mman.h>
++#include "CompilationUnit.h"
+ #include "Dalvik.h"
+ #include "libdex/DexOpcodes.h"
+ #include "compiler/Compiler.h"
+@@ -1857,7 +1858,7 @@ static bool generateCode (CompilationUnit *cUnit, BasicBlock *bb, BasicBlock **n
+ //!
+ //! \param cUnit: The current compilation unit
+ //! \param info: JitTranslationInfo. Holds generated code address on success
+-static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
++static void compilerMIR2LIRJit(CompilationUnit_O1 *cUnit, JitTranslationInfo *info)
+ {
+     //Used to determine whether we need a fallthrough jump
+     BasicBlock *nextFallThrough = 0;
+@@ -2287,6 +2288,14 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+ //! \param cUnit: The current compilation unit
+ //! \param info: JitTranslationInfo.
+ void dvmCompilerMIR2LIR(CompilationUnit *cUnit, JitTranslationInfo *info) {
++
++    //Make a x86 version of our CompilationUnit
++    CompilationUnit_O1 x86CUnit;
++
++    //Get a CompilationUnit of x86CUnit
++    CompilationUnit *child = &x86CUnit;
++    *child = *cUnit;
++
+    //Save the optimization state to restore it at the end of this compilation
+    SErrorCompilationState compilationState;
+    dvmSaveOptimizationState (compilationState);
+@@ -2309,11 +2318,11 @@ void dvmCompilerMIR2LIR(CompilationUnit *cUnit, JitTranslationInfo *info) {
+ 
+         //Do the trace compilation
+         numTries++;
+-        compilerMIR2LIRJit(cUnit, info);
++        compilerMIR2LIRJit(&x86CUnit, info);
+ 
+         //Once done, see if errors happened, and if so
+         //see if we can retry and come back
+-    } while (IS_ANY_JIT_ERROR_SET() && dvmCanFixErrorsAndRetry(cUnit));
++    } while (IS_ANY_JIT_ERROR_SET() && dvmCanFixErrorsAndRetry(&x86CUnit));
+ 
+    //Restore the compilation state
+    dvmRestoreCompilationState (compilationState);
+diff --git a/vm/compiler/codegen/x86/CompilationUnit.cpp b/vm/compiler/codegen/x86/CompilationUnit.cpp
+new file mode 100644
+index 0000000..5faea03
+--- /dev/null
++++ b/vm/compiler/codegen/x86/CompilationUnit.cpp
+@@ -0,0 +1,45 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "CompilationUnit.h"
++
++bool CompilationUnit_O1::getCanSpillRegister (int reg)
++{
++    //Check overflow first
++    if (reg < 0 || reg >= PhysicalReg_Null)
++    {
++        return false;
++    }
++
++    //Otherwise, use what is in the array
++    return canSpillRegister[reg];
++}
++
++bool CompilationUnit_O1::setCanSpillRegister (int reg, bool value)
++{
++    //Check overflow first
++    if (reg < 0 || reg >= PhysicalReg_Null)
++    {
++        //Cannot update it
++        return false;
++    }
++
++    //Otherwise, use what is in the array
++    canSpillRegister[reg] = value;
++
++    //Update succeeded
++    return true;
++}
+diff --git a/vm/compiler/codegen/x86/CompilationUnit.h b/vm/compiler/codegen/x86/CompilationUnit.h
+new file mode 100644
+index 0000000..6e93dc0
+--- /dev/null
++++ b/vm/compiler/codegen/x86/CompilationUnit.h
+@@ -0,0 +1,53 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef H_COMPILATIONUNIT
++#define H_COMPILATIONUNIT
++
++#include "Lower.h"
++#include "compiler/CompilerIR.h"
++
++class CompilationUnit_O1: public CompilationUnit
++{
++    protected:
++        /** @brief Physical registers that should not be spilled */
++        bool canSpillRegister[PhysicalReg_Null];
++
++    public:
++        /**
++         * @brief Can we spill a register?
++         * @param reg the register we care about
++         * @return true if reg can be spilled, false if outside of the range of the array or should not spill
++         */
++        bool getCanSpillRegister (int reg);
++
++        /**
++         * @brief Set whether we can spill a register? Does nothing if reg would overflow the array
++         * @param reg the register we care about
++         * @param value if we should spill or not
++         * @return whether the update was successful
++         */
++        bool setCanSpillRegister (int reg, bool value);
++
++        void resetCanSpillRegisters (void)
++        {
++            for(int k = 0; k < PhysicalReg_Null; k++) {
++                canSpillRegister[k] = true;
++            }
++        }
++};
++
++#endif
+diff --git a/vm/compiler/codegen/x86/Lower.cpp b/vm/compiler/codegen/x86/Lower.cpp
+index 2170ec3..2de13d4 100644
+--- a/vm/compiler/codegen/x86/Lower.cpp
++++ b/vm/compiler/codegen/x86/Lower.cpp
+@@ -20,7 +20,7 @@
+ 
+ */
+ 
+-//#include "uthash.h"
++#include "CompilationUnit.h"
+ #include "libdex/DexOpcodes.h"
+ #include "libdex/DexFile.h"
+ #include <math.h>
+@@ -60,7 +60,7 @@ Method* currentMethod = NULL;
+ int currentExceptionBlockIdx = -1;
+ BasicBlock* traceCurrentBB = NULL;
+ JitMode traceMode = kJitTrace;
+-CompilationUnit *gCompilationUnit;
++CompilationUnit_O1 *gCompilationUnit;
+ 
+ int common_invokeArgsDone(ArgsDoneType);
+ 
+@@ -458,7 +458,7 @@ void startOfBasicBlock(BasicBlock* bb) {
+ }
+ 
+ void startOfTrace(const Method* method, int exceptionBlockId,
+-                  CompilationUnit *cUnit) {
++                  CompilationUnit_O1 *cUnit) {
+ 
+     //Set the global compilation
+     gCompilationUnit = cUnit;
+diff --git a/vm/compiler/codegen/x86/Lower.h b/vm/compiler/codegen/x86/Lower.h
+index 5dc8df2..e59691c 100644
+--- a/vm/compiler/codegen/x86/Lower.h
++++ b/vm/compiler/codegen/x86/Lower.h
+@@ -618,7 +618,8 @@ extern int ncgClassNum;
+ extern int ncgMethodNum;
+ 
+ // Global pointer to the current CompilationUnit
+-extern CompilationUnit *gCompilationUnit;
++class CompilationUnit_O1;
++extern CompilationUnit_O1 *gCompilationUnit;
+ 
+ bool existATryBlock(Method* method, int startPC, int endPC);
+ // interface between register allocator & lowering
+@@ -671,10 +672,10 @@ void transferToState(int);
+ //Handle virtual register writebacks
+ int handleVRsEndOfBB(bool lastBytecodeIsJump);
+ 
++//Call to reset certain flags before generating native code
+ void startNativeCode(int num, int type);
+-void endNativeCode();
+-void donotSpillReg(int physicalReg);
+-void doSpillReg(int physicalReg);
++//Call to reset certain flags after generating native code
++void endNativeCode(void);
+ 
+ #define XMM_1 PhysicalReg_XMM0
+ #define XMM_2 PhysicalReg_XMM1
+@@ -1342,8 +1343,14 @@ bool lowerByteCodeJit(const Method* method, const MIR * mir, const u2 * dalvikPC
+ void startOfBasicBlock(struct BasicBlock* bb);
+ extern struct BasicBlock* traceCurrentBB;
+ extern JitMode traceMode;
+-void startOfTrace(const Method* method, int, CompilationUnit*);
++
++//Forward declaration
++class CompilationUnit_O1;
++//Start of a trace call to reset certain elements
++void startOfTrace(const Method* method, int, CompilationUnit_O1*);
++//End of a trace call to reset certain elements
+ void endOfTrace(bool freeOnly);
++
+ LowOp* jumpToBasicBlock(char* instAddr, int targetId, bool targetIsChainingCell = false);
+ LowOp* condJumpToBasicBlock(char* instAddr, ConditionCode cc, int targetId, bool immediateNeedsAligned = false);
+ bool jumpToException(const char* target);
+diff --git a/vm/compiler/codegen/x86/LowerHelper.cpp b/vm/compiler/codegen/x86/LowerHelper.cpp
+index a75d072..5bb10db 100644
+--- a/vm/compiler/codegen/x86/LowerHelper.cpp
++++ b/vm/compiler/codegen/x86/LowerHelper.cpp
+@@ -31,11 +31,12 @@ A single native instruction can use multiple physical registers.
+   we can't call freeReg in the middle of emitting a native instruction,
+   since it may free the physical register used by an operand and cause two operands being allocated to the same physical register.
+ 
+-When allocating a physical register for an operand, we can't spill the operands that are already allocated. To avoid that, we call startNativeCode before each native instruction, here flag "canSpill" is set to true for each physical register;
+-  when a physical register is allocated, we set its flag "canSpill" to false;
+-  at end of each native instruction, call endNativeCode to set flag "canSpill" to true.
++When allocating a physical register for an operand, we can't spill the operands that are already allocated. To avoid that, we call startNativeCode before each native instruction, it resets the spill information to true for each physical register;
++  when a physical register is allocated, we set its corresponding flag to false;
++  at end of each native instruction, call endNativeCode to also reset the flags to true.
+ */
+ 
++#include "CompilationUnit.h"
+ #include "libdex/DexOpcodes.h"
+ #include "libdex/DexFile.h"
+ #include "Lower.h"
+@@ -510,7 +511,9 @@ LowOpRegReg* dump_reg_reg_diff_types(Mnemonic m, AtomOpCode m2, OpndSize srcSize
+             regAll2 = registerAllocMove(regDest, destType, isDestPhysical, regAll, true);
+         } else {
+ #endif
+-        donotSpillReg(regAll);
++        //Do not spill regAll
++        gCompilationUnit->setCanSpillRegister (regAll, false);
++
+         regAll2 = registerAlloc(destType, destReg, isDestPhysical, true, true);
+ 
+         // NOTE: The use of (destSize, destType) as THE (size, type) can be confusing. In most
+@@ -633,7 +636,8 @@ LowOpMemReg* dump_mem_reg(Mnemonic m, AtomOpCode m2, OpndSize size, int disp,
+         if (isMoveOptimizable(m)) {
+             freeReg(false);
+         } else {
+-            donotSpillReg(baseAll);
++            //Do not spill baseAll
++            gCompilationUnit->setCanSpillRegister (baseAll, false);
+         }
+         int regAll = registerAlloc(type, reg, isPhysical, true, true);
+         endNativeCode();
+@@ -660,7 +664,10 @@ LowOpMemReg* dump_moves_mem_reg(Mnemonic m, OpndSize size,
+         startNativeCode(-1, -1);
+         freeReg(true);
+         int baseAll = registerAlloc(LowOpndRegType_gp, base_reg, isBasePhysical, true);
+-        donotSpillReg(baseAll);
++
++        //Do not spill baseAll
++        gCompilationUnit->setCanSpillRegister (baseAll, false);
++
+         int regAll = registerAlloc(LowOpndRegType_gp, reg, isPhysical, true);
+         endNativeCode();
+         return lower_mem_reg(m, ATOM_NORMAL, size, disp, baseAll, MemoryAccess_Unknown, -1,
+@@ -682,7 +689,10 @@ LowOpMemReg* dump_movez_mem_reg(Mnemonic m, OpndSize size, int disp,
+         freeReg(false);
+         int baseAll = registerAlloc(LowOpndRegType_gp, base_reg, isBasePhysical,
+                 true);
+-        donotSpillReg(baseAll);
++
++        //Do not spill baseAll
++        gCompilationUnit->setCanSpillRegister (baseAll, false);
++
+         int regAll = registerAlloc(LowOpndRegType_gp, reg, isPhysical, true, true);
+         endNativeCode();
+         return lower_mem_to_reg(m, ATOM_NORMAL, size, disp, baseAll,
+@@ -718,7 +728,10 @@ LowOpRegReg* dump_movez_reg_reg(Mnemonic m, OpndSize size,
+         //reg is source if m is MOV
+         freeReg(true);
+         int regAll = registerAlloc(LowOpndRegType_gp, reg, isPhysical, true);
+-        donotSpillReg(regAll);
++
++        //Do not spill regAll
++        gCompilationUnit->setCanSpillRegister (regAll, false);
++
+         int regAll2 = registerAlloc(LowOpndRegType_gp, reg2, isPhysical2, true);
+         stream = encoder_movez_reg_to_reg(size, regAll, true, regAll2, true,
+                                           LowOpndRegType_gp, stream);
+@@ -779,14 +792,20 @@ LowOpMemReg* dump_mem_scale_reg(Mnemonic m, OpndSize size, int base_reg,
+         freeReg(false);
+         int baseAll = registerAlloc(LowOpndRegType_gp, base_reg, isBasePhysical,
+                 true);
+-        donotSpillReg(baseAll); //make sure index will not use the same physical reg
++
++        //Do not spill baseAll
++        gCompilationUnit->setCanSpillRegister (baseAll, false);
++
+         int indexAll = registerAlloc(LowOpndRegType_gp, index_reg,
+                 isIndexPhysical, true);
+         if (isMoveOptimizable(m)) {
+             freeReg(false);
+-            doSpillReg(baseAll); //base can be used now
++
++            //We can now spill base
++            gCompilationUnit->setCanSpillRegister (baseAll, true);
+         } else {
+-            donotSpillReg(indexAll);
++            //Do not spill indexAll
++            gCompilationUnit->setCanSpillRegister (indexAll, false);
+         }
+         bool isMovzs = (m == Mnemonic_MOVZX || m == Mnemonic_MOVSX);
+         int regAll = registerAlloc(isMovzs ? LowOpndRegType_gp : type, reg,
+@@ -846,10 +865,16 @@ LowOpRegMem* dump_reg_mem_scale(Mnemonic m, OpndSize size, int reg,
+         freeReg(false);
+         int baseAll = registerAlloc(LowOpndRegType_gp, base_reg, isBasePhysical,
+                 true);
+-        donotSpillReg(baseAll);
++
++        //Do not spill baseAll
++        gCompilationUnit->setCanSpillRegister (baseAll, false);
++
+         int indexAll = registerAlloc(LowOpndRegType_gp, index_reg,
+                 isIndexPhysical, true);
+-        donotSpillReg(indexAll);
++
++        //Do not spill indexAll
++        gCompilationUnit->setCanSpillRegister (indexAll, false);
++
+         int regAll = registerAlloc(type, reg, isPhysical, true, true);
+         endNativeCode();
+         return lower_reg_to_mem_scale(m, size, regAll, true /*isPhysical*/,
+@@ -914,7 +939,10 @@ LowOpRegMem* dump_reg_mem(Mnemonic m, AtomOpCode m2, OpndSize size, int reg,
+         freeReg(false);
+         int baseAll = registerAlloc(LowOpndRegType_gp, base_reg, isBasePhysical,
+                 true);
+-        donotSpillReg(baseAll);
++
++        //Do not spill baseAll
++        gCompilationUnit->setCanSpillRegister (baseAll, false);
++
+         int regAll = registerAlloc(type, reg, isPhysical, true);
+         endNativeCode();
+         return lower_reg_to_mem(m, m2, size, regAll, true /*isPhysical*/, disp,
+@@ -1432,7 +1460,10 @@ void compare_VR_reg_all(OpndSize size,
+         int regAll = checkVirtualReg(vA, type, 0/*do not update*/);
+         if(regAll != PhysicalReg_Null) { //do not spill regAll when allocating register for dst
+             startNativeCode(-1, -1);
+-            donotSpillReg(regAll);
++
++            //Do not spill regAll
++            gCompilationUnit->setCanSpillRegister (regAll, false);
++
+             dump_reg_reg_noalloc_src(m, ATOM_NORMAL, size, regAll, true, reg, isPhysical, pType);
+             endNativeCode();
+         }
+@@ -2053,7 +2084,10 @@ void alu_sd_binary_VR_reg(ALU_Opcode opc, int vA, int reg, bool isPhysical, bool
+         if(regAll != PhysicalReg_Null) {
+             startNativeCode(-1, -1); //should we use vA, type
+             //CHECK: callupdateVRAtUse
+-            donotSpillReg(regAll);
++
++            //Do not spill regAll
++            gCompilationUnit->setCanSpillRegister (regAll, false);
++
+             dump_reg_reg_noalloc_src(m, ATOM_NORMAL_ALU, size, regAll, true, reg,
+                          isPhysical, LowOpndRegType_xmm);
+             endNativeCode();
+@@ -2134,7 +2168,10 @@ void alu_binary_VR_reg(OpndSize size, ALU_Opcode opc, int vA, int reg, bool isPh
+         int regAll = checkVirtualReg(vA, getTypeFromIntSize(size), 0);
+         if(regAll != PhysicalReg_Null) {
+             startNativeCode(-1, -1);
+-            donotSpillReg(regAll);
++
++            //Do not spill regAll
++            gCompilationUnit->setCanSpillRegister (regAll, false);
++
+             dump_reg_reg_noalloc_src(m, ATOM_NORMAL_ALU, size, regAll, true, reg,
+                          isPhysical, getTypeFromIntSize(size));
+             endNativeCode();
+@@ -2625,7 +2662,10 @@ void get_virtual_reg_all(int vR, OpndSize size, int reg, bool isPhysical, Mnemon
+         // register needs allocated for the temp
+         if(physRegForVR != PhysicalReg_Null) {
+             startNativeCode(vR, type);
+-            donotSpillReg(physRegForVR);
++
++            //Do not spill physRegForVR
++            gCompilationUnit->setCanSpillRegister (physRegForVR, false);
++
+             //check XFER_MEM_TO_XMM
+             updateVRAtUse(vR, type, physRegForVR);
+             //temporary reg has "pType"
+@@ -2661,7 +2701,10 @@ void get_virtual_reg_all(int vR, OpndSize size, int reg, bool isPhysical, Mnemon
+                 MemoryAccess_VR, vR, physRegForVR, true, pType);
+             //xmm with 32 bits
+             startNativeCode(vR, type);
+-            donotSpillReg(physRegForVR);
++
++            //Do not spill physRegForVR
++            gCompilationUnit->setCanSpillRegister (physRegForVR, false);
++
+             dump_reg_reg_noalloc_src(m2, ATOM_NORMAL, size2, physRegForVR, true, reg, isPhysical, pType);
+             endNativeCode();
+             updateRefCount(vR, type);
+@@ -2714,7 +2757,10 @@ void set_virtual_reg_all(int vA, OpndSize size, int reg, bool isPhysical, Mnemon
+         int regAll = checkVirtualReg(vA, type, 0);
+         if(regAll != PhysicalReg_Null)  { //case 1
+             startNativeCode(-1, -1);
+-            donotSpillReg(regAll);
++
++            //Do not spill regAll
++            gCompilationUnit->setCanSpillRegister (regAll, false);
++
+             dump_reg_reg_noalloc_dst(m2, size2, reg, isPhysical, regAll, true, pType); //temporary reg is "pType"
+             endNativeCode();
+             updateRefCount(vA, type);
+@@ -2736,7 +2782,10 @@ void set_virtual_reg_all(int vA, OpndSize size, int reg, bool isPhysical, Mnemon
+         }
+ 
+         startNativeCode(-1, -1);
+-        donotSpillReg(regAll);
++
++        //Do not spill regAll
++        gCompilationUnit->setCanSpillRegister (regAll, false);
++
+         dump_reg_reg_noalloc_dst(m2, size2, reg, isPhysical, regAll, true, pType);
+         endNativeCode();
+         updateRefCount(vA, type);
+@@ -2961,7 +3010,10 @@ int get_res_classes(int reg, bool isPhysical) {
+         startNativeCode(-1, -1);
+         freeReg(true);
+         int regAll = registerAlloc(LowOpndRegType_gp, PhysicalReg_GLUE_DVMDEX, false, false/*updateRefCount*/, true);
+-        donotSpillReg(regAll);
++
++        //Do not spill regAll
++        gCompilationUnit->setCanSpillRegister (regAll, false);
++
+         dump_mem_reg_noalloc_mem(Mnemonic_MOV, ATOM_NORMAL, OpndSize_32, OFFSETOF_MEMBER(DvmDex, pResClasses), regAll, true, MemoryAccess_Unknown, -1, reg, isPhysical, LowOpndRegType_gp);
+         endNativeCode();
+     }
+@@ -2990,7 +3042,10 @@ int get_res_methods(int reg, bool isPhysical) {
+         startNativeCode(-1, -1);
+         freeReg(true);
+         int regAll = registerAlloc(LowOpndRegType_gp, PhysicalReg_GLUE_DVMDEX, false, false/*updateRefCount*/, true);
+-        donotSpillReg(regAll);
++
++        //Do not spill regAll
++        gCompilationUnit->setCanSpillRegister (regAll, false);
++
+         dump_mem_reg_noalloc_mem(Mnemonic_MOV, ATOM_NORMAL, OpndSize_32, OFFSETOF_MEMBER(DvmDex, pResMethods), regAll, true, MemoryAccess_Unknown, -1, reg, isPhysical, LowOpndRegType_gp);
+         endNativeCode();
+     }
+@@ -3044,7 +3099,10 @@ int get_glue_dvmdex(int reg, bool isPhysical) {
+         startNativeCode(-1, -1);
+         freeReg(true);
+         int regAll = registerAlloc(LowOpndRegType_gp, PhysicalReg_GLUE_DVMDEX, false, false/*updateRefCount*/, true);
+-        donotSpillReg(regAll);
++
++        //Do not spill regAll
++        gCompilationUnit->setCanSpillRegister (regAll, false);
++
+         dump_reg_reg_noalloc_src(Mnemonic_MOV, ATOM_NORMAL, OpndSize_32, regAll, true,
+                                           reg, isPhysical, LowOpndRegType_gp);
+         endNativeCode();
+-- 
+1.7.4.1
+

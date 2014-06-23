@@ -1,0 +1,431 @@
+From c098ef47e70e69ec3ae097dcec9464458c4e3a7c Mon Sep 17 00:00:00 2001
+From: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Date: Wed, 17 Jul 2013 08:58:52 -0700
+Subject: Dalvik: Traces and loops now use common basic block information calculation
+
+BZ: 116060
+
+Both traces and loops now take similar path for calculations of basic block
+information. This ensures that basic block information is complete in either
+scenario. For example, now traces receive live-in and live-out information.
+They also get phi nodes calculated in cases of joins.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Ic027a3eaa09a5e0a8e2192f95e8df85473e7b64c
+Orig-MCG-Change-Id: I7e9f6efc04f97f101523ca182738273d4f4112cd
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/Compiler.h                  |   11 +++-
+ vm/compiler/Frontend.cpp                |   14 +++-
+ vm/compiler/LoopOpt.cpp                 |  117 -------------------------------
+ vm/compiler/LoopOpt.h                   |    9 ---
+ vm/compiler/SSATransformation.cpp       |  107 ++++++++++++++++++++++++++--
+ vm/compiler/codegen/x86/pcg/Utility.cpp |   20 +++---
+ 6 files changed, 132 insertions(+), 146 deletions(-)
+
+diff --git a/vm/compiler/Compiler.h b/vm/compiler/Compiler.h
+index 43222e3..fee96bd 100644
+--- a/vm/compiler/Compiler.h
++++ b/vm/compiler/Compiler.h
+@@ -276,7 +276,16 @@ void dvmCompilerDataFlowAnalysisDispatcher(struct CompilationUnit *cUnit,
+                 DataFlowAnalysisMode dfaMode,
+                 bool isIterative);
+ void dvmCompilerMethodSSATransformation(struct CompilationUnit *cUnit);
+-bool dvmCompilerBuildLoop(struct CompilationUnit *cUnit, bool filter = true);
++
++/**
++ * @brief Calculate the BasicBlock information
++ * @param cUnit the CompilationUnit
++ * @param filter do we wish to filter the loop? (default: true)
++ * @param buildLoopInfo do we wish to build loop information (default: false)
++ * @return whether the calculation succeeded or not
++ */
++bool dvmCompilerCalculateBasicBlockInformation (CompilationUnit *cUnit, bool filter = true, bool buildLoopInfo = false);
++
+ void dvmCompilerUpdateGlobalState(void);
+ JitTraceDescription *dvmCopyTraceDescriptor(const u2 *pc,
+                                             const struct JitEntry *desc);
+diff --git a/vm/compiler/Frontend.cpp b/vm/compiler/Frontend.cpp
+index f6675ae..294dcec 100644
+--- a/vm/compiler/Frontend.cpp
++++ b/vm/compiler/Frontend.cpp
+@@ -2196,6 +2196,7 @@ bool dvmCompileTrace(JitTraceDescription *desc, int numMaxInsts,
+     curBB = dvmCompilerNewBB(kEntryBlock, numBlocks++);
+     dvmInsertGrowableList(blockList, (intptr_t) curBB);
+     curBB->startOffset = curOffset;
++    cUnit.entryBlock = curBB;
+ 
+     entryCodeBB = dvmCompilerNewBB(kDalvikByteCode, numBlocks++);
+     dvmInsertGrowableList(blockList, (intptr_t) entryCodeBB);
+@@ -2546,8 +2547,10 @@ bool dvmCompileTrace(JitTraceDescription *desc, int numMaxInsts,
+ 
+     dvmCompilerInitializeRegAlloc(&cUnit);  // Needs to happen after SSA naming
+ #else
+-    //set that the CompilationUnit is not a loop
+-    dvmCompilerCalculateBasicBlockInformation (&cUnit);
++    //Now calculate basic block information. We set the "filter" argument to false because
++    //we are in trace mode and thus we do not need to test any loops if they are correctly formed.
++    //We also set the "buildLoopInformation" to false because we have no loops to build.
++    dvmCompilerCalculateBasicBlockInformation (&cUnit, false, false);
+ #endif
+ 
+     if (cUnit.printMe) {
+@@ -2563,6 +2566,13 @@ bool dvmCompileTrace(JitTraceDescription *desc, int numMaxInsts,
+     //The loop optimization framework can work for traces as well
+     dvmCompilerLoopOpt(&cUnit);
+ 
++    //If anybody wanted to quit, exit now. We check the "quitLoopMode" because the loop framework sets
++    //that flag to true when something wrong is encountered.
++    if (cUnit.quitLoopMode == true)
++    {
++        return false;
++    }
++
+     {
+         //Get backend gate function
+         bool (*backEndGate) (CompilationUnit *) = gDvmJit.jitFramework.backEndGate;
+diff --git a/vm/compiler/LoopOpt.cpp b/vm/compiler/LoopOpt.cpp
+index 881f935..83fbad9 100644
+--- a/vm/compiler/LoopOpt.cpp
++++ b/vm/compiler/LoopOpt.cpp
+@@ -32,7 +32,6 @@
+  * @brief Static functions defined below
+  */
+ static void handlePassFlag (CompilationUnit *cUnit, Pass *pass);
+-static void clearPHIInformation (CompilationUnit *cUnit);
+ 
+ /**
+  * @brief Three macros to help pass definitions
+@@ -140,55 +139,6 @@ void dvmCompilerBuildPassList (void)
+     }
+ }
+ 
+-bool dvmCompilerCalculateBasicBlockInformation (CompilationUnit *cUnit, bool filter, bool buildLoopInfo)
+-{
+-    //Clear SSA information
+-    clearPHIInformation (cUnit);
+-
+-    //Calculate Predecessors
+-    dvmCompilerCalculatePredecessors (cUnit);
+-
+-    //Now it depends if cUnit is a loop
+-    if (cUnit->jitMode == kJitLoop)
+-    {
+-        //Call build loop it does the work for us
+-        bool res = dvmCompilerBuildLoop (cUnit, filter);
+-
+-        //If we succeeded
+-        if (res == true)
+-        {
+-            //Then call loop information fill
+-            if (buildLoopInfo == true)
+-            {
+-                cUnit->loopInformation = LoopInformation::getLoopInformation (cUnit, cUnit->loopInformation);
+-            }
+-
+-            //Clear the constants
+-            cUnit->constantValues->clear ();
+-
+-            //Finally, get the constant information and set the cUnit correctly
+-            dvmCompilerDataFlowAnalysisDispatcher(cUnit,
+-                    dvmCompilerDoConstantPropagation,
+-                    kAllNodes,
+-                    false /* isIterative */);
+-
+-            //Finally, find the induction variables
+-            dvmCompilerFindInductionVariables (cUnit, cUnit->loopInformation);
+-        }
+-        return res;
+-    }
+-    else
+-    {
+-        //Do the initialization
+-        dvmInitializeSSAConversion (cUnit);
+-
+-        //Non loop analysis
+-        dvmCompilerNonLoopAnalysis (cUnit);
+-    }
+-
+-    return true;
+-}
+-
+ /**
+   * @brief Handle pass flag, if it is kOptimizationBasicBlockChange, call back dvmCompilerCalculateBasicBlockInformation
+   * @param cUnit the CompilationUnit
+@@ -271,73 +221,6 @@ void dvmCompilerLoopOptimizationDriver (CompilationUnit *cUnit)
+     }
+ }
+ 
+-/**
+- * @brief Helper to remove all PHI nodes from BasicBlocks
+- * @param cUnit the CompilationUnit
+- * @param bb the BasicBlock
+- * @return whether we changed something to the BasicBlock
+- */
+-static bool clearPHIInformationHelper (CompilationUnit *cUnit, BasicBlock *bb)
+-{
+-    bool res = false;
+-
+-    //Go through each MIR
+-    MIR *mir = bb->firstMIRInsn;
+-
+-    while (mir != 0)
+-    {
+-        int opcode = mir->dalvikInsn.opcode;
+-
+-        if (opcode == kMirOpPhi)
+-        {
+-            //Going to change something
+-            res = true;
+-
+-            //First thing is to detach it
+-            MIR *prev = mir->prev;
+-            MIR *next = mir->next;
+-
+-            //Attach previous to next if it exists
+-            if (prev != 0)
+-            {
+-                prev->next = next;
+-            }
+-
+-            //Same for next
+-            if (next != 0)
+-            {
+-                next->prev = prev;
+-            }
+-
+-            //Instruction is now removed but we must handle first and last for the basic block
+-            if (mir == bb->firstMIRInsn)
+-            {
+-                bb->firstMIRInsn = next;
+-            }
+-
+-            //Remove the instruction for last
+-            if (mir == bb->lastMIRInsn)
+-            {
+-                bb->lastMIRInsn = prev;
+-            }
+-        }
+-
+-        //Go to the next instruction
+-        mir = mir->next;
+-    }
+-
+-    return res;
+-}
+-
+-/**
+- * @brief Clear the PHI nodes
+- * @param cUnit the CompilationUnit
+- */
+-void clearPHIInformation (CompilationUnit *cUnit)
+-{
+-    dvmCompilerDataFlowAnalysisDispatcher (cUnit, clearPHIInformationHelper, kAllNodes, false);
+-}
+-
+ bool dvmCompilerTraceIsLoop (const CompilationUnit *cUnit, const Pass *curPass)
+ {
+     (void) curPass;
+diff --git a/vm/compiler/LoopOpt.h b/vm/compiler/LoopOpt.h
+index c211480..e887b76 100644
+--- a/vm/compiler/LoopOpt.h
++++ b/vm/compiler/LoopOpt.h
+@@ -62,15 +62,6 @@ bool dvmCompilerTraceIsLoopNewSystem (const CompilationUnit *cUnit, const Pass *
+ bool dvmCompilerTraceIsLoopOldSystem (const CompilationUnit *cUnit, const Pass *curPass);
+ 
+ /**
+- * @brief Calculate the BasicBlock information
+- * @param cUnit the CompilationUnit
+- * @param filter do we wish to filter the loop? (default: true)
+- * @param buildLoopInfo do we wish to build loop information (default: false)
+- * @return whether the calculation succeeded or not
+- */
+-bool dvmCompilerCalculateBasicBlockInformation (CompilationUnit *cUnit, bool filter = true, bool buildLoopInfo = false);
+-
+-/**
+  * @brief Print the pass names
+  */
+ void dvmCompilerPrintPassNames (void);
+diff --git a/vm/compiler/SSATransformation.cpp b/vm/compiler/SSATransformation.cpp
+index 0294609..f9be1c3 100644
+--- a/vm/compiler/SSATransformation.cpp
++++ b/vm/compiler/SSATransformation.cpp
+@@ -825,25 +825,100 @@ bool dvmCompilerBuildDefUseChain (CompilationUnit *cUnit, BasicBlock *bb)
+     return res;
+ }
+ 
+-/*
+- * @brief Build a loop. Return true if a loop structure is successfully identified.
++/**
++ * @brief Helper to remove all PHI nodes from BasicBlocks
+  * @param cUnit the CompilationUnit
+- * @param filter do we filter the loop or not (default: true)
+- * @return whether or not the loop should be accepted
++ * @param bb the BasicBlock
++ * @return whether we changed something to the BasicBlock
+  */
+-bool dvmCompilerBuildLoop(CompilationUnit *cUnit, bool filter)
++static bool clearPHIInformationHelper (CompilationUnit *cUnit, BasicBlock *bb)
+ {
++    bool res = false;
++
++    //Go through each MIR
++    MIR *mir = bb->firstMIRInsn;
++
++    while (mir != 0)
++    {
++        int opcode = mir->dalvikInsn.opcode;
++
++        if (opcode == kMirOpPhi)
++        {
++            //Going to change something
++            res = true;
++
++            //First thing is to detach it
++            MIR *prev = mir->prev;
++            MIR *next = mir->next;
++
++            //Attach previous to next if it exists
++            if (prev != 0)
++            {
++                prev->next = next;
++            }
++
++            //Same for next
++            if (next != 0)
++            {
++                next->prev = prev;
++            }
++
++            //Instruction is now removed but we must handle first and last for the basic block
++            if (mir == bb->firstMIRInsn)
++            {
++                bb->firstMIRInsn = next;
++            }
++
++            //Remove the instruction for last
++            if (mir == bb->lastMIRInsn)
++            {
++                bb->lastMIRInsn = prev;
++            }
++        }
++
++        //Go to the next instruction
++        mir = mir->next;
++    }
++
++    return res;
++}
++
++/**
++ * @brief Clear the PHI nodes
++ * @param cUnit the CompilationUnit
++ */
++void clearPHIInformation (CompilationUnit *cUnit)
++{
++    dvmCompilerDataFlowAnalysisDispatcher (cUnit, clearPHIInformationHelper, kAllNodes, false);
++}
++
++/**
++ * @brief Calculate the BasicBlock information
++ * @see Compiler.h
++ */
++bool dvmCompilerCalculateBasicBlockInformation (CompilationUnit *cUnit, bool filter, bool buildLoopInfo)
++{
++    //Clear SSA information
++    clearPHIInformation (cUnit);
++
++    //Calculate Predecessors
++    dvmCompilerCalculatePredecessors (cUnit);
++
+     //If we want to filter the loop
+     if (filter == true)
+     {
++        //In order to filter, we need to build domination first.
++        //After we filter, we need to re-compute it
+         dvmCompilerBuildDomination (cUnit);
+ 
+         /* Loop structure not recognized/supported - return false */
+-        if (dvmCompilerFilterLoopBlocks(cUnit) == false)
++        if (dvmCompilerFilterLoopBlocks (cUnit) == false)
++        {
+             return false;
++        }
+     }
+ 
+-    /* Re-compute the DFS order just for the loop */
++    /* Compute the DFS order */
+     dvmCompilerBuildDomination (cUnit);
+ 
+     /* Allocate data structures in preparation for SSA conversion */
+@@ -894,5 +969,23 @@ bool dvmCompilerBuildLoop(CompilationUnit *cUnit, bool filter)
+     //Just for safety, reset walkData
+     cUnit->walkData = 0;
+ 
++    //Call loop information fill if needed
++    if (buildLoopInfo == true)
++    {
++        cUnit->loopInformation = LoopInformation::getLoopInformation (cUnit, cUnit->loopInformation);
++    }
++
++    //Clear the constants
++    cUnit->constantValues->clear ();
++
++    //Finally, get the constant information and set the cUnit correctly
++    dvmCompilerDataFlowAnalysisDispatcher(cUnit,
++            dvmCompilerDoConstantPropagation,
++            kAllNodes,
++            false /* isIterative */);
++
++    //Finally, find the induction variables
++    dvmCompilerFindInductionVariables (cUnit, cUnit->loopInformation);
++
+     return true;
+ }
+diff --git a/vm/compiler/codegen/x86/pcg/Utility.cpp b/vm/compiler/codegen/x86/pcg/Utility.cpp
+index 49178c9..e5440cf 100644
+--- a/vm/compiler/codegen/x86/pcg/Utility.cpp
++++ b/vm/compiler/codegen/x86/pcg/Utility.cpp
+@@ -398,23 +398,23 @@ bool dvmCompilerPcgSupportTrace (CompilationUnit *cUnit)
+     int bytecodeCount = 0;
+     int bwcc = 0;
+ 
+-    BasicBlock *entry = cUnit->entryBlock;
++    //First check if we have a loop
++    LoopInformation *info = cUnit->loopInformation;
+ 
+-    if (entry != 0)
++    if (info != 0)
+     {
+-        //Then we have a loop and it must be the entrance of the loop
+-        LoopInformation *info = cUnit->loopInformation;
++        //Get the entry block for trace
++        BasicBlock *entry = cUnit->entryBlock;
+ 
+-        if (info == 0)
+-        {
+-            return false;
+-        }
+-
+-        //Otherwise, it's entrance must be its preheader
++        //Get the loop preheader
+         BasicBlock *pre = info->getPreHeader ();
+ 
++        //Because PCG returns to entry after backward chaining, we need to ensure
++        //that we only accept cases where the entry is the preheader so that it
++        //is semantically correct.
+         if (pre != entry)
+         {
++            ALOGI("\n::::: Not using PCG - trace entry does not match loop preheader ::::\n");
+             return false;
+         }
+     }
+-- 
+1.7.4.1
+

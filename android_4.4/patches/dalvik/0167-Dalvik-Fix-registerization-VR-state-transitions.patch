@@ -1,0 +1,3526 @@
+From 2deea990f3c632ea3ceb6e498b9c72cf54c7123f Mon Sep 17 00:00:00 2001
+From: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Date: Tue, 21 May 2013 11:19:25 -0700
+Subject: Dalvik: Fix registerization VR state transitions
+
+BZ: 98775
+
+When registerization must merge the state of two blocks, it must be able to
+support understanding when there is a mismatch of state. This patch allows
+registerization to notice when there is a mismatch of a VR in one of the
+following states: in memory, in gp register, wide in xmm register, non-wide
+in xmm register, and constant.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: If1f9cc45d5842932bf81d3decbc401f75c20ac35
+Orig-MCG-Change-Id: I93521a9bebee39825cd470e6f8a9ef626e8a8ab6
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/RegisterizationME.cpp             |    8 +-
+ vm/compiler/codegen/x86/AnalysisO1.cpp        |  635 +++++++++------
+ vm/compiler/codegen/x86/AnalysisO1.h          |  303 ++++++--
+ vm/compiler/codegen/x86/BytecodeVisitor.cpp   |  205 ++++-
+ vm/compiler/codegen/x86/Lower.h               |    2 -
+ vm/compiler/codegen/x86/LowerHelper.cpp       |    3 +-
+ vm/compiler/codegen/x86/LowerJump.cpp         |    7 +
+ vm/compiler/codegen/x86/RegisterizationBE.cpp | 1084 +++++++++++++++++--------
+ vm/compiler/codegen/x86/RegisterizationBE.h   |   41 +-
+ 9 files changed, 1629 insertions(+), 659 deletions(-)
+
+diff --git a/vm/compiler/RegisterizationME.cpp b/vm/compiler/RegisterizationME.cpp
+index 9d4d6da..1f95b30 100644
+--- a/vm/compiler/RegisterizationME.cpp
++++ b/vm/compiler/RegisterizationME.cpp
+@@ -743,10 +743,8 @@ static bool parseBlock (BasicBlock *bb)
+ 
+             default:
+                 //Not accepted, refuse the block
+-                {
+-                    char *tmp = dvmCompilerGetDalvikDisassembly (& (mir->dalvikInsn), NULL);
+-                    ALOGD ("Rejecting registerization due to %s", tmp);
+-                }
++                ALOGV ("Rejecting registerization due to %s",
++                        dvmCompilerGetDalvikDisassembly (& (mir->dalvikInsn), NULL));
+                 return false;
+         }
+     }
+@@ -818,7 +816,7 @@ static bool wouldRegisterize (const CompilationUnit *cUnit, const LoopInformatio
+     //Is it the inner loop ?
+     if (nbr == 0)
+     {
+-        //Actually registerize the loop
++        //Check if we would registerize the loop
+         return checkLoop (cUnit, info);
+     }
+     else
+diff --git a/vm/compiler/codegen/x86/AnalysisO1.cpp b/vm/compiler/codegen/x86/AnalysisO1.cpp
+index a7ab80a..e37c61d 100644
+--- a/vm/compiler/codegen/x86/AnalysisO1.cpp
++++ b/vm/compiler/codegen/x86/AnalysisO1.cpp
+@@ -178,7 +178,7 @@ bool isAFullyCoverB(int regA, LowOpndRegType tA, int regB, LowOpndRegType tB) {
+       XferPoint xferPoints[]
+    2> MemoryVRInfo memVRTable[]
+       LiveRange* ranges
+-   3> compileTableEntry compileTable[]
++   3> CompileTableEntry compileTable[]
+    4> VirtualRegInfo
+       DefOrUse reachingDefs[3]
+    5> DefUsePair, LiveRange
+@@ -187,7 +187,7 @@ bool isAFullyCoverB(int regA, LowOpndRegType tA, int regB, LowOpndRegType tB) {
+ //! one entry for each variable used
+ 
+ //! a variable can be virtual register, or a temporary (can be hard-coded)
+-compileTableEntry compileTable[COMPILE_TABLE_SIZE];
++CompileTableEntry compileTable[COMPILE_TABLE_SIZE];
+ int num_compile_entries;
+ //! tables to save the states of register allocation
+ regAllocStateEntry1 stateTable1_1[COMPILE_TABLE_SIZE];
+@@ -247,8 +247,9 @@ int mergeEntry2(BasicBlock_O1* bb);
+ int sortAllocConstraint(RegAllocConstraint* allocConstraints,
+                         RegAllocConstraint* allocConstraintsSorted, bool fromHighToLow);
+ 
+-//used in codeGenBasicBlock
+-int insertFromVirtualInfo(BasicBlock_O1* bb, int k); //update compileTable
++//Updates compile table with information about virtual register usage
++static int insertFromVirtualInfo (VirtualRegInfo &regInfo);
++
+ int insertFromTempInfo(int k); //update compileTable
+ int updateXferPoints(void);
+ static int updateLiveTable();
+@@ -486,125 +487,205 @@ void freeCFG(void) {
+ }
+ 
+ /**
+- * @brief Initializes the MemVRTable
+- * @return True if successful, False if error occurred
++ * @brief Inserts high VR entries into compile table.
++ * @details Looks through compile table and for all wide VRs it finds, it ensures that an entry exists for the
++ * high part of the VR. Namely, if it finds that v1 is wide, it ensures that there is entry in compile table for v2.
++ * @return Returns true if it succeed insert high VR for all wide VRs.
+  */
+-bool initializeMemVRTable(void) {
+-    num_memory_vr = 0;
+-    int k;
+-    for(k = 0; k < num_compile_entries; k++) {
+-        if(!isVirtualReg(compileTable[k].physicalType)) continue;
+-        /* VRs in compileTable */
+-
+-        bool setToInMemory =
+-                (compileTable[k].physicalReg == PhysicalReg_Null) ?
+-                        true :
+-                        currentBB->associationTable.wasVRInMemory(
+-                                compileTable[k].regNum);
+-
+-        int regNum = compileTable[k].regNum;
+-        OpndSize sizeVR = getRegSize(compileTable[k].physicalType);
+-        /* search memVRTable for the VR in compileTable */
+-        int kk;
+-        int indexL = -1;
+-        int indexH = -1;
+-        for(kk = 0; kk < num_memory_vr; kk++) {
+-            if(memVRTable[kk].regNum == regNum) {
+-                indexL = kk;
+-                continue;
+-            }
+-            if(memVRTable[kk].regNum == regNum+1 && sizeVR == OpndSize_64) {
+-                indexH = kk;
+-                continue;
+-            }
++static bool addHighOfWideVRToCompileTable (void)
++{
++    for (int entry = 0; entry < num_compile_entries; entry++)
++    {
++        //We only need to do the correction for wide VRs
++        if (compileTable[entry].isVirtualReg () == false)
++        {
++            continue;
+         }
+-        if(indexL < 0) {
+-            /* the low half of VR is not in memVRTable
+-               add an entry for the low half in memVRTable */
+-            if(num_memory_vr >= NUM_MEM_VR_ENTRY) {
+-                ALOGI("JIT_INFO: Index %d exceeds size of memVRTable\n", num_memory_vr);
+-                SET_JIT_ERROR(kJitErrorRegAllocFailed);
+-                return false;
+-            }
+-            memVRTable[num_memory_vr].regNum = regNum;
+-            memVRTable[num_memory_vr].inMemory = setToInMemory;
+-            memVRTable[num_memory_vr].nullCheckDone = false;
+-            memVRTable[num_memory_vr].boundCheck.checkDone = false;
+-            memVRTable[num_memory_vr].num_ranges = 0;
+-            memVRTable[num_memory_vr].ranges = NULL;
+-            for(int c=0; c<VRDELAY_COUNT; c++) {
+-                memVRTable[num_memory_vr].delayFreeCounters[c] = 0;
++
++        //If we have a 64-bit VR, we should also insert the high bits into the compile table
++        if (compileTable[entry].getSize () == OpndSize_64)
++        {
++            //The high bits of a wide virtual register are available in following register number
++            //For example: wide v0 occupies space on stack for v0 and v1.
++            int highVR = compileTable[entry].getRegisterNumber () + 1;
++
++            int indexHigh = searchCompileTable (LowOpndRegType_virtual | LowOpndRegType_gp, highVR);
++
++            //If we don't have an entry for the high bits, we insert it now.
++            if (indexHigh < 0)
++            {
++                //If we exceed size of table, we must throw an error
++                if (num_compile_entries >= COMPILE_TABLE_SIZE)
++                {
++                    ALOGI("JIT_INFO: compileTable overflow at addHighOfWideVRToCompileTable");
++                    SET_JIT_ERROR(kJitErrorRegAllocFailed);
++                    return false;
++                }
++
++                //Let's insert at end of table
++                indexHigh = num_compile_entries++;
++
++                //Create a new entry for the high VR. Since we just care about 32-bits we make it GP type
++                CompileTableEntry newEntry (highVR, LowOpndRegType_virtual | LowOpndRegType_gp);
++
++                //We now copy it to the table
++                compileTable[indexHigh] = newEntry;
+             }
++        }
++    }
++
++    //If we make it here we were successful at inserting the high VR
++    return true;
++}
++
++void MemoryVRInfo::reset (void)
++{
++    //Set this entry to invalid register
++    regNum = -1;
++
++    //Now set its state to being in memory because it's certainly not in a
++    //location we are keeping track of
++    inMemory = true;
++
++    //Set null check and bound check to false
++    nullCheckDone = false;
++    boundCheck.checkDone = false;
++
++    //Use invalid register for index VR for bound check
++    boundCheck.indexVR = -1;
++
++    //Zero out information about live ranges
++    num_ranges = 0;
++    ranges = 0;
+ 
+-            DEBUG_MEMORYVR(ALOGD("Initializing state of v%d %sin memory",
+-                    memVRTable[num_memory_vr].regNum,
+-                    (memVRTable[k].inMemory ? "" : "NOT ")));
++    //Initalize all delay free requests
++    for (int c = 0; c < VRDELAY_COUNT; c++)
++    {
++        delayFreeCounters[c] = 0;
++    }
++}
++
++/**
++ * @brief Initializes the in memory tracking table for virtual registers.
++ * @param bb The basic block which we are looking at for initialization.
++ * @return Returns true if all initialization completed successfully. Otherwise it returns false.
++ */
++static bool initializeMemVRTable (BasicBlock_O1 *bb)
++{
++    //Reset number of entries in table
++    num_memory_vr = 0;
+ 
+-            num_memory_vr++;
++    //Now walk through compile entries so we can track in memory state for every VR.
++    //For wide VRs, the compile table must guarantee an entry for both the low and high VR.
++    for(int entry = 0; entry < num_compile_entries; entry++)
++    {
++        //We can skip any entry that is not a virtual register
++        if (compileTable[entry].isVirtualReg () == false)
++        {
++            continue;
+         }
+-        if(sizeVR == OpndSize_64 && indexH < 0) {
+-            /* the high half of VR is not in memVRTable
+-               add an entry for the high half in memVRTable */
+-            if(num_memory_vr >= NUM_MEM_VR_ENTRY) {
+-                ALOGI("JIT_INFO: Index %d exceeds size of memVRTable for 64-bit OpndSize\n", num_memory_vr);
+-                SET_JIT_ERROR(kJitErrorRegAllocFailed);
+-                return false;
+-            }
+-            memVRTable[num_memory_vr].regNum = regNum+1;
+-            memVRTable[num_memory_vr].inMemory = setToInMemory;
+-            memVRTable[num_memory_vr].nullCheckDone = false;
+-            memVRTable[num_memory_vr].boundCheck.checkDone = false;
+-            memVRTable[num_memory_vr].num_ranges = 0;
+-            memVRTable[num_memory_vr].ranges = NULL;
+-            for(int c=0; c<VRDELAY_COUNT; c++) {
+-                memVRTable[num_memory_vr].delayFreeCounters[c] = 0;
++
++        //Make it easier to refer to the VR number
++        int vR = compileTable[entry].getRegisterNumber ();
++
++        //Now we want to figure out if we need to make an entry for the VR to keep
++        //track of its inMemory state.
++        bool alreadyInserted = false;
++        for (int memEntry = 0; memEntry < num_memory_vr; memEntry++)
++        {
++            //If we find an entry, we must have already inserted since we reset table at
++            //the beginning of this function
++            if (memVRTable[memEntry].getVirtualRegister () == vR)
++            {
++                alreadyInserted = true;
++                break;
+             }
++        }
+ 
+-            DEBUG_MEMORYVR(ALOGD("Initializing state of v%d %sin memory",
+-                    memVRTable[num_memory_vr].regNum,
+-                    (memVRTable[k].inMemory ? "" : "NOT ")));
++        //If we have already inserted this, we can continue
++        if (alreadyInserted == true)
++        {
++            continue;
++        }
+ 
+-            num_memory_vr++;
++        //Let's make sure we won't overflow the table if we make this insertion
++        if (num_memory_vr >= NUM_MEM_VR_ENTRY)
++        {
++            ALOGI("JIT_INFO: Index %d exceeds size of memVRTable\n", num_memory_vr);
++            SET_JIT_ERROR(kJitErrorRegAllocFailed);
++            return false;
+         }
++
++        //We know we have an entry in the table by the time we get here so simply get a reference to it
++        MemoryVRInfo &memInfo = memVRTable[num_memory_vr];
++
++        //We are adding an entry so increment the number of entries
++        num_memory_vr++;
++
++        //Initialize fields for this entry
++        memInfo.reset ();
++
++        //Set the virtual register for this entry
++        memInfo.setVirtualRegister (vR);
++
++        //Determine if parent said that the VR was in memory
++        bool setToInMemory = bb->associationTable.wasVRInMemory (vR);
++
++        //Now set the in memory state for our new entry
++        memInfo.setInMemoryState (setToInMemory);
++
++        DEBUG_MEMORYVR(ALOGD("Initializing state of v%d %sin memory",
++                vR, (setToInMemory ? "" : "NOT ")));
+     }
++
++    //If we made it here we were successful
+     return true;
+ }
+ 
+ /**
+- * @brief Initializes constant table
+- * @return True if successful
++ * @brief Initializes constant table.
++ * @param bb The basic block which we are looking at for initialization.
++ * @return Returns true if all initialization completed successfully. Otherwise it returns false.
+  */
+-bool initializeConstVRTable(void) {
+-    // Set number of entries to zero since we are initializing
++static bool initializeConstVRTable (BasicBlock_O1 *bb)
++{
++    //Reset the number of entries to zero since we are initializing
+     num_const_vr = 0;
+ 
+-    for (int k = 0; k < num_compile_entries; k++) {
+-        // Only initialize entries that are VRs
+-        if (isVirtualReg(compileTable[k].physicalType) == false)
++    //Now walk through compile entries so we can track the constantness for every VR.
++    //For wide VRs, the compile table must guarantee an entry for both the low and high VR.
++    for (int entry = 0; entry < num_compile_entries; entry++)
++    {
++        //We can skip any entry that is not a virtual register
++        if (compileTable[entry].isVirtualReg () == false)
++        {
+             continue;
++        }
++
++        //Make it easier to refer to the VR number
++        int vR = compileTable[entry].getRegisterNumber ();
+ 
+-        OpndSize size = getRegSize(compileTable[k].physicalType);
+-        int VR = compileTable[k].regNum;
+-        int constValue;
++        //Determine if the virtual register was constant
++        if (bb->associationTable.wasVRConstant (vR) == true)
++        {
++            //We make space for two value because setVRToConst might access high bits
++            int constValue[2];
+ 
+-        // First take care of case when VR entry in table is 64-bit
+-        if (size == OpndSize_64) {
+-            if (currentBB->associationTable.wasVRConstant(VR + 1)) {
+-                constValue = currentBB->associationTable.getVRConstValue(
+-                        VR + 1);
++            //It was constant so let's get its value
++            constValue[0] = bb->associationTable.getVRConstValue (vR);
+ 
+-                // We can eagerly just set the high 32-bits of constant.
+-                // Since we are updating just 32-bits, we are safe to not
+-                // use an array for constValue.
+-                setVRToConst(VR + 1, OpndSize_32, &constValue);
+-            }
+-        }
++            //Paranoid so we set high bits to 0
++            constValue[1] = 0;
+ 
+-        // Now look at the low 32-bits to see if they are constant
+-        if (currentBB->associationTable.wasVRConstant(VR)) {
+-            constValue = currentBB->associationTable.getVRConstValue(VR);
++            //Set it to constant
++            bool result = setVRToConst (vR, OpndSize_32, constValue);
+ 
+-            setVRToConst(VR, OpndSize_32, &constValue);
++            //We bail out if we failed to set VR to constant. If setVRToConst failed, it already
++            //set an error message.
++            if (result == false)
++            {
++                return false;
++            }
+         }
+     }
+ 
+@@ -613,31 +694,44 @@ bool initializeConstVRTable(void) {
+ 
+ /**
+  * @brief Initializes entries in the compile table at start of BB.
+- * @details It ensures that it updates compile table based on the
+- * given associations from its parent.
+- * @param bb
++ * @details It ensures that it updates compile table based on the given associations from its parent.
++ * @param bb The basic block whose virtual register state should be initialized.
++ * @return Returns true if all initialization completed successfully. Otherwise it returns false.
+  */
+-bool initializeRegStateOfBB(BasicBlock_O1* bb) {
+-    //for GLUE variables, do not exist
++static bool initializeRegStateOfBB(BasicBlock_O1* bb)
++{
++    assert (bb != 0);
+ 
+-    if(AssociationTable::syncCompileTableWithAssociations(bb->associationTable) == false)
++    //Load associations into compile table
++    if (AssociationTable::syncCompileTableWithAssociations (bb->associationTable) == false)
++    {
+         return false;
++    }
+ 
+-    // Now initialize constants and inMemory tracking
+-    if (initializeMemVRTable() == false)
++    //Ensure that we also have an entry in compile table for high bits of a VR
++    if (addHighOfWideVRToCompileTable () == false)
++    {
+         return false;
+-    if (initializeConstVRTable() == false)
++    }
++
++    //We are ready to initialize the MemVRTable since compile table has been updated
++    if (initializeMemVRTable (bb) == false)
++    {
+         return false;
++    }
+ 
+-    for(int k = 0; k < num_compile_entries; k++) {
+-        // If we have copied any associations into compile table,
+-        // lets make sure that the reference count is 0
+-        compileTable[k].refCount = 0;
++    //We are ready to initialize the constant table since compile table has been updated
++    if (initializeConstVRTable (bb) == false)
++    {
++        return false;
++    }
+ 
++    for (int k = 0; k < num_compile_entries; k++)
++    {
+         if(compileTable[k].regNum != PhysicalReg_GLUE &&
+            compileTable[k].regNum >= PhysicalReg_GLUE_DVMDEX) {
+             /* glue related registers */
+-            compileTable[k].physicalReg = PhysicalReg_Null;
++            compileTable[k].setPhysicalReg (PhysicalReg_Null);
+             compileTable[k].spill_loc_index = -1;
+         }
+     }
+@@ -916,16 +1010,7 @@ int preprocessingBB(CompilationUnit *cUnit, BasicBlock* bb) {
+  */
+ int preprocessingTrace(void) {
+     int k, k2;
+-    unsigned int jj;
+     int retCode = 0;
+-    /* this is a simplified verson of setTypeOfVR()
+-        all VRs are assumed to be GL, no VR will be GG
+-    */
+-    for(k = 0; k < num_bbs_for_method; k++) {
+-        unsigned int max = method_bbs_sorted[k]->infoBasicBlock.size ();
+-        for(jj = 0; jj < max; jj++)
+-            method_bbs_sorted[k]->infoBasicBlock[jj].gType = GLOBALTYPE_GL;
+-    }
+ 
+     /* insert a glue-related register GLUE_DVMDEX to compileTable */
+     insertGlueReg();
+@@ -936,7 +1021,7 @@ int preprocessingTrace(void) {
+         unsigned int max = method_bbs_sorted[k2]->infoBasicBlock.size ();
+         /* update compileTable with virtual register from currentBB */
+         for(unsigned int k3 = 0; k3 < max; k3++) {
+-            retCode = insertFromVirtualInfo(currentBB, k3);
++            retCode = insertFromVirtualInfo (currentBB->infoBasicBlock[k3]);
+             if (retCode < 0)
+                 return retCode;
+         }
+@@ -947,8 +1032,7 @@ int preprocessingTrace(void) {
+         for(k = 0; k < num_compile_entries; k++) {
+             currentInfo.regNum = compileTable[k].regNum;
+             currentInfo.physicalType = (LowOpndRegType)compileTable[k].physicalType;
+-            if(isVirtualReg(compileTable[k].physicalType) &&
+-               compileTable[k].gType == GLOBALTYPE_GL) {
++            if(isVirtualReg(compileTable[k].physicalType)) {
+                 /* update defUseTable by assuming a fake usage at END of a basic block for variable @ currentInfo */
+                 fakeUsageAtEndOfBB(currentBB);
+             }
+@@ -1011,6 +1095,11 @@ int codeGenBasicBlockJit(const Method* method, BasicBlock* bb) {
+     if (gDvmJit.scheduling)
+         singletonPtr<Scheduler>()->signalEndOfNativeBasicBlock();
+ 
++    // Finalize this block's association table because we are generating
++    // it and thus any parent of it that hasn't been generated yet must
++    // be aware of this fact.
++    currentBB->associationTable.finalize ();
++
+     // If basic block does not have any MIRs, we do not need to generate
+     // code for the MIRs. However, let's make sure to update its association
+     // table. Also, it might need to update register/memory state before it
+@@ -1131,6 +1220,9 @@ static bool shouldRejectBasicBlock(BasicBlock_O1* bb) {
+     // Assume that we do not want to reject the BB
+     bool shouldReject = false;
+ 
++    // Set a generic error message in case someone forgets to set a proper one
++    JitCompilationErrors errorIfRejected = kJitErrorCodegen;
++
+     /**
+      * Rejection Scenario 1:
+      * If the basic block has incoming virtual registers that are in physical
+@@ -1174,7 +1266,8 @@ static bool shouldRejectBasicBlock(BasicBlock_O1* bb) {
+                 // If we will be using x87 for this registerized VR, we cannot
+                 // handle
+                 if (type == LowOpndRegType_fs || type == LowOpndRegType_fs_s) {
+-                    ALOGE("Found x87 usage for VR that has been registerized.");
++                    ALOGI("JIT_INFO: Found x87 usage for VR that has been registerized.");
++                    errorIfRejected = kJitErrorBERegisterization;
+                     shouldReject = true;
+                     break;
+                 }
+@@ -1191,7 +1284,7 @@ static bool shouldRejectBasicBlock(BasicBlock_O1* bb) {
+     currentBB = savedCurrentBB;
+ 
+     if (shouldReject) {
+-        SET_JIT_ERROR(kJitErrorBBCannotBeHandled);
++        SET_JIT_ERROR (errorIfRejected);
+     }
+ 
+     return shouldReject;
+@@ -1208,16 +1301,16 @@ static bool shouldRejectBasicBlock(BasicBlock_O1* bb) {
+     Before lowering each bytecode, compileTable is updated with infoByteCodeTemp;
+     At end of the basic block, right before the jump instruction, handles constant VRs and GG VRs
+ */
+-int codeGenBasicBlock(const Method* method, BasicBlock_O1* bb) {
++int codeGenBasicBlock(const Method* method, BasicBlock_O1* bb)
++{
++    //Eagerly set retCode to 0 since most likely everythign will be okay
+     int retCode = 0;
+-    /* we assume at the beginning of each basic block,
+-       all GL VRs reside in memory and all GG VRs reside in predefined physical registers,
+-       so at the end of a basic block, recover a spilled GG VR, store a GL VR to memory */
++
+     /* update compileTable with entries in bb->infoBasicBlock */
+     int k, max;
+     max = bb->infoBasicBlock.size ();
+     for(k = 0; k < max; k++) {
+-        retCode = insertFromVirtualInfo(bb, k);
++        retCode = insertFromVirtualInfo (bb->infoBasicBlock[k]);
+         if (retCode < 0)
+             return retCode;
+     }
+@@ -1237,8 +1330,12 @@ int codeGenBasicBlock(const Method* method, BasicBlock_O1* bb) {
+     dumpCompileTable();
+ #endif
+ 
++    //We have already loaded the information about VR from each bytecode in this basic block.
++    //Thus we are now ready to finish initializing virtual register state.
+     if (initializeRegStateOfBB(bb) == false)
++    {
+         return -1;
++    }
+ 
+     retCode = updateLiveTable();
+     if (retCode < 0)
+@@ -2507,7 +2604,6 @@ void insertAccess(int tableIndex, LiveRange* startP, int rangeStart) {
+ }
+ 
+ /////////////////////////////////////////////////////////////////////
+-bool isInMemory(int regNum, OpndSize size);
+ void setVRToMemory(int regNum, OpndSize size);
+ bool isVRLive(int vA);
+ int getSpillIndex(bool isGLUE, OpndSize size);
+@@ -2700,7 +2796,7 @@ void invalidateVRDueToConst(int reg, OpndSize size) {
+         if(size == OpndSize_32)
+             dumpPartToMem(compileTable[index].physicalReg, reg, false); //dump high of xmm to memory
+ 
+-        compileTable[index].physicalReg = PhysicalReg_Null;
++        compileTable[index].setPhysicalReg (PhysicalReg_Null);
+     }
+     index = searchCompileTable(LowOpndRegType_virtual | LowOpndRegType_xmm, reg-1);
+     if(index >= 0 && compileTable[index].physicalReg != PhysicalReg_Null) {
+@@ -2709,7 +2805,7 @@ void invalidateVRDueToConst(int reg, OpndSize size) {
+ #endif
+         dumpPartToMem(compileTable[index].physicalReg, reg-1, true); //dump low of xmm to memory
+ 
+-        compileTable[index].physicalReg = PhysicalReg_Null;
++        compileTable[index].setPhysicalReg (PhysicalReg_Null);
+     }
+     index = searchCompileTable(LowOpndRegType_virtual | LowOpndRegType_gp, reg);
+     if(index >= 0 && compileTable[index].physicalReg != PhysicalReg_Null) {
+@@ -2717,7 +2813,7 @@ void invalidateVRDueToConst(int reg, OpndSize size) {
+         ALOGI("INVALIDATE virtual reg %d type %d", reg, LowOpndRegType_gp);
+ #endif
+ 
+-        compileTable[index].physicalReg = PhysicalReg_Null;
++        compileTable[index].setPhysicalReg (PhysicalReg_Null);
+     }
+     index = searchCompileTable(LowOpndRegType_virtual | LowOpndRegType_ss, reg);
+     if(index >= 0 && compileTable[index].physicalReg != PhysicalReg_Null) {
+@@ -2725,7 +2821,7 @@ void invalidateVRDueToConst(int reg, OpndSize size) {
+         ALOGI("INVALIDATE virtual reg %d type %d", reg, LowOpndRegType_ss);
+ #endif
+ 
+-        compileTable[index].physicalReg = PhysicalReg_Null;
++        compileTable[index].setPhysicalReg (PhysicalReg_Null);
+     }
+     if(size == OpndSize_64) {
+         index = searchCompileTable(LowOpndRegType_virtual | LowOpndRegType_xmm, reg+1);
+@@ -2735,7 +2831,7 @@ void invalidateVRDueToConst(int reg, OpndSize size) {
+ #endif
+             dumpPartToMem(compileTable[index].physicalReg, reg+1, false); //dump high of xmm to memory
+ 
+-            compileTable[index].physicalReg = PhysicalReg_Null;
++            compileTable[index].setPhysicalReg (PhysicalReg_Null);
+         }
+         index = searchCompileTable(LowOpndRegType_virtual | LowOpndRegType_gp, reg+1);
+         if(index >= 0 && compileTable[index].physicalReg != PhysicalReg_Null) {
+@@ -2743,7 +2839,7 @@ void invalidateVRDueToConst(int reg, OpndSize size) {
+             ALOGI("INVALIDATE virtual reg %d type %d", reg+1, LowOpndRegType_gp);
+ #endif
+ 
+-            compileTable[index].physicalReg = PhysicalReg_Null;
++            compileTable[index].setPhysicalReg (PhysicalReg_Null);
+         }
+         index = searchCompileTable(LowOpndRegType_virtual | LowOpndRegType_ss, reg+1);
+         if(index >= 0 && compileTable[index].physicalReg != PhysicalReg_Null) {
+@@ -2751,7 +2847,7 @@ void invalidateVRDueToConst(int reg, OpndSize size) {
+             ALOGI("INVALIDATE virtual reg %d type %d", reg+1, LowOpndRegType_ss);
+ #endif
+ 
+-            compileTable[index].physicalReg = PhysicalReg_Null;
++            compileTable[index].setPhysicalReg (PhysicalReg_Null);
+         }
+     }
+ }
+@@ -2775,7 +2871,7 @@ void invalidateVR(int reg, LowOpndRegType pType) {
+             if(getRegSize(pType) == OpndSize_32)
+                 dumpPartToMem(compileTable[index].physicalReg, reg, false); //dump high of xmm to memory
+ 
+-            compileTable[index].physicalReg = PhysicalReg_Null;
++            compileTable[index].setPhysicalReg (PhysicalReg_Null);
+         }
+     }
+     //check misaligned xmm @ reg-1
+@@ -2786,7 +2882,7 @@ void invalidateVR(int reg, LowOpndRegType pType) {
+ #endif
+         dumpPartToMem(compileTable[index].physicalReg, reg-1, true); //dump low of xmm to memory
+ 
+-        compileTable[index].physicalReg = PhysicalReg_Null;
++        compileTable[index].setPhysicalReg (PhysicalReg_Null);
+     }
+     //check misaligned xmm @ reg+1
+     if(pType == LowOpndRegType_xmm || pType == LowOpndRegType_fs) {
+@@ -2798,7 +2894,7 @@ void invalidateVR(int reg, LowOpndRegType pType) {
+ #endif
+             dumpPartToMem(compileTable[index].physicalReg, reg+1, false); //dump high of xmm to memory
+ 
+-            compileTable[index].physicalReg = PhysicalReg_Null;
++            compileTable[index].setPhysicalReg (PhysicalReg_Null);
+         }
+     }
+     if(pType != LowOpndRegType_gp) {
+@@ -2809,7 +2905,7 @@ void invalidateVR(int reg, LowOpndRegType pType) {
+             ALOGI("INVALIDATE virtual reg %d type %d", reg, LowOpndRegType_gp);
+ #endif
+ 
+-            compileTable[index].physicalReg = PhysicalReg_Null;
++            compileTable[index].setPhysicalReg (PhysicalReg_Null);
+         }
+     }
+     if(pType == LowOpndRegType_xmm || pType == LowOpndRegType_fs) {
+@@ -2820,7 +2916,7 @@ void invalidateVR(int reg, LowOpndRegType pType) {
+             ALOGI("INVALIDATE virtual reg %d type %d", reg+1, LowOpndRegType_gp);
+ #endif
+ 
+-            compileTable[index].physicalReg = PhysicalReg_Null;
++            compileTable[index].setPhysicalReg (PhysicalReg_Null);
+         }
+     }
+     if(pType != LowOpndRegType_ss) {
+@@ -2831,7 +2927,7 @@ void invalidateVR(int reg, LowOpndRegType pType) {
+             ALOGI("INVALIDATE virtual reg %d type %d", reg, LowOpndRegType_ss);
+ #endif
+ 
+-            compileTable[index].physicalReg = PhysicalReg_Null;
++            compileTable[index].setPhysicalReg (PhysicalReg_Null);
+         }
+     }
+     if(pType == LowOpndRegType_xmm || pType == LowOpndRegType_fs) {
+@@ -2842,7 +2938,7 @@ void invalidateVR(int reg, LowOpndRegType pType) {
+             ALOGI("INVALIDATE virtual reg %d type %d", reg+1, LowOpndRegType_ss);
+ #endif
+ 
+-            compileTable[index].physicalReg = PhysicalReg_Null;
++            compileTable[index].setPhysicalReg (PhysicalReg_Null);
+         }
+     }
+ }
+@@ -2965,7 +3061,7 @@ int registerAlloc(int type, int reg, bool isPhysical, bool updateRefCount, bool
+ #endif
+ 
+         //Update the physical register
+-        compileTable[tIndex].physicalReg = reg;
++        compileTable[tIndex].setPhysicalReg (reg);
+         //Update the isWritten field, if isDest is true, set it to true
+         if (isDest == true) {
+             compileTable[tIndex].isWritten = true;
+@@ -2999,14 +3095,14 @@ int registerAlloc(int type, int reg, bool isPhysical, bool updateRefCount, bool
+     int index = getFreeReg(newType, reg, tIndex);
+     if(index >= 0 && index < PhysicalReg_Null) {
+         //update compileTable & allRegs
+-        compileTable[tIndex].physicalReg = allRegs[index].physicalReg;
++        compileTable[tIndex].setPhysicalReg (allRegs[index].physicalReg);
+         allRegs[index].isUsed = true;
+ #ifdef DEBUG_REG_USED
+         ALOGI("REGALLOC: register %d is free", allRegs[index].physicalReg);
+ #endif
+     } else {
+         PhysicalReg allocR = spillForLogicalReg(newType, reg, tIndex);
+-        compileTable[tIndex].physicalReg = allocR;
++        compileTable[tIndex].setPhysicalReg (allocR);
+     }
+     if(compileTable[tIndex].spill_loc_index >= 0) {
+         unspillLogicalReg(tIndex, compileTable[tIndex].physicalReg);
+@@ -3048,7 +3144,7 @@ int registerAllocMove(int reg, int type, bool isPhysical, int srcReg, bool isDes
+         compileTable[index].isWritten = true;
+     }
+     decreaseRefCount(index);
+-    compileTable[index].physicalReg = srcReg;
++    compileTable[index].setPhysicalReg (srcReg);
+ 
+ #ifdef DEBUG_REGALLOC
+     ALOGI("REGALLOC: registerAllocMove %d for logical register %d %d",
+@@ -3432,7 +3528,7 @@ int spillLogicalReg(int spill_index, bool updateTable) {
+     if(!updateTable) return PhysicalReg_Null;
+ 
+     int allocR = compileTable[spill_index].physicalReg;
+-    compileTable[spill_index].physicalReg = PhysicalReg_Null;
++    compileTable[spill_index].setPhysicalReg (PhysicalReg_Null);
+ 
+     return allocR;
+ }
+@@ -3631,62 +3727,121 @@ int findVirtualRegInTable(int vA, LowOpndRegType type) {
+     return k;
+ }
+ 
+-//! check whether a virtual register is constant
+-
+-//! the value of the constant is stored in valuePtr; if updateRefCount is true & the VR is constant, reference count for the VR will be reduced by 1
+-int isVirtualRegConstant(int regNum, LowOpndRegType type, int* valuePtr, bool updateRefCount) {
++/**
++ * @brief Checks whether the virtual register is constant.
++ * @param regNum The virtual register to check.
++ * @param opndRegType The physical type of this virtual register.
++ * @param valuePtr If non-null, this is updated by function to contain the constant values.
++ * @param updateRefCount When set, lowers reference count in compile table for this VR.
++ * @return Returns information about the constantness of this VR.
++ */
++VirtualRegConstantness isVirtualRegConstant(int regNum, int opndRegType, int *valuePtr, bool updateRefCount)
++{
++    //Determine the size of the VR by looking at its physical type
++    OpndSize size = getRegSize (opndRegType);
+ 
+-    OpndSize size = getRegSize(type);
+-    int k;
++    //Use these to keep track of index in the constant table of the VR we are looking for
+     int indexL = -1;
+     int indexH = -1;
+-    for(k = 0; k < num_const_vr; k++) {
++
++    //Iterate through constant table to find the desired virtual register
++    for(int k = 0; k < num_const_vr; k++)
++    {
+ #ifdef DEBUG_CONST
+         ALOGI("constVRTable VR %d isConst %d value %x", constVRTable[k].regNum, constVRTable[k].isConst, constVRTable[k].value);
+ #endif
+-        if(constVRTable[k].regNum == regNum) {
++        if(constVRTable[k].regNum == regNum)
++        {
+             indexL = k;
+             continue;
+         }
+-        if(constVRTable[k].regNum == regNum + 1 && size == OpndSize_64) {
++
++        if(constVRTable[k].regNum == regNum + 1 && size == OpndSize_64)
++        {
+             indexH = k;
+             continue;
+         }
+     }
++
++    //Eagerly assume that we won't find constantness of this VR
+     bool isConstL = false;
+     bool isConstH = false;
+-    if(indexL >= 0) {
++
++    //If we found an entry in constant table for this VR, check if it is constant.
++    if(indexL >= 0)
++    {
+         isConstL = constVRTable[indexL].isConst;
+     }
+-    if(size == OpndSize_64 && indexH >= 0) {
++
++    //If we found an entry in constant table for the high part of VR, check if it is constant.
++    if(size == OpndSize_64 && indexH >= 0)
++    {
+         isConstH = constVRTable[indexH].isConst;
+     }
+ 
+-    if((isConstL || isConstH)) {
+-        if(size == OpndSize_64 && isConstH)
+-            valuePtr[1] = constVRTable[indexH].value;
+-        if(isConstL)
+-            *valuePtr = constVRTable[indexL].value;
++    //Only tell the caller the values of constant if space has been provided for this purpose
++    if (valuePtr != 0)
++    {
++        //Are either the low bits or high bits constant?
++        if (isConstL == true || isConstH == true)
++        {
++            //If the high bits are constant and we care about them, then set value.
++            if (size == OpndSize_64 && isConstH == true)
++            {
++                valuePtr[1] = constVRTable[indexH].value;
++            }
++
++            //Now see if we can set value for the low bits
++            if (isConstL == true)
++            {
++                valuePtr[0] = constVRTable[indexL].value;
++            }
++        }
+     }
+-    if((isConstL && size == OpndSize_32) || (isConstL && isConstH)) {
+-        if(updateRefCount) {
+-            int indexOrig = searchCompileTable(type | LowOpndRegType_virtual, regNum);
+-            if(indexOrig < 0) {
+-                ALOGI("JIT_INFO: Cannot find VR in isVirtualRegConstant num %d type %d\n", regNum, type);
++
++    //If we are looking at non-wide VR that is constant or wide VR whose low and high parts are both constant,
++    //then we say that this VR is constant.
++    if((isConstL == true && size == OpndSize_32) || (isConstL == true && isConstH == true))
++    {
++        if(updateRefCount)
++        {
++            //We want to find entry in the compile table that matches the physical type we want.
++            //Since compile table keeps track of physical type along with logical type in same field,
++            //we do a binary bitwise inclusive or including the virtual register type.
++            int indexOrig = searchCompileTable(opndRegType | LowOpndRegType_virtual, regNum);
++
++            if(indexOrig < 0)
++            {
++                //We were not able to find the virtual register in compile table so just set an error
++                //and say that it is not constant.
++                ALOGI("JIT_INFO: Cannot find VR in isVirtualRegConstant num %d type %d\n", regNum, opndRegType);
+                 SET_JIT_ERROR(kJitErrorRegAllocFailed);
+-                return -1;
++                return VR_IS_NOT_CONSTANT;
+             }
++
++            //Decrement the reference count for this VR
+             decreaseRefCount(indexOrig);
+         }
+ #ifdef DEBUG_CONST
+         ALOGI("VR %d %d is const case", regNum, type);
+ #endif
+-        return 3;
++        return VR_IS_CONSTANT;
++    }
++    else if (isConstL == true && size != OpndSize_32)
++    {
++        //If the VR is wide and only low part is constant, we return saying that
++        return VR_LOW_IS_CONSTANT;
++    }
++    else if (isConstH == true && size != OpndSize_32)
++    {
++        //If the VR is wide and only high part is constant, we return saying that
++        return VR_HIGH_IS_CONSTANT;
++    }
++    else
++    {
++        //If we make it here, this VR is not constant
++        return VR_IS_NOT_CONSTANT;
+     }
+-    if(size == OpndSize_32) return 0;
+-    if(isConstL) return 1;
+-    if(isConstH) return 2;
+-    return 0;
+ }
+ 
+ //!update RegAccessType of virtual register vB given RegAccessType of vA
+@@ -3972,7 +4127,7 @@ void setVRToMemory(int regNum, OpndSize size) {
+             (memVRTable[indexL].inMemory ? "" : "NOT ")));
+     if(size == OpndSize_64) {
+         if(indexH < 0) {
+-            ALOGI("JIT_INFO: VR %d not in memVRTabl at setVRToMemory for upper 64-bits", regNum+1);
++            ALOGI("JIT_INFO: VR %d not in memVRTable at setVRToMemory for upper 64-bits", regNum+1);
+             SET_JIT_ERROR(kJitErrorRegAllocFailed);
+             return;
+         }
+@@ -4331,7 +4486,7 @@ bool updatePhysicalRegForVR(int vR, PhysicalReg oldReg, PhysicalReg newReg) {
+                 && compileTable[entry].physicalReg == oldReg) {
+ 
+             //Update it and report success
+-            compileTable[entry].physicalReg = newReg;
++            compileTable[entry].setPhysicalReg (newReg);
+ 
+             return true;
+         }
+@@ -5081,7 +5236,7 @@ int freeReg(bool writeBackAllVRs) {
+ 
+     for(int k = 0; k < num_compile_entries; k++) {
+         if (writeBackAllVRs && isVirtualReg(compileTable[k].physicalType)
+-                && compileTable[k].physicalReg != PhysicalReg_Null) {
++                && compileTable[k].inPhysicalRegister () == true) {
+ #ifdef DEBUG_REGALLOC
+             ALOGI("FREE v%d with type %d allocated to %s",
+                     compileTable[k].regNum, compileTable[k].physicalType,
+@@ -5092,7 +5247,7 @@ int freeReg(bool writeBackAllVRs) {
+             spillLogicalReg(k, true);
+         }
+ 
+-        if(compileTable[k].refCount == 0 && compileTable[k].physicalReg != PhysicalReg_Null) {
++        if(compileTable[k].refCount == 0 && compileTable[k].inPhysicalRegister () == true) {
+             bool isTemp = (isVirtualReg(compileTable[k].physicalType) == false);
+ 
+             if (isTemp) {
+@@ -5103,7 +5258,7 @@ int freeReg(bool writeBackAllVRs) {
+                                compileTable[k].physicalReg)));
+ #endif
+ 
+-                compileTable[k].physicalReg = PhysicalReg_Null;
++                compileTable[k].setPhysicalReg (PhysicalReg_Null);
+ 
+                 if(compileTable[k].spill_loc_index >= 0) {
+                     /* update spill info for temporaries */
+@@ -5209,7 +5364,7 @@ int resetGlue(int glue_reg) {
+ #ifdef DEBUG_GLUE
+     ALOGI("GLUE reset for %d", glue_reg);
+ #endif
+-    compileTable[index].physicalReg = PhysicalReg_Null;
++    compileTable[index].setPhysicalReg (PhysicalReg_Null);
+     if(compileTable[index].spill_loc_index >= 0)
+         spillIndexUsed[compileTable[index].spill_loc_index >> 2] = 0;
+     compileTable[index].spill_loc_index = -1;
+@@ -5245,7 +5400,7 @@ int updateGlue(int reg, bool isPhysical, int glue_reg) {
+ #ifdef DEBUG_GLUE
+     ALOGI("physical register for GLUE %d set to %d", glue_reg, compileTable[index2].physicalReg);
+ #endif
+-    compileTable[index].physicalReg = compileTable[index2].physicalReg;
++    compileTable[index].setPhysicalReg (compileTable[index2].getPhysicalReg ());
+     compileTable[index].spill_loc_index = -1;
+     return 0;
+ }
+@@ -5393,7 +5548,7 @@ int handleVRsEndOfBB(bool lastByteCodeIsJump) {
+     for(int k = 0; k < num_compile_entries; k++) {
+         if(compileTable[k].regNum >= PhysicalReg_GLUE_DVMDEX &&
+            compileTable[k].regNum != PhysicalReg_GLUE) {
+-            compileTable[k].physicalReg = PhysicalReg_Null;
++            compileTable[k].setPhysicalReg (PhysicalReg_Null);
+             compileTable[k].spill_loc_index = -1;
+         }
+     }
+@@ -5416,7 +5571,7 @@ int nextVersionOfHardReg(PhysicalReg pReg, int refCount) {
+         SET_JIT_ERROR(kJitErrorRegAllocFailed);
+         return -1;
+     }
+-    compileTable[indexT].physicalReg = PhysicalReg_Null;
++    compileTable[indexT].setPhysicalReg (PhysicalReg_Null);
+ #ifdef DEBUG_REFCOUNT
+     ALOGI("REFCOUNT: to %d in nextVersionOfHardReg %d", refCount, pReg);
+ #endif
+@@ -5424,32 +5579,50 @@ int nextVersionOfHardReg(PhysicalReg pReg, int refCount) {
+     return 0;
+ }
+ 
+-//! \brief update compileTable with bb->infoBasicBlock[k]
+-//!
+-//! \param bb basic block
+-//! \param k index
+-//!
+-//! \return -1 on error, 0 otherwise
+-int insertFromVirtualInfo(BasicBlock_O1* bb, int k) {
+-    int index = searchCompileTable(LowOpndRegType_virtual | bb->infoBasicBlock[k].physicalType, bb->infoBasicBlock[k].regNum);
+-    if(index < 0) {
+-        /* the virtual register is not in compileTable, insert it */
+-        index = num_compile_entries;
+-        compileTable[num_compile_entries].physicalType = (LowOpndRegType_virtual | bb->infoBasicBlock[k].physicalType);
+-        compileTable[num_compile_entries].regNum = bb->infoBasicBlock[k].regNum;
+-        compileTable[num_compile_entries].physicalReg = PhysicalReg_Null;
+-        compileTable[num_compile_entries].spill_loc_index = -1;
+-        compileTable[num_compile_entries].gType = bb->infoBasicBlock[k].gType;
+-        num_compile_entries++;
+-        if(num_compile_entries >= COMPILE_TABLE_SIZE) {
++/**
++ * @brief Updates compile table with virtual register information.
++ * @details If compile table already contains information about virtual register, only the
++ * reference counts are updated. Otherwise a new entry is created in the compile table.
++ * @param regInfo Information about the virtual register.
++ * @return Returns 0 on success and -1 on failure.
++ */
++int insertFromVirtualInfo (VirtualRegInfo &regInfo)
++{
++    int vR = regInfo.regNum;
++
++    //We want to find entry in the compile table that matches the physical type we want.
++    //Since compile table keeps track of physical type along with logical type in same field,
++    //we do a binary bitwise inclusive or including the virtual register type.
++    int index = searchCompileTable (LowOpndRegType_virtual | regInfo.physicalType, vR);
++
++    if (index < 0)
++    {
++        //If we get here it means that the VR is not in the compile table
++
++        //If we exceed size of table, we must throw an error
++        if (num_compile_entries >= COMPILE_TABLE_SIZE)
++        {
+             ALOGI("JIT_INFO: compileTable overflow at insertFromVirtualInfo");
+             SET_JIT_ERROR(kJitErrorRegAllocFailed);
+             return -1;
+         }
++
++        //Let's insert at end of table
++        index = num_compile_entries;
++
++        //Create the new entry and then copy it to the table
++        compileTable[index] = CompileTableEntry (regInfo);
++
++        //We have added an entry so increment the count
++        num_compile_entries++;
++    }
++    else
++    {
++        //Just update the ref count when we already have an entry
++        compileTable[index].updateRefCount (regInfo.refCount);
+     }
+-    /* re-set reference count of all VRs */
+-    compileTable[index].refCount = bb->infoBasicBlock[k].refCount;
+ 
++    //If we make it here, return 0 for success
+     return 0;
+ }
+ 
+@@ -5461,41 +5634,44 @@ int insertFromVirtualInfo(BasicBlock_O1* bb, int k) {
+ int insertFromTempInfo(int k) {
+     int index = searchCompileTable(infoByteCodeTemp[k].physicalType, infoByteCodeTemp[k].regNum);
+     if(index < 0) {
+-        /* the temporary is not in compileTable, insert it */
+-        index = num_compile_entries;
+-        compileTable[num_compile_entries].physicalType = infoByteCodeTemp[k].physicalType;
+-        compileTable[num_compile_entries].regNum = infoByteCodeTemp[k].regNum;
+-        num_compile_entries++;
+         if(num_compile_entries >= COMPILE_TABLE_SIZE) {
+             ALOGI("JIT_INFO: compileTable overflow at insertFromTempInfo");
+             SET_JIT_ERROR(kJitErrorRegAllocFailed);
+             return -1;
+         }
++
++        /* the temporary is not in compileTable, insert it */
++        index = num_compile_entries;
++        compileTable[num_compile_entries].physicalType = infoByteCodeTemp[k].physicalType;
++        compileTable[num_compile_entries].regNum = infoByteCodeTemp[k].regNum;
++        compileTable[num_compile_entries].size = getRegSize (compileTable[num_compile_entries].physicalType);
++
++        num_compile_entries++;
+     }
+-    compileTable[index].physicalReg = PhysicalReg_Null;
++    compileTable[index].setPhysicalReg (PhysicalReg_Null);
+     compileTable[index].refCount = infoByteCodeTemp[k].refCount;
+     compileTable[index].linkageToVR = infoByteCodeTemp[k].linkageToVR;
+-    compileTable[index].gType = GLOBALTYPE_L;
+     compileTable[index].spill_loc_index = -1;
+     return 0;
+ }
+ 
+ /* insert a glue-related register GLUE_DVMDEX to compileTable */
+ void insertGlueReg() {
++    if(num_compile_entries >= COMPILE_TABLE_SIZE) {
++        ALOGI("JIT_INFO: compileTable overflow at insertGlueReg");
++        SET_JIT_ERROR(kJitErrorRegAllocFailed);
++        return;
++    }
++
+     compileTable[num_compile_entries].physicalType = LowOpndRegType_gp;
+     compileTable[num_compile_entries].regNum = PhysicalReg_GLUE_DVMDEX;
++    compileTable[num_compile_entries].size = getRegSize (compileTable[num_compile_entries].physicalType);
+     compileTable[num_compile_entries].refCount = 2;
+-    compileTable[num_compile_entries].physicalReg = PhysicalReg_Null;
++    compileTable[num_compile_entries].setPhysicalReg (PhysicalReg_Null);
+     compileTable[num_compile_entries].spill_loc_index = -1;
+     compileTable[num_compile_entries].linkageToVR = -1;
+-    compileTable[num_compile_entries].gType = GLOBALTYPE_L;
+ 
+     num_compile_entries++;
+-    if(num_compile_entries >= COMPILE_TABLE_SIZE) {
+-        ALOGI("JIT_INFO: compileTable overflow at insertGlueReg");
+-        SET_JIT_ERROR(kJitErrorRegAllocFailed);
+-        return;
+-    }
+ }
+ 
+ /** print infoBasicBlock of the given basic block
+@@ -5524,11 +5700,10 @@ void dumpCompileTable() {
+     ALOGD("%d entries\t%d memory_vr\t%d const_vr", num_compile_entries,
+             num_memory_vr, num_const_vr);
+     for(int entry = 0; entry < num_compile_entries; entry++) {
+-        ALOGD("regNum %d physicalType %d refCount %d type %d physicalReg %s",
++        ALOGD("regNum %d physicalType %d refCount %d physicalReg %s",
+                compileTable[entry].regNum, compileTable[entry].physicalType,
+-               compileTable[entry].refCount, compileTable[entry].gType,
+-               physicalRegToString(static_cast<PhysicalReg>(
+-                       compileTable[entry].physicalReg)));
++               compileTable[entry].refCount, physicalRegToString(
++                       static_cast<PhysicalReg>(compileTable[entry].physicalReg)));
+     }
+     for(int entry = 0; entry < num_memory_vr; entry++) {
+         ALOGD("v%d inMemory:%s", memVRTable[entry].regNum,
+@@ -5618,19 +5793,19 @@ void goToState(int stateNum) {
+ #endif
+     for(k = 0; k < num_compile_entries; k++) {
+         if(stateNum == 1) {
+-            compileTable[k].physicalReg = stateTable1_1[k].physicalReg;
++            compileTable[k].setPhysicalReg (stateTable1_1[k].physicalReg);
+             compileTable[k].spill_loc_index = stateTable1_1[k].spill_loc_index;
+         }
+         else if(stateNum == 2) {
+-            compileTable[k].physicalReg = stateTable1_2[k].physicalReg;
++            compileTable[k].setPhysicalReg (stateTable1_2[k].physicalReg);
+             compileTable[k].spill_loc_index = stateTable1_2[k].spill_loc_index;
+         }
+         else if(stateNum == 3) {
+-            compileTable[k].physicalReg = stateTable1_3[k].physicalReg;
++            compileTable[k].setPhysicalReg (stateTable1_3[k].physicalReg);
+             compileTable[k].spill_loc_index = stateTable1_3[k].spill_loc_index;
+         }
+         else if(stateNum == 4) {
+-            compileTable[k].physicalReg = stateTable1_4[k].physicalReg;
++            compileTable[k].setPhysicalReg (stateTable1_4[k].physicalReg);
+             compileTable[k].spill_loc_index = stateTable1_4[k].spill_loc_index;
+         }
+         else {
+diff --git a/vm/compiler/codegen/x86/AnalysisO1.h b/vm/compiler/codegen/x86/AnalysisO1.h
+index 6c0dcb0..a50b8e7 100644
+--- a/vm/compiler/codegen/x86/AnalysisO1.h
++++ b/vm/compiler/codegen/x86/AnalysisO1.h
+@@ -50,7 +50,7 @@
+ 
+ #define LOOP_COUNT 10
+ //! maximal number of entries in compileTable
+-#define COMPILE_TABLE_SIZE 200
++#define COMPILE_TABLE_SIZE 230
+ //! maximal number of transfer points per basic block
+ #define MAX_XFER_PER_BB 1000  //on Jan 4
+ #define PC_FOR_END_OF_BB -999
+@@ -86,17 +86,7 @@ typedef enum RegAccessType {
+   REGACCESS_N, //no access
+   REGACCESS_UNKNOWN
+ } RegAccessType;
+-//! a variable can be local (L), globally local (GL) or global (GG)
+-typedef enum GlobalType {
+-  GLOBALTYPE_GG,
+-  GLOBALTYPE_GL,
+-  GLOBALTYPE_L
+-} GlobalType;
+-typedef enum VRState {
+-  VRSTATE_SPILLED,
+-  VRSTATE_UPDATED,
+-  VRSTATE_CLEAN
+-} VRState;
++
+ //! helper state indexes to determine if freeing VRs needs to be delayed
+ enum VRDelayFreeCounters {
+   VRDELAY_NULLCHECK = 0, // used when VR is used for null check and freeing must be delayed
+@@ -104,11 +94,7 @@ enum VRDelayFreeCounters {
+   VRDELAY_CAN_THROW = 2, // used when bytecode can throw exception, in fact delays freeing any VR
+   VRDELAY_COUNT = 3, // Count of delay reasons
+ };
+-typedef enum TRState { //state of temporary registers
+-  TRSTATE_SPILLED,
+-  TRSTATE_UNSPILLED,
+-  TRSTATE_CLEAN
+-} TRState;
++
+ //!information about a physical register
+ typedef struct RegisterInfo {
+   PhysicalReg physicalReg;
+@@ -116,12 +102,7 @@ typedef struct RegisterInfo {
+   bool isCalleeSaved;
+   int freeTimeStamp;
+ } RegisterInfo;
+-typedef struct UniqueRegister {
+-  LowOpndRegType physicalType;
+-  int regNum;
+-  int numExposedUsage;
+-  PhysicalReg physicalReg;
+-} UniqueRegister;
++
+ //!specifies the weight of a VR allocated to a specific physical register
+ //!it is used for GPR VR only
+ typedef struct RegAllocConstraint {
+@@ -182,13 +163,13 @@ typedef struct VirtualRegInfo {
+   LowOpndRegType physicalType;
+   int refCount;
+   RegAccessType accessType;
+-  GlobalType gType;
+   RegAllocConstraint allocConstraints[8];
+   RegAllocConstraint allocConstraintsSorted[8];
+ 
+   DefOrUse reachingDefs[3]; //!reaching defs to the virtual register
+   int num_reaching_defs;
+ } VirtualRegInfo;
++
+ //!information of whether a VR is constant and its value
+ typedef struct ConstVRInfo {
+   int regNum;
+@@ -232,13 +213,45 @@ typedef struct BoundCheckIndex {
+  * @brief information for a virtual register such as live ranges, in memory
+  */
+ typedef struct MemoryVRInfo {
+-  int regNum;                   /**< @brief The register number */
+-  bool inMemory;                /**< @brief Is it in memory or not */
+-  bool nullCheckDone;           /**< @brief Has a null check been done for it? */
+-  BoundCheckIndex boundCheck;   /**< @brief Bound check information for the VR */
+-  int num_ranges;               /**< @brief Number of ranges, used as a size for ranges */
+-  LiveRange* ranges;            /**< @brief Live range information for the entry */
+-  int delayFreeCounters[VRDELAY_COUNT]; /**< @brief Used with indexes defined by VRDelayFreeCounters enum to delay freeing */
++    int regNum;                   /**< @brief The register number */
++    bool inMemory;                /**< @brief Is it in memory or not */
++    bool nullCheckDone;           /**< @brief Has a null check been done for it? */
++    BoundCheckIndex boundCheck;   /**< @brief Bound check information for the VR */
++    int num_ranges;               /**< @brief Number of ranges, used as a size for ranges */
++    LiveRange* ranges;            /**< @brief Live range information for the entry */
++    int delayFreeCounters[VRDELAY_COUNT]; /**< @brief Used with indexes defined by VRDelayFreeCounters enum to delay freeing */
++
++    /**
++     * @brief Used to reset information about the VR to default values.
++     * @details Creates a logically invalid entry.
++     */
++    void reset (void);
++
++    /**
++     * @brief Returns the virtual register represented by this entry.
++     */
++    int getVirtualRegister (void)
++    {
++        return regNum;
++    }
++
++    /**
++     * @brief Sets the virtual register represented by this entry.
++     * @param regNum The virtual register number.
++     */
++    void setVirtualRegister (int regNum)
++    {
++        this->regNum = regNum;
++    }
++
++    /**
++     * @brief Sets the in memory state of this entry which represent specific virtual register.
++     * @param inMemory The in memory state to set to this entry.
++     */
++    void setInMemoryState (bool inMemory)
++    {
++        this->inMemory = inMemory;
++    }
+ } MemoryVRInfo;
+ 
+ //!information of a temporary
+@@ -256,34 +269,198 @@ struct BasicBlock_O1;
+ //!all variables accessed
+ 
+ /**
+- * @class compileTableEntry
+- * @brief compileTableEntry represents an entry to the compilation table, helping the compiler follow what register is where
+- * @details the pair <regNum, physicalType> uniquely determines a variable
++ * @brief Provides a mapping between physical type and the size represented.
++ * @param type The physical type represented by LowOpndRegType.
++ * @return Returns size represented by the physical type.
+  */
+-struct compileTableEntry {
++OpndSize getRegSize (int type);
++
++/**
++ * @brief Represents an entry to the compilation table, helping the compiler follow what register is where.
++ * @details The pair <regNum, physicalType> uniquely determines a variable
++ */
++class CompileTableEntry {
++public:
++    /**
++     * @brief Empty constructor.
++     */
++    CompileTableEntry (void) :
++            regNum (-1), physicalType (LowOpndRegType_invalid), physicalReg (PhysicalReg_Null),
++            size (OpndSize_Null), isConst (false), refCount(0), linkageToVR (-1), spill_loc_index (-1),
++            isWritten (false)
++    {
++    }
++
++    /**
++     * @brief Constructor which initializes an entry with its register number and type.
++     * @param regNum The register number: vr number, temp number, or hardcoded register number.
++     * @param physicalType the LowOpndRegType for this register. Should reflect both its physical
++     * type and its logical type.
++     */
++    CompileTableEntry (int regNum, int physicalType) :
++            regNum (regNum), physicalType (physicalType), physicalReg (PhysicalReg_Null),
++            isConst (false), refCount(0), linkageToVR (0), spill_loc_index (-1), isWritten (false)
++    {
++        size = getRegSize (physicalType);
++    }
++
++    /**
++     * @brief Constructs a compile table entry which represents a virtual register.
++     * @param vrInfo The virtual register info to use for initialization.
++     */
++    CompileTableEntry (const VirtualRegInfo &vrInfo) :
++            regNum (vrInfo.regNum), physicalType (LowOpndRegType_virtual | vrInfo.physicalType),
++            physicalReg (PhysicalReg_Null), isConst (false), refCount(vrInfo.refCount),
++            linkageToVR (0), spill_loc_index (-1), isWritten (false)
++    {
++        size = getRegSize (vrInfo.physicalType);
++    }
++
++    /**
++     * @brief Returns the register number.
++     */
++    int getRegisterNumber (void) const
++    {
++        return regNum;
++    }
++
++    /**
++     * @brief Returns the physical type for this entry. This returns only type of physical register
++     * usable for this entry.
++     */
++    LowOpndRegType getPhysicalType (void) const
++    {
++        return static_cast<LowOpndRegType> (physicalType & MASK_FOR_TYPE);
++    }
++
++    /**
++     * @brief Returns the physical register used for this entry.
++     */
++    PhysicalReg getPhysicalReg (void) const
++    {
++        return static_cast<PhysicalReg> (physicalReg);
++    }
++
++    /**
++     * @brief Returns the size of the physical type for this entry.
++     */
++    OpndSize getSize (void) const
++    {
++        return size;
++    }
++
++    /**
++     * @brief Sets a new physical register for this entry.
++     * @param newReg The new physical register.
++     */
++    void setPhysicalReg (PhysicalReg newReg)
++    {
++        setPhysicalReg (static_cast<int> (newReg));
++    }
++
++    /**
++     * @brief Sets a new physical register for this entry.
++     * @param newReg The new physical register.
++     */
++    void setPhysicalReg (int newReg)
++    {
++        // It doesn't make sense to set physical register to a non-existent register.
++        // Thus we have this check here for sanity.
++        assert (newReg <= PhysicalReg_Null);
++        physicalReg = newReg;
++    }
++
++    /**
++     * @brief Updates the reference count for this entry.
++     * @param newCount The reference count to set.
++     */
++    void updateRefCount (int newCount)
++    {
++        refCount = newCount;
++    }
++
++    /**
++     * @brief Returns whether this entry is in a physical register.
++     */
++    bool inPhysicalRegister (void) const
++    {
++        return physicalReg != PhysicalReg_Null;
++    }
++
++    /**
++     * @brief Returns whether this entry is in a general purpose register.
++     */
++    bool inGeneralPurposeRegister (void) const
++    {
++        return (physicalReg >= PhysicalReg_StartOfGPMarker && physicalReg <= PhysicalReg_EndOfGPMarker);
++    }
++
++    /**
++     * @brief Returns whether this entry is in an xmm register.
++     */
++    bool inXMMRegister (void) const
++    {
++        return (physicalReg >= PhysicalReg_StartOfXmmMarker && physicalReg <= PhysicalReg_EndOfXmmMarker);
++    }
++
++    /**
++     * @brief Returns whether this entry represent a virtual register.
++     */
++    bool isVirtualReg (void) const
++    {
++        return ((physicalType & LowOpndRegType_virtual) != 0);
++    }
++
++    /**
++     * @brief Returns whether this entry represent a backend temporary.
++     */
++    bool isTemporary (void) const
++    {
++        return (isVirtualReg () == false && regNum < PhysicalReg_GLUE_DVMDEX);
++    }
++
++    /**
++     * @brief Resets properties of compile entry to default values. Does not reset the type and register represented
++     * by this compile entry.
++     */
++    void reset (void)
++    {
++        //We do not reset regNum and physicalType because those uniquely represent an entry
++        //Because of that, we also do not reset size because it is calculated based on physical type.
++
++        //Reset physical register to null
++        physicalReg = PhysicalReg_Null;
++
++        //Not a constant
++        isConst = false;
++        value[0] = 0, value[1] = 0;
++
++        //Unknown number of references
++        refCount = 0;
++
++        //If temporary, we don't know the VR it represents
++        linkageToVR = -1;
++
++        //We have not spilled this entry so no spill index
++        spill_loc_index = -1;
++
++        //We have not written to this
++        isWritten = false;
++    }
++
+     int regNum;               /**< @brief The register number */
+     int physicalType;         /**< @brief The physical type: gp, xmm or scratch, virtual */
+     int physicalReg;          /**< @brief Which physical register was chosen */
++    OpndSize size;            /**< @brief Used to keep track of size of entry */
+ 
+-  // TODO isConst and value[2] should be removed because we keep track of them
+-  // via the constVRTable
+     bool isConst;             /**< @brief Is the entry a constant */
+     int value[2];             /**< @brief The value: [0]: lower [1]: higher */
+     int refCount;             /**< @brief Number of reference counts for the entry */
+ 
+     int linkageToVR;          /**< @brief Linked to which VR, for temporary registers only */
+-    GlobalType gType;         /**< @brief What is the GlobalType for the entry */
+ 
+     int spill_loc_index;      /**< @brief what is the spill location index (for temporary registers only) */
+     bool isWritten;           /**< @brief is the entry written */
+-
+-    PhysicalReg getPhysicalReg() {
+-        return static_cast<PhysicalReg>(physicalReg);
+-    }
+-
+-    void setPhysicalReg(PhysicalReg newReg) {
+-        physicalReg = newReg;
+-    }
+ };
+ 
+ //!to save the state of register allocator
+@@ -352,7 +529,7 @@ typedef struct CFGWork {
+ 
+ extern MemoryVRInfo memVRTable[NUM_MEM_VR_ENTRY];
+ extern int num_memory_vr;
+-extern compileTableEntry compileTable[COMPILE_TABLE_SIZE];
++extern CompileTableEntry compileTable[COMPILE_TABLE_SIZE];
+ extern int num_compile_entries;
+ extern VirtualRegInfo infoByteCode[MAX_REG_PER_BYTECODE];
+ extern int num_regs_per_bytecode;
+@@ -388,9 +565,6 @@ int getVirtualRegInfo(VirtualRegInfo* infoArray, const MIR * currentMIR);
+ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR);
+ int createCFGHandler(Method* method);
+ 
+-//Set a VR to a constant value
+-void setVRToConst(int regNum, OpndSize size, int* tmpValue);
+-
+ int findVirtualRegInTable(int vA, LowOpndRegType type);
+ int searchCompileTable(int type, int regNum);
+ void handleJump(BasicBlock_O1* bb_prev, int relOff);
+@@ -401,11 +575,36 @@ int collectInfoOfBasicBlock(Method* method, BasicBlock_O1* bb); //update bb->inf
+ 
+ void updateCurrentBBWithConstraints(PhysicalReg reg);
+ void updateConstInfo(BasicBlock_O1*);
+-OpndSize getRegSize(int type);
+ void invalidateVRDueToConst(int reg, OpndSize size);
+ 
+ //Set a VR to a constant value
+-void setVRToConst(int regNum, OpndSize size, int* tmpValue);
++bool setVRToConst(int regNum, OpndSize size, int* tmpValue);
++
++//Set that VR is not a constant
++void setVRToNonConst(int regNum, OpndSize size);
++
++/**
++ * @brief Used the represent the constantness of a virtual register.
++ */
++enum VirtualRegConstantness
++{
++    VR_IS_NOT_CONSTANT = 0,  //!< virtual register is not constant
++    VR_LOW_IS_CONSTANT = 1,  //!< only the low 32-bit of virtual register is constant
++    VR_HIGH_IS_CONSTANT = 2, //!< only the high 32-bit of virtual register is constant
++    VR_IS_CONSTANT = 3       //!< virtual register is entirely constant
++};
++
++//Checks if VR is constant
++VirtualRegConstantness isVirtualRegConstant (int regNum, int opndRegType, int *valuePtr, bool updateRef);
++
++//If VR is dirty, it writes the constant value to the VR on stack
++void writeBackConstVR (int vR, int value);
++
++//Writes virtual register back to memory if it holds a constant value
++bool writeBackVRIfConstant (int vR, LowOpndRegType type);
++
++//Check if VR is in memory
++bool isInMemory(int regNum, OpndSize size);
+ 
+ //Find free registers and update the set
+ void findFreeRegisters(std::set<PhysicalReg> & outFreeRegisters);
+diff --git a/vm/compiler/codegen/x86/BytecodeVisitor.cpp b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+index 1d85012..6ac3738 100644
+--- a/vm/compiler/codegen/x86/BytecodeVisitor.cpp
++++ b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+@@ -471,10 +471,19 @@ void setVRToNonConst(int regNum, OpndSize size) {
+         constVRTable[indexH].isConst = false;
+     }
+ }
+-//! update constVRTable for a given virtual register
+ 
+-//! set "isConst" to true
+-void setVRToConst(int regNum, OpndSize size, int* tmpValue) {
++/**
++ * @brief Marks a virtual register as being constant.
++ * @param regNum The virtual register number.
++ * @param size The size of the virtual register.
++ * @param tmpValue Array representing the constant values for this VR. It must be the correct size to match
++ * the size argument.
++ * @return Returns true if setting VR to constant succeeded. On failure it returns false.
++ */
++bool setVRToConst (int regNum, OpndSize size, int *tmpValue)
++{
++    assert (tmpValue != 0);
++
+     int k;
+     int indexL = -1;
+     int indexH = -1;
+@@ -488,28 +497,58 @@ void setVRToConst(int regNum, OpndSize size, int* tmpValue) {
+             continue;
+         }
+     }
+-    if(indexL < 0) {
++
++    //Add the entry for the VR to the table if we don't have it
++    if(indexL < 0)
++    {
++        //Now check for possible table overflow. If we don't have an entry for this,
++        //then we must add it. Check now for possible overflow.
++        if (num_const_vr > MAX_CONST_REG)
++        {
++            ALOGI("JIT_INFO: constVRTable overflows at setVRToConst.");
++            SET_JIT_ERROR(kJitErrorRegAllocFailed);
++            return false;
++        }
++
+         indexL = num_const_vr;
+         constVRTable[indexL].regNum = regNum;
+         num_const_vr++;
+     }
++
++    //Now initialize the entry with the constant value
+     constVRTable[indexL].isConst = true;
+     constVRTable[indexL].value = tmpValue[0];
+-    if(size == OpndSize_64) {
+-        if(indexH < 0) {
++
++    //If we have a 64-bit VR, we must also initialize the high bits
++    if (size == OpndSize_64)
++    {
++        //Add entry to the table if we don't have it
++        if (indexH < 0)
++        {
++            //Now check for possible table overflow. If we don't have an entry for this,
++            //then we must add it. Check now for possible overflow.
++            if (num_const_vr > MAX_CONST_REG)
++            {
++                ALOGI("JIT_INFO: constVRTable overflows at setVRToConst.");
++                SET_JIT_ERROR(kJitErrorRegAllocFailed);
++                return false;
++            }
++
+             indexH = num_const_vr;
+-            constVRTable[indexH].regNum = regNum+1;
++            constVRTable[indexH].regNum = regNum + 1;
+             num_const_vr++;
+         }
++
++        //Now initialize the entry with the constant value
+         constVRTable[indexH].isConst = true;
+         constVRTable[indexH].value = tmpValue[1];
+     }
+-    if(num_const_vr > MAX_CONST_REG) {
+-        ALOGI("JIT_INFO: constVRTable overflows at setVRToConst");
+-        SET_JIT_ERROR(kJitErrorRegAllocFailed);
+-        return;
+-    }
+-    invalidateVRDueToConst(regNum, size);
++
++    //This VR just became a constant so invalidate other information we have about it
++    invalidateVRDueToConst (regNum, size);
++
++    //If we make it here we were successful
++    return true;
+ }
+ 
+ //! perform work on constWorklist
+@@ -540,8 +579,11 @@ void updateConstInfo(BasicBlock_O1* bb) {
+ //! \return 1 if the bytecode generates a const, 0 otherwise, and -1 if an
+ //! error occured.
+ int getConstInfo(BasicBlock_O1* bb, const MIR * currentMIR) {
++    //retCode and success are used to keep track of success of function calls from this function
+     int retCode = 0;
+-    compileTableEntry* infoArray = compileTable;
++    bool success = false;
++
++    CompileTableEntry* infoArray = compileTable;
+     Opcode inst_op = currentMIR->dalvikInsn.opcode;
+     int vA = 0, vB = 0, v1, v2;
+     u2 BBBB;
+@@ -582,7 +624,14 @@ int getConstInfo(BasicBlock_O1* bb, const MIR * currentMIR) {
+             entry = findVirtualRegInTable(vA, LowOpndRegType_gp);
+             if (entry < 0)
+                 return -1;
+-            setVRToConst(vA, OpndSize_32, tmpValue);
++
++            success = setVRToConst(vA, OpndSize_32, tmpValue);
++            if (success == false)
++            {
++                //setVRToConst set an error message when it failed so we just pass along the failure information
++                return -1;
++            }
++
+             infoArray[entry].isConst = true;
+             infoArray[entry].value[0] = tmpValue[0];
+             compileTable[entry].refCount--;
+@@ -604,7 +653,14 @@ int getConstInfo(BasicBlock_O1* bb, const MIR * currentMIR) {
+             entry = findVirtualRegInTable(vA, LowOpndRegType_xmm);
+             if (entry < 0)
+                 return -1;
+-            setVRToConst(vA, OpndSize_64, tmpValue);
++
++            success = setVRToConst(vA, OpndSize_64, tmpValue);
++            if (success == false)
++            {
++                //setVRToConst set an error message when it failed so we just pass along the failure information
++                return -1;
++            }
++
+             compileTable[entry].refCount--;
+             retCode = touchOneVR(vB, LowOpndRegType_xmm);
+             if (retCode < 0)
+@@ -768,7 +824,14 @@ int getConstInfo(BasicBlock_O1* bb, const MIR * currentMIR) {
+             if(inst_op == OP_INT_TO_SHORT) //sar
+                 infoArray[entry].value[0] = (tmpValue[0] << 16) >> 16;
+             tmpValue[0] = infoArray[entry].value[0];
+-            setVRToConst(vA, OpndSize_32, tmpValue);
++
++            success = setVRToConst(vA, OpndSize_32, tmpValue);
++            if (success == false)
++            {
++                //setVRToConst set an error message when it failed so we just pass along the failure information
++                return -1;
++            }
++
+             compileTable[entry].refCount--;
+             retCode = touchOneVR(vB, LowOpndRegType_gp);
+             if (retCode < 0)
+@@ -844,7 +907,14 @@ int getConstInfo(BasicBlock_O1* bb, const MIR * currentMIR) {
+             if(inst_op == OP_USHR_INT_2ADDR)
+                 infoArray[entry].value[0] = (unsigned int)tmpValue[0] >> tmpValue2[0];
+             tmpValue[0] = infoArray[entry].value[0];
+-            setVRToConst(vA, OpndSize_32, tmpValue);
++
++            success = setVRToConst(vA, OpndSize_32, tmpValue);
++            if (success == false)
++            {
++                //setVRToConst set an error message when it failed so we just pass along the failure information
++                return -1;
++            }
++
+             compileTable[entry].refCount--;
+             retCode = touchOneVR(v2, LowOpndRegType_gp);
+             if (retCode < 0)
+@@ -890,7 +960,14 @@ int getConstInfo(BasicBlock_O1* bb, const MIR * currentMIR) {
+             if(inst_op == OP_XOR_INT_LIT16)
+                 infoArray[entry].value[0] = tmpValue[0] ^ tmp_s4;
+             tmpValue[0] = infoArray[entry].value[0];
+-            setVRToConst(vA, OpndSize_32, tmpValue);
++
++            success = setVRToConst(vA, OpndSize_32, tmpValue);
++            if (success == false)
++            {
++                //setVRToConst set an error message when it failed so we just pass along the failure information
++                return -1;
++            }
++
+             compileTable[entry].refCount--;
+             retCode = touchOneVR(vB, LowOpndRegType_gp);
+             if (retCode < 0)
+@@ -946,7 +1023,14 @@ int getConstInfo(BasicBlock_O1* bb, const MIR * currentMIR) {
+             if(inst_op == OP_USHR_INT)
+                 infoArray[entry].value[0] = (unsigned int)tmpValue[0] >> tmpValue2[0];
+             tmpValue[0] = infoArray[entry].value[0];
+-            setVRToConst(vA, OpndSize_32, tmpValue);
++
++            success = setVRToConst(vA, OpndSize_32, tmpValue);
++            if (success == false)
++            {
++                //setVRToConst set an error message when it failed so we just pass along the failure information
++                return -1;
++            }
++
+             compileTable[entry].refCount--;
+             retCode = touchOneVR(v1, LowOpndRegType_gp);
+             if (retCode < 0)
+@@ -1004,7 +1088,14 @@ int getConstInfo(BasicBlock_O1* bb, const MIR * currentMIR) {
+             if(inst_op == OP_USHR_INT_LIT8)
+                 infoArray[entry].value[0] = (unsigned int)tmpValue[0] >> tmp_s4;
+             tmpValue[0] = infoArray[entry].value[0];
+-            setVRToConst(vA, OpndSize_32, tmpValue);
++
++            success = setVRToConst(vA, OpndSize_32, tmpValue);
++            if (success == false)
++            {
++                //setVRToConst set an error message when it failed so we just pass along the failure information
++                return -1;
++            }
++
+             compileTable[entry].refCount--;
+             retCode = touchOneVR(vB, LowOpndRegType_gp);
+             if (retCode < 0)
+@@ -1069,7 +1160,14 @@ int getConstInfo(BasicBlock_O1* bb, const MIR * currentMIR) {
+         infoArray[entry].isConst = true;
+         infoArray[entry].value[0] = tmp_s4;
+         tmpValue[0] = infoArray[entry].value[0];
+-        setVRToConst(vA, OpndSize_32, tmpValue);
++
++        success = setVRToConst(vA, OpndSize_32, tmpValue);
++        if (success == false)
++        {
++            //setVRToConst set an error message when it failed so we just pass along the failure information
++            return -1;
++        }
++
+         compileTable[entry].refCount--;
+ #ifdef DEBUG_CONST
+         ALOGD("getConstInfo: set VR %d to %d", vA, tmp_s4);
+@@ -1084,7 +1182,14 @@ int getConstInfo(BasicBlock_O1* bb, const MIR * currentMIR) {
+         infoArray[entry].isConst = true;
+         infoArray[entry].value[0] = (s2)BBBB;
+         tmpValue[0] = infoArray[entry].value[0];
+-        setVRToConst(vA, OpndSize_32, tmpValue);
++
++        success = setVRToConst(vA, OpndSize_32, tmpValue);
++        if (success == false)
++        {
++            //setVRToConst set an error message when it failed so we just pass along the failure information
++            return -1;
++        }
++
+         compileTable[entry].refCount--;
+ #ifdef DEBUG_CONST
+         ALOGD("getConstInfo: set VR %d to %d", vA, infoArray[entry].value[0]);
+@@ -1099,7 +1204,14 @@ int getConstInfo(BasicBlock_O1* bb, const MIR * currentMIR) {
+         infoArray[entry].isConst = true;
+         infoArray[entry].value[0] = (s4)tmp_u4;
+         tmpValue[0] = infoArray[entry].value[0];
+-        setVRToConst(vA, OpndSize_32, tmpValue);
++
++        success = setVRToConst(vA, OpndSize_32, tmpValue);
++        if (success == false)
++        {
++            //setVRToConst set an error message when it failed so we just pass along the failure information
++            return -1;
++        }
++
+         compileTable[entry].refCount--;
+ #ifdef DEBUG_CONST
+         ALOGD("getConstInfo: set VR %d to %d", vA, infoArray[entry].value[0]);
+@@ -1114,7 +1226,14 @@ int getConstInfo(BasicBlock_O1* bb, const MIR * currentMIR) {
+         infoArray[entry].isConst = true;
+         infoArray[entry].value[0] = ((s4)tmp_u2)<<16;
+         tmpValue[0] = infoArray[entry].value[0];
+-        setVRToConst(vA, OpndSize_32, tmpValue);
++
++        success = setVRToConst(vA, OpndSize_32, tmpValue);
++        if (success == false)
++        {
++            //setVRToConst set an error message when it failed so we just pass along the failure information
++            return -1;
++        }
++
+         compileTable[entry].refCount--;
+ #ifdef DEBUG_CONST
+         ALOGD("getConstInfo: set VR %d to %d", vA, infoArray[entry].value[0]);
+@@ -1140,7 +1259,14 @@ int getConstInfo(BasicBlock_O1* bb, const MIR * currentMIR) {
+         infoArray[entry].isConst = true;
+         infoArray[entry].value[0] = ((s2)tmp_u2)>>31;
+         tmpValue[1] = infoArray[entry].value[0];
+-        setVRToConst(vA, OpndSize_64, tmpValue);
++
++        success = setVRToConst(vA, OpndSize_64, tmpValue);
++        if (success == false)
++        {
++            //setVRToConst set an error message when it failed so we just pass along the failure information
++            return -1;
++        }
++
+         compileTable[entry].refCount--;
+ #ifdef DEBUG_CONST
+         ALOGD("getConstInfo: set VR %d to %x", vA+1, infoArray[entry].value[0]);
+@@ -1166,7 +1292,14 @@ int getConstInfo(BasicBlock_O1* bb, const MIR * currentMIR) {
+         infoArray[entry].isConst = true;
+         infoArray[entry].value[0] = ((s4)tmp_u4)>>31;
+         tmpValue[1] = infoArray[entry].value[0];
+-        setVRToConst(vA, OpndSize_64, tmpValue);
++
++        success = setVRToConst(vA, OpndSize_64, tmpValue);
++        if (success == false)
++        {
++            //setVRToConst set an error message when it failed so we just pass along the failure information
++            return -1;
++        }
++
+         compileTable[entry].refCount--;
+ #ifdef DEBUG_CONST
+         ALOGD("getConstInfo: set VR %d to %x", vA+1, infoArray[entry].value[0]);
+@@ -1193,7 +1326,14 @@ int getConstInfo(BasicBlock_O1* bb, const MIR * currentMIR) {
+         infoArray[entry].isConst = true;
+         infoArray[entry].value[0] = (s4)tmp_u4;
+         tmpValue[1] = infoArray[entry].value[0];
+-        setVRToConst(vA, OpndSize_64, tmpValue);
++
++        success = setVRToConst(vA, OpndSize_64, tmpValue);
++        if (success == false)
++        {
++            //setVRToConst set an error message when it failed so we just pass along the failure information
++            return -1;
++        }
++
+         compileTable[entry].refCount--;
+ #ifdef DEBUG_CONST
+         ALOGD("getConstInfo: set VR %d to %x", vA+1, infoArray[entry].value[0]);
+@@ -1219,7 +1359,14 @@ int getConstInfo(BasicBlock_O1* bb, const MIR * currentMIR) {
+         infoArray[entry].isConst = true;
+         infoArray[entry].value[0] = ((s4)tmp_u2)<<16;
+         tmpValue[1] = infoArray[entry].value[0];
+-        setVRToConst(vA, OpndSize_64, tmpValue);
++
++        success = setVRToConst(vA, OpndSize_64, tmpValue);
++        if (success == false)
++        {
++            //setVRToConst set an error message when it failed so we just pass along the failure information
++            return -1;
++        }
++
+         compileTable[entry].refCount--;
+ #ifdef DEBUG_CONST
+         ALOGD("getConstInfo: set VR %d to %x", vA+1, infoArray[entry].value[0]);
+diff --git a/vm/compiler/codegen/x86/Lower.h b/vm/compiler/codegen/x86/Lower.h
+index e03a284..5f3cf72 100644
+--- a/vm/compiler/codegen/x86/Lower.h
++++ b/vm/compiler/codegen/x86/Lower.h
+@@ -633,7 +633,6 @@ int checkVirtualReg(int reg, LowOpndRegType type, int updateRef); //returns the
+ int updateRefCount(int reg, LowOpndRegType type);
+ int updateRefCount2(int reg, int type, bool isPhysical);
+ int spillVirtualReg(int vrNum, LowOpndRegType type, bool updateTable);
+-int isVirtualRegConstant(int regNum, LowOpndRegType type, int* valuePtr, bool updateRef);
+ int checkTempReg(int reg, int type, bool isPhysical, int vA);
+ bool checkTempReg2(int reg, int type, bool isPhysical, int physicalRegForVR, int vB);
+ int freeReg(bool writeBackAllVRs);
+@@ -1369,7 +1368,6 @@ void move_chain_to_mem(OpndSize size, int imm,
+                         int disp, int base_reg, bool isBasePhysical);
+ void move_chain_to_reg(OpndSize size, int imm, int reg, bool isPhysical);
+ 
+-void writeBackConstVR(int vR, int value);
+ bool isInMemory(int regNum, OpndSize size);
+ int touchEbx();
+ int boundCheck(int vr_array, int reg_array, bool isPhysical_array,
+diff --git a/vm/compiler/codegen/x86/LowerHelper.cpp b/vm/compiler/codegen/x86/LowerHelper.cpp
+index fa37948..0acf9d0 100644
+--- a/vm/compiler/codegen/x86/LowerHelper.cpp
++++ b/vm/compiler/codegen/x86/LowerHelper.cpp
+@@ -1906,8 +1906,7 @@ bool alu_imm_to_VR(OpndSize size, ALU_Opcode opc, int srcVR, int destVR, int imm
+                     //Add or subtract
+                     constValue[0] = finalSum;
+                     constValue[1] = 0; //To be safe
+-                    setVRToConst(destVR, size, constValue);
+-                    return true; //Successfully updated
++                    return setVRToConst(destVR, size, constValue);
+                 }
+                 else if (caseDest == DEST_IN_MEMORY) {
+                     dump_imm_mem_noalloc(Mnemonic_MOV, size, finalSum, 4*destVR, PhysicalReg_FP, true, MemoryAccess_VR, destVR);
+diff --git a/vm/compiler/codegen/x86/LowerJump.cpp b/vm/compiler/codegen/x86/LowerJump.cpp
+index 4b7d9e4..218a253 100644
+--- a/vm/compiler/codegen/x86/LowerJump.cpp
++++ b/vm/compiler/codegen/x86/LowerJump.cpp
+@@ -1257,6 +1257,13 @@ int common_if(s4 tmp, ConditionCode cc_next, ConditionCode cc) {
+             return -1;
+         }
+ 
++        //Just in case the current BB has any spill requests, let's handle them
++        //before we satisfy BB associations
++        if (AssociationTable::handleSpillRequestsFromME (currentBB) == false)
++        {
++            return -1;
++        }
++
+         //Now we want to satisfy the associations of the loop entry.
+         //We also inform satisfyBBAssociations that this is a backward branch.
+         if (AssociationTable::satisfyBBAssociations (backward, loopEntry,
+diff --git a/vm/compiler/codegen/x86/RegisterizationBE.cpp b/vm/compiler/codegen/x86/RegisterizationBE.cpp
+index 824eb2d..44b8907 100644
+--- a/vm/compiler/codegen/x86/RegisterizationBE.cpp
++++ b/vm/compiler/codegen/x86/RegisterizationBE.cpp
+@@ -24,10 +24,18 @@
+ #include "RegisterizationBE.h"
+ 
+ //#define DEBUG_REGISTERIZATION
++
++#ifdef DEBUG_REGISTERIZATION
++#define DEBUG_ASSOCIATION(X) X
++#define DEBUG_SPILLING(X) X
++#define DEBUG_ASSOCIATION_MERGE(X) X
++#define DEBUG_COMPILETABLE_UPDATE(X) X
++#else
+ #define DEBUG_ASSOCIATION(X)
+ #define DEBUG_SPILLING(X)
+ #define DEBUG_ASSOCIATION_MERGE(X)
+ #define DEBUG_COMPILETABLE_UPDATE(X)
++#endif
+ 
+ AssociationTable::AssociationTable(void) {
+     //Call clear function, it will reset everything
+@@ -51,14 +59,9 @@ void AssociationTable::clear(void) {
+     isFinal = false;
+ }
+ 
+-bool AssociationTable::copy(AssociationTable & source) {
++bool AssociationTable::copy(AssociationTable &source) {
+     //We cannot copy anything if we are finalized
+-    if (hasBeenFinalized()) {
+-        //Print out an error and set it before returning false
+-        ALOGW("Association table has been finalized but we want to update it.");
+-        SET_JIT_ERROR(kJitErrorBERegisterization);
+-        return false;
+-    }
++    assert (hasBeenFinalized() == false);
+ 
+     //Insert all associations from source
+     associations.insert(source.associations.begin(), source.associations.end());
+@@ -75,14 +78,9 @@ bool AssociationTable::copy(AssociationTable & source) {
+     return true;
+ }
+ 
+-bool AssociationTable::associate(compileTableEntry & compileEntry) {
++bool AssociationTable::associate(const CompileTableEntry & compileEntry) {
+     // We cannot update once the association table has been finalized
+-    if (hasBeenFinalized()) {
+-        //Print out error, set error, and return false
+-        ALOGW("Association table has been finalized but we want to update it.");
+-        SET_JIT_ERROR(kJitErrorBERegisterization);
+-        return false;
+-    }
++    assert (hasBeenFinalized() == false);
+ 
+     // Paranoid: this must be a virtual register
+     assert(isVirtualReg(compileEntry.physicalType));
+@@ -91,19 +89,29 @@ bool AssociationTable::associate(compileTableEntry & compileEntry) {
+     int VR = compileEntry.regNum;
+     int physicalReg = compileEntry.physicalReg;
+ 
++    bool safeToUpdate = true;
++
+     // Check if we are overwriting an existing association
+     const_iterator assocEntry = associations.find(VR);
+-    if (assocEntry != associations.end()) {
++    if (assocEntry != associations.end())
++    {
+         int oldPhysicalReg = assocEntry->second.physicalReg;
+ 
++        //If the new physical register is null, then we don't want to update the
++        //association that we saved already.
++        if (physicalReg == PhysicalReg_Null)
++        {
++            safeToUpdate = false;
++        }
++
+         // We might be saving VRs even when they don't have physical register
+         // associated and thus we don't care for overwriting unless one has
+         // physical register
+-        if (oldPhysicalReg != PhysicalReg_Null || physicalReg != PhysicalReg_Null) {
++        if (oldPhysicalReg != PhysicalReg_Null && physicalReg != PhysicalReg_Null) {
+             // Overwriting an association must mean that we are reading from a source
+             // that has the duplicate entries for the same VR. Most likely this can
+             // happen when a VR is associated with XMM and GP in same trace
+-            ALOGE ("JIT_INFO: Overwriting association of v%d:%s with %s\n", VR,
++            ALOGI ("JIT_INFO: Overwriting association of v%d:%s with %s\n", VR,
+                     physicalRegToString(static_cast<PhysicalReg>(oldPhysicalReg)),
+                     physicalRegToString(static_cast<PhysicalReg>(physicalReg)));
+             SET_JIT_ERROR(kJitErrorBERegisterization);
+@@ -111,23 +119,23 @@ bool AssociationTable::associate(compileTableEntry & compileEntry) {
+         }
+     }
+ 
+-    // Make a copy of the compileTableEntry
+-    associations[VR] = compileEntry;
++    //We only do the update if it is safe
++    if (safeToUpdate == true)
++    {
++        // Make a copy of the compile table entry
++        associations[VR] = compileEntry;
+ 
+-    DEBUG_ASSOCIATION( ALOGD ("Associating v%d with %s\n",
+-                    VR, physicalRegToString(physicalReg)));
++        DEBUG_ASSOCIATION( ALOGD ("Associating v%d with %s\n", VR,
++                physicalRegToString(static_cast<PhysicalReg> (physicalReg))));
++    }
+ 
+     //Report success
+     return true;
+ }
+ 
+-bool AssociationTable::associate(MemoryVRInfo & memVRInfo) {
++bool AssociationTable::associate(const MemoryVRInfo &memVRInfo) {
+     // We cannot update once the association table has been finalized
+-    if (hasBeenFinalized()) {
+-        ALOGW("Association table has been finalized but we want to update it.");
+-        SET_JIT_ERROR(kJitErrorBERegisterization);
+-        return false;
+-    }
++    assert (hasBeenFinalized() == false);
+ 
+     int VR = memVRInfo.regNum;
+ 
+@@ -137,13 +145,9 @@ bool AssociationTable::associate(MemoryVRInfo & memVRInfo) {
+     return true;
+ }
+ 
+-bool AssociationTable::associate(ConstVRInfo & constVRInfo) {
++bool AssociationTable::associate(const ConstVRInfo &constVRInfo) {
+     // We cannot update once the association table has been finalized
+-    if (hasBeenFinalized()) {
+-        ALOGW("Association table has been finalized but we want to update it.");
+-        SET_JIT_ERROR(kJitErrorBERegisterization);
+-        return false;
+-    }
++    assert (hasBeenFinalized() == false);
+ 
+     int VR = constVRInfo.regNum;
+ 
+@@ -153,21 +157,26 @@ bool AssociationTable::associate(ConstVRInfo & constVRInfo) {
+     return true;
+ }
+ 
+-bool AssociationTable::wasVRInMemory(int VR) {
++bool AssociationTable::wasVRInMemory(int VR) const
++{
+     //Find the VR in the inMemoryTracker map
+     inMemoryTrackerConstIterator entry = inMemoryTracker.find(VR);
+ 
+-    //If we can't find it, it isn't in memory
+-    if (entry == inMemoryTracker.end()) {
+-        return false;
++    //If we cannot find then it must be in memory. Our parent would have kept track of it
++    //if it used it. Since it did not use it, it must be in memory.
++    if (entry == inMemoryTracker.end())
++    {
++        return true;
+     }
+-    else {
++    else
++    {
+         //Return what the entry tells us
+         return entry->second.inMemory;
+     }
+ }
+ 
+-bool AssociationTable::wasVRConstant(int VR) {
++bool AssociationTable::wasVRConstant(int VR) const
++{
+     //Find the VR in the constTracker map
+     constantTrackerConstIterator entry = constTracker.find(VR);
+ 
+@@ -175,7 +184,8 @@ bool AssociationTable::wasVRConstant(int VR) {
+     return (entry != constTracker.end());
+ }
+ 
+-int AssociationTable::getVRConstValue(int VR) {
++int AssociationTable::getVRConstValue(int VR) const
++{
+     //Find the VR in the constTracker map
+     constantTrackerConstIterator entry = constTracker.find(VR);
+ 
+@@ -191,41 +201,22 @@ void AssociationTable::finalize() {
+     isFinal = true;
+ }
+ 
+-void AssociationTable::findUsedRegisters(
+-        std::set<PhysicalReg> & outUsedRegisters) {
+-
++void AssociationTable::findUsedRegisters (std::set<PhysicalReg> & outUsedRegisters) const
++{
+     // Go through all association table entries and find used registers
+-    for (const_iterator iter = begin(); iter != end(); iter++) {
++    for (const_iterator iter = begin(); iter != end(); iter++)
++    {
+         //Get a local version of the register used
+-        PhysicalReg regUsed = static_cast<PhysicalReg>(iter->second.physicalReg);
++        PhysicalReg regUsed = iter->second.getPhysicalReg ();
+ 
+         //If not the Null register, insert it
+-        if (regUsed != PhysicalReg_Null) {
++        if (regUsed != PhysicalReg_Null)
++        {
+             outUsedRegisters.insert(regUsed);
+         }
+     }
+ }
+ 
+-PhysicalReg AssociationTable::getVRAssociation(int vR) {
+-    //Traverse the table
+-    for (const_iterator iter = begin(); iter != end(); iter++) {
+-
+-        //Get local values
+-        int curVR = iter->first;
+-        PhysicalReg regUsed = static_cast<PhysicalReg>(iter->second.physicalReg);
+-
+-        //If it is the vR we want and it isn't Null, return it
+-        //Allows us to search for a next association using vR
+-        if (curVR == vR && regUsed != PhysicalReg_Null) {
+-            return regUsed;
+-        }
+-
+-    }
+-
+-    //Report we did not find the association
+-    return PhysicalReg_Null;
+-}
+-
+ void AssociationTable::printToDot(FILE * file) {
+     DEBUG_ASSOCIATION(ALOGD("Printing association table to dot file"));
+ 
+@@ -252,52 +243,56 @@ void AssociationTable::printToDot(FILE * file) {
+     }
+ }
+ 
+-//Helper static functions for the class
+-static bool shouldSaveAssociation(compileTableEntry & compileEntry) {
+-    // Make a buffer for constant value even if we won't use it
+-    int constantValue[2];
++static bool shouldSaveAssociation(const CompileTableEntry &compileEntry)
++{
++    int vR = compileEntry.regNum;
++    LowOpndRegType type = compileEntry.getPhysicalType ();
+ 
+-    // We want to save association if the VR is either in a physical
+-    // register or is a constant
+-    bool res = (compileEntry.physicalReg != PhysicalReg_Null
+-            || isVirtualRegConstant(compileEntry.regNum,
+-                    static_cast<LowOpndRegType>(compileEntry.physicalType
+-                            & MASK_FOR_TYPE), constantValue, false) == 3);
++    // We want to save association if the VR is either in a physical register or is a constant
++    bool res = compileEntry.inPhysicalRegister () || isVirtualRegConstant (vR, type, 0, false) != VR_IS_NOT_CONSTANT;
+ 
+     return res;
+ }
+ 
+-//Static functions of the class
+-bool AssociationTable::syncAssociationsWithCompileTable(AssociationTable & associationsToUpdate) {
+-    if (associationsToUpdate.hasBeenFinalized()) {
+-        ALOGW("Association table has been finalized but we want to update it.");
++bool AssociationTable::syncAssociationsWithCompileTable (AssociationTable & associationsToUpdate)
++{
++    if (associationsToUpdate.hasBeenFinalized ())
++    {
++        ALOGI ("JIT_INFO: Association table has been finalized but we want to update it.");
+         SET_JIT_ERROR(kJitErrorBERegisterization);
+         return false;
+     }
+ 
+     // Go through each entry of the compile table
+-    for (int entry = 0; entry < num_compile_entries; entry++) {
++    for (int entry = 0; entry < num_compile_entries; entry++)
++    {
+         // Update associations for every VR entry we find
+-        if (isVirtualReg(compileTable[entry].physicalType) == true
+-                && shouldSaveAssociation(compileTable[entry]) == true) {
+-            if (associationsToUpdate.associate(compileTable[entry]) == false) {
++        if (compileTable[entry].isVirtualReg () == true && shouldSaveAssociation (compileTable[entry]) == true)
++        {
++            if (associationsToUpdate.associate (compileTable[entry]) == false)
++            {
+                 return false;
+             }
+         }
+     }
+ 
+     // Go through each entry in memVRTable to save whether VR is in memory
+-    for (int entry = 0; entry < num_memory_vr; entry++) {
+-        if (associationsToUpdate.associate(memVRTable[entry]) == false) {
++    for (int entry = 0; entry < num_memory_vr; entry++)
++    {
++        if (associationsToUpdate.associate (memVRTable[entry]) == false)
++        {
+             return false;
+         }
+     }
+ 
+     // Go through each entry in constVRTable
+-    for (int entry = 0; entry < num_const_vr; entry++) {
++    for (int entry = 0; entry < num_const_vr; entry++)
++    {
+         // Only save entry if it is actually a constant
+-        if (constVRTable[entry].isConst == true) {
+-            if (associationsToUpdate.associate(constVRTable[entry]) == false) {
++        if (constVRTable[entry].isConst == true)
++        {
++            if (associationsToUpdate.associate (constVRTable[entry]) == false)
++            {
+                 return false;
+             }
+         }
+@@ -315,26 +310,31 @@ bool AssociationTable::syncCompileTableWithAssociations(AssociationTable & assoc
+ 
+     // Go through every association we saved
+     for (AssociationTable::const_iterator assocIter = associationsToUse.begin();
+-            assocIter != associationsToUse.end(); assocIter++) {
+-
++            assocIter != associationsToUse.end(); assocIter++)
++    {
+         //Suppose we will not find the entry
+         bool foundCompileTableEntry = false;
+ 
+         DEBUG_COMPILETABLE_UPDATE(ALOGD("Starting to search through compile "
+                 "table that has %d entries", num_compile_entries));
+ 
+-        // Now search the compile table for an appropriate entry
+-        for (int entry = 0; entry < num_compile_entries; entry++) {
++        int vR = assocIter->first;
++        const CompileTableEntry &associationEntry = assocIter->second;
+ 
++        // Now search the compile table for an appropriate entry
++        for (int entry = 0; entry < num_compile_entries; entry++)
++        {
+             //If it is a virtual register and the right register
+-            if (isVirtualReg(compileTable[entry].physicalType) == true
+-                    && compileTable[entry].physicalType == assocIter->second.physicalType
+-                    && compileTable[entry].regNum == assocIter->first) {
++            if (compileTable[entry].isVirtualReg () == true
++                    && compileTable[entry].getPhysicalType () == associationEntry.getPhysicalType ()
++                    && compileTable[entry].getRegisterNumber () == vR)
++            {
+                 DEBUG_COMPILETABLE_UPDATE(ALOGD("Found that v%d is in compile "
+                         "table already.", assocIter->first));
+ 
+-                // Overwrite current compile table entry
+-                compileTable[entry] = assocIter->second;
++                // The only relevant part we care about updating is the physical register
++                compileTable[entry].setPhysicalReg (associationEntry.getPhysicalReg ());
++
+                 //Mark that we found it
+                 foundCompileTableEntry = true;
+                 break;
+@@ -342,22 +342,30 @@ bool AssociationTable::syncCompileTableWithAssociations(AssociationTable & assoc
+         }
+ 
+         // If we did not find an entry, we must insert it
+-        if (foundCompileTableEntry == false) {
++        if (foundCompileTableEntry == false)
++        {
+             DEBUG_COMPILETABLE_UPDATE(ALOGD("We have not found v%d in compile "
+                         "table so we will make a new entry.", assocIter->first));
+ 
+-            //Add it to the global compileTable
+-            compileTable[num_compile_entries] = assocIter->second;
+-            //Augment number of entries
+-            num_compile_entries++;
+-
+             //Paranoid
+-            if (num_compile_entries >= COMPILE_TABLE_SIZE) {
+-                ALOGE("JIT_INFO: compileTable overflow at "
+-                        "syncCompileTableWithAssociations");
++            if (num_compile_entries >= COMPILE_TABLE_SIZE)
++            {
++                ALOGI ("JIT_INFO: compileTable overflow at syncCompileTableWithAssociations");
+                 SET_JIT_ERROR(kJitErrorRegAllocFailed);
+                 return false;
+             }
++
++            //Add it to the global compileTable
++            compileTable[num_compile_entries] = assocIter->second;
++
++            //Since we added it ourselves and it wasn't there before, lets reset it
++            compileTable[num_compile_entries].reset ();
++
++            //Now set its physical register correctly
++            compileTable[num_compile_entries].setPhysicalReg (assocIter->second.getPhysicalReg ());
++
++            //Augment number of entries
++            num_compile_entries++;
+         }
+     }
+ 
+@@ -367,117 +375,572 @@ bool AssociationTable::syncCompileTableWithAssociations(AssociationTable & assoc
+         syncAllRegs();
+     }
+ 
+-    DEBUG_COMPILETABLE_UPDATE(ALOGD("Finished merging associations into "
+-            "compile table"));
+-    DEBUG_COMPILETABLE_UPDATE(dumpCompileTable());
++    DEBUG_COMPILETABLE_UPDATE (ALOGD ("Finished merging associations into compile table"));
+ 
+     //Report success
+     return true;
+ }
+ 
+ /**
+- * @brief Initialization for satisfyBBAssociations helper: sets up most parameters
+- * @param associationsToUse the association to compare ourselves with
+- * @param otherVRToPhysicalReg what is the associationsToUse having as associations (updated by the function)
+- * @param otherVRs what VRs is the associationsToUse using (updated by the function)
+- * @param currentVRToPhysicalReg what is the current association state between VRs to Physical ((updated by the function))
+- * @param currentVRs what VRs is the current association using as VRs (updated by the function)
++ * @brief Used to represent the possibilities of the state of a virtual register.
++ */
++enum VirtualRegisterState
++{
++    VRState_InMemory = 0, //!< In memory.
++    VRState_InGP,         //!< In general purpose register.
++    VRState_Constant,     //!< Constant value.
++    VRState_NonWideInXmm, //!< Non-wide VR in xmm register.
++    VRState_WideInXmm,    //!< Wide VR in xmm register.
++    VRState_HighOfWideVR, //!< The high bits when we have wide VR.
++};
++
++#ifdef DEBUG_REGISTERIZATION
++/**
++ * @brief Provides a mapping between the virtual register state and representative string.
++ * @param state The virtual register state.
++ * @return Returns string representation of virtual register state.
++ */
++static const char* convertVirtualRegisterStateToString (VirtualRegisterState state)
++{
++    switch (state)
++    {
++        case VRState_InMemory:
++            return "in memory";
++        case VRState_InGP:
++            return "in GP";
++        case VRState_Constant:
++            return "constant";
++        case VRState_NonWideInXmm:
++            return "non-wide in xmm";
++        case VRState_WideInXmm:
++            return "wide in xmm";
++        case VRState_HighOfWideVR:
++            return "high of wide";
++        default:
++            break;
++    }
++
++    return "invalid state";
++}
++#endif
++
++/**
++ * @brief Container for keeping track of actions attributed with a VR when state mismatch
++ * is found between two basic blocks.
++ */
++struct VirtualRegisterStateActions
++{
++    std::set<int> virtualRegistersToStore;        //!< Set of VRs to store on stack.
++    std::set<int> virtualRegistersToLoad;         //!< Set of VRs to load into registers.
++    std::set<int> virtualRegistersRegToReg;       //!< Set of VRs that must be moved to different registers.
++    std::set<int> virtualRegistersCheckConstants; //!< Set of VRs that are constants but must be checked for consistency.
++    std::set<int> virtualRegistersImmToReg;       //!< Set of VRs that are constant but must be moved to register.
++};
++
++/**
++ * @brief Fills the set of virtual registers with the union of all VRs used in both parent and child.
++ * @param parentAssociations The association table of parent.
++ * @param childAssociations The association table of child.
++ * @param virtualRegisters Updated by function to contain the set of all VRs used in both parent and child.
++ */
++static void filterVirtualRegisters (const AssociationTable &parentAssociations,
++                                    const AssociationTable &childAssociations,
++                                    std::set<int> &virtualRegisters)
++{
++    AssociationTable::const_iterator assocIter;
++
++    //Simply look through all of parent's associations and save all those VRs
++    for (assocIter = parentAssociations.begin (); assocIter != parentAssociations.end (); assocIter++)
++    {
++        virtualRegisters.insert (assocIter->first);
++    }
++
++    //Now look through all of child's associations and save all those VRs
++    for (assocIter = childAssociations.begin (); assocIter != childAssociations.end (); assocIter++)
++    {
++        virtualRegisters.insert (assocIter->first);
++    }
++}
++
++/**
++ * @brief Looks through the association table to determine the state of each VR of interest.
++ * @param associations The association table to look at.
++ * @param virtualRegisters The virtual registers to determine state for.
++ * @param vrState Updated by function
++ * @return True if we can determine state of all VRs of interest. Otherwise error is set and false is returned.
++ */
++static bool determineVirtualRegisterState (const AssociationTable &associations,
++                                           const std::set<int> &virtualRegisters,
++                                           std::map<int, VirtualRegisterState> &vrState)
++{
++    //We iterate through every VR of interest
++    for (std::set<int>::const_iterator iter = virtualRegisters.begin (); iter != virtualRegisters.end (); iter++)
++    {
++        int vR = *iter;
++
++        //We are iterating over a set which is sorted container. So if we are dealing with
++        //a wide VR, then we have already set the mapping for the low bits to contain information
++        //about the wideness.
++        std::map<int, VirtualRegisterState>::const_iterator wideIter = vrState.find (vR - 1);
++
++        //Do we have an entry for the low VR?
++        if (wideIter != vrState.end())
++        {
++            VirtualRegisterState lowState = wideIter->second;
++
++            //If we have a wide VR, then set the high bits correspondingly
++            if (lowState == VRState_WideInXmm)
++            {
++                vrState[vR] = VRState_HighOfWideVR;
++                continue;
++            }
++        }
++
++        //Look for the compile table entry for this VR
++        AssociationTable::const_iterator assocIter = associations.find (vR);
++
++        if (assocIter != associations.end ())
++        {
++            const CompileTableEntry &compileEntry = assocIter->second;
++
++            bool inGP = compileEntry.inGeneralPurposeRegister ();
++            bool inXMM = compileEntry.inXMMRegister ();
++
++            //In order to have saved it, it must have been in either GP or XMM
++            assert ((inGP || inXMM) == true);
++
++            if (inGP == true)
++            {
++                vrState[vR] = VRState_InGP;
++                continue;
++            }
++            else if (inXMM == true)
++            {
++                //If it is in XMM, let's figure out if the VR is wide or not
++                OpndSize size = compileEntry.getSize ();
++
++                if (size == OpndSize_64)
++                {
++                    vrState[vR] = VRState_WideInXmm;
++                    continue;
++                }
++                else if (size == OpndSize_32)
++                {
++                    vrState[vR] = VRState_NonWideInXmm;
++                    continue;
++                }
++            }
++            else if (compileEntry.inPhysicalRegister ())
++            {
++                ALOGI ("JIT_INFO: We failed to satisfy BB associations because we found a VR that "
++                        "is in physical register but not in GP or XMM.");
++                SET_JIT_ERROR(kJitErrorBERegisterization);
++                return false;
++            }
++        }
++
++        //Let's figure out if it is believed that this VR is constant.
++        //We do this before checking if it was in memory because even if it was in memory,
++        //a child generated code using the assumptions of constant.
++        if (associations.wasVRConstant (vR) == true)
++        {
++            vrState[vR] = VRState_Constant;
++            continue;
++        }
++
++        //When we get here, we have tried our best to determine what physical register was used
++        //for this VR or if it was a constant. Only thing left is to see if this VR was marked as
++        //in memory
++        if (associations.wasVRInMemory (vR) == true)
++        {
++            vrState[vR] = VRState_InMemory;
++            continue;
++        }
++
++        //If we make it here it means we have not figured out the state of the VR
++        ALOGI ("JIT_INFO: We failed to satisfy BB associations because we couldn't figure "
++                "out state of virtual register.");
++        SET_JIT_ERROR(kJitErrorBERegisterization);
++        return false;
++    }
++
++    //If we make it here we are all good
++    return true;
++}
++
++/**
++ * @brief For every virtual register, it compares state in parent and child and then makes a decision on action to take.
++ * @param parentState Map of virtual register to its state in the parent association table.
++ * @param childState Map of virtual register to its state in the child association table.
++ * @param virtualRegisters List of virtual registers to make a decision for.
++ * @param actions Updated by function to contain the actions to take in order to merge the two states.
++ * @return Returns true if all state merging can be handled. Return false if mismatch of state is detected which
++ * cannot be handled safely.
++ */
++static bool decideOnMismatchAction (const std::map<int, VirtualRegisterState> &parentState,
++                                    const std::map<int, VirtualRegisterState> &childState,
++                                    const std::set<int> &virtualRegisters,
++                                    VirtualRegisterStateActions &actions)
++{
++    //We iterate through every VR of interest
++    for (std::set<int>::const_iterator iter = virtualRegisters.begin (); iter != virtualRegisters.end (); iter++)
++    {
++        //Get the VR
++        int vR = *iter;
++
++        //Create an iterator so we can look through child state and parent state for the VR
++        std::map<int, VirtualRegisterState>::const_iterator vrStateIter;
++
++        //Get the state of this VR in parent
++        vrStateIter = parentState.find (vR);
++
++        //Paranoid because parentState should contain all VRs in set of virtualRegisters
++        assert (vrStateIter != parentState.end());
++
++        //Save state of this VR in parent
++        VirtualRegisterState vrStateInParent = vrStateIter->second;
++
++        //Get the state of this VR in child
++        vrStateIter = childState.find (vR);
++
++        //Paranoid because childState should contain all VRs in set of virtualRegisters
++        assert (vrStateIter != childState.end());
++
++        //Save state of this VR in child
++        VirtualRegisterState vrStateInChild = vrStateIter->second;
++
++        DEBUG_ASSOCIATION_MERGE (ALOGD ("We are looking at v%d that is %s for parent and "
++                "%s for child", vR, convertVirtualRegisterStateToString (vrStateInParent),
++                convertVirtualRegisterStateToString (vrStateInChild)));
++
++        bool mismatched = (vrStateInParent != vrStateInChild);
++
++        if (mismatched == true)
++        {
++            //First let's check to see if child believes VR is constant
++            if (vrStateInChild == VRState_Constant)
++            {
++                //So we have a state mismatch and child believes that VR is a constant
++                ALOGI ("JIT_INFO: Child believes VR is constant but we don't. Without a runtime check "
++                        "we cannot confirm.");
++                SET_JIT_ERROR(kJitErrorBERegisterization);
++                return false;
++            }
++            //Now check if parent has it in memory
++            else if (vrStateInParent == VRState_InMemory)
++            {
++                //The high bits of this VR will be taken care of along with the low bits since
++                //we know we have a wide VR.
++                if (vrStateInChild == VRState_HighOfWideVR)
++                {
++                    continue;
++                }
++
++                //Paranoid because we are expecting to load it into register
++                assert (vrStateInChild == VRState_InGP || vrStateInChild == VRState_NonWideInXmm
++                        || vrStateInChild == VRState_WideInXmm);
++
++                DEBUG_ASSOCIATION_MERGE (ALOGD (">> We need to load v%d into register", vR));
++
++                //If parent has it in memory but child has it in register then we need
++                //to load it.
++                actions.virtualRegistersToLoad.insert (vR);
++            }
++            else if (vrStateInChild == VRState_InMemory)
++            {
++                //The high bits of this VR will be taken care of along with the low bits since
++                //we know we have a wide VR.
++                if (vrStateInParent == VRState_HighOfWideVR)
++                {
++                    continue;
++                }
++
++                DEBUG_ASSOCIATION_MERGE (ALOGD (">> We need to store v%d back on stack", vR));
++
++                //Add it to set to store back
++                actions.virtualRegistersToStore.insert (vR);
++            }
++            else if (vrStateInParent == VRState_Constant && vrStateInChild == VRState_InGP)
++            {
++                DEBUG_ASSOCIATION_MERGE (ALOGD (">> We need to move immediate into GP for v%d", vR));
++
++                //Technically we need to add it to set for which we need to do imm to reg for
++                //but since that is not implemented let's add it to sets which we need to store
++                //back and then reload.
++                actions.virtualRegistersToStore.insert (vR);
++                actions.virtualRegistersToLoad.insert (vR);
++            }
++            else
++            {
++                DEBUG_ASSOCIATION_MERGE (ALOGD (">> We must store v%d in memory and then reload in "
++                        "proper place due to mismatch", vR));
++
++                //On state mismatch, the easiest solution is to store the VR into memory and then load
++                //it back into proper state
++                actions.virtualRegistersToStore.insert (vR);
++
++                //If child believes that this VR is the high part of the wide VR,
++                //then the load of the low part into xmm will take care of this case
++                if (vrStateInChild != VRState_HighOfWideVR)
++                {
++                    actions.virtualRegistersToLoad.insert (vR);
++                }
++            }
++        }
++        else
++        {
++            if (vrStateInParent == VRState_InGP || vrStateInParent == VRState_NonWideInXmm
++                    || vrStateInParent == VRState_WideInXmm)
++            {
++                DEBUG_ASSOCIATION_MERGE (ALOGD(">> We need to do a reg to reg move for v%d", vR));
++
++                // Insert it into set that needs to be handled via reg to reg moves
++                actions.virtualRegistersRegToReg.insert (vR);
++            }
++            else if (vrStateInParent == VRState_Constant)
++            {
++                DEBUG_ASSOCIATION_MERGE (ALOGD (">> We need to check constants to ensure "
++                        "consistency for v%d", vR));
++
++                //We will need to do a constant check to make sure we have same constant
++                actions.virtualRegistersCheckConstants.insert (vR);
++            }
++            else
++            {
++                //We have nothing to do
++                DEBUG_ASSOCIATION_MERGE (ALOGD (">> We have nothing to do because state matches for v%d", vR));
++            }
++        }
++    }
++
++    //If we make it here everything went okay
++    return true;
++}
++
++/**
++ * @brief Compares the constant in each virtual register in order to figure out that they match.
++ * @param parentAssociations The association table of parent.
++ * @param childAssociations The association table of child.
++ * @param virtualRegistersCheckConstants
++ * @return Returns false if it finds a case when the constant value for same VR differs between parent and child.
++ */
++static bool checkConstants (const AssociationTable &parentAssociations,
++                            const AssociationTable &childAssociations,
++                            const std::set<int> &virtualRegistersCheckConstants)
++{
++    //Iterate through all VRs that are constants in both parent and child to check that
++    //the constant value matches
++    for (std::set<int>::const_iterator iter = virtualRegistersCheckConstants.begin ();
++            iter != virtualRegistersCheckConstants.end (); iter++)
++    {
++        int vR = *iter;
++
++        //Get value parent believes for this VR
++        int parentValue = parentAssociations.getVRConstValue (vR);
++
++        //Get value child believes for this VR
++        int childValue = childAssociations.getVRConstValue (vR);
++
++        if (parentValue != childValue)
++        {
++            //If there is a mismatch, there's nothing we can do about it
++            ALOGI ("JIT_INFO: Both child and parent believe VR is constant but each believes "
++                        "it is a different value");
++            SET_JIT_ERROR(kJitErrorBERegisterization);
++            return false;
++        }
++    }
++
++    //If we make it here, all constants match in value
++    return true;
++}
++
++/**
++ * @brief Decides whether merging state of parent to match its child can be done safely.
++ * @param childAssociations The association table of child.
++ * @param actions Updated by function to contain the actions to take in order to merge the two states.
++ * @return Returns true if all state merging can be handled. Return false if mismatch of state is detected which
++ * cannot be handled safely.
+  */
+-static void initAssociationHelperTables (AssociationTable &associationsToUse,
+-                  std::map<int, PhysicalReg> &otherVRToPhysicalReg,
+-                  std::set<int> &otherVRs,
+-                  std::map<int, PhysicalReg> &currentVRToPhysicalReg,
+-                  std::set<int> &currentVRs) {
++static bool canHandleMismatch (const AssociationTable &childAssociations,
++                               VirtualRegisterStateActions &actions)
++{
++    //We want to make it easy to compare state of child and state of parent and thus
++    //we load the compile table into an association table. The parent associations
++    //will no longer be valid once we start actioning on mismatch
++    AssociationTable parentAssociations;
++    if (AssociationTable::syncAssociationsWithCompileTable (parentAssociations) == false)
++    {
++        //When loading from compile table problems were found. It's best to bail early.
++        return false;
++    }
++
++    //Now figure out which virtual registers are used in each state so we can start
++    //figuring out any state mismatch
++    std::set<int> virtualRegisters;
++    filterVirtualRegisters (parentAssociations, childAssociations, virtualRegisters);
++
++    //For each virtual register we want to figure out the state in both parent and child
++    std::map<int, VirtualRegisterState> childState, parentState;
++    if (determineVirtualRegisterState(childAssociations, virtualRegisters, childState) == false)
++    {
++        return false;
++    }
++    if (determineVirtualRegisterState(parentAssociations, virtualRegisters, parentState) == false)
++    {
++        return false;
++    }
++
++    //Now we need to make a decision when we have a mismatch
++
++    bool result = decideOnMismatchAction (parentState, childState, virtualRegisters, actions);
++
++    if (result == false)
++    {
++        //While searching for action on mismatch, we found a state we couldn't deal with
++        //so we now return false.
++        return false;
++    }
++
++    // Now that we figured out mismatch and also actions for each, let's look at constants
++    // for both parent and child. We want to make sure that if child believes a VR is constant,
++    // the parent believes it is the same constant.
++    result = checkConstants (parentAssociations, childAssociations, actions.virtualRegistersCheckConstants);
++
++    if (result == false)
++    {
++        //If we found non matching constants, we must bail out because there's nothing we can do
++        return false;
++    }
++
++    //If we make it here, we can handle the mismatch
++    return true;
++}
+ 
++/**
++ * @brief Sets up mapping between virtual registers and their physical registers.
++ * @param associationToUse the association to compare ourselves with
++ * @param otherVRToPhysicalReg what is the associationsToUse having as associations (updated by the function)
++ * @param currentVRToPhysicalReg what is the current association state between VRs to Physical (updated by the function)
++ */
++static void initAssociationHelperTables (const AssociationTable &associationsToUse,
++                                         std::map<int, PhysicalReg> &otherVRToPhysicalReg,
++                                         std::map<int, PhysicalReg> &currentVRToPhysicalReg)
++{
+     // First we need to go through each of the child's association entries
+     // to figure out each VR's association with physical register
+     for (AssociationTable::const_iterator assocIter = associationsToUse.begin();
+-            assocIter != associationsToUse.end(); assocIter++) {
+-
+-        if (assocIter->second.physicalReg != PhysicalReg_Null) {
++            assocIter != associationsToUse.end(); assocIter++)
++    {
++        if (assocIter->second.physicalReg != PhysicalReg_Null)
++        {
+             // Save the mapping to physical register
+             otherVRToPhysicalReg[assocIter->first] =
+                     static_cast<PhysicalReg>(assocIter->second.physicalReg);
+-            // Keep track of VRs that have physical reg mapping
+-            otherVRs.insert(assocIter->first);
+         }
+-
+     }
+ 
+     // Now go through current compile table to figure out what VRs are in
+     // physical registers
+-    for (int entry = 0; entry < num_compile_entries; entry++) {
+-
++    for (int entry = 0; entry < num_compile_entries; entry++)
++    {
+         if (isVirtualReg(compileTable[entry].physicalType)
+-                && compileTable[entry].physicalReg != PhysicalReg_Null) {
+-
++                && compileTable[entry].physicalReg != PhysicalReg_Null)
++        {
+             // Save the mapping to physical register
+             currentVRToPhysicalReg[compileTable[entry].regNum] =
+                     static_cast<PhysicalReg>(compileTable[entry].physicalReg);
+-            // Keep track of VRs that have physical reg mapping
+-            currentVRs.insert(compileTable[entry].regNum);
+-
+         }
+-
+     }
+ }
+ 
+ /**
+- * @brief Spill Virtual Registers to memory
+- * @param parent the parent BasicBlock, contains the write back requests
+- * @param childUsedReg what registers are being used at entry for the child
+- * @param currentVRs the current Virtual Registers used by the parent at the end of code generation
+- * @param childVRs the child's Virtual Register usage at entrance of code generation
++ * @brief Writes back virtual registers to stack.
++ * @param virtualRegistersToStore Set of virtual registers to write back.
+  * @param trySkipWriteBack This enables an optimization where the write backs are only handled
+  * if VR is in the BB's write back requests. This can be useful when spilling to memory for loop
+  * entry but loop never reads the written value.
++ * @param writeBackRequests Used when trySkipWriteBack is true. This is a vector of VR writeback
++ * requests from the basic block.
++ * @param registersToFree Used when trySkipWriteBack is true. This is a set of physical registers
++ * to ensure that the VR associated with it gets written back.
++ * @return Returns true if successfully writes back all VRs to memory.
+  */
+-static void spillVRToMemory (const BasicBlock_O1 *parent,
+-                             const std::set<PhysicalReg> &childUsedReg,
+-                             const std::set<int> &currentVRs,
+-                             const std::set<int> &childVRs,
+-                             bool trySkipWriteBack) {
+-    std::set<int> setOperationResult;
+-
+-    // Do we have any VRs that are currently in physical registers
+-    // but the child is not expecting them to be in registers? To get this we
+-    // do a set difference (currentVRs - childVRs)
+-    std::set_difference(currentVRs.begin(), currentVRs.end(), childVRs.begin(),
+-            childVRs.end(),
+-            std::inserter(setOperationResult, setOperationResult.end()));
+-
+-    //Spill anything that is in this difference set
+-    for (std::set<int>::const_iterator setOpIter = setOperationResult.begin();
+-            setOpIter != setOperationResult.end(); setOpIter++)
++static bool writeBackVirtualRegistersToMemory (const std::set<int> &virtualRegistersToStore,
++                                               bool trySkipWriteBack = false,
++                                               const BitVector *writeBackRequests = 0,
++                                               const std::set<PhysicalReg> *registersToFree = 0)
++{
++    //Write back anything that is in the set of VRs to store
++    for (std::set<int>::const_iterator setOpIter = virtualRegistersToStore.begin ();
++            setOpIter != virtualRegistersToStore.end ();
++            setOpIter++)
+     {
+-        int VR = *setOpIter;
++        int vR = *setOpIter;
+ 
++        //Now look through compile table to find the matching entry
+         for (int entry = 0; entry < num_compile_entries; entry++)
+         {
+-            // We want to skip the write back if the optimization is enabled, if parent
+-            // did not request it for spill, and if the child does not plan on reusing it
+-            bool skipWriteBack = trySkipWriteBack
+-                    && (dvmIsBitSet(parent->requestWriteBack, VR) == false)
+-                    && (childUsedReg.find(
+-                            static_cast<PhysicalReg>(compileTable[entry].physicalReg))
+-                            == childUsedReg.end());
+-
+-            // Handle the write back
+-            if (isVirtualReg(compileTable[entry].physicalType)
+-                    && compileTable[entry].physicalReg != PhysicalReg_Null
+-                    && compileTable[entry].regNum == VR
+-                    && skipWriteBack == false)
++            CompileTableEntry &compileEntry = compileTable[entry];
++
++            //Do we have a match in compile table with this VR we want to write back?
++            if (compileEntry.isVirtualReg () == true && compileEntry.getRegisterNumber () == vR)
+             {
+-                DEBUG_ASSOCIATION_MERGE(ALOGD("Spilling v%d back to memory because "
+-                        "child does not expect it in a physical register", VR));
+-                spillLogicalReg(entry, true);
++                //We want to skip the write back if the optimization is enabled.
++                bool skipWriteBack = (trySkipWriteBack == true);
++
++                //However, we do NOT want to skip writeback if it is in set of registers to free
++                //because someone wants this VR out of that physical register.
++                if (skipWriteBack == true && registersToFree != 0)
++                {
++                    skipWriteBack = registersToFree->find (compileTable[entry].getPhysicalReg ())
++                            == registersToFree->end ();
++                }
++
++                //Finally we do NOT want to skip writeback if this VR is in vector of writeback requests
++                if (skipWriteBack == true && writeBackRequests != 0)
++                {
++                    skipWriteBack = dvmIsBitSet (writeBackRequests, vR) == false;
++                }
++
++                //If we are not skipping the write back, then we actually need to do it
++                if (skipWriteBack == false)
++                {
++                    DEBUG_ASSOCIATION_MERGE (ALOGD ("Writing v%d back to memory", vR));
++
++                    //Handle the write back when in physical register
++                    if (compileEntry.inPhysicalRegister () == true)
++                    {
++                        //Try to write back the virtual register
++                        if (spillLogicalReg (entry, true) < 0)
++                        {
++                            return false;
++                        }
++                    }
++                    else
++                    {
++                        //We make it here if the VR is not in physical register. Try figuring out
++                        //if this is a constant. If it isn't a constant, we are okay because there's
++                        //nothing we need to write back.
++                        bool res = writeBackVRIfConstant (vR, LowOpndRegType_gp);
++
++                        //If this VR was constant, then since we wrote it back we mark it as non-constant.
++                        if (res == true)
++                        {
++                            setVRToNonConst (vR, OpndSize_32);
++                        }
++                    }
++                }
+             }
+         }
+     }
+ 
+-    // Since we have spilled VRs, lets make sure we properly keep track
+-    // of which physical registers are currently being used
++    //Since we have spilled VRs, lets make sure we properly keep track
++    //of which physical registers are currently being used
+     syncAllRegs();
++
++    //If we make it here, everything is okay.
++    return true;
+ }
+ 
+ /**
+@@ -485,12 +948,12 @@ static void spillVRToMemory (const BasicBlock_O1 *parent,
+  * @param childUsedReg registers used by the child at entrance
+  * @param scratchRegs any scratch register at the end of parent's code generation (updated by the function)
+  */
+-static void findScratchRegisters (std::set<PhysicalReg> &childUsedReg,
+-                                  std::set<PhysicalReg> &scratchRegs) {
+-
++static void findScratchRegisters (const std::set<PhysicalReg> &childUsedReg,
++                                  std::set<PhysicalReg> &scratchRegs)
++{
+     // All free registers are candidates for use as scratch
+     std::set<PhysicalReg> parentFreeReg;
+-    findFreeRegisters(parentFreeReg);
++    findFreeRegisters (parentFreeReg);
+ 
+     // Subtract child used registers from parent free registers
+     // so we can figure out what we can use as scratch
+@@ -499,7 +962,7 @@ static void findScratchRegisters (std::set<PhysicalReg> &childUsedReg,
+             std::inserter(scratchRegs, scratchRegs.end()));
+ 
+ #ifdef DEBUG_REGISTERIZATION
+-    //Debuging purposes
++    //Debugging purposes
+     std::set<PhysicalReg>::const_iterator scratchRegIter;
+     for (scratchRegIter = scratchRegs.begin();
+             scratchRegIter != scratchRegs.end(); scratchRegIter++) {
+@@ -511,31 +974,24 @@ static void findScratchRegisters (std::set<PhysicalReg> &childUsedReg,
+ 
+ /**
+  * @brief Find the registers to be moved and fill the regToRegMoves map
+- * @param childVRs the child usage of Virtual Registers at entrance
+- * @param currentVRs the current usage of Virtual Registers at end of code generation for the current BasicBlock
++ * @param virtualRegistersRegToReg Set of virtual registers that must be moved to new registers
+  * @param childVRToPhysicalReg child association between VRs and physical registers at child code generation entrance
+  * @param currentVRToPhysicalReg child association between VRs and physical registers at current code generation exit
+  * @param regToRegMoves register to register moves to be done (updated by function)
++ * @return Returns true if we successfully can determine the moves to be done.
+  */
+-static bool findRegistersToMove (std::set<int> &childVRs,
+-                          std::set<int> &currentVRs,
+-                          std::map<int, PhysicalReg> &childVRToPhysicalReg,
+-                          std::map<int, PhysicalReg> &currentVRToPhysicalReg,
+-                          std::map<PhysicalReg, PhysicalReg> &regToRegMoves) {
+-    // What VRs do we have in common? Lets make sure they are in the
+-    // right physical registers
+-
+-    // Lets do an intersection to find the common VRs that are in physical
+-    // registers.
+-    std::set<int> setOperationResult;
+-    setOperationResult.clear();
+-    std::set_intersection(childVRs.begin(), childVRs.end(), currentVRs.begin(),
+-            currentVRs.end(),
+-            std::inserter(setOperationResult, setOperationResult.end()));
+-
++static bool findRegistersToMove (const std::set<int> &virtualRegistersRegToReg,
++                                 std::map<int, PhysicalReg> &childVRToPhysicalReg,
++                                 std::map<int, PhysicalReg> &currentVRToPhysicalReg,
++                                 std::map<PhysicalReg, PhysicalReg> &regToRegMoves)
++{
+     std::set<int>::const_iterator setOpIter;
+-    for (setOpIter = setOperationResult.begin();
+-            setOpIter != setOperationResult.end(); setOpIter++) {
++
++    //Now we need to filter the reg to reg moves so walk through all of them
++    for (setOpIter = virtualRegistersRegToReg.begin ();
++            setOpIter != virtualRegistersRegToReg.end ();
++            setOpIter++)
++    {
+         int VR = *setOpIter;
+         PhysicalReg childReg = childVRToPhysicalReg[VR];
+         PhysicalReg currentReg = currentVRToPhysicalReg[VR];
+@@ -547,8 +1003,9 @@ static bool findRegistersToMove (std::set<int> &childVRs,
+                     physicalRegToString(childReg)));
+ 
+             if (regToRegMoves.find(currentReg) != regToRegMoves.end()) {
+-                ALOGE("JIT_INFO: We are overwriting the reg to reg move from %s",
++                ALOGI ("JIT_INFO: We are overwriting the reg to reg move from %s",
+                         physicalRegToString(currentReg));
++                SET_JIT_ERROR(kJitErrorBERegisterization);
+                 return false;
+             }
+ 
+@@ -591,7 +1048,7 @@ static bool moveRegisters (std::map<PhysicalReg, PhysicalReg> &regToRegMoves,
+         }
+ 
+         if (regToRegMoves.count(source) > 1) {
+-            ALOGE("JIT_INFO: We have the same physical register as source "
++            ALOGI ("JIT_INFO: We have the same physical register as source "
+                     "multiple times.");
+             SET_JIT_ERROR(kJitErrorBERegisterization);
+             return false;
+@@ -658,9 +1115,10 @@ static bool moveRegisters (std::map<PhysicalReg, PhysicalReg> &regToRegMoves,
+             }
+         }
+ 
+-        if (useMemoryForSwap) {
+-            ALOGE("JIT_INFO: We have no scratch registers so we must use memory "
+-                    "for swap");
++        //TODO We should be able to swap without register
++        if (useMemoryForSwap == true)
++        {
++            ALOGI ("JIT_INFO: We have no scratch registers so we must use memory for swap");
+             SET_JIT_ERROR(kJitErrorBERegisterization);
+             return false;
+         }
+@@ -685,7 +1143,7 @@ static bool moveRegisters (std::map<PhysicalReg, PhysicalReg> &regToRegMoves,
+                     && getTypeOfRegister(source) != LowOpndRegType_xmm)
+                     || (getTypeOfRegister(dest) != LowOpndRegType_gp
+                             && getTypeOfRegister(dest) != LowOpndRegType_xmm)) {
+-                ALOGE("JIT_INFO: We cannot handle association table merge for "
++                ALOGI ("JIT_INFO: We cannot handle association table merge for "
+                         "anything but xmm and gp registers");
+                 SET_JIT_ERROR(kJitErrorBERegisterization);
+                 return false;
+@@ -694,7 +1152,7 @@ static bool moveRegisters (std::map<PhysicalReg, PhysicalReg> &regToRegMoves,
+             if (getTypeOfRegister(source) != getTypeOfRegister(dest)) {
+                 // They are different types of registers and we currently
+                 // cannot handle moves between different types
+-                ALOGE("JIT_INFO: We cannot transfer from GP reg to XMM and "
++                ALOGI ("JIT_INFO: We cannot transfer from GP reg to XMM and "
+                         "vice versa");
+                 SET_JIT_ERROR(kJitErrorBERegisterization);
+                 return false;
+@@ -744,51 +1202,67 @@ static bool moveRegisters (std::map<PhysicalReg, PhysicalReg> &regToRegMoves,
+ }
+ 
+ /**
+- * @brief Move to child's physical registers requests
++ * @brief Load virtual registers to child's physical registers requests
+  * @param associationsToUse the association table for the child at code generation entrance
+- * @param childVRs the child Virtual Register usage at start of the code generation
+- * @param currentVRs the current BasicBlock's Virtual Register usage at end of the code generation
++ * @param virtualRegistersToLoad Set of virtual registers we need to load into physical registers.
+  * @param childVRToPhysicalReg the child map of Virtual Register to physical register at start of code generation
+  * @return whether or not the function succeeds
+  */
+-static bool moveToChildPhysical (AssociationTable &associationsToUse,
+-                                 std::set<int> &childVRs,
+-                                 std::set<int> &currentVRs,
+-                                 std::map<int, PhysicalReg> &childVRToPhysicalReg
+-                                 ) {
+-
+-    //Ge the difference between child and current virtual register usage
+-    std::set<int> setOperationResult;
+-    std::set_difference(childVRs.begin(), childVRs.end(), currentVRs.begin(),
+-            currentVRs.end(),
+-            std::inserter(setOperationResult, setOperationResult.end()));
+-
+-    //Now iterate on the difference
++static bool loadVirtualRegistersForChild (const AssociationTable &associationsToUse,
++                                          const std::set<int> &virtualRegistersToLoad,
++                                          const std::map<int, PhysicalReg> &childVRToPhysicalReg)
++{
+     std::set<int>::const_iterator setOpIter;
+-    for (setOpIter = setOperationResult.begin();
+-            setOpIter != setOperationResult.end(); setOpIter++) {
++
++    //Now walk through the VRs we need to load
++    for (setOpIter = virtualRegistersToLoad.begin();
++            setOpIter != virtualRegistersToLoad.end(); setOpIter++)
++    {
+         int VR = *setOpIter;
+-        PhysicalReg targetReg = childVRToPhysicalReg[VR];
++
++        //Look to see if we have a physical register for this VR
++        std::map<int, PhysicalReg>::const_iterator findRegIter;
++        findRegIter = childVRToPhysicalReg.find (VR);
++
++        //This should never happen but could happen in rare cases. For example,
++        //if a VR is wide in child, then it might be possible we get a request
++        //to load the high part of VR into a non-existent register. However if
++        //the VR is wide, we should have already handled case of loading both
++        //low and high parts into an XMM.
++        if (findRegIter == childVRToPhysicalReg.end ())
++        {
++            //If we don't actually have a physical register then there's nowhere
++            //to load this VR. Thus we can safely skip it.
++            continue;
++        }
++
++        PhysicalReg targetReg = findRegIter->second;
+ 
+         //This should never happen but it will make buffer overflow checkers happy
+-        if (targetReg >= PhysicalReg_Null) {
++        if (targetReg >= PhysicalReg_Null)
++        {
+             continue;
+         }
+ 
+         LowOpndRegType type = LowOpndRegType_invalid;
++        OpndSize size = OpndSize_Null;
++
+         // Look through child's association entries to find the type of the VR
+         // so we can load it properly into the physical register
+-        for (AssociationTable::const_iterator assocIter = associationsToUse.begin();
+-                assocIter != associationsToUse.end(); assocIter++) {
+-            if (assocIter->second.physicalReg == targetReg) {
+-                type =
+-                        static_cast<LowOpndRegType>(assocIter->second.physicalType
+-                                & MASK_FOR_TYPE);
++        for (AssociationTable::const_iterator assocIter = associationsToUse.begin ();
++                assocIter != associationsToUse.end (); assocIter++)
++        {
++            const CompileTableEntry &compileEntry = assocIter->second;
++
++            if (compileEntry.getPhysicalReg () == targetReg)
++            {
++                type = compileEntry.getPhysicalType ();
++                size = compileEntry.getSize ();
+             }
+         }
+ 
+-        assert (type !=  LowOpndRegType_invalid);
+-        OpndSize size = getRegSize(type);
++        assert (type != LowOpndRegType_invalid);
++        assert (size != OpndSize_Null);
+ 
+         // If we are loading wide VR, lets do a sanity check that high order
+         // bits are in memory
+@@ -799,7 +1273,7 @@ static bool moveToChildPhysical (AssociationTable &associationsToUse,
+                 // We only care about the 32-bit that is high order. It must be
+                 // in memory before we load it in xmm
+                 if (isInMemory(VR + 1, OpndSize_32) == false) {
+-                    ALOGE("JIT_INFO: We are loading wide v%d but high order "
++                    ALOGI ("JIT_INFO: We are loading wide v%d but high order "
+                             "bits are not in memory!", VR);
+                     SET_JIT_ERROR(kJitErrorBERegisterization);
+                     return false;
+@@ -818,20 +1292,19 @@ static bool moveToChildPhysical (AssociationTable &associationsToUse,
+             get_virtual_reg_noalloc(VR, size, targetReg, true);
+         }
+ 
+-        // TODO The following code needs to be refactored out of here. There
+-        // should be a helper that can do this
+         int entry;
+-        for (entry = 0; entry < num_compile_entries; entry++) {
+-            if (isVirtualReg(compileTable[entry].physicalType)
+-                    && compileTable[entry].regNum == VR) {
+-                compileTable[entry].physicalReg = targetReg;
++        for (entry = 0; entry < num_compile_entries; entry++)
++        {
++            if (compileTable[entry].isVirtualReg () == true && compileTable[entry].getRegisterNumber () == VR)
++            {
++                compileTable[entry].setPhysicalReg (targetReg);
+                 break;
+             }
+         }
+ 
+         // TODO We must handle case when we don't have entry in the compile table
+         if (entry == num_compile_entries) {
+-            ALOGE("JIT_INFO: We are not handling properly when we don't have "
++            ALOGI ("JIT_INFO: We are not handling properly when we don't have "
+                     "entry in compile table");
+             SET_JIT_ERROR(kJitErrorBERegisterization);
+             return false;
+@@ -859,113 +1332,86 @@ bool AssociationTable::satisfyBBAssociations (BasicBlock_O1 * parent,
+      *   - How both associations can be synchronized
+      */
+ 
+-    //First part: get the information about the current associations and the child's
+-    AssociationTable & associationsToUse = child->associationTable;
+-    std::map<int, PhysicalReg> childVRToPhysicalReg, currentVRToPhysicalReg;
+-    std::set<int> childVRs, currentVRs;
++    AssociationTable &childAssociations = child->associationTable;
++    VirtualRegisterStateActions actions;
+ 
+-    //Initialize helper maps in regards to parent and child associations
+-    initAssociationHelperTables (associationsToUse, childVRToPhysicalReg, childVRs,
+-                                                    currentVRToPhysicalReg, currentVRs);
++    // 1) Gather information on current associations and the child's and decide
++    // on actions for dealing with state mismatch between VRs
++    if (canHandleMismatch (childAssociations, actions) == false)
++    {
++        return false;
++    }
+ 
+-    // Look at child to see what physical registers it is using
++    //Look at child to see what physical registers it is using
+     std::set<PhysicalReg> childUsedReg;
+-    associationsToUse.findUsedRegisters(childUsedReg);
++    childAssociations.findUsedRegisters (childUsedReg);
++
++    // 2) We write back anything child wants in memory because this will allow us to have scratch
++    // registers in case we need to do reg to reg moves.
++    if (writeBackVirtualRegistersToMemory (actions.virtualRegistersToStore, isBackward == true,
++            parent->requestWriteBack, &childUsedReg) == false)
++    {
++        return false;
++    }
+ 
+-    //Handle VR difference to spill anything the child wants: frees registers
+-    //For backward branches, we want to try skipping anything that is not a
+-    //phi node.
+-    spillVRToMemory (parent, childUsedReg, currentVRs, childVRs,
+-            isBackward == true);
++    // 3) Prepare for doing reg to reg moves by finding scratch registers, finding mapping between
++    // VRs and their physical register, and for deciding which registers to move.
+ 
+-    //Third step: find scratch registers
++    //Figure out the scratch registers we have available.
+     std::set<PhysicalReg> scratchRegs;
+     findScratchRegisters (childUsedReg, scratchRegs);
+ 
+-    //Fourth step: find the registers that should be moved
++    //Initialize helper maps in regards to parent and child associations
++    std::map<int, PhysicalReg> childVRToPhysicalReg, currentVRToPhysicalReg;
++    initAssociationHelperTables (childAssociations, childVRToPhysicalReg, currentVRToPhysicalReg);
++
++    //Find the registers that should be moved
+     std::map<PhysicalReg, PhysicalReg> regToRegMoves;
+ 
+-    if (findRegistersToMove (childVRs, currentVRs, childVRToPhysicalReg,
+-                             currentVRToPhysicalReg, regToRegMoves) == false) {
++    if (findRegistersToMove (actions.virtualRegistersRegToReg, childVRToPhysicalReg,
++            currentVRToPhysicalReg, regToRegMoves) == false)
++    {
+         //If findRegistersToMove fails, we bail too
+         return false;
+     }
+ 
+-    //Fifth step: move registers to the correct physical register
+-    if (moveRegisters (regToRegMoves, scratchRegs, currentVRToPhysicalReg) == false) {
++    // 4) Do the actual moving of registers to the correct physical register
++    if (moveRegisters (regToRegMoves, scratchRegs, currentVRToPhysicalReg) == false)
++    {
+         //If moveRegisters fails, we bail too
+         return false;
+     }
+ 
+-    //Sixth step: Do we have any VRs that child is expecting to be in physical
+-    // register but currently is in memory?
+-    if (moveToChildPhysical (associationsToUse, childVRs, currentVRs, childVRToPhysicalReg) == false) {
++    // 5) Load any VRs we believe is in memory because child wants it in physical register
++    if (loadVirtualRegistersForChild (childAssociations, actions.virtualRegistersToLoad, childVRToPhysicalReg) == false)
++    {
+         //If moveToChildPhysical fails, we bail too
+         return false;
+     }
+ 
+-    // TODO What happens when child thinks that a VR is constant when we
+-    // have no idea if it is?!?!
++    //TODO Add function to deal with moving immediate to register
+ 
+     return true;
+ }
+ 
+ bool AssociationTable::handleSpillRequestsFromME(BasicBlock_O1 * bb) {
+-    BitVector * spillRequests = bb->requestWriteBack;
+-
+-    // TODO All this spilling code should either be reused or we must
+-    // have something like spillVirtualReg instead of explicitly calling
+-    // spillLogicalReg and writeBackConstVR
++    //Initialize empty set of VRs to write back
++    std::set<int> virtualRegisterToWriteBack;
+ 
+-    // TODO Check whether VR is in memory before spilling
++    //We need to iterate through the writeback requests to add them to our set of VRs
++    BitVectorIterator bvIterator;
++    dvmBitVectorIteratorInit(bb->requestWriteBack, &bvIterator);
+ 
+-    for (int entry = 0; entry < num_compile_entries; entry++) {
+-        if (isVirtualReg(compileTable[entry].physicalType)
+-                && compileTable[entry].physicalReg != PhysicalReg_Null
+-                && dvmIsBitSet(spillRequests, compileTable[entry].regNum)) {
+-            DEBUG_SPILLING(ALOGD("Spilling registerized v%d",
+-                    compileTable[entry].regNum));
+-            spillLogicalReg(entry, true);
+-        }
++    //Go through each VR so we can add it to our set
++    for (int vR = dvmBitVectorIteratorNext (&bvIterator); vR != -1; vR = dvmBitVectorIteratorNext (&bvIterator))
++    {
++        virtualRegisterToWriteBack.insert (vR);
+     }
+-    syncAllRegs();
+ 
+-    std::set<int> spilledConstVRs;
+-
+-    // Now handle spill requests for constants
+-    for (int entry = 0; entry < num_const_vr; entry++) {
+-        // TODO Probably a better idea is to call isVirtualRegConst instead
+-        // of checking the flag in the table
+-        if (constVRTable[entry].isConst
+-                && dvmIsBitSet(spillRequests, constVRTable[entry].regNum)) {
+-            DEBUG_SPILLING(ALOGD("Spilling CONSTANT v%d",
+-                    constVRTable[entry].regNum));
+-            // TODO We must be able to spill wide constants!
+-            writeBackConstVR(constVRTable[entry].regNum, constVRTable[entry].value);
+-            // TODO Since we know for sure this is the end of BB, lets unmark the
+-            // constant so we don't pass its information via association table.
+-            // Technically it should be job of writeBackConstVR to do that.
+-            constVRTable[entry].isConst = false;
+-            spilledConstVRs.insert(constVRTable[entry].regNum);
+-        }
+-    }
+-
+-    // The following stub checks for unhandled spilling of high order bits.
+-    // Should be removed when we can handle spilling of wide constants.
+-    for (int entry = 0; entry < num_const_vr; entry++) {
+-        if (constVRTable[entry].isConst) {
+-            if (spilledConstVRs.find(constVRTable[entry].regNum - 1)
+-                    != spilledConstVRs.end()) {
+-                ALOGE("JIT_INFO: We have spilled low order bits of constant "
+-                        "v%d but not the higher order bits.",
+-                        constVRTable[entry].regNum - 1);
+-                SET_JIT_ERROR(kJitErrorBERegisterization);
+-                return false;
+-            }
+-        }
+-    }
++    //Do the actual write back
++    bool result = writeBackVirtualRegistersToMemory (virtualRegisterToWriteBack);
+ 
+-    return true;
++    return result;
+ }
+ 
+ /**
+diff --git a/vm/compiler/codegen/x86/RegisterizationBE.h b/vm/compiler/codegen/x86/RegisterizationBE.h
+index 577b4d3..8bb11d7 100644
+--- a/vm/compiler/codegen/x86/RegisterizationBE.h
++++ b/vm/compiler/codegen/x86/RegisterizationBE.h
+@@ -21,7 +21,7 @@
+ 
+ // Forward declarations
+ struct BasicBlock_O1;
+-struct compileTableEntry;
++class CompileTableEntry;
+ struct ConstVRInfo;
+ struct MemoryVRInfo;
+ 
+@@ -33,20 +33,11 @@ struct MemoryVRInfo;
+ class AssociationTable {
+ public:
+     /**
+-     * @brief Looks for the physical register associated with a VR
+-     * @param vR virtual register to look up
+-     * @return Returns physical register associated with VR.
+-     * PhysicalReg_Null if association for the VR cannot be found or if
+-     * really there is no association
+-     */
+-    PhysicalReg getVRAssociation(int vR);
+-
+-    /**
+      * @brief Looks through all associations and finds used physical registers
+      * @param outUsedRegisters is a set that is updated with the used physical
+      * registers
+      */
+-    void findUsedRegisters(std::set<PhysicalReg> & outUsedRegisters);
++    void findUsedRegisters(std::set<PhysicalReg> & outUsedRegisters) const;
+ 
+     /**
+      * @brief Once association table is been finalized, this can be called to
+@@ -54,7 +45,7 @@ public:
+      * @param vR virtual register
+      * @return Returns whether or not VR was in memory
+      */
+-    bool wasVRInMemory(int vR);
++    bool wasVRInMemory(int vR) const;
+ 
+     /**
+      * @brief Once association table is been finalized, this can be called to
+@@ -64,7 +55,7 @@ public:
+      * @param vR virtual register
+      * @return Returns whether or not virtual register was a constant.
+      */
+-    bool wasVRConstant(int vR);
++    bool wasVRConstant(int vR) const;
+ 
+     /**
+      * @brief Returns the 32 bit constant value associated with VR
+@@ -72,28 +63,28 @@ public:
+      * @param vR virtual register
+      * @return Returns the constant value of virtual register.
+      */
+-    int getVRConstValue(int vR);
++    int getVRConstValue(int vR) const;
+ 
+     /**
+      * @brief Updates association table given a compile entry from the compile table.
+      * @param compileEntry compilation entry
+      * @return Returns whether adding compile entry to associations was successful
+      */
+-    bool associate(compileTableEntry & compileEntry);
++    bool associate(const CompileTableEntry &compileEntry);
+ 
+     /**
+      * @brief Updates association table given a memory VR information
+      * @param memVRInfo the memory virtual register information entry
+      * @return Returns whether adding compile entry to associations was successful
+      */
+-    bool associate(MemoryVRInfo & memVRInfo);
++    bool associate(const MemoryVRInfo &memVRInfo);
+ 
+     /**
+      * @brief Updates association table given a constant VR information
+      * @param constVRInfo the constant virtual register entry
+      * @return Returns whether adding compile entry to associations was successful
+      */
+-    bool associate(ConstVRInfo & constVRInfo);
++    bool associate(const ConstVRInfo &constVRInfo);
+ 
+     /**
+      * @brief Used to determine whether the association table can be
+@@ -140,12 +131,12 @@ public:
+     /**
+      * @brief Random access const iterator. This does not modify structure it is iterating.
+      */
+-    typedef std::map<int, compileTableEntry>::const_iterator const_iterator;
++    typedef std::map<int, CompileTableEntry>::const_iterator const_iterator;
+ 
+     /**
+      * @brief Random access iterator. This may modify structure it is iterating.
+      */
+-    typedef std::map<int, compileTableEntry>::iterator iterator;
++    typedef std::map<int, CompileTableEntry>::iterator iterator;
+ 
+     /**
+      * @brief Returns an iterator pointing to the first association.
+@@ -180,6 +171,16 @@ public:
+         return associations.end();
+     }
+ 
++    /**
++     * @brief Returns a const interator to the compile table entry matching the desired VR.
++     * @param vR The virtual register to look for.
++     * @return Returns iterator matching the result found or iterator that equals end() when
++     * no match is found.
++     */
++    const_iterator find (const int &vR) const {
++        return associations.find(vR);
++    }
++
+     AssociationTable(void); /**< @brief Constructor */
+ 
+     ~AssociationTable(void); /**< @brief Destructor */
+@@ -237,7 +238,7 @@ private:
+      * @brief Map for every VR to its corresponding compile table entry
+      * when association occurred.
+      */
+-    std::map<int, compileTableEntry> associations;
++    std::map<int, CompileTableEntry> associations;
+ 
+     /**
+      * @brief Map for every VR to its state in memory when the association
+-- 
+1.7.4.1
+

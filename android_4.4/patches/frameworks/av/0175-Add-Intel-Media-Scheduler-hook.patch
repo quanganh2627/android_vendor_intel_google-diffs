@@ -1,0 +1,493 @@
+From 8fba2ef3ec7b2e59a226fa7bf4ac6f2f9236fa46 Mon Sep 17 00:00:00 2001
+From: zsheng <jerry.sheng@intel.com>
+Date: Fri, 13 Dec 2013 12:16:38 +0800
+Subject: Add Intel Media Scheduler hook.
+
+Intel Media Scheduler can reduce the power consumption by combining several
+decode and vp operations within one vsync. Thus GPU need not to wake up in
+every vsync, instead GPU is able to run in one vsync then sleep in next 3
+vsyncs if we combine 4 decode and vp operations together.
+
+This change will load a library dynamically and decide if we need to enable
+Intel Media Scheduler or not. Moreover it also defines a base class for
+AwesomePlayer and OMXCodec, thus we can overwrite the necessary interfaces to
+make the decode and vp combination happen.
+
+The purpose of creating a new base class for AwesomePlayer and OMXCodec is:
+(1) Make several AwesomePlayer's functions as virtual, thus Intel Media
+    Scheduler Player, which derived from AwesomePlayer, is able to overwrite
+    these virtual functions to provide Intel Media Scheduler features.
+(2) Declaring virtual functions in AwesomePlayerBase class instead of in
+    AwesomePlayer class directly is to minimize the code changes in
+    libstagefright and minimize the efforts when Android code base upgrade in
+    future.
+
+The real scheduling work will be done in libimsplayer library which will be
+delivered separately.
+
+The original media playback flow will NOT be impacted if the libimsplayer
+library does not exist or Intel Media Scheduler is disabled.
+
+Change-Id: I671548c8f33c1054f97229387555239312e8276f
+Category: AOSP Enhancement
+Domain: MEDIA
+Upstream-Candidate: yes
+Signed-off-by: Jerry Sheng <jerry.sheng@intel.com>
+---
+ include/media/stagefright/OMXCodec.h              |   11 ++-
+ include/media/stagefright/OMXCodecBase.h          |   46 ++++++++
+ media/libmediaplayerservice/Android.mk            |    1 +
+ media/libmediaplayerservice/IMSPlayerLoader.cpp   |  121 +++++++++++++++++++++
+ media/libmediaplayerservice/IMSPlayerLoader.h     |   46 ++++++++
+ media/libmediaplayerservice/StagefrightPlayer.cpp |   19 +++-
+ media/libmediaplayerservice/StagefrightPlayer.h   |    2 +
+ media/libstagefright/include/AwesomePlayer.h      |   11 ++-
+ media/libstagefright/include/AwesomePlayerBase.h  |   55 ++++++++++
+ 9 files changed, 309 insertions(+), 3 deletions(-)
+ create mode 100644 include/media/stagefright/OMXCodecBase.h
+ create mode 100644 media/libmediaplayerservice/IMSPlayerLoader.cpp
+ create mode 100644 media/libmediaplayerservice/IMSPlayerLoader.h
+ create mode 100644 media/libstagefright/include/AwesomePlayerBase.h
+
+diff --git a/include/media/stagefright/OMXCodec.h b/include/media/stagefright/OMXCodec.h
+index a8508c2..d19f7e4 100644
+--- a/include/media/stagefright/OMXCodec.h
++++ b/include/media/stagefright/OMXCodec.h
+@@ -20,6 +20,7 @@
+ 
+ #include <android/native_window.h>
+ #include <media/IOMX.h>
++#include <media/stagefright/OMXCodecBase.h>
+ #include <media/stagefright/MediaBuffer.h>
+ #include <media/stagefright/MediaSource.h>
+ #include <utils/threads.h>
+@@ -37,8 +38,11 @@ class SkipCutBuffer;
+ class VPPProcessor;
+ #endif
+ 
++// We created the OMXCodecBase as the base class of OMXCodec is for the same design and
++// purpose with what we did for AwesomePlayer. See the detail description in AwesomePlayer.h
+ struct OMXCodec : public MediaSource,
+-                  public MediaBufferObserver {
++                  public MediaBufferObserver,
++                  public OMXCodecBase {
+     enum CreationFlags {
+         kPreferSoftwareCodecs    = 1,
+         kIgnoreCodecSpecificData = 2,
+@@ -137,6 +141,11 @@ private:
+     // Make sure mLock is accessible to OMXCodecObserver
+     friend class OMXCodecObserver;
+ 
++    // Make sure the private variables are accessible to the
++    // inherit class IMSOMXCodec and IMSOMXCodecObserver
++    friend struct IMSOMXCodec;
++    friend class IMSOMXCodecObserver;
++
+ #ifdef TARGET_HAS_VPP
+     // Make sure BufferInfo is accessible in VPPProcessor
+     friend class VPPProcessor;
+diff --git a/include/media/stagefright/OMXCodecBase.h b/include/media/stagefright/OMXCodecBase.h
+new file mode 100644
+index 0000000..6a40551
+--- /dev/null
++++ b/include/media/stagefright/OMXCodecBase.h
+@@ -0,0 +1,46 @@
++/*
++ * Copyright (C) 2009 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef OMX_CODEC_BASE_H_
++#define OMX_CODEC_BASE_H_
++
++#include <utils/Errors.h>
++#include <OMX_Types.h>
++
++namespace android {
++
++struct OMXCodecBase {
++public:
++    OMXCodecBase() {}
++    virtual ~OMXCodecBase() {}
++
++protected:
++    virtual status_t allocateBuffers() = 0;
++    virtual status_t allocateBuffersOnPort(OMX_U32 portIndex) = 0;
++    virtual status_t allocateOutputBuffersFromNativeWindow() = 0;
++
++    virtual status_t freeBuffer(OMX_U32 portIndex, size_t bufIndex) = 0;
++    virtual status_t freeBuffersOnPort(OMX_U32 portIndex, bool onlyThoseWeOwn = false) = 0;
++
++private:
++    OMXCodecBase(const OMXCodecBase &);
++    OMXCodecBase &operator=(const OMXCodecBase &);
++};
++
++}  // namespace android
++
++
++#endif /* OMX_CODEC_BASE_H_ */
+diff --git a/media/libmediaplayerservice/Android.mk b/media/libmediaplayerservice/Android.mk
+index c3d9d59..8c5c91e 100644
+--- a/media/libmediaplayerservice/Android.mk
++++ b/media/libmediaplayerservice/Android.mk
+@@ -22,6 +22,7 @@ LOCAL_SRC_FILES:=               \
+     StagefrightPlayer.cpp       \
+     StagefrightRecorder.cpp     \
+     TestPlayerStub.cpp          \
++    IMSPlayerLoader.cpp         \
+ 
+ LOCAL_SHARED_LIBRARIES :=       \
+     libbinder                   \
+diff --git a/media/libmediaplayerservice/IMSPlayerLoader.cpp b/media/libmediaplayerservice/IMSPlayerLoader.cpp
+new file mode 100644
+index 0000000..a3052c6
+--- /dev/null
++++ b/media/libmediaplayerservice/IMSPlayerLoader.cpp
+@@ -0,0 +1,121 @@
++/*
++ * Copyright (C) 2009 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++//#define LOG_NDEBUG 0
++#define LOG_TAG "IMSPlayerLoader"
++#include <utils/Log.h>
++#include <dlfcn.h>
++#include "IMSPlayerLoader.h"
++#include "AwesomePlayer.h"
++
++namespace android {
++
++typedef bool(*isIMSEnabledFunc_t)();
++typedef android::AwesomePlayerBase* (*getPlayerFunc_t)();
++typedef void (*deletePlayerFunc_t)(android::AwesomePlayerBase*);
++
++IMSPlayerLoader::IMSPlayerLoader()
++    : mIMSLibHandler(NULL),
++      mIsIMSPlayerLoaded(false) {
++    ALOGV("IMSPlayerLoader");
++}
++
++IMSPlayerLoader::~IMSPlayerLoader() {
++    ALOGV("~IMSPlayerLoader");
++    if (NULL != mIMSLibHandler) {
++        dlclose(mIMSLibHandler);
++        mIMSLibHandler = NULL;
++    }
++}
++
++AwesomePlayer* IMSPlayerLoader::load() {
++    ALOGV("load");
++    AwesomePlayer *pAwesomePlayer = NULL;
++
++    do {
++        if (NULL == mIMSLibHandler) {
++            mIMSLibHandler = dlopen("libimsplayer.so", RTLD_NOW);
++            if (!mIMSLibHandler) {
++                ALOGV("Cannot open libimsplayer.so");
++                break;
++            }
++        }
++
++        // call dlerror before dlsym is to read / clear the last error caused by other codes.
++        const char* error = dlerror();
++
++        isIMSEnabledFunc_t isIMSEnabledFunc =
++                (isIMSEnabledFunc_t)dlsym(mIMSLibHandler, "isIMSEnabled");
++        error = dlerror();
++        if ((error != NULL) || (NULL == isIMSEnabledFunc)) {
++            ALOGE("Cannot get function isIMSEnabled() from libimsplayer library");
++            break;
++        }
++
++        bool isIMSEnabled = (bool)((*isIMSEnabledFunc)());
++        if (!isIMSEnabled) {
++            ALOGV("IMS was configured to disabled");
++            break;
++        }
++
++        getPlayerFunc_t getPlayerFunc = (getPlayerFunc_t) dlsym(mIMSLibHandler, "getPlayer");
++        error = dlerror();
++        if ((error != NULL) || (NULL == getPlayerFunc)) {
++            ALOGE("IMS: Cannot get function getPlayer() from libimsplayer library");
++            break;
++        }
++
++        pAwesomePlayer = (AwesomePlayer *)((*getPlayerFunc)());
++        if (NULL == pAwesomePlayer) {
++            ALOGE("IMS: Cannot initialize IMS player instance");
++            break;
++        }
++
++        mIsIMSPlayerLoaded = true;
++    } while (false);
++
++    return pAwesomePlayer;
++}
++
++bool IMSPlayerLoader::unload(AwesomePlayer *pAwesomePlayer) {
++    ALOGV("unload");
++    bool ret = false;
++
++    do {
++        if ((NULL == pAwesomePlayer) || (NULL == mIMSLibHandler)) {
++            ALOGE("Cannot unload IMS player. The input is null or load() was not called before");
++            break;
++        }
++
++        // call dlerror before dlsym is to read / clear the last error caused by other codes.
++        const char* error = dlerror();
++
++        deletePlayerFunc_t deletePlayerFunc =
++                (deletePlayerFunc_t) dlsym(mIMSLibHandler, "deletePlayer");
++        error = dlerror();
++        if ((error != NULL) || (NULL == deletePlayerFunc)) {
++            ALOGE("Cannot get function deletePlayer() from libimsplayer library");
++            break;
++        }
++
++        (*deletePlayerFunc)(pAwesomePlayer);
++        ret = true;
++    } while (false);
++
++    return ret;
++}
++
++}  // namespace android
+diff --git a/media/libmediaplayerservice/IMSPlayerLoader.h b/media/libmediaplayerservice/IMSPlayerLoader.h
+new file mode 100644
+index 0000000..c181b52
+--- /dev/null
++++ b/media/libmediaplayerservice/IMSPlayerLoader.h
+@@ -0,0 +1,46 @@
++/*
++**
++** Copyright 2009, The Android Open Source Project
++**
++** Licensed under the Apache License, Version 2.0 (the "License");
++** you may not use this file except in compliance with the License.
++** You may obtain a copy of the License at
++**
++**     http://www.apache.org/licenses/LICENSE-2.0
++**
++** Unless required by applicable law or agreed to in writing, software
++** distributed under the License is distributed on an "AS IS" BASIS,
++** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++** See the License for the specific language governing permissions and
++** limitations under the License.
++*/
++
++#ifndef ANDROID_IMSPLAYERLOADER_H
++#define ANDROID_IMSPLAYERLOADER_H
++
++namespace android {
++
++struct AwesomePlayer;
++
++class IMSPlayerLoader {
++public:
++    IMSPlayerLoader();
++    virtual ~IMSPlayerLoader();
++
++public:
++    AwesomePlayer* load();
++    bool unload(AwesomePlayer *pAwesomePlayer);
++    bool isIMSPlayerLoaded() { return mIsIMSPlayerLoaded; }
++
++private:
++    IMSPlayerLoader(const IMSPlayerLoader &);
++    IMSPlayerLoader &operator=(const IMSPlayerLoader &);
++
++private:
++    void *mIMSLibHandler;
++    bool mIsIMSPlayerLoaded;
++};
++
++}  // namespace android
++
++#endif  // ANDROID_IMSPLAYERLOADER_H
+diff --git a/media/libmediaplayerservice/StagefrightPlayer.cpp b/media/libmediaplayerservice/StagefrightPlayer.cpp
+index de61d9b..8576540 100644
+--- a/media/libmediaplayerservice/StagefrightPlayer.cpp
++++ b/media/libmediaplayerservice/StagefrightPlayer.cpp
+@@ -25,12 +25,22 @@
+ #include <media/Metadata.h>
+ #include <media/stagefright/MediaExtractor.h>
+ 
++#define ENABLE_IMS_PLAYER
++
+ namespace android {
+ 
+ StagefrightPlayer::StagefrightPlayer()
+-    : mPlayer(new AwesomePlayer) {
++    : mPlayer(NULL) {
+     ALOGV("StagefrightPlayer");
+ 
++#ifdef ENABLE_IMS_PLAYER
++    mPlayer = mIMSPlayerLoader.load();
++#endif
++
++    if (NULL == mPlayer) {
++        mPlayer = new AwesomePlayer();
++    }
++
+     mPlayer->setListener(this);
+ }
+ 
+@@ -38,6 +48,13 @@ StagefrightPlayer::~StagefrightPlayer() {
+     ALOGV("~StagefrightPlayer");
+     reset();
+ 
++#ifdef ENABLE_IMS_PLAYER
++    if (mIMSPlayerLoader.isIMSPlayerLoaded()) {
++        mIMSPlayerLoader.unload(mPlayer);
++        mPlayer = NULL;
++    }
++#endif
++
+     delete mPlayer;
+     mPlayer = NULL;
+ }
+diff --git a/media/libmediaplayerservice/StagefrightPlayer.h b/media/libmediaplayerservice/StagefrightPlayer.h
+index 600945e..4346f81 100644
+--- a/media/libmediaplayerservice/StagefrightPlayer.h
++++ b/media/libmediaplayerservice/StagefrightPlayer.h
+@@ -19,6 +19,7 @@
+ #define ANDROID_STAGEFRIGHTPLAYER_H
+ 
+ #include <media/MediaPlayerInterface.h>
++#include "IMSPlayerLoader.h"
+ 
+ namespace android {
+ 
+@@ -66,6 +67,7 @@ public:
+ 
+ private:
+     AwesomePlayer *mPlayer;
++    IMSPlayerLoader mIMSPlayerLoader;
+ 
+     StagefrightPlayer(const StagefrightPlayer &);
+     StagefrightPlayer &operator=(const StagefrightPlayer &);
+diff --git a/media/libstagefright/include/AwesomePlayer.h b/media/libstagefright/include/AwesomePlayer.h
+index e25b440..de563d4 100644
+--- a/media/libstagefright/include/AwesomePlayer.h
++++ b/media/libstagefright/include/AwesomePlayer.h
+@@ -20,6 +20,7 @@
+ 
+ #include "HTTPBase.h"
+ #include "TimedEventQueue.h"
++#include "AwesomePlayerBase.h"
+ 
+ #ifdef TARGET_HAS_VPP
+ #include "VPPProcessor.h"
+@@ -75,7 +76,14 @@ struct IntelPlatformPrivate {
+ };
+ #endif
+ 
+-struct AwesomePlayer {
++//We attached a base class (AwesomePlayerBase) to AwesomePlayer here is order to:
++//(1) Make several AwesomePlayer's functions as "virtual"(declared in AwesomePlayerBase class),
++//    thus Intel Media Scheduler Player, which derived from AwesomePlayer, is able to
++//    overwrite these virtual functions to provide Intel Media Scheduler features.
++//(2) Declaring "virtual" functions in AwesomePlayerBase class instead of in AwesomePlayer class
++//    directly is to minimize the code changes in libstagefright and minimize the efforts
++//    when Android code base upgrade in future.
++struct AwesomePlayer : public AwesomePlayerBase {
+     AwesomePlayer();
+     ~AwesomePlayer();
+ 
+@@ -131,6 +139,7 @@ struct AwesomePlayer {
+ private:
+     friend struct AwesomeEvent;
+     friend struct PreviewPlayer;
++    friend struct IMSPlayer;
+ 
+     enum {
+         PLAYING             = 0x01,
+diff --git a/media/libstagefright/include/AwesomePlayerBase.h b/media/libstagefright/include/AwesomePlayerBase.h
+new file mode 100644
+index 0000000..b60edf2
+--- /dev/null
++++ b/media/libstagefright/include/AwesomePlayerBase.h
+@@ -0,0 +1,55 @@
++/*
++ * Copyright (C) 2009 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef AWESOME_PLAYER_BASE_H_
++#define AWESOME_PLAYER_BASE_H_
++
++#include <media/stagefright/DataSource.h>
++#include <media/stagefright/MediaExtractor.h>
++
++namespace android {
++
++struct AwesomePlayerBase {
++public:
++    AwesomePlayerBase() {}
++    virtual ~AwesomePlayerBase() {}
++
++protected:
++    virtual status_t setDataSource_l(const char *uri, const KeyedVector<String8, String8> *headers = NULL) = 0;
++    virtual status_t setDataSource_l(const sp<DataSource> &dataSource) = 0;
++    virtual status_t setDataSource_l(const sp<MediaExtractor> &extractor) = 0;
++    virtual void addTextSource_l(size_t trackIndex, const sp<MediaSource>& source) = 0;
++
++    virtual status_t initVideoDecoder(uint32_t flags = 0) = 0;
++    virtual void initRenderer_l() = 0;
++
++    virtual status_t play_l() = 0;
++    virtual status_t seekTo_l(int64_t timeUs) = 0;
++    virtual status_t pause_l(bool at_eos = false) = 0;
++    virtual void reset_l() = 0;
++
++    virtual void shutdownVideoDecoder_l() = 0;
++    virtual void onVideoEvent() = 0;
++    virtual void onStreamDone() = 0;
++
++private:
++    AwesomePlayerBase(const AwesomePlayerBase &);
++    AwesomePlayerBase &operator=(const AwesomePlayerBase &);
++};
++
++}  // namespace android
++
++#endif  // AWESOME_PLAYER_BASE_H_
+-- 
+1.7.4.1
+

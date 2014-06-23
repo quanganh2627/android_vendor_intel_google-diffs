@@ -1,0 +1,477 @@
+From 8fed0d3913d4703acdda8c371f476987c3fede51 Mon Sep 17 00:00:00 2001
+From: David L Kreitzer <david.l.kreitzer@intel.com>
+Date: Fri, 20 Sep 2013 15:01:49 -0700
+Subject: Dalvik: Add support for the vectorization bytecodes in pcgDalvik
+
+BZ: 140053
+
+This patch adds initial support for the vectorization bytecodes.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I2471f906a15669ca9974cda801e72da1162a2db8
+Orig-MCG-Change-Id: I645880b18143c66ebee20dd9632dcc568fdcd8c5
+Signed-off-by: Kreitzer, David L <david.l.kreitzer@intel.com>
+Reviewed-on: http://android.intel.com:8080/133469
+Reviewed-by: Hartley, Timothy D <timothy.d.hartley@intel.com>
+Reviewed-by: Banerji, Udayan <udayan.banerji@intel.com>
+Reviewed-by: Ansari, Zia <zia.ansari@intel.com>
+Reviewed-by: Dittert, Eric <eric.dittert@intel.com>
+Reviewed-by: lab_aqa <lab_aqa@intel.com>
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/Dataflow.cpp                           |   11 +-
+ vm/compiler/codegen/x86/pcg/Analysis.cpp           |   20 +++
+ vm/compiler/codegen/x86/pcg/CodeGeneration.cpp     |   24 +++
+ vm/compiler/codegen/x86/pcg/CompilationUnitPCG.cpp |   12 ++-
+ vm/compiler/codegen/x86/pcg/CompilationUnitPCG.h   |    7 +
+ vm/compiler/codegen/x86/pcg/LowerExtended.cpp      |  155 ++++++++++++++++++++
+ vm/compiler/codegen/x86/pcg/LowerExtended.h        |   42 ++++++
+ vm/compiler/codegen/x86/pcg/PcgInterface.cpp       |    2 -
+ vm/compiler/codegen/x86/pcg/UtilityPCG.cpp         |   18 +++
+ vm/compiler/codegen/x86/pcg/UtilityPCG.h           |   16 ++
+ 10 files changed, 302 insertions(+), 5 deletions(-)
+
+diff --git a/vm/compiler/Dataflow.cpp b/vm/compiler/Dataflow.cpp
+index bf2af24..9c45132 100644
+--- a/vm/compiler/Dataflow.cpp
++++ b/vm/compiler/Dataflow.cpp
+@@ -1260,7 +1260,10 @@ void dvmCompilerExtendedDisassembler (const CompilationUnit *cUnit,
+             snprintf (buffer, len, "kMirOpMove128b xmm%d = xmm%d", insn->vA, insn->vB);
+             break;
+         case kMirOpPackedSet:
+-            snprintf (buffer, len, "kMirOpPackedSet xmm%d = v%d, size %d", insn->vA, insn->vB, insn->vC);
++            snprintf (buffer, len, "kMirOpPackedSet xmm%d = %s, size %d",
++                      insn->vA,
++                      getSSAName (cUnit, mir->ssaRep->uses[0], operand0),
++                      insn->vC);
+             break;
+         case kMirOpConst128b:
+             snprintf (buffer, len, "kMirOpConst128DW xmm%d = %x, %x, %x, %x", insn->vA, insn->arg[0], insn->arg[1], insn->arg[2], insn->arg[3]);
+@@ -1272,7 +1275,11 @@ void dvmCompilerExtendedDisassembler (const CompilationUnit *cUnit,
+             snprintf (buffer, len, "kMirOpPackedMultiply xmm%d = xmm%d * xmm%d, size %d", insn->vA, insn->vA, insn->vB, insn->vC);
+             break;
+         case kMirOpPackedAddReduce:
+-            snprintf (buffer, len, "kMirOpPackedAddReduce v%d = xmm%d, size %d", insn->vA, insn->vB, insn->vC);
++            snprintf (buffer, len, "kMirOpPackedAddReduce %s = xmm%d + %s, size %d",
++                      getSSAName (cUnit, mir->ssaRep->defs[0], operand0),
++                      insn->vB,
++                      getSSAName (cUnit, mir->ssaRep->uses[0], operand1),
++                      insn->vC);
+             break;
+         case kMirOpNullCheck:
+             if (mir != 0)
+diff --git a/vm/compiler/codegen/x86/pcg/Analysis.cpp b/vm/compiler/codegen/x86/pcg/Analysis.cpp
+index 5b8b337..52aca23 100644
+--- a/vm/compiler/codegen/x86/pcg/Analysis.cpp
++++ b/vm/compiler/codegen/x86/pcg/Analysis.cpp
+@@ -1525,6 +1525,26 @@ bool dvmCompilerPcgNewRegisterizeVRAnalysis (CompilationUnitPCG *cUnit)
+                     //No virtual registers are being used
+                     break;
+ 
++                // All the packed opcodes have references to XMM physical
++                // registers.  We do not need to do any analysis for them.  We
++                // already know their data types, they are always registerized,
++                // and they are never written back.  We only need to record the
++                // uses and definitions of the VRs.
++                case kMirOpPackedSet:
++                    pcgRef (cUnit, ssaRep->uses[0], INTreg);
++                    break;
++
++                case kMirOpPackedAddReduce:
++                    pcgRef (cUnit, ssaRep->uses[0], INTreg);
++                    pcgDefRef (cUnit, ssaRep->defs[0], INTreg);
++                    break;
++
++                case kMirOpConst128b:
++                case kMirOpMove128b:
++                case kMirOpPackedAddition:
++                case kMirOpPackedMultiply:
++                    break;
++
+                 default:
+                     ALOGI ("Unsupported instruction in trace for new registerization:");
+                     char mybuf[2048];
+diff --git a/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp b/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
+index d4dd3e5..a08a861 100644
+--- a/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
++++ b/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
+@@ -105,6 +105,30 @@ static bool dvmCompilerPcgTranslateInsn (CompilationUnitPCG *cUnit, MIR *mir)
+                 dvmCompilerPcgTranslateCheckStackOverflow (cUnit, mir);
+                 break;
+ 
++            case kMirOpPackedSet:
++                dvmCompilerPcgTranslatePackedSet (cUnit, mir);
++                break;
++
++            case kMirOpConst128b:
++                dvmCompilerPcgTranslatePackedConst (cUnit, mir);
++                break;
++
++            case kMirOpMove128b:
++                dvmCompilerPcgTranslatePackedMove (cUnit, mir);
++                break;
++
++            case kMirOpPackedAddition:
++                dvmCompilerPcgTranslatePackedAdd (cUnit, mir);
++                break;
++
++            case kMirOpPackedMultiply:
++                dvmCompilerPcgTranslatePackedMul (cUnit, mir);
++                break;
++
++            case kMirOpPackedAddReduce:
++                dvmCompilerPcgTranslatePackedAddReduce (cUnit, mir);
++                break;
++
+             default:
+                 LOGE ("Jit (PCG): unsupported extended MIR opcode");
+                 assert (0);
+diff --git a/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.cpp b/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.cpp
+index 6d6c9da..531de22 100644
+--- a/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.cpp
++++ b/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.cpp
+@@ -74,7 +74,8 @@ CompilationUnitPCG::CompilationUnitPCG (CompilationUnit *cUnit)
+     // This needs to be initialized to some value larger than the highest
+     // SSA number, because we use the SSA number as the
+     // temp number when we registerize VRs.
+-    setCurrentTemporaryVR (numSSARegs);
++    // Also, reserve temporaries for the XMM registers.
++    setCurrentTemporaryVR (numSSARegs + gDvmJit.vectorRegisters);
+     vmPtrReg = getCurrentTemporaryVR (true);
+ 
+     //Create the frame pointer register
+@@ -123,6 +124,15 @@ bool CompilationUnitPCG::addRelocation (CRelocation *relocation)
+     return true;
+ }
+ 
++CGTemp CompilationUnitPCG::getCGTempForXMM (int xmmNum)
++{
++    // We reserved the first gDvmJitGlobals.vectorRegisters available CGTemp
++    // numbers after the max SSA number for the XMM registers.
++    assert (xmmNum >= 0 && xmmNum < gDvmJitGlobals.vectorRegisters);
++
++    return numSSARegs + xmmNum;
++}
++
+ /**
+  * @details findRelocation attempts to find a reference to the specified symbol
+  * in the code.  This routine is specifically used to find references to the
+diff --git a/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.h b/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.h
+index df557ee..5b6843d 100644
+--- a/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.h
++++ b/vm/compiler/codegen/x86/pcg/CompilationUnitPCG.h
+@@ -224,6 +224,13 @@ class CompilationUnitPCG: public CompilationUnit
+         void setCurrentTemporaryVR (CGTemp value) {nextTemp = value;}
+ 
+         /**
++         * @brief Get the temporary associated with a physical XMM register
++         * @param xmmNum the XMM register of interest, must be in the range [0, 7]
++         * @return the CGTemp for xmmNum
++         */
++        CGTemp getCGTempForXMM (int xmmNum);
++
++        /**
+          * @brief Get the virtual machine pointer
+          * @return the VR containing the VM pointer
+          */
+diff --git a/vm/compiler/codegen/x86/pcg/LowerExtended.cpp b/vm/compiler/codegen/x86/pcg/LowerExtended.cpp
+index e40034a..06f3a8b 100644
+--- a/vm/compiler/codegen/x86/pcg/LowerExtended.cpp
++++ b/vm/compiler/codegen/x86/pcg/LowerExtended.cpp
+@@ -189,3 +189,158 @@ void dvmCompilerPcgTranslateCheckStackOverflow (CompilationUnitPCG *cUnit, MIR *
+     //Bind label so we can get here when we don't take the overflow path
+     CGBindLabel (noOverflow);
+ }
++
++void dvmCompilerPcgTranslatePackedSet (CompilationUnitPCG *cUnit, MIR *mir)
++{
++    int vecUnitSize = mir->dalvikInsn.vC;
++    int destXMM = mir->dalvikInsn.vA;
++    SSARepresentation *ssaRep = mir->ssaRep;
++    assert (ssaRep != 0);
++    CGInst val = dvmCompilerPcgGetVirtualReg (cUnit, ssaRep->uses[0], "mov", 4);
++
++    // Broadcast val into an XMM register
++    val = CGCreateNewInst ("emovdfi", "r", val);
++    if (vecUnitSize == 2)
++    {
++        // PCG really ought to have a utility opcode for pbroadcastwx.  For the
++        // time being, unpack the word to dword and use pbroadcastdx.
++        val = CGCreateNewInst ("epunpcklwd", "rr", val, val);
++    }
++    val = CGCreateNewInst ("pbroadcastdx", "r", val);
++
++    dvmCompilerPcgSetXMMReg (cUnit, destXMM, val);
++}
++
++void dvmCompilerPcgTranslatePackedConst (CompilationUnitPCG *cUnit, MIR *mir)
++{
++    int destXMM = mir->dalvikInsn.vA;
++    int constVal[4];
++    CGInst val;
++
++    // The constant value is stored in reverse order in the MIR.
++    constVal[0] = mir->dalvikInsn.arg[3];
++    constVal[1] = mir->dalvikInsn.arg[2];
++    constVal[2] = mir->dalvikInsn.arg[1];
++    constVal[3] = mir->dalvikInsn.arg[0];
++
++    // Check for 0 as a special case.  PCG could do this conversion for us,
++    // but we would like to avoid generation of the memory constant as well.
++    //
++    // TODO: In the future, we could handle this in the same way that we
++    //       handle unreferenced chaining cells.  That is, we can always create
++    //       the memConst here, let PCG optimize away special values like 0,
++    //       and then look for references to each memory constant in the
++    //       PCG-generated code and only generate constants that are referenced.
++    //
++    if (constVal[0] == 0 && constVal[1] == 0 && constVal[2] == 0 && constVal[3] == 0)
++    {
++        val = CGCreateNewInst ("epzero", "");
++    }
++    else
++    {
++        // Create the constant in memory
++        CGSymbol memConstSymbol = cUnit->getMemConstSymbol ( (uint8_t*) constVal, 16, 16);
++        CGAddr addr = CGCreateAddr (CGInstInvalid, CGInstInvalid, 0, memConstSymbol, 0);
++        val = CGCreateNewInst ("ldps", "m", addr, 16, (void*)1);
++    }
++    dvmCompilerPcgSetXMMReg (cUnit, destXMM, val);
++}
++
++void dvmCompilerPcgTranslatePackedMove (CompilationUnitPCG *cUnit, MIR *mir)
++{
++    int sourceXMM = mir->dalvikInsn.vB;
++    int destXMM = mir->dalvikInsn.vA;
++
++    CGInst src = dvmCompilerPcgGetXMMReg (cUnit, sourceXMM);
++    CGInst copy = CGCreateNewInst ("movps", "r", src);
++    dvmCompilerPcgSetXMMReg (cUnit, destXMM, copy);
++}
++
++/**
++ * @brief Translate bytecodes of the form XMMdest = XMMdest "op" XMMsrc
++ * @param cUnit the CompilationUnitPCG
++ * @param mir the MIR instruction
++ * @param pcgOpcode the PCG opcode name that defines "op"
++ */
++static void translatePackedOp2 (CompilationUnitPCG *cUnit, MIR *mir, const char *pcgOpcode)
++{
++    int sourceXMM = mir->dalvikInsn.vB;
++    int destXMM = mir->dalvikInsn.vA;
++    CGInst op1 = dvmCompilerPcgGetXMMReg (cUnit, destXMM);
++    CGInst op2 = dvmCompilerPcgGetXMMReg (cUnit, sourceXMM);
++    CGInst inst = CGCreateNewInst (pcgOpcode, "rr", op1, op2);
++    dvmCompilerPcgSetXMMReg (cUnit, destXMM, inst);
++}
++
++void dvmCompilerPcgTranslatePackedAdd (CompilationUnitPCG *cUnit, MIR *mir)
++{
++    const char *pcgOpcode;
++    int vecUnitSize = mir->dalvikInsn.vC;
++
++    if (vecUnitSize == 2)
++    {
++        pcgOpcode = "epaddw";
++    }
++    else
++    {
++        pcgOpcode = "epaddd";
++    }
++
++    translatePackedOp2 (cUnit, mir, pcgOpcode);
++}
++
++void dvmCompilerPcgTranslatePackedMul (CompilationUnitPCG *cUnit, MIR *mir)
++{
++    int vecUnitSize = mir->dalvikInsn.vC;
++    const char *pcgOpcode;
++
++    if (vecUnitSize == 2)
++    {
++        pcgOpcode = "epmullw";
++    }
++    else
++    {
++        pcgOpcode = "epmulldx";
++    }
++
++    translatePackedOp2 (cUnit, mir, pcgOpcode);
++}
++
++void dvmCompilerPcgTranslatePackedAddReduce (CompilationUnitPCG *cUnit, MIR *mir)
++{
++    SSARepresentation *ssaRep = mir->ssaRep;
++    assert (ssaRep != 0);
++
++    int sourceXMM = mir->dalvikInsn.vB;
++    int vecUnitSize = mir->dalvikInsn.vC;
++    const int vectorBytes = 16;
++    int vecElems = vectorBytes / vecUnitSize;
++    CGInst sum = dvmCompilerPcgGetXMMReg (cUnit, sourceXMM);
++    const char *pcgOpcode;
++
++    if (vecUnitSize == 2)
++    {
++        pcgOpcode = "ephaddw";
++    }
++    else
++    {
++        pcgOpcode = "ephaddd";
++    }
++
++    while (vecElems > 1)
++    {
++        sum = CGCreateNewInst (pcgOpcode, "rr", sum, sum);
++        vecElems >>= 1;
++    }
++
++    sum = CGCreateNewInst ("emovdti", "r", sum);
++    if (vecUnitSize == 2)
++    {
++        sum = CGCreateNewInst ("zext", "ri", sum, 16);
++    }
++
++    CGInst origVR = dvmCompilerPcgGetVirtualReg (cUnit, ssaRep->uses[0], "mov", 4);
++    sum = CGCreateNewInst ("add", "rr", sum, origVR);
++
++    dvmCompilerPcgSetVirtualReg (cUnit, ssaRep->defs[0], "mov", 4, sum);
++}
+diff --git a/vm/compiler/codegen/x86/pcg/LowerExtended.h b/vm/compiler/codegen/x86/pcg/LowerExtended.h
+index 2b812da..5fb3a0a 100644
+--- a/vm/compiler/codegen/x86/pcg/LowerExtended.h
++++ b/vm/compiler/codegen/x86/pcg/LowerExtended.h
+@@ -66,4 +66,46 @@ void dvmCompilerPcgTranslatePredictionInlineCheck (CompilationUnitPCG *cUnit, MI
+  */
+ void dvmCompilerPcgTranslateCheckStackOverflow (CompilationUnitPCG *cUnit, MIR *mir);
+ 
++/**
++ * @brief Translate a packed set instruction
++ * @param cUnit the CompilationUnitPCG
++ * @param mir the MIR instruction
++ */
++void dvmCompilerPcgTranslatePackedSet (CompilationUnitPCG *cUnit, MIR *mir);
++
++/**
++ * @brief Translate a packed constant instruction
++ * @param cUnit the CompilationUnitPCG
++ * @param mir the MIR instruction
++ */
++void dvmCompilerPcgTranslatePackedConst (CompilationUnitPCG *cUnit, MIR *mir);
++
++/**
++ * @brief Translate a packed move instruction
++ * @param cUnit the CompilationUnitPCG
++ * @param mir the MIR instruction
++ */
++void dvmCompilerPcgTranslatePackedMove (CompilationUnitPCG *cUnit, MIR *mir);
++
++/**
++ * @brief Translate a packed add instruction
++ * @param cUnit the CompilationUnitPCG
++ * @param mir the MIR instruction
++ */
++void dvmCompilerPcgTranslatePackedAdd (CompilationUnitPCG *cUnit, MIR *mir);
++
++/**
++ * @brief Translate a packed mul instruction
++ * @param cUnit the CompilationUnitPCG
++ * @param mir the MIR instruction
++ */
++void dvmCompilerPcgTranslatePackedMul (CompilationUnitPCG *cUnit, MIR *mir);
++
++/**
++ * @brief Translate a packed add reduce instruction
++ * @param cUnit the CompilationUnitPCG
++ * @param mir the MIR instruction
++ */
++void dvmCompilerPcgTranslatePackedAddReduce (CompilationUnitPCG *cUnit, MIR *mir);
++
+ #endif // H_LOWEREXTENDED
+diff --git a/vm/compiler/codegen/x86/pcg/PcgInterface.cpp b/vm/compiler/codegen/x86/pcg/PcgInterface.cpp
+index 4380c4e..3b72aff 100644
+--- a/vm/compiler/codegen/x86/pcg/PcgInterface.cpp
++++ b/vm/compiler/codegen/x86/pcg/PcgInterface.cpp
+@@ -263,8 +263,6 @@ extern "C" bool dalvikPluginInit (void)
+ 
+     setupPcgJit();
+ 
+-    dvmCompilerRemovePass ("Vectorization");
+-
+     //Loops with invokes exposes a bug with PCG. Therefore we check after inlining if we have
+     //any remaining invokes that we have not inlined when in loop mode
+     dvmCompilerReplaceEnd ("Method_Inlining", dvmCompilerPcgRejectLoopsWithInvokes);
+diff --git a/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp b/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp
+index 33f1af5..d7959f2 100644
+--- a/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp
++++ b/vm/compiler/codegen/x86/pcg/UtilityPCG.cpp
+@@ -226,6 +226,18 @@ void dvmCompilerPcgSetVirtualReg (CompilationUnitPCG *cUnit, int ssaNum, const c
+     CGCreateNewInst (pcgOpcode, "mr", addr, storeSize, handle, storeVal);
+ }
+ 
++CGInst dvmCompilerPcgGetXMMReg (CompilationUnitPCG *cUnit, int xmmNum)
++{
++    CGTemp xmmTemp = cUnit->getCGTempForXMM (xmmNum);
++    return CGGetTempUseInst (xmmTemp);
++}
++
++void dvmCompilerPcgSetXMMReg (CompilationUnitPCG *cUnit, int xmmNum, CGInst val)
++{
++    CGTemp xmmTemp = cUnit->getCGTempForXMM (xmmNum);
++    CGAddTempDef (xmmTemp, val);
++}
++
+ void* dvmCompilerPcgGetVRHandle (u2 virtualReg, uint32_t size)
+ {
+     // Start with a non-zero handle, because PCG assigns a special meaning to a null handle.
+@@ -441,6 +453,12 @@ bool dvmCompilerPcgSupportsExtendedOp (int extendedOpcode)
+         case kMirOpNullCheck:
+         case kMirOpNullNRangeUpCheck:
+         case kMirOpNullNRangeDownCheck:
++        case kMirOpPackedSet:
++        case kMirOpConst128b:
++        case kMirOpMove128b:
++        case kMirOpPackedAddition:
++        case kMirOpPackedMultiply:
++        case kMirOpPackedAddReduce:
+             return true;
+         default:
+             break;
+diff --git a/vm/compiler/codegen/x86/pcg/UtilityPCG.h b/vm/compiler/codegen/x86/pcg/UtilityPCG.h
+index 1083597..6584fd9 100644
+--- a/vm/compiler/codegen/x86/pcg/UtilityPCG.h
++++ b/vm/compiler/codegen/x86/pcg/UtilityPCG.h
+@@ -132,6 +132,22 @@ CGInst dvmCompilerPcgGetVirtualReg (CompilationUnitPCG *cUnit, int ssaNum, const
+ void dvmCompilerPcgSetVirtualReg (CompilationUnitPCG *cUnit, int ssaNum, const char *pcgOpcode, uint32_t storeSize, CGInst store_val);
+ 
+ /**
++ * @brief Get an instruction that references an XMM temporary from the MIR
++ * @param cUnit the CompilationUnitPCG
++ * @param xmmNum the XMM temporary number
++ * @return A CGInst that holds the desired XMM temp
++ */
++CGInst dvmCompilerPcgGetXMMReg (CompilationUnitPCG *cUnit, int xmmNum);
++
++/**
++ * @brief Define an XMM temporary from the MIR
++ * @param cUnit the CompilationUnitPCG
++ * @param xmmNum the XMM temporary number
++ * @param val the instruction we are using to define the XMM temporary
++ */
++void dvmCompilerPcgSetXMMReg (CompilationUnitPCG *cUnit, int xmmNum, CGInst val);
++
++/**
+  * @brief Get a block name
+  * @param bb the BasicBlockPCG
+  * @param label the block name is set there
+-- 
+1.7.4.1
+

@@ -1,0 +1,1819 @@
+From 3690c8aba6835891823b09ecb0c8b6ffe146a6c7 Mon Sep 17 00:00:00 2001
+From: Udayan Banerji <udayan.banerji@intel.com>
+Date: Sun, 15 Dec 2013 12:17:10 -0800
+Subject: Dalvik: Method Context framework with constant information collection
+
+BZ: 125782
+
+This change enables the calculation and storage of method context for JIT
+traces. The information calculation is done on a method basis, so can be
+used in a Method JIT environment too. Additionally, this patch also adds
+the collection of constant information for the context, and an API to get
+the information
+
+MethodContext.cpp/.h: Contains the core Context class and data store
+
+MethodContextHandler.cpp/.h: Contains the handler class for managing all
+the contexts for the methods. Also contains the APIs as they are being
+created.
+
+Frontend.cpp: A dvmCompilerPrepareCUnit function to create CFG for a method
+
+BBOptimization.cpp/.h: Changed the function to hide unreachable blocks
+
+Dataflow.cpp: Changed the dispatcher so that walkData is passed as an
+argument
+
+Change-Id: I5975ed122f932420dc13a59dd0563f4d31920aea
+Category: device enablement
+Domain: AOSP.Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, need rework
+Signed-off-by: Udayan Banerji <udayan.banerji@intel.com>
+Signed-off-by: Yixin Shou <yixin.shou@intel.com>
+---
+ vm/Dvm.mk                            |    4 +-
+ vm/Init.cpp                          |   23 +
+ vm/compiler/Compiler.cpp             |    4 +
+ vm/compiler/Compiler.h               |   26 ++-
+ vm/compiler/Dataflow.cpp             |   56 ++-
+ vm/compiler/Frontend.cpp             |   96 +++--
+ vm/compiler/MethodContext.cpp        |  741 ++++++++++++++++++++++++++++++++++
+ vm/compiler/MethodContext.h          |  188 +++++++++
+ vm/compiler/MethodContextHandler.cpp |  259 ++++++++++++
+ vm/compiler/MethodContextHandler.h   |  112 +++++
+ vm/compiler/RegisterizationME.cpp    |    7 +-
+ vm/compiler/SSATransformation.cpp    |    8 +-
+ 12 files changed, 1464 insertions(+), 60 deletions(-)
+ create mode 100644 vm/compiler/MethodContext.cpp
+ create mode 100644 vm/compiler/MethodContext.h
+ create mode 100644 vm/compiler/MethodContextHandler.cpp
+ create mode 100644 vm/compiler/MethodContextHandler.h
+
+diff --git a/vm/Dvm.mk b/vm/Dvm.mk
+index 99c57e6..ea0925a 100644
+--- a/vm/Dvm.mk
++++ b/vm/Dvm.mk
+@@ -388,7 +388,9 @@ ifeq ($(dvm_arch),x86)
+               compiler/AccumulationSinking.cpp \
+               compiler/SinkCastOpt.cpp \
+               compiler/Vectorization.cpp \
+-              compiler/JitVerbose.cpp
++              compiler/JitVerbose.cpp \
++              compiler/MethodContext.cpp \
++              compiler/MethodContextHandler.cpp
+ 
+        LOCAL_C_INCLUDES += \
+               dalvik/vm/compiler \
+diff --git a/vm/Init.cpp b/vm/Init.cpp
+index d36bc6c..b3a5b96 100644
+--- a/vm/Init.cpp
++++ b/vm/Init.cpp
+@@ -49,6 +49,7 @@
+ #include "compiler/codegen/x86/X86Common.h"
+ #include "compiler/CompilerUtility.h"
+ #include "compiler/PassDriver.h"
++#include "compiler/MethodContextHandler.h"
+ #endif
+ 
+ #if defined(WITH_JIT)
+@@ -192,6 +193,8 @@ static void usage(const char* progName)
+     dvmFprintf(stderr, "  -Xjitinliningmethodsizemax:<value> The maximum number of bytecodes a method can have to be considered for inlining\n");
+     dvmFprintf(stderr, "  -Xjitdisablepredictedinlining Disable method inlining that is done on a predicted method");
+     dvmFprintf(stderr, "  -Xjitmaxscratch:<value> The maximum number of scratch registers that are allowed to be used in optimization passes\n");
++    dvmFprintf(stderr, "  -Xjitmaxmethodcontexts:<value> Set the maximum number of method context in the system\n");
++    dvmFprintf(stderr, "  -Xjitmaxconstantspercontext:<value> Set the maximum number of constants to collect per method context\n");
+ #endif
+ #if defined(VTUNE_DALVIK)
+     dvmFprintf(stderr, "  -Xjitsepdalvik\n");
+@@ -1734,6 +1737,26 @@ int processOptions(int argc, const char* const argv[], bool ignoreUnrecognized)
+         } else if (strncmp (argv[i], "-Xjitabortonerror", 17) == 0) {
+             gDvmJit.abortOnCompilerError = true;
+ #ifdef ARCH_IA32
++        } else if (strncmp (argv[i], "-Xjitmaxmethodcontexts:", 23) == 0) {
++            char *endptr = NULL;
++            //Get requested value
++            unsigned long res = strtoul (argv[i] + 23, &endptr, 0);
++
++            //Pass on the value to the context handler
++            if (endptr == NULL || *endptr != '\0' || MethodContextHandler::setMaxContexts (res) == false)
++            {
++                dvmFprintf (stderr, "Refusing option for %s, the value is invalid for the maximum number of contexts\n", argv[i]);
++            }
++        } else if (strncmp (argv[i], "-Xjitmaxconstantspercontext:", 28) == 0) {
++            char *endptr = NULL;
++            //Get requested value
++            unsigned long res = strtoul (argv[i] + 28, &endptr, 0);
++
++            //Pass on the value to the context handler
++            if (endptr == NULL || *endptr != '\0' || MethodContextHandler::setMaxConstantsPerContext (res) == false)
++            {
++                dvmFprintf (stderr, "Refusing option for %s, the value is either invalid or too large for the number of constants\n", argv[i]);
++            }
+         } else if (strncmp (argv[i], "-Xjitarenatrimstyle:", 20) == 0) {
+             const char *style = argv[i] + 20;
+             const char *acceptedStyles[] = {"none", "onlyOne", "average", "user"};
+diff --git a/vm/compiler/Compiler.cpp b/vm/compiler/Compiler.cpp
+index 3eae123..6a0a50a 100644
+--- a/vm/compiler/Compiler.cpp
++++ b/vm/compiler/Compiler.cpp
+@@ -21,6 +21,7 @@
+ #include "Dalvik.h"
+ #include "interp/Jit.h"
+ #include "CompilerInternals.h"
++#include "MethodContextHandler.h"
+ #ifdef ARCH_IA32
+ #include "codegen/x86/lightcg/Translator.h"
+ #include "codegen/x86/lightcg/Lower.h"
+@@ -811,6 +812,9 @@ void dvmCompilerShutdown(void)
+             ALOGD("Compiler thread has shut down");
+     }
+ 
++    /* Remove all the method contexts */
++    MethodContextHandler::eraseMethodMap();
++
+     /* Break loops within the translation cache */
+ #if defined(VTUNE_DALVIK)
+     gDvmJit.vtuneInfo = kVTuneInfoDisabled; // stop sending unchain updates to VTune
+diff --git a/vm/compiler/Compiler.h b/vm/compiler/Compiler.h
+index fb440e8..f3aab6b 100644
+--- a/vm/compiler/Compiler.h
++++ b/vm/compiler/Compiler.h
+@@ -305,10 +305,22 @@ void dvmCompilerExtendedDisassembler (const CompilationUnit *cUnit,
+ 
+ char *dvmCompilerGetSSAString(struct CompilationUnit *cUnit,
+                               struct SSARepresentation *ssaRep);
++
++/**
++ * @brief Apply a function to BasicBlocks of the CompilationUnit
++ * @details Traverse the CFG of the cUnit according to the dfaMode,
++ * and perform the function on each block.
++ * @param cUnit CompilationUnit in which we dispatch the function
++ * @param func Function to apply to each BasicBlock
++ * @param dfaMode The DataFlowAnalysisMode to use to iterate the BBs
++ * @param isIterative Whether we iterate on changes
++ * @param walkData Supplemental data if needed during the traversal
++ */
+ void dvmCompilerDataFlowAnalysisDispatcher(struct CompilationUnit *cUnit,
+                 bool (*func)(struct CompilationUnit *, struct BasicBlock *),
+                 DataFlowAnalysisMode dfaMode,
+-                bool isIterative);
++                bool isIterative, void *walkData = 0);
++
+ void dvmCompilerMethodSSATransformation(struct CompilationUnit *cUnit);
+ 
+ /**
+@@ -320,6 +332,18 @@ void dvmCompilerMethodSSATransformation(struct CompilationUnit *cUnit);
+  */
+ bool dvmCompilerCalculateBasicBlockInformation (CompilationUnit *cUnit, bool filter = true, bool buildLoopInfo = false);
+ 
++/**
++ * @brief Fill in a CompilationUnit with method level data
++ * @details Create the complete CFG of the method as BasicBlocks of the cUnit
++ * Also add the exception blocks to the CFG if asked for, and verify the predecessor
++ * information at the end.
++ * @param[out] cUnit The CompilationUnit to fill in
++ * @param method The method for which the cUnit will be prepared for
++ * @param needTryCatchBlocks whether we also want data about try catch blocks
++ * @return true if we were able to successfully fill up the cUnit
++ */
++bool dvmCompilerFillCUnitWithMethodData(CompilationUnit &cUnit, const Method *method, bool needTryCatchBlocks);
++
+ void dvmCompilerUpdateGlobalState(void);
+ JitTraceDescription *dvmCopyTraceDescriptor(const u2 *pc,
+                                             const struct JitEntry *desc);
+diff --git a/vm/compiler/Dataflow.cpp b/vm/compiler/Dataflow.cpp
+index 87308b1..2c442f6 100644
+--- a/vm/compiler/Dataflow.cpp
++++ b/vm/compiler/Dataflow.cpp
+@@ -805,11 +805,14 @@ long long dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     // FF OP_UNUSED_FF
+     DF_NOP,
+ 
+-    // This is the beginning of the extended MIR opcodes. We make sure that each receives the
+-    // tag for extended format so that we can treat the uses and defs specially for each.
++    /*
++     * This is the beginning of the extended MIR opcodes. We make sure that the
++     * more complex ones receives the tag for extended format so that we can treat
++     * the uses and defs specially.
++     */
+ 
+     //kMirOpPhi
+-    DF_FORMAT_EXT_OP,
++    DF_DA,
+ 
+     //kMirOpNullNRangeUpCheck
+     DF_FORMAT_EXT_OP,
+@@ -1588,9 +1591,6 @@ void handleExtOpUses (BitVector *useV, BitVector *defV, MIR *mir)
+ 
+     switch (static_cast<int> (dInsn->opcode))
+     {
+-        case kMirOpPhi:
+-            //Phi nodes shouldn't be updating the ssa so we make it seem that it has no uses
+-            break;
+         case kMirOpNullNRangeUpCheck:
+         case kMirOpNullNRangeDownCheck:
+             //vA holds the array pointer register
+@@ -1652,9 +1652,6 @@ void handleExtOpDefs (BitVector *defV, DecodedInstruction* dInsn)
+         case kMirOpRegisterize:
+             //No defs
+             break;
+-        case kMirOpPhi:
+-            handleDef (defV, dInsn->vA);
+-            break;
+         default:
+             ALOGW("JIT_INFO: Unexpected Extended opcode %#x", dInsn->opcode);
+             break;
+@@ -2020,10 +2017,6 @@ static void dataFlowSSAFormatExtendedOp(CompilationUnit *cUnit, MIR *mir)
+ 
+     switch (static_cast<int> (mir->dalvikInsn.opcode))
+     {
+-        case kMirOpPhi:
+-            handleSSADef (cUnit, defs, mir->dalvikInsn.vA, numDefs);
+-            numDefs++;
+-            break;
+         case kMirOpNullNRangeUpCheck:
+         case kMirOpNullNRangeDownCheck:
+             handleSSAUse(cUnit, uses, mir->dalvikInsn.vA, numUses);
+@@ -2278,6 +2271,22 @@ bool dvmCompilerDoSSAConversion(CompilationUnit *cUnit, BasicBlock *bb)
+         dvmCompilerDoSSAConversion (cUnit, bb->fallThrough);
+     }
+ 
++    //If we have a successor list, process that
++    if (bb->successorBlockList.blockListType != kNotUsed)
++    {
++        GrowableListIterator iterator;
++        dvmGrowableListIteratorInit(&bb->successorBlockList.blocks,
++                                    &iterator);
++
++        for (SuccessorBlockInfo *successorBlockInfo = (SuccessorBlockInfo *) (dvmGrowableListIteratorNext(&iterator));
++            successorBlockInfo != NULL;
++            successorBlockInfo = (SuccessorBlockInfo *) (dvmGrowableListIteratorNext(&iterator)))
++        {
++            BasicBlock *succBB = successorBlockInfo->block;
++            dvmCompilerDoSSAConversion (cUnit, succBB);
++        }
++    }
++
+     //For ensuring sanity of memcpy, we check that type matches because both structures should be same size
+     assert (sizeof (*(cUnit->dalvikToSSAMap)) == sizeof (*(bb->dataFlowInfo->dalvikToSSAMapExit)));
+ 
+@@ -3334,8 +3343,21 @@ static bool predecessorsFirstTraversal(CompilationUnit *cUnit,  bool (*func)(Com
+ void dvmCompilerDataFlowAnalysisDispatcher(CompilationUnit *cUnit,
+                 bool (*func)(CompilationUnit *, BasicBlock *),
+                 DataFlowAnalysisMode dfaMode,
+-                bool isIterative)
++                bool isIterative, void *walkData)
+ {
++    //Use the walkData if supplied
++    if (walkData != 0)
++    {
++        //We should not have a walkData already
++        if (cUnit->walkData != 0)
++        {
++            assert(false && "Overwriting walkData in dvmCompilerDataFlowAnalysis");
++        }
++
++        //Set the walk data
++        cUnit->walkData = walkData;
++    }
++
+     bool change = true;
+ 
+     while (change) {
+@@ -3490,6 +3512,12 @@ void dvmCompilerDataFlowAnalysisDispatcher(CompilationUnit *cUnit,
+         /* If isIterative is false, exit the loop after the first iteration */
+         change &= isIterative;
+     }
++
++    //Reset the walk data if we started with it
++    if (walkData != 0)
++    {
++        cUnit->walkData = 0;
++    }
+ }
+ 
+ /* Main entry point to do SSA conversion for non-loop traces */
+diff --git a/vm/compiler/Frontend.cpp b/vm/compiler/Frontend.cpp
+index 688f516..a0f2c85 100644
+--- a/vm/compiler/Frontend.cpp
++++ b/vm/compiler/Frontend.cpp
+@@ -24,6 +24,7 @@
+ #include "LoopInformation.h"
+ #include "RegisterizationME.h"
+ #include "Utility.h"
++#include "MethodContextHandler.h"
+ 
+ #ifdef ARCH_IA32
+ #define BYTECODE_FILTER
+@@ -1784,37 +1785,14 @@ bool dvmCompilerBuildCFG (const Method *method, GrowableList *blockList, BasicBl
+     return true;
+ }
+ 
+-/*
+- * Similar to dvmCompileTrace, but the entity processed here is the whole
+- * method.
+- *
+- * TODO: implementation will be revisited when the trace builder can provide
+- * whole-method traces.
+- */
+-bool dvmCompileMethod(const Method *method, JitTranslationInfo *info)
+-{
+-    CompilationUnit cUnit;
+-    const DexCode *dexCode = dvmGetMethodCode(method);
+-    const u2 *codePtr = dexCode->insns;
+-
+-    /* Method already compiled */
+-    if (dvmJitGetMethodAddr(codePtr)) {
+-        info->codeAddress = NULL;
+-        return false;
+-    }
+-
++bool dvmCompilerFillCUnitWithMethodData(CompilationUnit &cUnit, const Method *method, bool needTryCatchBlocks) {
++    //Clear the cUnit to begin with
+     memset(&cUnit, 0, sizeof(cUnit));
+     cUnit.method = method;
+ 
+-    cUnit.jitMode = kJitMethod;
+-
+-    //Set the constant values
+-    std::map<int, int> constantValues;
+-    cUnit.constantValues = &constantValues;
++    const DexCode *dexCode = dvmGetMethodCode(method);
+ 
+-    // Initialize the degenerate PHI map
+-    std::map<int, int> degeneratePhiMap;
+-    cUnit.degeneratePhiMap = &degeneratePhiMap;
++    cUnit.jitMode = kJitMethod;
+ 
+     //Set up the jit verbose infrastructure
+     std::vector<std::pair<BBType, char*> > code_block_table;
+@@ -1830,17 +1808,22 @@ bool dvmCompileMethod(const Method *method, JitTranslationInfo *info)
+     /* Initialize the PC reconstruction list */
+     dvmInitGrowableList(&cUnit.pcReconstructionList, 8);
+ 
+-    /* Allocate the bit-vector to track the beginning of basic blocks */
+-    BitVector *tryBlockAddr = dvmCompilerAllocBitVector(dexCode->insnsSize,
+-                                                        true /* expandable */);
+-    cUnit.tryBlockAddr = tryBlockAddr;
++    cUnit.tryBlockAddr = 0;
+ 
+-    /* Identify code range in try blocks and set up the empty catch blocks */
+-    processTryCatchBlocks (cUnit.method, &cUnit.blockList, cUnit.tryBlockAddr);
++    // See if we need to process exception blocks
++    if (needTryCatchBlocks == true ) {
++        /* Allocate the bit-vector to track the beginning of basic blocks */
++        BitVector *tryBlockAddr = dvmCompilerAllocBitVector(dexCode->insnsSize,
++                true /* expandable */);
++        cUnit.tryBlockAddr = tryBlockAddr;
++
++        /* Identify code range in try blocks and set up the empty catch blocks */
++        processTryCatchBlocks (cUnit.method, &cUnit.blockList, cUnit.tryBlockAddr);
++    }
+ 
+     /* Build CGF for the method */
+     bool createdCFG = dvmCompilerBuildCFG (cUnit.method, &cUnit.blockList,
+-            &cUnit.entryBlock, &cUnit.exitBlock, cUnit.tryBlockAddr, resolveReferences);
++            &cUnit.entryBlock, &cUnit.exitBlock, cUnit.tryBlockAddr, 0);
+ 
+     if (createdCFG == false)
+     {
+@@ -1859,6 +1842,46 @@ bool dvmCompileMethod(const Method *method, JitTranslationInfo *info)
+                                           kAllNodes,
+                                           false /* isIterative */);
+ 
++    return true;
++}
++
++/*
++ * Similar to dvmCompileTrace, but the entity processed here is the whole
++ * method.
++ *
++ * TODO: implementation will be revisited when the trace builder can provide
++ * whole-method traces.
++ */
++bool dvmCompileMethod(const Method *method, JitTranslationInfo *info)
++{
++    const DexCode *dexCode = dvmGetMethodCode(method);
++    const u2 *codePtr = dexCode->insns;
++
++    /* Method already compiled */
++    if (dvmJitGetMethodAddr(codePtr) != 0) {
++        info->codeAddress = 0;
++        return false;
++    }
++
++    CompilationUnit cUnit;
++
++    bool success = dvmCompilerFillCUnitWithMethodData(cUnit, method, true);
++
++    if (success == false) {
++        return success;
++    }
++
++    /*
++     * We want to allocate the constantValues and degeneratePhiMap maps on stack
++     * together with the cUnit, so that both are destroyed together and we don't
++     * have to handle that. For this reason, it is not filled in the
++     * dvmCompilerFillCUnitWithMethodData
++     */
++    std::map<int, int> constantValues;
++    cUnit.constantValues = &constantValues;
++
++    std::map<int, int> degeneratePhiMap;
++    cUnit.degeneratePhiMap = &degeneratePhiMap;
+ 
+     /* Perform SSA transformation for the whole method */
+     dvmCompilerMethodSSATransformation(&cUnit);
+@@ -2549,6 +2572,11 @@ bool dvmCompileTrace(JitTraceDescription *desc, int numMaxInsts,
+         return false;
+     }
+ 
++#ifdef DEBUG_METHOD_CONTEXT
++    //To facilitate debugging, just cause the creation of the context
++    MethodContextHandler::getMethodContext(cUnit.method);
++#endif
++
+     //Compile as a loop first: only do this in the new loop detection system
+     if ( (gDvmJit.oldLoopDetection == false) && (optHints & JIT_OPT_NO_LOOP) == 0) {
+         dvmCompilerArenaReset();
+diff --git a/vm/compiler/MethodContext.cpp b/vm/compiler/MethodContext.cpp
+new file mode 100644
+index 0000000..232a981
+--- /dev/null
++++ b/vm/compiler/MethodContext.cpp
+@@ -0,0 +1,741 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ * MethodContext.cpp
++ *
++ * This file contains the implementation of the MethodContext class. Some details are noteworthy.
++ *
++ * DETAILS:
++ *
++ * 1. Essentially, this class is a data store. The functions here assist in collecting the data,
++ *    but at the end we are left with maps and queues containing data. Note that the only public
++ *    function which creates the context is the createNewInstance, which returns a const. So the
++ *    context is immutable to the outside world, and can only be queried.
++ *
++ * 2. Moreover, we can perform optimizations on the data store such as sorting the queues, without
++ *    worrying about the sorting ever being invalid.
++ *
++ * 3. Due to that, any expansion of the class which adds APIs, should make the API functions const.
++ *
++ * DEBUGGING:
++ *
++ * Do a (hash) define of DEBUG_METHOD_CONTEXT in MethodContex.h to get debugging information, including statistics
++ * about the Method Context. Everybody likes statistics.
++ *
++ * LIMITATIONS:
++ *
++ * 1. The maximum number of constants a context can contain is defined by MAX_POSSIBLE_CONSTANTS in MethodContext.h.
++ *    The limitation exists since we store the constant information for each VR in @see ConstOffset struct,
++ *    which contains the index into a table of all constants. By limiting the number of constants to 256,
++ *    the index is just one byte. The start offset of the VR's constant range is two bytes, the end offset is
++ *    one more, for a total of 4 bytes, which fits snugly in 32-bits. We like snug structures.
++ *
++ *    => Note that the actual value guarding the number of constants is maxConstants, which can be set by the user.
++ *       Use the -Xjitmaxconstantspercontext:<value> flag to do so.
++ *       However, maxConstants cannot go over MAX_POSSIBLE_CONSTANTS, which is fixed.
++ *
++ * TODOs:
++ *
++ * 1. The findConstantVRs function only looks at constants defined by virtue of coming from a const bytecode. It
++ *    should also look at constant VRs which are constants because we did a MOVE of another constant VR to it.
++ */
++
++#include "MethodContext.h"
++#include "SSAWalkData.h"
++#include "BBOptimization.h"
++
++#include <queue>
++
++#ifdef DEBUG_METHOD_CONTEXT
++#define METHOD_CONTEXT_LOG(X) X
++#else
++#define METHOD_CONTEXT_LOG(X)
++#endif
++
++#ifdef DEBUG_METHOD_CONTEXT
++static void contextLog (const MethodContext *const context, const char *message)
++{
++    ALOGE ("METHOD_CONTEXT: %s%s - %s", context->getMethod ()->clazz->descriptor, context->getMethod ()->name, message);
++}
++#endif
++
++//Initialize the static elements
++unsigned int MethodContext::maxConstants = MAX_POSSIBLE_CONSTANTS;
++
++MethodContext::MethodContext (const Method *method)
++{
++    this->method = method;
++}
++
++int MethodContext::getIndexForConst (unsigned int value)
++{
++    std::vector<unsigned int>::iterator it;
++
++    unsigned int position = 0;
++
++    //Find the index of the constant if present
++    for (it = constants.begin (); it != constants.end (); it++)
++    {
++        if ((*it) == value)
++        {
++            return position;
++        }
++        position++;
++
++        //Paranoid
++        assert (position <= maxConstants);
++    }
++
++    //Not found. Add it to the store if possible
++    if (constants.size () < maxConstants)
++    {
++        constants.push_back (value);
++        return position;
++    }
++    else
++    {
++        METHOD_CONTEXT_LOG (contextLog (this, "Reached constant table size limit"));
++    }
++
++    //Position cannot be determined for this constant
++    return -1;
++}
++
++bool MethodContext::getConstAtIndex (unsigned int index, unsigned int &value) const
++{
++    //The index should be within bounds
++    if (index >= constants.size ())
++    {
++        METHOD_CONTEXT_LOG (contextLog (this, "Illegal const table access"));
++        return false;
++    }
++
++    value = constants[index];
++
++    return true;
++}
++
++/**
++ * @brief Go through all the MIRs and record the constants being set
++ * @details Record wide and non-wide constants, and those set through a move
++ * on a constant VR.
++ * @param cUnit The CompilationUnit
++ * @param bb The BasicBlock for which we want to record the constant
++ * @return false if an error occured while collecting constants, true otherwise
++ */
++static bool findConstantVRs (CompilationUnit *cUnit, BasicBlock *bb)
++{
++    // Skip if we have already seen this BasicBlock
++    if (bb->visited == true)
++    {
++        return false;
++    }
++
++    bb->visited = true;
++
++    //Get the pass data, which contains the Method Context and a map for VRs
++    std::pair<MethodContext *, std::map<int, int> *> *passData =
++            static_cast<std::pair<MethodContext *, std::map<int, int> *> *> (cUnit->walkData);
++
++    std::map<int, int> *uniqueDefVR = passData->second;
++    MethodContext *context = passData->first;
++
++    //Go through all the MIRs and see if they set or move a constant
++    for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        unsigned short beginOffset = 0;
++        unsigned short endOffset = 0;
++
++        int dfAttributes =
++                dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
++
++        if ( (dfAttributes & DF_HAS_DEFS) == 0)
++        {
++            continue;
++        }
++
++        /* Handle instructions that set up constants directly */
++        if ( (dfAttributes & DF_SETS_CONST) != 0)
++        {
++            int lowConst = 0, highConst = 0;
++            bool isWideConstDef = false;
++
++            //Get the actual value of the VR
++            bool setsConst = dexGetConstant (mir->dalvikInsn, lowConst, highConst, isWideConstDef);
++
++            //Fake use for non-assert build
++            (void) setsConst;
++
++            //Paranoid
++            assert (setsConst == true);
++
++            endOffset = beginOffset = mir->offset;
++
++            //Now find the offset till which the VR is a constant
++            SSARepresentation *ssaRep = mir->ssaRep;
++
++            //Cannot continue without SSA
++            if (ssaRep == 0)
++            {
++                METHOD_CONTEXT_LOG (contextLog (context, "No SSA available while finding constants"));
++                return false;
++            }
++
++            //Get the VRs
++            u4 lowVR = dvmExtractSSARegister(cUnit, mir->ssaRep->defs[0]);
++            u4 highVR = -1;
++
++            if (isWideConstDef == true)
++            {
++                if (mir->ssaRep->numDefs != 2)
++                {
++                    METHOD_CONTEXT_LOG (contextLog (context, "High Definition not found for wide VR"));
++                    return false;
++                }
++
++                highVR = dvmExtractSSARegister(cUnit, mir->ssaRep->defs[1]);
++            }
++
++            /* Check if the constant define is the first define of the VR. If so, add it.
++             * If not, put a -1 so that it is not considered.
++             */
++
++            //First look at low VR
++            std::map<int, int>::iterator it = uniqueDefVR->find(lowVR);
++
++            if (it == uniqueDefVR->end())
++            {
++                //This is the first
++                (*uniqueDefVR)[lowVR] = 1;
++            }
++            else
++            {
++                //Redefinition. Put -1 so that it is ignored later
++                (*uniqueDefVR)[lowVR] = -1;
++            }
++
++            //Do the same for High VR
++            if (isWideConstDef == true)
++            {
++                it = uniqueDefVR->find(highVR);
++
++                if (it == uniqueDefVR->end())
++                {
++                    //This is the first
++                    (*uniqueDefVR)[highVR] = 1;
++                }
++                else
++                {
++                    //Redefinition. Put -1 so that it is ignored later
++                    (*uniqueDefVR)[highVR] = -1;
++                }
++            }
++
++            //Get the uses of the low and, if available, high part
++            SUsedChain *usedChainLow = ssaRep->usedNext[0];
++            SUsedChain *usedChainHigh = ssaRep->numDefs == 2 ? ssaRep->usedNext[1] : 0;
++
++            //Remember the previous MIR in the used chain, to maintain a continuous chain
++            MIR *lastMIRInUseChain = mir;
++
++            /* Go through the useNext chain. We want to go as far as we can in the chain
++             * while maintaining consistency if both low and high parts are present
++             */
++            while (usedChainLow != 0)
++            {
++                MIR *currentMIRInUseChain = usedChainLow->mir;
++
++                //Paranoid
++                if (currentMIRInUseChain == 0)
++                {
++                    break;
++                }
++
++                //Quit if it is a Phi node
++                if (currentMIRInUseChain->dalvikInsn.opcode == static_cast<Opcode>(kMirOpPhi))
++                {
++                    break;
++                }
++
++                //The const defined VR should not be redefining itself. If it does, the SSA version
++                //changes, but the old version might still live on. When queried from the trace world
++                //the SSA information is lost, and the multiple VR versions will cause confusion (bugs)
++                //about const-ness. So bail when this happens.
++                unsigned int currentDFA = dvmCompilerDataFlowAttributes[currentMIRInUseChain->dalvikInsn.opcode];
++
++                if (currentMIRInUseChain->dalvikInsn.vA == lowVR )
++                {
++                    if ((currentDFA & DF_DA) != 0 || (currentDFA & DF_DA_WIDE) != 0)
++                    {
++                        break;
++                    }
++                }
++
++                //Check if the wide part is consistent
++                if (isWideConstDef == true)
++                {
++
++                    //If the low chain is here, but high chain does not exist
++                    //We would still keep the endOffset we have updated so far
++                    if (usedChainHigh == 0)
++                    {
++                        METHOD_CONTEXT_LOG (contextLog(context, "Missing high VR use for wide const"));
++                        break;
++                    }
++
++                    //If the low chain and high chain go different ways
++                    //We would still keep the endOffset we have updated so far
++                    if (usedChainHigh->mir->offset != currentMIRInUseChain->offset)
++                    {
++                        METHOD_CONTEXT_LOG (contextLog(context, "Inconsistent high VR for wide const"));
++                        break;
++                    }
++                }
++
++                /*
++                 * Check if the offset of the next use forms a continuous increasing chain.
++                 * If the use chain, goes backwards, or jumps over a basic block, we need to
++                 * handle it separately.
++                 */
++
++                //Now see if the offset is continuous
++                if (currentMIRInUseChain->bb != lastMIRInUseChain->bb)
++                {
++                    //Make sure the BBs are consecutive
++                    BasicBlock *lastBB = lastMIRInUseChain->bb;
++                    BasicBlock *currentBB = currentMIRInUseChain->bb;
++
++                    if (lastBB->lastMIRInsn->offset + lastBB->lastMIRInsn->width != currentBB->firstMIRInsn->offset)
++                    {
++                        //Stop the previous offset range at the lastMIR
++                        context->updateVRConsts (lowVR, lowConst, beginOffset, lastBB->lastMIRInsn->offset);
++                        if (isWideConstDef == true)
++                        {
++                            context->updateVRConsts (highVR, highConst, beginOffset, lastBB->lastMIRInsn->offset);
++                        }
++
++                        //Continue with the chain with the new beginOffset
++                        beginOffset = currentMIRInUseChain->offset;
++                    }
++                }
++
++                //Update endOffset to at least this MIR
++                endOffset = currentMIRInUseChain->offset;
++
++                //Record this MIR
++                lastMIRInUseChain = currentMIRInUseChain;
++
++                //Go to the next MIR
++                usedChainLow = usedChainLow->nextUse;
++
++                if (isWideConstDef == true)
++                {
++                    usedChainHigh = usedChainHigh->nextUse;
++                }
++
++            }
++
++            /*
++             * Update the values. The endOffsets and beginOffsets are only updated in the code above
++             * if the usedChains are proper. That is, they are over continuous  and increasing
++             * offsets, and the wide part follows the same chain as the low part
++             */
++            context->updateVRConsts (lowVR, lowConst, beginOffset, endOffset);
++            if (isWideConstDef == true)
++            {
++                context->updateVRConsts (highVR, highConst, beginOffset, endOffset);
++            }
++        }
++        else
++        {
++            /*
++             * We have a def but it does not set a const. Since we are tracking const defines which
++             * are the only defines of the VR, let's mark this VR as not interesting for that purpose
++             */
++            SSARepresentation *ssaRep = mir->ssaRep;
++
++            if (ssaRep == 0)
++            {
++                continue;
++            }
++
++            for (int i = 0; i < mir->ssaRep->numDefs; i++)
++            {
++                int vr = dvmExtractSSARegister (cUnit, mir->ssaRep->defs[i]);
++                (*uniqueDefVR)[vr] = -1;
++            }
++        }
++    }
++
++    return true;
++}
++
++/**
++ * @brief Hides blocks which are unreachable from the entry block
++ * @details This is functionally similar to @see dvmCompilerRemoveUnreachableBlocks
++ * though this function will hide any block which cannot be reached from the entry,
++ * while that function hides blocks with no predecessors. So connected exception
++ * blocks separate from the main CFG will be removed by this function, but kept
++ * by that one
++ * @param cUnit The CompilationUnit containing the entry block
++ */
++static void hideBlocksUnreachableFromEntry (CompilationUnit *cUnit)
++{
++    /* We will use the visited flag as a temporary flag to mark
++     * the reachable block
++     */
++
++    //First, mark all nodes as not-visited
++    dvmCompilerDataFlowAnalysisDispatcher (cUnit,
++            dvmCompilerClearVisitedFlag, kAllNodes, false);
++
++    std::queue<BasicBlock *> blocks;
++
++    //Now let's start at the entry and "visit" whatever is reachable
++    blocks.push (cUnit->entryBlock);
++
++    while (blocks.size () > 0)
++    {
++        BasicBlock *bb = blocks.front ();
++        blocks.pop ();
++
++        if (bb == 0 || bb->visited == true || bb->hidden == true)
++        {
++            continue;
++        }
++
++        //Visit this block
++        bb->visited = true;
++
++        //Now go through all the children and add them to our list
++        ChildBlockIterator succIter (bb);
++        BasicBlock **succPtr = succIter.getNextChildPtr ();
++
++        while (succPtr != 0)
++        {
++            //Get the basic block
++            BasicBlock *successor = *succPtr;
++
++            //Paranoid
++            assert (successor != 0);
++
++            blocks.push (successor);
++
++            //Take next successor
++            succPtr = succIter.getNextChildPtr ();
++        }
++    }
++
++    //Now hide any blocks which could not be visited
++    GrowableListIterator bvIterator;
++
++    //Now again go through the blocks and hide any block we could not visit
++    dvmGrowableListIteratorInit (&cUnit->blockList, &bvIterator);
++
++    while (true)
++    {
++        BasicBlock *bb =
++                (BasicBlock *)dvmGrowableListIteratorNext (&bvIterator);
++
++        //Paranoid
++        if (bb == 0)
++        {
++            break;
++        }
++
++        //Hide it if not visited
++        if (bb->visited == false)
++        {
++            //Remove the block
++            dvmCompilerHideBasicBlock (cUnit->blockList, bb);
++        }
++    }
++
++}
++
++bool MethodContext::handleConstants (CompilationUnit *cUnit)
++{
++    SSAWalkData data (cUnit);
++    void *walkData = static_cast<void *>(&data);
++
++    //Reset flags
++    dvmCompilerDataFlowAnalysisDispatcher (cUnit, dvmCompilerClearVisitedFlag, kAllNodes, false);
++
++    /*
++     * We are also interested in VRs which are only defined once, and defined
++     * as constants. For such VRs, we can put the whole method as constant range.
++     * To do that, we have a map of all interesting VRs
++     */
++    std::map<int, int> uniqueDefVRs;
++
++    //Pass the context and this map to the findConstantVRs function
++    std::pair<MethodContext *, std::map<int, int> *> passData;
++
++    passData.first = this;
++    passData.second = &uniqueDefVRs;
++
++    walkData = static_cast<void *>(&passData);
++    dvmCompilerDataFlowAnalysisDispatcher (cUnit,
++            findConstantVRs, kReachableNodes, false, walkData);
++
++    //The map should now have been filled with uniquely defined constants.
++    for (std::map<int, int>::iterator it = uniqueDefVRs.begin(); it != uniqueDefVRs.end(); it++)
++    {
++        if (it->second == 1)
++        {
++            int VR = it->first;
++
++            //Get constant index of this VR
++            const std::vector<ConstOffset>& offsets = vRConstMap.find (VR)->second;
++
++            //Paranoid: The VR should have at least one const value
++            if (offsets.size() < 1)
++            {
++                return false;
++            }
++
++            int constIndex = offsets[0].constIndex;
++
++            //Add this VR and its constant index to the method wide const VR map
++            methodWideConstVRs[VR] = constIndex;
++
++            //The VR is const method wide. Remove the offset level information for this VR
++            vRConstMap.erase(VR);
++        }
++    }
++
++    return true;
++}
++
++const MethodContext *MethodContext::createNewInstance (const Method * method)
++{
++
++    /* Perform method level analysis */
++    // The temporary CFG for processing
++    CompilationUnit cUnit;
++
++    //Setup the cUnit for processing
++    bool success = dvmCompilerFillCUnitWithMethodData (cUnit, method, false);
++
++    //If we fail to create CFG, we cannot continue
++    if (success == false)
++    {
++        METHOD_CONTEXT_LOG (ALOGE ("METHOD_CONTEXT: Failed to create CFG for method %s%s", method->clazz->descriptor, method->name));
++        return 0;
++    }
++
++    /*
++     * We want to allocate the constantValues and degeneratePhiMap maps on stack
++     * together with the cUnit, so that both are destroyed together and we don't
++     * have to handle that. For this reason, it is not filled in the
++     * dvmCompilerFillCUnitWithMethodData
++     */
++    std::map<int, int> constantValues;
++    cUnit.constantValues = &constantValues;
++
++    std::map<int, int> degeneratePhiMap;
++    cUnit.degeneratePhiMap = &degeneratePhiMap;
++
++    // Hide all blocks unreachable from entry
++    hideBlocksUnreachableFromEntry (&cUnit);
++
++    /* Perform SSA transformation for the whole method */
++    dvmCompilerMethodSSATransformation (&cUnit);
++
++    dvmCompilerCalculateBasicBlockInformation (&cUnit, false, false);
++
++    //The cUnit preparation is done so now let's create the context
++    MethodContext *context = new MethodContext (method);
++
++    //Paranoid
++    if (context == 0)
++    {
++        return 0;
++    }
++
++    /* Now let us collect each of the statistics individually */
++
++    /* ----------- Record constant's information ---------------*/
++
++    //If we fail during constant finding, we bail
++    if (context->handleConstants (&cUnit) == false)
++    {
++        METHOD_CONTEXT_LOG (contextLog (context, "Constant information collection failed"));
++
++        //Clear the data structures
++        context->constants.clear();
++        context->vRConstMap.clear();
++        context->methodWideConstVRs.clear();
++    }
++
++    return context;
++}
++
++bool MethodContext::getConstValueOfVR (unsigned int offset, int vR, unsigned int &value) const
++{
++    //First see if this VR is constant in the whole method
++    if (methodWideConstVRs.find (vR) != methodWideConstVRs.end ())
++    {
++        //Found it. Get the value and return it
++        return getConstAtIndex (methodWideConstVRs.find(vR)->second, value);
++    }
++
++    unsigned short offsetInShort = static_cast<unsigned short>(offset);
++
++    //Get the offset list of the VR
++    std::map<int, std::vector<ConstOffset> >::const_iterator mapIterator = vRConstMap.find (vR);
++
++    //Fail if the VR is not found
++    if (mapIterator == vRConstMap.end ())
++    {
++        return false;
++    }
++
++    const std::vector<ConstOffset>& constOffsetList = mapIterator->second;
++    std::vector<ConstOffset>::const_iterator constOffsets;
++
++    //Go through the offset list and see where this offset belongs
++    for (constOffsets = constOffsetList.begin (); constOffsets != constOffsetList.end (); constOffsets++)
++    {
++        ConstOffset vrConstOffset = *constOffsets;
++
++        //See if the offset falls in the range of this constant
++        if (vrConstOffset.offsetStart <= offsetInShort &&
++                vrConstOffset.offsetStart + vrConstOffset.offsetEnd >= offsetInShort )
++        {
++            //Get the constant and return it
++            return getConstAtIndex (vrConstOffset.constIndex, value);
++        }
++    }
++
++    return false;
++}
++
++bool MethodContext::setMaxConstants (unsigned long numConstants)
++{
++    if (numConstants < MAX_POSSIBLE_CONSTANTS)
++    {
++        maxConstants = numConstants;
++        return true;
++    }
++
++    METHOD_CONTEXT_LOG (ALOGE ("Invalid value %ld for maximum constants. Must be within [0 - %d]", numConstants, MAX_POSSIBLE_CONSTANTS));
++    return false;
++}
++
++bool MethodContext::updateVRConsts (int vR, unsigned int value, unsigned int offsetStart, unsigned int offsetEnd)
++{
++    //Let's keep a limit on the number of offsets we create for a VR
++    const int MAX_OFFSETS = 50;
++
++    //Convenience variable for the maximum value we can fit in a byte
++    const int MAX_VALUE_BYTE = 0xFF;
++
++    int offsetDiff = offsetEnd - offsetStart;
++
++    //Sanity check on the range
++    if (offsetDiff < 0)
++    {
++        return false;
++    }
++
++    //If the offsets are far apart, we will break it down
++    //and add each small chunk to the VR list. Each offset
++    //will be kept in one byte, and we don't want too many
++    //of these offsets
++    if ((offsetDiff / MAX_VALUE_BYTE) > MAX_OFFSETS)
++    {
++        METHOD_CONTEXT_LOG (contextLog (this, "Cannot updateVRConsts because offset range is too large"));
++        return false;
++    }
++
++    //Add constant to table, get the index
++    int constIndex = getIndexForConst (value);
++
++    //If we cannot get an index for our value, this VR const information
++    //has to be given up
++    if (constIndex < 0 || constIndex > MAX_VALUE_BYTE)
++    {
++        METHOD_CONTEXT_LOG (contextLog (this, "Failed to updateVRConst because could not get const index"));
++        return false;
++    }
++
++    //The index has to be 8-bit
++    unsigned char constIndexByte = constIndex;
++
++    //Chop off the offset into byte size ranges
++    //Because that is what we are going to store.
++    do
++    {
++
++        ConstOffset newOffset;
++
++        /*
++         * This assignment of the subtraction of two unsigned ints to
++         * a signed int is safe because we are checking it above as well
++         * and returning for negative values.
++         */
++        int tempOffsetDiff = offsetEnd - offsetStart;
++
++        if (tempOffsetDiff > MAX_VALUE_BYTE)
++        {
++            //Such large offset ranges are rare. Log it as interesting
++            METHOD_CONTEXT_LOG (contextLog (this, "Offset range crosses 255"));
++        }
++
++        //We want the offsetDiff to be a maximum of 255
++        tempOffsetDiff = tempOffsetDiff & MAX_VALUE_BYTE;
++
++        newOffset.constIndex = constIndexByte;
++        newOffset.offsetStart = offsetStart;
++        newOffset.offsetEnd = static_cast<unsigned char>(tempOffsetDiff);
++
++        vRConstMap[vR].push_back (newOffset);
++
++        offsetStart += (tempOffsetDiff + 1);
++
++    } while (offsetEnd > offsetStart);
++
++    return true;
++}
++
++void MethodContext::printStatistics (void) const
++{
++    //Get information about the offsetRanges: How many, and max per VR
++    unsigned int totalOffsetRanges = 0;
++    unsigned int maxOffsetRanges = 0;
++    int maxOffsetVR = 0;
++
++    std::map<int, std::vector<ConstOffset> >::const_iterator vRConstMapIter;
++
++    for (vRConstMapIter = vRConstMap.begin (); vRConstMapIter != vRConstMap.end (); vRConstMapIter++)
++    {
++        unsigned int size = vRConstMapIter->second.size ();
++
++        totalOffsetRanges += size;
++
++        if (size > maxOffsetRanges)
++        {
++            maxOffsetRanges = size;
++            maxOffsetVR = vRConstMapIter->first;
++        }
++    }
++
++    //Print out all the statistics in one line
++    ALOGE ("JIT_INFO: For %s%s - Const VRs: %d, Max Offset Ranges: %d for VR %d, Uniq Const: %d",
++            method->clazz->descriptor, method->name, vRConstMap.size (), maxOffsetRanges, maxOffsetVR, constants.size ());
++}
+diff --git a/vm/compiler/MethodContext.h b/vm/compiler/MethodContext.h
+new file mode 100644
+index 0000000..f5f2db3
+--- /dev/null
++++ b/vm/compiler/MethodContext.h
+@@ -0,0 +1,188 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef DALVIK_VM_METHODCONTEXT
++#define DALVIK_VM_METHODCONTEXT
++
++#include "CompilerUtility.h"
++#include "CompilerIR.h"
++#include "Dalvik.h"
++
++//Forward declarations
++struct BasicBlock;
++struct BitVector;
++class CompilationUnit;
++class Pass;
++
++/**
++ * @brief Specifies the type of a const VR
++ */
++enum ConstVRType
++{
++    /** @brief A 32-bit const VR */
++    kVRNonWideConst,
++    /** @brief A 64-bit const VR */
++    kVRWideConst,
++    /** @brief A definitively non const VR */
++    kVRNotConst,
++    /** @brief The const-ness of the VR is unknown */
++    kVRUnknown
++};
++
++/**
++ * @class ConstOffset
++ * @brief Struct to store a basic const + offset set
++ */
++struct ConstOffset
++{
++    /** @brief The index in the constant table */
++    unsigned char constIndex;
++
++    /** @brief The end offset as an offset from the offsetStart */
++    unsigned char offsetEnd;
++
++    /** @brief The beginning offset of this constant*/
++    unsigned short offsetStart;
++};
++
++/**
++ * @class MethodContext
++ * @brief MethodContext Keeps a method level context and information to be used by traces
++ */
++class MethodContext
++{
++private:
++    /** @brief The Method */
++    const Method *method;
++
++    /* --------- Constructors, Destructor --------- */
++
++    /**
++     * @brief Regular constructors
++     * @details unused
++     */
++    MethodContext (void);
++
++    /**
++     * @brief Copy constructor
++     * @details unused
++     */
++    MethodContext (const MethodContext&);
++
++    /**
++     * @brief Assignment operator
++     * @details unused
++     * @return Reference to the assigned MethodContext
++     */
++    MethodContext& operator= (const MethodContext&);
++
++    /**
++     * @brief Constructor
++     * @param method the method for which the context has the data
++     * @return A new context for the method
++     */
++    MethodContext (const Method *method);
++
++    /* -------- Elements needed for constant information ------ */
++
++    /** @brief Map to keep information about constant VRs */
++    std::map<int, std::vector<ConstOffset> > vRConstMap;
++
++    /** @brief Map of VRs which are constant for the whole method */
++    std::map<int, unsigned int> methodWideConstVRs;
++
++    /** @brief The maximum number of constants we can have in each context */
++    static unsigned int maxConstants;
++
++    /** @brief The maximum constants that are possible, due to data structure limiations
++     *  @details This value serves as the limit for the maxConstants value
++     */
++    const static unsigned int MAX_POSSIBLE_CONSTANTS = 255;
++
++    /** @brief The list of constants */
++    std::vector<unsigned int> constants;
++
++    /**
++     * @brief Given a context and a cUnit, collect information about the constants in the method
++     * @param cUnit The CompilationUnit for the method
++     * @return true if everything was fine
++     */
++    bool handleConstants (CompilationUnit *cUnit);
++
++    /**
++     * @brief Get the index for a constant value
++     * @details If the value is not found in the table,
++     * and we have not exceeded the maxConstants limit, the value will
++     * be added to the table
++     * @param value The value for which we need the index
++     * @return The index in the const table, or -1 if not found
++     */
++    int getIndexForConst (unsigned int value);
++
++    /**
++     * @brief Get the const at a given index
++     * @details The index is guarded by the maxConstants value
++     * @param index for the constant
++     * @param[out] value The value at that index
++     * @return whether a value was found at the index
++     */
++    bool getConstAtIndex (unsigned int index, unsigned int &value) const;
++
++public:
++    /**
++     * @brief Returns the Method for which this context is created
++     * @return The Method for this context
++     */
++    const Method *getMethod (void) const { return method; }
++
++    /**
++     * @brief Instance function
++     * @param method The Method for which we need the context
++     * @return the generated MethodContext, or null
++     */
++    static const MethodContext *createNewInstance (const Method *method);
++
++    /**
++     * @brief Get the const value
++     * @param offset the offset where the const value is needed
++     * @param vR the VR whose const value is needed
++     * @param[out] value the value of the const
++     * @return Whether a const value of the VR at that offset is found
++     */
++    bool getConstValueOfVR (unsigned int offset, int vR, unsigned int &value) const;
++
++    /**
++     * @brief Add the VR information to our temporary structures
++     * @param vR The VR for which we need to add const information
++     * @param value the 32-bit value as the const
++     * @param offsetStart the beginning offset of the VRs constness
++     * @param offsetEnd the end offset of the VRs constness
++     * @return whether the VR could be updated successfully
++     */
++    bool updateVRConsts (int vR, unsigned int value, unsigned int offsetStart, unsigned int offsetEnd);
++
++    /**
++     * @brief Sets the maximum number of constants in the constant table
++     * @param numConstants The number of constants requested
++     * @return Whether we could set the value
++     */
++    static bool setMaxConstants (unsigned long numConstants);
++
++    /** @brief Print statistics about the MethodContext */
++    void printStatistics (void) const;
++};
++
++#endif
+diff --git a/vm/compiler/MethodContextHandler.cpp b/vm/compiler/MethodContextHandler.cpp
+new file mode 100644
+index 0000000..8523fb9
+--- /dev/null
++++ b/vm/compiler/MethodContextHandler.cpp
+@@ -0,0 +1,259 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ * MethodContextHandler.cpp
++ *
++ * This file contains the implementation of the MethodContextHandler class. Some details are noteworthy.
++ *
++ * DETAILS:
++ *
++ * 1. The purpose of this class is to act as a handler for the MethodContext instance created, including
++ *    taking care of the instances. Any piece of code which wants to use the method context needs to go
++ *    through this class.
++ *
++ * 2. getMethodContext returns a context instance for the supplied method. If such an instance does not
++ *    exist, one is created and added to a map called methodMap. Subsequent request for a context get the
++ *    context saved in the map.
++ *
++ * 3. NOTE: We only attempt to create the context once. If we fail, we add an entry for the method to the map,
++ *    but keep the context as null. Subsequent requests for a context for the method always get a null value.
++ *
++ * 4. Because of that, any APIs we create in this file should be prepared to handle the case when we don't find
++ *    a context. For example, the API for "what is the const value of this VR at this offset of this method" will
++ *    try to find the context for the method. If it fails, it can just say "I don't know", simply because we don't
++ *    have the context.
++ *
++ * DEBUGGING:
++ *
++ * Do a (hash) define DEBUG_METHOD_CONTEXT is MethodContext.h to get debugging information, including statistics
++ * about the Method Contexts. Everybody likes statistics.
++ *
++ * LIMITATIONS:
++ *
++ * 1. The maximum number of contexts we can add to the map is limited by the value of MAX_POSSIBLE_CONTEXTs. Note that
++ *    the value maxContexts is used as a limit, and can be set by user, but maxContexts cannot go over MAX_POSSIBLE_CONTEXTS.
++ *    The limitation is arbitrary in terms of its value, but is present for sanity, in case the user tries to put a huge,
++ *    unmanageable value. A value of 0 for maxContexts basically shuts off the method context system.
++ *
++ *    => Use the -Xjitmaxmethodcontexts:<value> flag to set maxContexts
++ *
++ * TODOs:
++ *
++ * 1. Since the context information can be quite large, we need to periodically clean up the map, for example in a LRU manner.
++ *    Such intelligence needs to be put in the cleanupMethodMap function.
++ *
++ * 2. We need to keep track of the memory usage of the map, and call cleanupMethodMap when required.
++ */
++
++#include "MethodContextHandler.h"
++#include "SSAWalkData.h"
++
++
++#ifdef DEBUG_METHOD_CONTEXT
++#define METHOD_CONTEXT_LOG(X) X
++#else
++#define METHOD_CONTEXT_LOG(X)
++#endif
++
++//Initialize the static elements
++std::map<const Method *, const MethodContext *> MethodContextHandler::methodMap;
++unsigned int MethodContextHandler::maxContexts = 500;
++
++bool MethodContextHandler::cleanUpMethodMap (void)
++{
++    //TODO: Add intelligent map cleaning
++
++    //Return whether we could free up space
++    return (methodMap.size() < maxContexts);
++}
++
++const MethodContext *MethodContextHandler::getMethodContext (const Method * method)
++{
++    //See if maxContexts is 0, which means the context system has to turn off.
++    if (maxContexts == 0)
++    {
++        return 0;
++    }
++
++    //Assume we will not find the context
++    const MethodContext *context = 0;
++
++    std::map <const Method *, const MethodContext *>::iterator it;
++
++    it = methodMap.find (method);
++
++    //The context might not be available yet
++    if (it == methodMap.end ())
++    {
++
++        //First check if we have space for the new context
++        if (methodMap.size () >= maxContexts)
++        {
++            //Attempt to create space in the map
++            bool success = cleanUpMethodMap ();
++
++            //Bail if we cannot make space for this context
++            if (success == false)
++            {
++                return 0;
++            }
++        }
++
++        /* Since we now have space for the context, let's
++         * create one
++         */
++        context = MethodContext::createNewInstance (method);
++
++        /* NOTE: The context can be null. We still want to add the method
++         * to our map so that we keep returning null context for the method
++         * and never recalculate it
++         */
++        methodMap[method] = context;
++    }
++    else
++    {
++        context = it->second;
++    }
++
++    return context;
++}
++
++void MethodContextHandler::eraseMethodMap (void)
++{
++    //Iterate over the context map, and destroy all the contexts
++    std::map<const Method *, const MethodContext *>::iterator contextIter;
++
++    //Print out some information if we are getting debugged
++    METHOD_CONTEXT_LOG (ALOGE ("----------------CLEARING UP METHOD CONTEXTS----------------------------"));
++    METHOD_CONTEXT_LOG (ALOGE ("Total number of contexts in the system: %u", methodMap.size ()));
++
++    for (contextIter = methodMap.begin (); contextIter != methodMap.end (); contextIter++)
++    {
++        const MethodContext *toDelete = contextIter->second;
++
++        //Print statistics for the individual context */
++        if (toDelete != 0)
++        {
++            METHOD_CONTEXT_LOG (toDelete->printStatistics ());
++        }
++
++        delete toDelete, toDelete = 0;
++    }
++
++    methodMap.clear ();
++}
++
++bool MethodContextHandler::setMaxContexts (unsigned long numContexts)
++{
++    if (numContexts <= MAX_POSSIBLE_CONTEXTS)
++    {
++        maxContexts = numContexts;
++        return true;
++    }
++
++    METHOD_CONTEXT_LOG (ALOGE ("Could not set a value of %ld for maximum contexts", numContexts));
++    return false;
++}
++
++bool MethodContextHandler::setMaxConstantsPerContext (unsigned long numConstants)
++{
++    return MethodContext::setMaxConstants (numConstants);
++}
++
++ConstVRType dvmCompilerGetConstValueOfVR (const MIR *mirForVR, u4 vR, u8 &value)
++{
++    //Get the method associated with the MIR
++    const Method *method = mirForVR->nesting.sourceMethod;
++
++    //If the MIR has no associated method, we cannot have any context information
++    if (method == 0)
++    {
++        return kVRUnknown;
++    }
++
++    //Get the context for the method to which the mir belongs to
++    const MethodContext *metCon = MethodContextHandler::getMethodContext (method);
++
++    //If there is not context, we cannot determine if it is a constant
++    if (metCon == 0)
++    {
++        return kVRUnknown;
++    }
++
++    //See if the VR is actually present in the MIR
++    if (vR != mirForVR->dalvikInsn.vA && vR != mirForVR->dalvikInsn.vB && vR != mirForVR->dalvikInsn.vC)
++    {
++        return kVRUnknown;
++    }
++
++    //Check if we are dealing with a wide VR
++    int dfAttributes = dvmCompilerDataFlowAttributes[mirForVR->dalvikInsn.opcode];
++
++    //Let's ignore more complicated bytecodes for now
++    if ((dfAttributes & DF_FORMAT_35C) != 0 || (dfAttributes & DF_FORMAT_3RC) != 0 )
++    {
++        return kVRUnknown;
++    }
++
++    bool isWide = false;
++
++    if ((vR == mirForVR->dalvikInsn.vA && (dfAttributes & DF_UA_WIDE) != 0)
++            || (vR == mirForVR->dalvikInsn.vB && (dfAttributes & DF_UB_WIDE) != 0)
++            || (vR == mirForVR->dalvikInsn.vC && (dfAttributes & DF_UC_WIDE) != 0))
++    {
++        isWide = true;
++    }
++
++    //Now try to get the constant value
++    bool success = false;
++    unsigned int lowConst = 0;
++    unsigned int highConst = 0;
++
++    /*
++     * There might be a difference in the context's understanding of the VR numbers of this
++     * MIR and the one passed, since inlining could have renamed the VRs and gotten different
++     * numbers, while the context calculation uses VRs from the raw dex file. If renamed, we
++     * will have a non-zero value for virtualRegRenameOffset. Let us always subtract anyways
++     * to be consistent
++     */
++
++    u4 actualVR = vR - mirForVR->virtualRegRenameOffset;
++
++    success = metCon->getConstValueOfVR (mirForVR->offset, actualVR, lowConst);
++
++    //For wides, additionally get the const for the higher VR
++    if (isWide == true)
++    {
++        success = (success == true) && (metCon->getConstValueOfVR (mirForVR->offset, actualVR+1, highConst) == true);
++    }
++
++    if (success == true)
++    {
++        value = highConst;
++        value <<= 32;
++        value |= (lowConst & 0xFFFFFFFF);
++
++        if (isWide == true)
++        {
++            return kVRWideConst;
++        }
++
++        return kVRNonWideConst;
++    }
++
++    return kVRNotConst;
++}
+diff --git a/vm/compiler/MethodContextHandler.h b/vm/compiler/MethodContextHandler.h
+new file mode 100644
+index 0000000..e8db732
+--- /dev/null
++++ b/vm/compiler/MethodContextHandler.h
+@@ -0,0 +1,112 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef DALVIK_VM_METHODCONTEXTHANDLER
++#define DALVIK_VM_METHODCONTEXTHANDLER
++
++#include "MethodContext.h"
++
++/**
++ * @class MethodContextHandler
++ * @brief MethodContextHandler Handles the MethodContexts of the system
++ */
++class MethodContextHandler
++{
++private:
++    /* --------- Constructors, Destructor --------- */
++
++    /**
++     * @brief Regular constructors
++     * @details unused
++     */
++    MethodContextHandler (void);
++
++    /**
++     * @brief Copy constructor
++     * @details unused
++     */
++    MethodContextHandler (const MethodContext&);
++
++    /**
++     * @brief Assignment operator
++     * @details unused
++     * @return Reference to the assigned MethodContext
++     */
++    MethodContextHandler& operator= (const MethodContextHandler&);
++
++    /** @brief Destructor */
++    ~MethodContextHandler (void) {};
++
++    /* -------- Elements for management of the context --------- */
++
++    /** @brief The method context map */
++    static std::map<const Method *, const MethodContext *> methodMap;
++
++    /** @brief The value here is arbitrary, just kept for sanity
++     *  @details Serves as a bound for the maxContexts value, since
++     *  that can set by user
++     */
++    static const unsigned int MAX_POSSIBLE_CONTEXTS = 1000;
++
++    /** @brief Default value, based on the average number of methods in many common apps */
++    static unsigned int maxContexts;
++
++    /**
++     * @brief Cleanup the context map
++     * @details Create an empty entry in the context map so that
++     * new context information can be added
++     * @return Whether we could successfully create an entry
++     */
++    static bool cleanUpMethodMap (void);
++
++public:
++
++    /**
++     * @brief Instance function
++     * @param method The Method for which we need the context
++     * @return the generated MethodContext, or null
++     */
++    static const MethodContext *getMethodContext (const Method *method);
++
++    /**
++     * @brief Set the maximum number of contexts allowed in the system
++     * @param numContexts The maximum allowed contexts
++     * @return Whether we could successfully set the value
++     */
++    static bool setMaxContexts (unsigned long numContexts);
++
++    /**
++     * @brief Set the maximum number of constants to be allowed per context
++     * @param numConstants The maximum number of constants requested
++     * @return Whether we could successfully set the value
++     */
++    static bool setMaxConstantsPerContext (unsigned long numConstants);
++
++    /** @brief Erase the entire map */
++    static void eraseMethodMap (void);
++
++};
++
++/**
++ * @brief Check whether a VR is constant at the mir
++ * @param mirForVR The MIR in which the vR is used
++ * @param[out] vR The vR for which we need const information
++ * @param value The value of the vR, if found
++ * @return The type of the constant, if found
++ */
++ConstVRType dvmCompilerGetConstValueOfVR (const MIR *mirForVR, u4 vR, u8 &value);
++
++#endif
+diff --git a/vm/compiler/RegisterizationME.cpp b/vm/compiler/RegisterizationME.cpp
+index 698e490..f1f6b9d 100644
+--- a/vm/compiler/RegisterizationME.cpp
++++ b/vm/compiler/RegisterizationME.cpp
+@@ -346,13 +346,10 @@ static bool countRegistersHelper (CompilationUnit *cUnit, BasicBlock *bb)
+ static void countRegisters (CompilationUnit *cUnit, std::map<int, int> &registerCounts)
+ {
+     //Set walking data
+-    cUnit->walkData = static_cast<void *> (&registerCounts);
++    void *walkData = static_cast<void *> (&registerCounts);
+ 
+     //Dispatch the counting
+-    dvmCompilerDataFlowAnalysisDispatcher(cUnit, countRegistersHelper, kAllNodes, false);
+-
+-    //Reset walking data
+-    cUnit->walkData = 0;
++    dvmCompilerDataFlowAnalysisDispatcher (cUnit, countRegistersHelper, kAllNodes, false, walkData);
+ }
+ 
+ /**
+diff --git a/vm/compiler/SSATransformation.cpp b/vm/compiler/SSATransformation.cpp
+index 58827d3..7d253a3 100644
+--- a/vm/compiler/SSATransformation.cpp
++++ b/vm/compiler/SSATransformation.cpp
+@@ -827,6 +827,7 @@ void dvmCompilerMethodSSATransformation(CompilationUnit *cUnit)
+     dvmCompilerDataFlowAnalysisDispatcher(cUnit, insertPhiNodeOperands,
+                                           kReachableNodes,
+                                           false /* isIterative */);
++
+     if (cUnit->degeneratePhiMap->empty () == false) {
+         dvmCompilerDataFlowAnalysisDispatcher(cUnit, fixDegeneratePhiUses,
+                                               kReachableNodes,
+@@ -1126,18 +1127,15 @@ bool dvmCompilerCalculateBasicBlockInformation (CompilationUnit *cUnit, bool fil
+ 
+     //Set walk data: create the data on the stack, will get destroyed automatically at the end of the function
+     SSAWalkData data (cUnit);
+-    cUnit->walkData = static_cast<void *> (&data);
++    void *walkData = static_cast<void *> (&data);
+ 
+     //Once this is done, we fill in the def/use chain and topological order for the MIRs
+     //We suppose here that SSA has been done already
+-    dvmCompilerDataFlowAnalysisDispatcher (cUnit, dvmCompilerBuildDefUseChain, kPredecessorsFirstTraversal, false);
++    dvmCompilerDataFlowAnalysisDispatcher (cUnit, dvmCompilerBuildDefUseChain, kPredecessorsFirstTraversal, false, walkData);
+ 
+     //Before anything else: any value without a definition might have one now, handle them now
+     data.handleNoDefinitions ();
+ 
+-    //Just for safety, reset walkData
+-    cUnit->walkData = 0;
+-
+ #ifdef ARCH_IA32
+     //Call loop information fill if needed
+     if (buildLoopInfo == true)
+-- 
+1.7.4.1
+

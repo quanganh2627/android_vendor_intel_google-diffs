@@ -1,0 +1,606 @@
+From 94e8e4bc23e85b64f967d4e99fb6d20a05bdc79c Mon Sep 17 00:00:00 2001
+From: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Date: Tue, 22 Jan 2013 16:58:14 -0800
+Subject: Dalvik: JIT common InvokeArgsDone optimization
+
+BZ: 79059
+
+The common invokeArgsDone used by JIT has been cleaned up
+and instructions have been reordered to reduce pipeline stalls.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I7e0df008bfae269372338c7c5be932bbd72ecb1d
+Orig-MCG-Change-Id: I9d05cfa5ce1d20d30d1d4404f657438908e39498
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/codegen/x86/Lower.cpp       |   10 +-
+ vm/compiler/codegen/x86/Lower.h         |    1 -
+ vm/compiler/codegen/x86/LowerInvoke.cpp |  408 ++++++++++++++++++-------------
+ vm/compiler/codegen/x86/LowerJump.cpp   |    6 -
+ 4 files changed, 241 insertions(+), 184 deletions(-)
+
+diff --git a/vm/compiler/codegen/x86/Lower.cpp b/vm/compiler/codegen/x86/Lower.cpp
+index 2550c5e..a708b64 100644
+--- a/vm/compiler/codegen/x86/Lower.cpp
++++ b/vm/compiler/codegen/x86/Lower.cpp
+@@ -62,7 +62,7 @@ BasicBlock* traceCurrentBB = NULL;
+ JitMode traceMode = kJitTrace;
+ bool branchInLoop = false;
+ 
+-int common_invokeArgsDone(ArgsDoneType, bool);
++int common_invokeArgsDone(ArgsDoneType);
+ 
+ //data section of .ia32:
+ char globalData[128];
+@@ -386,20 +386,18 @@ void initGlobalMethods() {
+     freeShortMap();
+     common_periodicChecks4();
+     freeShortMap();
+-    //common_invokeMethodNoRange();
+-    //common_invokeMethodRange();
+ 
+     if(dump_x86_inst)
+         ALOGI("ArgsDone_Normal start");
+-    common_invokeArgsDone(ArgsDone_Normal, false);
++    common_invokeArgsDone(ArgsDone_Normal);
+     freeShortMap();
+     if(dump_x86_inst)
+         ALOGI("ArgsDone_Native start");
+-    common_invokeArgsDone(ArgsDone_Native, false);
++    common_invokeArgsDone(ArgsDone_Native);
+     freeShortMap();
+     if(dump_x86_inst)
+         ALOGI("ArgsDone_Full start");
+-    common_invokeArgsDone(ArgsDone_Full, true/*isJitFull*/);
++    common_invokeArgsDone(ArgsDone_Full);
+     if(dump_x86_inst)
+         ALOGI("ArgsDone_Full end");
+     freeShortMap();
+diff --git a/vm/compiler/codegen/x86/Lower.h b/vm/compiler/codegen/x86/Lower.h
+index af74c47..51a0b03 100644
+--- a/vm/compiler/codegen/x86/Lower.h
++++ b/vm/compiler/codegen/x86/Lower.h
+@@ -1055,7 +1055,6 @@ int common_periodicChecks4();
+ int common_gotoBail(void);
+ int common_gotoBail_0(void);
+ int common_errStringIndexOutOfBounds();
+-void goto_invokeArgsDone();
+ 
+ #if defined VTUNE_DALVIK
+ void sendLabelInfoToVTune(int startStreamPtr, int endStreamPtr, const char* labelName);
+diff --git a/vm/compiler/codegen/x86/LowerInvoke.cpp b/vm/compiler/codegen/x86/LowerInvoke.cpp
+index 79f2cd7..ce7cfa5 100644
+--- a/vm/compiler/codegen/x86/LowerInvoke.cpp
++++ b/vm/compiler/codegen/x86/LowerInvoke.cpp
+@@ -700,7 +700,6 @@ int common_invokeMethod_Jmp(ArgsDoneType form) {
+     int startStreamPtr = (int)stream;
+ #endif
+ 
+-#if defined(WITH_JIT)
+     nextVersionOfHardReg(PhysicalReg_EDX, 1);
+     move_imm_to_reg(OpndSize_32, (int)rPC, PhysicalReg_EDX, true);
+     //arguments needed in ArgsDone:
+@@ -721,9 +720,6 @@ int common_invokeMethod_Jmp(ArgsDoneType form) {
+         unconditional_jump_global_API(".invokeArgsDone_native", false);
+     else
+         unconditional_jump_global_API(".invokeArgsDone_normal", false);
+-#else
+-    goto_invokeArgsDone();
+-#endif
+ 
+ #if defined VTUNE_DALVIK
+     if(gDvmJit.vtuneInfo != kVTuneInfoDisabled) {
+@@ -866,15 +862,6 @@ int common_invokeMethodRange(ArgsDoneType form, const DecodedInstruction &decode
+ #undef P_SCRATCH_9
+ #undef P_SCRATCH_10
+ 
+-#define P_GPR_1 PhysicalReg_EBX
+-#define P_GPR_3 PhysicalReg_ESI
+-#define P_SCRATCH_1 PhysicalReg_EAX
+-#define P_SCRATCH_2 PhysicalReg_EDX
+-#define P_SCRATCH_3 PhysicalReg_EAX
+-#define P_SCRATCH_4 PhysicalReg_EDX
+-#define P_SCRATCH_5 PhysicalReg_EAX
+-#define P_SCRATCH_6 PhysicalReg_EDX
+-
+ //! spill a register to native stack
+ 
+ //! decrease %esp by 4, then store a register at 0(%esp)
+@@ -892,140 +879,227 @@ int unspill_reg(int reg, bool isPhysical) {
+     return 0;
+ }
+ 
+-void generate_invokeNative(bool generateForNcg); //forward declaration
++int generate_invokeNative(void); //forward declaration
+ int generate_stackOverflow(void); //forward declaration
+ 
+-//! common code to invoke a method after all arguments are handled
+-
+-//!
+-//takes one argument to generate code
+-//  for invokeNativeSingle (form == ArgsDone_Native)
+-//   or invokeNonNativeSingle (form == ArgsDone_Normal) when WITH_JIT is true
+-//   to dynamically determine which one to choose (form == ArgsDone_Full)
+-/* common_invokeArgsDone is called at NCG time and
+-     at execution time during relocation
+-   generate invokeArgsDone for NCG if isJitFull is false && form == Full */
+-int common_invokeArgsDone(ArgsDoneType form, bool isJitFull) {
++/**
++ * @brief Common code to invoke a method after all of the arguments
++ * are handled.
++ * @details Requires that ECX holds the method to be called.
++ * @param form Used to decide which variant to generate which may contain
++ * fewer instructions than a full implementation. For invokeNativeSingle
++ * use ArgsDone_Native. For invokeNonNativeSingle use ArgsDone_Normal.
++ * To dynamically determine which one to choose (the full implementation)
++ * use ArgsDone_Full.
++ * @return value >= 0 on success
++ * @todo Since this section is static code that is dynamically generated,
++ * it can be written directly in assembly and built at compile time.
++ */
++int common_invokeArgsDone(ArgsDoneType form) {
+ #if defined VTUNE_DALVIK
+     int startStreamPtr = (int)stream;
+ #endif
+ 
+-    bool generateForNcg = false;
+-    if(form == ArgsDone_Full) {
+-        if(isJitFull){
+-            if (insertLabel(".invokeArgsDone_jit", false) == -1)
+-                return -1;
+-        }
+-        else {
+-            if (insertLabel(".invokeArgsDone", false) == -1)
+-                return -1;
+-            generateForNcg = true;
+-        }
+-    }
+-    else if(form == ArgsDone_Normal){
+-        if (insertLabel(".invokeArgsDone_normal", false) == -1)
+-            return -1;
+-    }
+-    else if(form == ArgsDone_Native) {
+-        if (insertLabel(".invokeArgsDone_native", false) == -1)
+-            return -1;
++    // Define scratch registers
++    scratchRegs[0] = PhysicalReg_EBX;
++    scratchRegs[1] = PhysicalReg_ESI;
++    scratchRegs[2] = PhysicalReg_EDX;
++    scratchRegs[3] = PhysicalReg_Null;
++
++    // Insert different labels for the various forms
++    const char * sectionLabel;
++    if (form == ArgsDone_Full) {
++        sectionLabel = ".invokeArgsDone_jit";
++    } else if (form == ArgsDone_Normal) {
++        sectionLabel = ".invokeArgsDone_normal";
++    } else { // form == ArgsDone_Native
++        sectionLabel = ".invokeArgsDone_native";
+     }
+-    //%ecx: methodToCall
+-    movez_mem_to_reg(OpndSize_16, offMethod_registersSize, PhysicalReg_ECX, true, P_SCRATCH_1, true); //regSize
+-    scratchRegs[0] = PhysicalReg_EBX; scratchRegs[1] = PhysicalReg_ESI;
+-    scratchRegs[2] = PhysicalReg_EDX; scratchRegs[3] = PhysicalReg_Null;
+-    savearea_from_fp(P_GPR_3, true);
+-    alu_binary_imm_reg(OpndSize_32, shl_opc, 2, P_SCRATCH_1, true);
+-    alu_binary_reg_reg(OpndSize_32, sub_opc, P_SCRATCH_1, true, P_GPR_3, true);
+-    //update newSaveArea->savedPc, here P_GPR_3 is new FP
+-    move_reg_to_mem(OpndSize_32, PhysicalReg_EDX, true, offStackSaveArea_savedPc-sizeofStackSaveArea, P_GPR_3, true);
+-    movez_mem_to_reg(OpndSize_16, offMethod_outsSize, PhysicalReg_ECX, true, P_SCRATCH_2, true); //outsSize
+-    move_reg_to_reg(OpndSize_32, P_GPR_3, true, P_GPR_1, true); //new FP
+-    alu_binary_imm_reg(OpndSize_32, sub_opc, sizeofStackSaveArea, P_GPR_3, true);
+-
+-    alu_binary_imm_reg(OpndSize_32, shl_opc, 2, P_SCRATCH_2, true);
+-    alu_binary_reg_reg(OpndSize_32, sub_opc, P_SCRATCH_2, true, P_GPR_3, true);
+-    get_self_pointer(P_SCRATCH_3, true);
+-    move_reg_to_mem(OpndSize_32, PhysicalReg_FP, true, offStackSaveArea_prevFrame-sizeofStackSaveArea, P_GPR_1, true); //set stack->prevFrame
+-    compare_mem_reg(OpndSize_32, offsetof(Thread, interpStackEnd), P_SCRATCH_3, true, P_GPR_3, true);
++
++    if (insertLabel(sectionLabel, false) == -1)
++        return -1;
++
++    // Determine how many ins+locals we have
++    movez_mem_to_reg(OpndSize_16, OFFSETOF_MEMBER(Method,registersSize),
++            PhysicalReg_ECX, true, PhysicalReg_EAX, true);
++
++    // Determine the offset by multiplying size of 4 with how many ins+locals we have
++    alu_binary_imm_reg(OpndSize_32, shl_opc, 2, PhysicalReg_EAX, true);
++
++    // Load save area
++    savearea_from_fp(PhysicalReg_ESI, true);
++
++    // Computer the new FP (old save area - regsSize)
++    alu_binary_reg_reg(OpndSize_32, sub_opc, PhysicalReg_EAX, true,
++            PhysicalReg_ESI, true);
++
++    // Get pointer to self Thread
++    get_self_pointer(PhysicalReg_EAX, true);
++
++    // Make a copy of the new FP
++    move_reg_to_reg(OpndSize_32, PhysicalReg_ESI, true, PhysicalReg_EBX, true);
++
++    // Set newSaveArea->savedPc
++    move_reg_to_mem(OpndSize_32, PhysicalReg_EDX, true,
++            OFFSETOF_MEMBER(StackSaveArea,savedPc) - sizeofStackSaveArea,
++            PhysicalReg_ESI, true);
++
++    // Load the size of stack save area into register
++    alu_binary_imm_reg(OpndSize_32, sub_opc, sizeofStackSaveArea,
++            PhysicalReg_ESI, true);
++
++    // Determine how many outs we have
++    movez_mem_to_reg(OpndSize_16, OFFSETOF_MEMBER(Method,outsSize),
++            PhysicalReg_ECX, true, PhysicalReg_EDX, true);
++
++    // Determine the offset by multiplying size of 4 with how many outs we have
++    alu_binary_imm_reg(OpndSize_32, shl_opc, 2, PhysicalReg_EDX, true);
++
++    // Calculate the bottom, namely newSaveArea - outsSize
++    alu_binary_reg_reg(OpndSize_32, sub_opc, PhysicalReg_EDX, true,
++            PhysicalReg_ESI, true);
++
++    // Set newSaveArea->prevFrame
++    move_reg_to_mem(OpndSize_32, PhysicalReg_FP, true,
++            OFFSETOF_MEMBER(StackSaveArea,prevFrame) - sizeofStackSaveArea,
++            PhysicalReg_EBX, true);
++
++    // Compare self->interpStackEnd and bottom
++    compare_mem_reg(OpndSize_32, OFFSETOF_MEMBER(Thread, interpStackEnd),
++            PhysicalReg_EAX, true, PhysicalReg_ESI, true);
++
++    // Handle frame overflow
+     conditional_jump(Condition_L, ".stackOverflow", true);
+ 
+-    if(form == ArgsDone_Full) {
+-        test_imm_mem(OpndSize_32, ACC_NATIVE, offMethod_accessFlags, PhysicalReg_ECX, true);
++    if (form == ArgsDone_Full) {
++        // Check for a native call
++        test_imm_mem(OpndSize_32, ACC_NATIVE,
++                OFFSETOF_MEMBER(Method,accessFlags), PhysicalReg_ECX, true);
+     }
+-    move_reg_to_mem(OpndSize_32, PhysicalReg_ECX, true, offStackSaveArea_method-sizeofStackSaveArea, P_GPR_1, true); //set stack->method
+-
+-    if(form == ArgsDone_Native || form == ArgsDone_Full) {
+-        /* to correctly handle code cache reset:
+-           update returnAddr and check returnAddr after done with the native method
+-           if returnAddr is set to NULL during code cache reset,
+-           the execution will correctly continue with interpreter */
+-        //get returnAddr from 4(%esp) and update stack
+-        move_mem_to_reg(OpndSize_32, 4, PhysicalReg_ESP, true,
+-                        PhysicalReg_EDX, true);
++
++    // Set newSaveArea->method
++    move_reg_to_mem(OpndSize_32, PhysicalReg_ECX, true,
++            OFFSETOF_MEMBER(StackSaveArea,method) - sizeofStackSaveArea,
++            PhysicalReg_EBX, true);
++
++    if (form == ArgsDone_Native || form == ArgsDone_Full) {
++        // to correctly handle code cache reset:
++        //  update returnAddr and check returnAddr after done with the native method
++        //  if returnAddr is set to NULL during code cache reset,
++        //  the execution will correctly continue with interpreter
++        // get returnAddr from 4(%esp) and update the save area with it
++        move_mem_to_reg(OpndSize_32, 4, PhysicalReg_ESP, true, PhysicalReg_EDX,
++                true);
+         move_reg_to_mem(OpndSize_32, PhysicalReg_EDX, true,
+-                        offStackSaveArea_returnAddr-sizeofStackSaveArea, P_GPR_1, true);
++                OFFSETOF_MEMBER(StackSaveArea,returnAddr) - sizeofStackSaveArea,
++                PhysicalReg_EBX, true);
+     }
+-    if(form == ArgsDone_Native) {
+-        generate_invokeNative(generateForNcg);
++
++    if (form == ArgsDone_Native) {
++        // Since we know we are invoking native method, generate code for the
++        // native invoke and the invoke implementation is done.
++        if (generate_invokeNative() == -1)
++            return -1;
++
++#if defined VTUNE_DALVIK
++        if(gDvmJit.vtuneInfo != kVTuneInfoDisabled) {
++            int endStreamPtr = (int)stream;
++            sendLabelInfoToVTune(startStreamPtr, endStreamPtr, sectionLabel);
++        }
++#endif
+         return 0;
+     }
+-    if(form == ArgsDone_Full) {
++
++    if (form == ArgsDone_Full) {
++        // Since we are generating the full implementation, we just did the
++        // check for native method and can now go do the native invoke
+         conditional_jump(Condition_NE, ".invokeNative", true);
+     }
+-    move_mem_to_reg(OpndSize_32, offMethod_clazz, PhysicalReg_ECX, true, P_SCRATCH_4, true); //get method->claz
+-    move_mem_to_reg(OpndSize_32, offClassObject_pDvmDex, P_SCRATCH_4, true, P_SCRATCH_4, true); //get method->clazz->pDvmDex
+-    move_reg_to_reg(OpndSize_32, P_GPR_1, true, PhysicalReg_FP, true); //update rFP
+-    get_self_pointer(P_GPR_1, true);
+-    move_reg_to_mem(OpndSize_32, PhysicalReg_ECX, true, offsetof(Thread, interpSave.method), P_GPR_1, true); //glue->method
+-    move_reg_to_mem(OpndSize_32, P_SCRATCH_4, true, offsetof(Thread, interpSave.methodClassDex), P_GPR_1, true); //set_glue_dvmdex
+-    move_reg_to_mem(OpndSize_32, PhysicalReg_FP, true, offThread_curFrame, P_GPR_1, true); //set glue->self->frame
+-    if(!generateForNcg) {
+-        /* returnAddr updated already for Full */
+-        //get returnAddr from 4(%esp) and update stack
+-        if(form == ArgsDone_Normal)
+-            move_mem_to_reg(OpndSize_32, 4, PhysicalReg_ESP, true,
+-                            PhysicalReg_EDX, true);
+-        //for JIT: starting bytecode in %ebx to invoke JitToInterp
+-        move_mem_to_reg(OpndSize_32, offMethod_insns, PhysicalReg_ECX, true, PhysicalReg_EBX, true);
+-        if(form == ArgsDone_Normal)
+-            move_reg_to_mem(OpndSize_32, PhysicalReg_EDX, true,
+-                            offStackSaveArea_returnAddr-sizeofStackSaveArea, PhysicalReg_FP, true);
++
++    // Get method->clazz
++    move_mem_to_reg(OpndSize_32, OFFSETOF_MEMBER(Method,clazz), PhysicalReg_ECX,
++            true, PhysicalReg_EDX, true);
++
++    // Update frame pointer with the new FP
++    move_reg_to_reg(OpndSize_32, PhysicalReg_EBX, true, PhysicalReg_FP, true);
++
++    // Get pointer to self Thread
++    get_self_pointer(PhysicalReg_EBX, true);
++
++    // Get method->clazz->pDvmDex
++    move_mem_to_reg(OpndSize_32, OFFSETOF_MEMBER(ClassObject,pDvmDex),
++            PhysicalReg_EDX, true, PhysicalReg_EDX, true);
++
++    // Set self->methodClassDex with method->clazz->pDvmDex
++    move_reg_to_mem(OpndSize_32, PhysicalReg_EDX, true,
++            OFFSETOF_MEMBER(Thread, interpSave.methodClassDex), PhysicalReg_EBX,
++            true);
++
++    // Set self->curFrame to the new FP
++    move_reg_to_mem(OpndSize_32, PhysicalReg_FP, true,
++            OFFSETOF_MEMBER(Thread,interpSave.curFrame), PhysicalReg_EBX, true);
++
++    // returnAddr updated already for Full. Get returnAddr from 4(%esp)
++    if (form == ArgsDone_Normal) {
++        move_mem_to_reg(OpndSize_32, 4, PhysicalReg_ESP, true, PhysicalReg_EDX,
++                true);
++    }
++
++    // Set self->method with method to call
++    move_reg_to_mem(OpndSize_32, PhysicalReg_ECX, true,
++            OFFSETOF_MEMBER(Thread, interpSave.method), PhysicalReg_EBX, true);
++
++    // Place starting bytecode in EBX for dvmJitToInterp
++    move_mem_to_reg(OpndSize_32, OFFSETOF_MEMBER(Method,insns), PhysicalReg_ECX,
++            true, PhysicalReg_EBX, true);
++
++    if (form == ArgsDone_Normal) {
++        // We have obtained the return address and now we can actually update it
++        move_reg_to_mem(OpndSize_32, PhysicalReg_EDX, true,
++                OFFSETOF_MEMBER(StackSaveArea,returnAddr) - sizeofStackSaveArea,
++                PhysicalReg_FP, true);
+     }
+ 
+     if (insertLabel(".invokeInterp", true) == -1)
+         return -1;
+-    if(!generateForNcg) {
+-        bool callNoChain = false;
++
++    bool callNoChain = false;
+ #ifdef PREDICTED_CHAINING
+-        if(form == ArgsDone_Full) callNoChain = true;
++    if (form == ArgsDone_Full)
++        callNoChain = true;
+ #endif
+-        if(callNoChain) {
+-            scratchRegs[0] = PhysicalReg_EAX;
+-            load_effective_addr(8, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++
++    if (callNoChain) {
++        scratchRegs[0] = PhysicalReg_EAX;
++        load_effective_addr(8, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
+ #if defined(WITH_JIT_TUNING)
+-            /* Predicted chaining failed. Fall back to interpreter and indicate
+-             * inline cache miss.
+-             */
+-            move_imm_to_reg(OpndSize_32, kInlineCacheMiss, PhysicalReg_EDX, true);
++        // Predicted chaining failed. Fall back to interpreter and indicated
++        // inline cache miss.
++        move_imm_to_reg(OpndSize_32, kInlineCacheMiss, PhysicalReg_EDX, true);
+ #endif
+-            call_dvmJitToInterpTraceSelectNoChain(); //input: rPC in %ebx
+-        } else {
+-            //jump to the stub at (%esp)
+-            move_mem_to_reg(OpndSize_32, 0, PhysicalReg_ESP, true,
+-                            PhysicalReg_EDX, true);
+-            load_effective_addr(8, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
+-            unconditional_jump_reg(PhysicalReg_EDX, true);
+-        }
++        call_dvmJitToInterpTraceSelectNoChain(); //input: rPC in %ebx
++    } else {
++        // Jump to the stub at (%esp)
++        move_mem_to_reg(OpndSize_32, 0, PhysicalReg_ESP, true, PhysicalReg_EDX,
++                true);
++        load_effective_addr(8, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++        unconditional_jump_reg(PhysicalReg_EDX, true);
++    }
++
++    if (form == ArgsDone_Full) {
++        // Generate code for handling native invoke
++        if (generate_invokeNative() == -1)
++            return -1;
+     }
+ 
+-    if(form == ArgsDone_Full) generate_invokeNative(generateForNcg);
++    // Generate code for handling stack overflow
+     if (generate_stackOverflow() == -1)
+         return -1;
++
+ #if defined VTUNE_DALVIK
+     if(gDvmJit.vtuneInfo != kVTuneInfoDisabled) {
+         int endStreamPtr = (int)stream;
+-        sendLabelInfoToVTune(startStreamPtr, endStreamPtr, "common_invokeArgsDone");
++        sendLabelInfoToVTune(startStreamPtr, endStreamPtr, sectionLabel);
+     }
+ #endif
+     return 0;
+@@ -1035,92 +1109,84 @@ int common_invokeArgsDone(ArgsDoneType form, bool isJitFull) {
+      JIT'ed code invokes native method, after invoke, execution will continue
+      with the interpreter or with JIT'ed code if chained
+ */
+-void generate_invokeNative(bool generateForNcg) {
++int generate_invokeNative() {
+     if (insertLabel(".invokeNative", true) == -1)
+-        return;
++        return -1;
++
+     //if(!generateForNcg)
+     //    load_effective_addr(-8, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
+     load_effective_addr(-28, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
+-    move_reg_to_mem(OpndSize_32, P_GPR_1, true, 0, PhysicalReg_ESP, true);
+-    move_reg_to_mem(OpndSize_32, P_GPR_1, true, 20, PhysicalReg_ESP, true);
++    move_reg_to_mem(OpndSize_32, PhysicalReg_EBX, true, 0, PhysicalReg_ESP, true);
++    move_reg_to_mem(OpndSize_32, PhysicalReg_EBX, true, 20, PhysicalReg_ESP, true);
+     scratchRegs[0] = PhysicalReg_EDX;
+-    get_self_pointer(P_SCRATCH_1, true); //glue->self
++    get_self_pointer(PhysicalReg_EAX, true); //glue->self
+     move_reg_to_mem(OpndSize_32, PhysicalReg_ECX, true, 8, PhysicalReg_ESP, true);
+-    move_reg_to_mem(OpndSize_32, P_SCRATCH_1, true, 12, PhysicalReg_ESP, true);
+-    move_reg_to_mem(OpndSize_32, P_SCRATCH_1, true, 24, PhysicalReg_ESP, true);
+-    move_mem_to_reg(OpndSize_32, offThread_jniLocal_nextEntry, P_SCRATCH_1, true, P_SCRATCH_2, true); //get self->local_next
++    move_reg_to_mem(OpndSize_32, PhysicalReg_EAX, true, 12, PhysicalReg_ESP, true);
++    move_reg_to_mem(OpndSize_32, PhysicalReg_EAX, true, 24, PhysicalReg_ESP, true);
++    move_mem_to_reg(OpndSize_32, offThread_jniLocal_nextEntry, PhysicalReg_EAX, true, PhysicalReg_EDX, true); //get self->local_next
+     scratchRegs[1] = PhysicalReg_EAX;
+-    move_reg_to_mem(OpndSize_32, P_SCRATCH_2, true, offStackSaveArea_localRefTop-sizeofStackSaveArea, P_GPR_1, true); //update jniLocalRef of stack
+-    move_reg_to_mem(OpndSize_32, P_GPR_1, true, offThread_curFrame, P_SCRATCH_1, true); //set self->curFrame
+-    move_imm_to_mem(OpndSize_32, 0, offThread_inJitCodeCache, P_SCRATCH_1, true); //clear self->inJitCodeCache
+-    load_effective_addr(offsetof(Thread, interpSave.retval), P_SCRATCH_1, true, P_SCRATCH_3, true); //self->retval
+-    move_reg_to_mem(OpndSize_32, P_SCRATCH_3, true, 4, PhysicalReg_ESP, true);
++    move_reg_to_mem(OpndSize_32, PhysicalReg_EDX, true, offStackSaveArea_localRefTop-sizeofStackSaveArea, PhysicalReg_EBX, true); //update jniLocalRef of stack
++    move_reg_to_mem(OpndSize_32, PhysicalReg_EBX, true, offThread_curFrame, PhysicalReg_EAX, true); //set self->curFrame
++    move_imm_to_mem(OpndSize_32, 0, offThread_inJitCodeCache, PhysicalReg_EAX, true); //clear self->inJitCodeCache
++    load_effective_addr(OFFSETOF_MEMBER(Thread, interpSave.retval), PhysicalReg_EAX, true, PhysicalReg_EAX, true); //self->retval
++    move_reg_to_mem(OpndSize_32, PhysicalReg_EAX, true, 4, PhysicalReg_ESP, true);
+     //NOTE: native method checks the interpreted stack for arguments
+     //      The immediate arguments on native stack: address of return value, new FP, self
+     call_mem(40, PhysicalReg_ECX, true);//*40(%ecx)
+     //we can't assume the argument stack is unmodified after the function call
+     //duplicate newFP & glue->self on stack: newFP (-28 & -8) glue->self (-16 & -4)
+-    move_mem_to_reg(OpndSize_32, 20, PhysicalReg_ESP, true, P_GPR_3, true); //new FP
+-    move_mem_to_reg(OpndSize_32, 24, PhysicalReg_ESP, true, P_GPR_1, true); //glue->self
++    move_mem_to_reg(OpndSize_32, 20, PhysicalReg_ESP, true, PhysicalReg_ESI, true); //new FP
++    move_mem_to_reg(OpndSize_32, 24, PhysicalReg_ESP, true, PhysicalReg_EBX, true); //glue->self
+     load_effective_addr(28, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
+-    move_mem_to_reg(OpndSize_32, offStackSaveArea_localRefTop-sizeofStackSaveArea, P_GPR_3, true, P_SCRATCH_1, true); //newSaveArea->jniLocal
+-    compare_imm_mem(OpndSize_32, 0, offThread_exception, P_GPR_1, true); //self->exception
+-    if(!generateForNcg)
+-        load_effective_addr(8, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
++    move_mem_to_reg(OpndSize_32, offStackSaveArea_localRefTop-sizeofStackSaveArea, PhysicalReg_ESI, true, PhysicalReg_EAX, true); //newSaveArea->jniLocal
++    compare_imm_mem(OpndSize_32, 0, offThread_exception, PhysicalReg_EBX, true); //self->exception
++    load_effective_addr(8, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
+     //NOTE: PhysicalReg_FP should be callee-saved register
+-    move_reg_to_mem(OpndSize_32, PhysicalReg_FP, true, offThread_curFrame, P_GPR_1, true); //set self->curFrame
+-    move_reg_to_mem(OpndSize_32, P_SCRATCH_1, true, offThread_jniLocal_nextEntry, P_GPR_1, true); //set self->jniLocal
++    move_reg_to_mem(OpndSize_32, PhysicalReg_FP, true, offThread_curFrame, PhysicalReg_EBX, true); //set self->curFrame
++    move_reg_to_mem(OpndSize_32, PhysicalReg_EAX, true, offThread_jniLocal_nextEntry, PhysicalReg_EBX, true); //set self->jniLocal
+     conditional_jump(Condition_NE, "common_exceptionThrown", false);
+-    if(!generateForNcg) {
+-        //get returnAddr, if it is not NULL,
+-        //    return to JIT'ed returnAddr after executing the native method
+-        /* to correctly handle code cache reset:
+-           update returnAddr and check returnAddr after done with the native method
+-           if returnAddr is set to NULL during code cache reset,
+-           the execution will correctly continue with interpreter */
+-        move_mem_to_reg(OpndSize_32, offStackSaveArea_returnAddr-sizeofStackSaveArea, P_GPR_3, true, P_SCRATCH_2, true);
+-        //set self->inJitCodeCache to returnAddr (P_GPR_1 is in %ebx)
+-        move_reg_to_mem(OpndSize_32, P_SCRATCH_2, true, offThread_inJitCodeCache, P_GPR_1, true);
+-        move_mem_to_reg(OpndSize_32, offStackSaveArea_savedPc-sizeofStackSaveArea, P_GPR_3, true, PhysicalReg_EBX, true); //savedPc
+-        compare_imm_reg(OpndSize_32, 0, P_SCRATCH_2, true);
+-        conditional_jump(Condition_E, ".nativeToInterp", true);
+-        unconditional_jump_reg(P_SCRATCH_2, true);
+-        //if returnAddr is NULL, return to interpreter after executing the native method
+-        if (insertLabel(".nativeToInterp", true) == -1)
+-            return;
+-        //move rPC by 6 (3 bytecode units for INVOKE)
+-        alu_binary_imm_reg(OpndSize_32, add_opc, 6, PhysicalReg_EBX, true);
+-        scratchRegs[0] = PhysicalReg_EAX;
++
++    //get returnAddr, if it is not NULL,
++    //    return to JIT'ed returnAddr after executing the native method
++    /* to correctly handle code cache reset:
++       update returnAddr and check returnAddr after done with the native method
++       if returnAddr is set to NULL during code cache reset,
++       the execution will correctly continue with interpreter */
++    move_mem_to_reg(OpndSize_32, offStackSaveArea_returnAddr-sizeofStackSaveArea, PhysicalReg_ESI, true, PhysicalReg_EDX, true);
++    //set self->inJitCodeCache to returnAddr (PhysicalReg_EBX is in %ebx)
++    move_reg_to_mem(OpndSize_32, PhysicalReg_EDX, true, offThread_inJitCodeCache, PhysicalReg_EBX, true);
++    move_mem_to_reg(OpndSize_32, offStackSaveArea_savedPc-sizeofStackSaveArea, PhysicalReg_ESI, true, PhysicalReg_EBX, true); //savedPc
++    compare_imm_reg(OpndSize_32, 0, PhysicalReg_EDX, true);
++    conditional_jump(Condition_E, ".nativeToInterp", true);
++    unconditional_jump_reg(PhysicalReg_EDX, true);
++    //if returnAddr is NULL, return to interpreter after executing the native method
++    if (insertLabel(".nativeToInterp", true) == -1) {
++        return -1;
++    }
++    //move rPC by 6 (3 bytecode units for INVOKE)
++    alu_binary_imm_reg(OpndSize_32, add_opc, 6, PhysicalReg_EBX, true);
++    scratchRegs[0] = PhysicalReg_EAX;
+ #if defined(WITH_JIT_TUNING)
+         /* Return address not in code cache. Indicate that continuing with interpreter
+          */
+         move_imm_to_reg(OpndSize_32, kCallsiteInterpreted, PhysicalReg_EDX, true);
+ #endif
+-        call_dvmJitToInterpTraceSelectNoChain(); //rPC in %ebx
+-    }
+-    return;
++    call_dvmJitToInterpTraceSelectNoChain(); //rPC in %ebx
++    return 0;
+ }
++
+ int generate_stackOverflow() {
+     if (insertLabel(".stackOverflow", true) == -1)
+         return -1;
+     //load_effective_addr(-8, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
+     move_reg_to_mem(OpndSize_32, PhysicalReg_ECX, true, 4, PhysicalReg_ESP, true);
+-    get_self_pointer(P_GPR_1, true); //glue->self
+-    move_reg_to_mem(OpndSize_32, P_GPR_1, true, 0, PhysicalReg_ESP, true);
++    get_self_pointer(PhysicalReg_EBX, true); //glue->self
++    move_reg_to_mem(OpndSize_32, PhysicalReg_EBX, true, 0, PhysicalReg_ESP, true);
+     call_dvmHandleStackOverflow();
+     load_effective_addr(8, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
+     unconditional_jump("common_exceptionThrown", false);
+     return 0;
+ }
+-#undef P_GPR_1
+-#undef P_GPR_2
+-#undef P_GPR_3
+-#undef P_SCRATCH_1
+-#undef P_SCRATCH_2
+-#undef P_SCRATCH_3
+-#undef P_SCRATCH_4
+-#undef P_SCRATCH_5
+-#undef P_SCRATCH_6
+ 
+ /////////////////////////////////////////////
+ #define P_GPR_1 PhysicalReg_EBX
+diff --git a/vm/compiler/codegen/x86/LowerJump.cpp b/vm/compiler/codegen/x86/LowerJump.cpp
+index 61377c1..80a2b35 100644
+--- a/vm/compiler/codegen/x86/LowerJump.cpp
++++ b/vm/compiler/codegen/x86/LowerJump.cpp
+@@ -600,13 +600,7 @@ void conditional_jump(ConditionCode cc, const char* target, bool isShortTerm) {
+         imm = getRelativeOffset(target, isShortTerm, JmpCall_cond, &unknown, &size);
+     dump_label(m, size, imm, target, isShortTerm);
+ }
+-/*!
+-\brief generate a single native instruction "jmp imm" to jump to ".invokeArgsDone"
+ 
+-*/
+-void goto_invokeArgsDone() {
+-    unconditional_jump_global_API(".invokeArgsDone", false);
+-}
+ /*!
+ \brief generate a single native instruction "jmp imm" to jump to a label
+ 
+-- 
+1.7.4.1
+

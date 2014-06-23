@@ -1,0 +1,169 @@
+From 0eae80209e70b535a19c752633caf71f6d280e75 Mon Sep 17 00:00:00 2001
+From: Yixin Shou <yixin.shou@intel.com>
+Date: Fri, 12 Jul 2013 09:18:44 -0700
+Subject: Dalvik: Use XMM register for inlined abs-double method
+
+BZ: 123672
+
+This ptch use xmm register for inlined abs-double method
+instead of previously using GPR register for abs-double method.
+
+This patch improves SmartBench Mandelbrot with 24% on Baylake.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I4f0d244e6ee078a3a357842dedbbbb5f329a588f
+Orig-MCG-Change-Id: Iaa059323b276fcec14c091a879d00d963d083c47
+Signed-off-by: Yixin Shou <yixin.shou@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/codegen/x86/BytecodeVisitor.cpp |   38 +++++++++++++++++---------
+ vm/compiler/codegen/x86/Lower.cpp           |    2 +
+ vm/compiler/codegen/x86/Lower.h             |    3 ++
+ vm/compiler/codegen/x86/LowerHelper.cpp     |   10 +++++++
+ vm/compiler/codegen/x86/LowerInvoke.cpp     |   10 +++----
+ 5 files changed, 44 insertions(+), 19 deletions(-)
+
+diff --git a/vm/compiler/codegen/x86/BytecodeVisitor.cpp b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+index c0f1597..db84857 100644
+--- a/vm/compiler/codegen/x86/BytecodeVisitor.cpp
++++ b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+@@ -3270,6 +3270,10 @@ int getVirtualRegInfo (VirtualRegInfo* infoArray, const MIR * currentMIR, bool u
+     case OP_EXECUTE_INLINE_RANGE:
+         u4 vC;
+         num = currentMIR->dalvikInsn.vA;
++
++        // get inline method id
++        u2 inlineMethodId;
++        inlineMethodId = currentMIR->dalvikInsn.vB;
+         if(inst_op == OP_EXECUTE_INLINE) {
+             // Note that vC, vD, vE, and vF might have bad values
+             // depending on count. The variable "num" should be
+@@ -3288,13 +3292,24 @@ int getVirtualRegInfo (VirtualRegInfo* infoArray, const MIR * currentMIR, bool u
+             infoArray[0].regNum = vC;
+             infoArray[0].refCount = 1;
+             infoArray[0].accessType = REGACCESS_U;
+-            infoArray[0].physicalType = LowOpndRegType_gp;
++            if (inlineMethodId == INLINE_MATH_ABS_DOUBLE) {
++                infoArray[0].physicalType = LowOpndRegType_xmm;
++            }
++            else {
++                infoArray[0].physicalType = LowOpndRegType_gp;
++            }
+         }
+         if(num >= 2) {
+-            infoArray[1].regNum = vD;
+-            infoArray[1].refCount = 1;
+-            infoArray[1].accessType = REGACCESS_U;
+-            infoArray[1].physicalType = LowOpndRegType_gp;
++            if (inlineMethodId != INLINE_MATH_ABS_DOUBLE) {
++                infoArray[1].regNum = vD;
++                infoArray[1].refCount = 1;
++                infoArray[1].accessType = REGACCESS_U;
++                infoArray[1].physicalType = LowOpndRegType_gp;
++            }
++            else {
++                num_regs_per_bytecode = 1;
++                break;
++            }
+         }
+         if(num >= 3) {
+             infoArray[2].regNum = vE;
+@@ -6045,16 +6060,13 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+                 return 2;
+             case INLINE_MATH_ABS_DOUBLE:
+                 infoArray[0].regNum = 1;
+-                infoArray[0].refCount = 2;
+-                infoArray[0].physicalType = LowOpndRegType_gp;
++                infoArray[0].refCount = 3;
++                infoArray[0].physicalType = LowOpndRegType_xmm;
++                infoArray[0].shareWithVR = false;
+                 infoArray[1].regNum = 2;
+-                infoArray[1].refCount = 3;
++                infoArray[1].refCount = 2;
+                 infoArray[1].physicalType = LowOpndRegType_gp;
+-                infoArray[1].shareWithVR = false;
+-                infoArray[2].regNum = 3;
+-                infoArray[2].refCount = 3;
+-                infoArray[2].physicalType = LowOpndRegType_gp;
+-                return 3;
++                return 2;
+             case INLINE_FLOAT_TO_RAW_INT_BITS:
+                 infoArray[0].regNum = 1;
+                 infoArray[0].refCount = 2;
+diff --git a/vm/compiler/codegen/x86/Lower.cpp b/vm/compiler/codegen/x86/Lower.cpp
+index f11409e..ff5b037 100644
+--- a/vm/compiler/codegen/x86/Lower.cpp
++++ b/vm/compiler/codegen/x86/Lower.cpp
+@@ -93,6 +93,8 @@ void initConstDataSec() {
+     *((u4*)tmpPtr) = 0x80000000;
+     tmpPtr += sizeof(u4);
+ 
++    // 16 byte aligned
++    tmpPtr = align(tmpPtr, 16);
+     LvaluePosInfLong = (int)tmpPtr;
+     *((u4*)tmpPtr) = 0xFFFFFFFF;
+     tmpPtr += sizeof(u4);
+diff --git a/vm/compiler/codegen/x86/Lower.h b/vm/compiler/codegen/x86/Lower.h
+index a28e187..f1ec1cd 100644
+--- a/vm/compiler/codegen/x86/Lower.h
++++ b/vm/compiler/codegen/x86/Lower.h
+@@ -1397,6 +1397,9 @@ OpndSize estOpndSizeFromImm(int target);
+ int preprocessingBB (CompilationUnit *cUnit, BasicBlock *bb);
+ /** @brief align the relative offset of jmp/jcc and movl within 16B */
+ void alignOffset(int cond);
++
++/** @brief align a pointer to n-bytes aligned */
++char* align(char* addr, int n);
+ bool doesJumpToBBNeedAlignment(BasicBlock * bb);
+ 
+ /**
+diff --git a/vm/compiler/codegen/x86/LowerHelper.cpp b/vm/compiler/codegen/x86/LowerHelper.cpp
+index 6daf878..d6bf14b 100644
+--- a/vm/compiler/codegen/x86/LowerHelper.cpp
++++ b/vm/compiler/codegen/x86/LowerHelper.cpp
+@@ -3893,6 +3893,16 @@ void alignOffset(int offset) {
+ }
+ 
+ /**
++  * @brief align a pointer to n-bytes aligned
++  * @param addr the pointer need to be aligned
++  * @param n n-bytes aligned
++  * @return aligned address
++  */
++char* align(char* addr, int n) {
++    char* alignedAddr = reinterpret_cast<char*>((reinterpret_cast<unsigned int>(addr) + (n-1)) & ~(n-1));
++    return alignedAddr;
++}
++/**
+  * @brief Returns whether the jump to BB needs alignment
+  * because it might be patched later on.
+  * @param bb Basic Block to look at
+diff --git a/vm/compiler/codegen/x86/LowerInvoke.cpp b/vm/compiler/codegen/x86/LowerInvoke.cpp
+index 78cc027..cf0170b 100644
+--- a/vm/compiler/codegen/x86/LowerInvoke.cpp
++++ b/vm/compiler/codegen/x86/LowerInvoke.cpp
+@@ -1385,12 +1385,10 @@ int op_execute_inline(const MIR * mir, bool isRange) {
+             move_reg_to_mem(OpndSize_32, 1, false, OFFSETOF_MEMBER(Thread, interpSave.retval), 2, false);
+             return 0;
+         case INLINE_MATH_ABS_DOUBLE:
+-            get_virtual_reg(vC, OpndSize_32, 1, false);
+-            get_virtual_reg(vD, OpndSize_32, 2, false);
+-            alu_binary_imm_reg(OpndSize_32, and_opc, 0x7fffffff, 2, false);
+-            get_self_pointer(3, false);
+-            move_reg_to_mem(OpndSize_32, 1, false, OFFSETOF_MEMBER(Thread, interpSave.retval), 3, false);
+-            move_reg_to_mem(OpndSize_32, 2, false, 4 + OFFSETOF_MEMBER(Thread, interpSave.retval), 3, false);
++            get_virtual_reg(vC, OpndSize_64, 1, false);
++            alu_binary_mem_reg(OpndSize_64, and_opc, LvaluePosInfLong, PhysicalReg_Null, true, 1, false);
++            get_self_pointer(2, false);
++            move_reg_to_mem(OpndSize_64, 1, false, OFFSETOF_MEMBER(Thread, interpSave.retval), 2, false);
+             return 0;
+         case INLINE_STRING_CHARAT:
+             get_virtual_reg(vC, OpndSize_32, 1, false);
+-- 
+1.7.4.1
+

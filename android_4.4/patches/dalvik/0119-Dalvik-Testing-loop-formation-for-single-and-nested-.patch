@@ -1,0 +1,927 @@
+From 892438199f878a159f95bdede37a9566e78119f9 Mon Sep 17 00:00:00 2001
+From: Udayan Banerji <udayan.banerji@intel.com>
+Date: Thu, 4 Apr 2013 11:58:22 -0700
+Subject: Dalvik: Testing loop formation for single and nested loops
+
+BZ: 94954
+
+The following patch adds testing logic to ensure correct loop formation
+for future optimizations.
+
+dvmCompilerTestLoops is introduced which tests whether the loops are formed
+correctly
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Ie3d7db50813ed8ca63362fca825dcef95d76bb19
+Orig-MCG-Change-Id: If98e04638961efd6d29fedb2a42ec4d91b16cdfc
+Signed-off-by: Udayan Banerji <udayan.banerji@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/Globals.h                    |    3 +
+ vm/Init.cpp                     |    4 +
+ vm/compiler/BBOptimization.cpp  |  394 +++++++++++++++++++++++++++++++++++----
+ vm/compiler/BBOptimization.h    |    7 +
+ vm/compiler/CompilerIR.h        |   10 +-
+ vm/compiler/IntermediateRep.cpp |    3 +
+ vm/compiler/Loop.cpp            |   36 +++-
+ vm/compiler/LoopInformation.cpp |   79 ++++++--
+ vm/compiler/LoopOpt.cpp         |    2 +-
+ 9 files changed, 467 insertions(+), 71 deletions(-)
+
+diff --git a/vm/Globals.h b/vm/Globals.h
+index 7640dc9..c3604f6 100644
+--- a/vm/Globals.h
++++ b/vm/Globals.h
+@@ -942,6 +942,9 @@ struct DvmJitGlobals {
+     /* Flag to control loops with branches in JIT mode or not */
+     bool branchLoops;
+ 
++    /* Flag to control whether the loops should be tested */
++    bool testLoops;
++
+     /* Flag to control backend registerization */
+     bool backEndRegisterization;
+ 
+diff --git a/vm/Init.cpp b/vm/Init.cpp
+index 198c6dc..3ae0e6f 100644
+--- a/vm/Init.cpp
++++ b/vm/Init.cpp
+@@ -159,6 +159,7 @@ static void usage(const char* progName)
+     dvmFprintf(stderr, "  -Xjitarenatrimstyle:<none|onlyOne|average|user> (Select arena triming style)\n");
+     dvmFprintf(stderr, "  -Xjitarenatrimvalue:<value> (The value for the user based arena trim style)\n");
+     dvmFprintf(stderr, "  -Xjitnestedloops (Allows nested loops to be compiled or not)\n");
++    dvmFprintf(stderr, "  -Xjittestloops (Whether to test the loop formation)\n");
+     dvmFprintf(stderr, "  -Xjitbranchloops (Allows branches in loops, only tested if nestedloops is also off)\n");
+     dvmFprintf(stderr, "  -Xjitoldloops (Only accept the old loop detection system)\n");
+     dvmFprintf(stderr, "  -Xjitignorepasses:<value> (Ignore certain loop passes, the full name of the pass must be included, see -Xjitlooppasses to get a list)\n");
+@@ -1176,6 +1177,8 @@ static int processOptions(int argc, const char* const argv[],
+             //For the moment turn off registerization in the back-end in the case of nested loops
+             gDvmJit.backEndRegisterization = false;
+             gDvmJit.maximumRegisterization = 0;
++        } else if (strncmp(argv[i], "-Xjittestloops", 14) == 0) {
++            gDvmJit.testLoops = true;
+         } else if (strncmp(argv[i], "-Xjitbranchloops", 16) == 0) {
+             gDvmJit.branchLoops = true;
+             //For the moment turn off registerization in the back-end in the case of nested loops
+@@ -1434,6 +1437,7 @@ static void setCommandLineDefaults()
+ 
+     gDvmJit.nestedLoops = false;
+     gDvmJit.branchLoops = false;
++    gDvmJit.testLoops = false;
+     gDvmJit.oldLoopDetection = false;
+     gDvmJit.backEndRegisterization = true;
+     gDvmJit.maximumRegisterization = UINT_MAX;
+diff --git a/vm/compiler/BBOptimization.cpp b/vm/compiler/BBOptimization.cpp
+index a4f4d45..3314a08 100644
+--- a/vm/compiler/BBOptimization.cpp
++++ b/vm/compiler/BBOptimization.cpp
+@@ -133,6 +133,30 @@ bool dvmCompilerMergeBasicBlocks (CompilationUnit *cUnit, BasicBlock *bb)
+ }
+ 
+ /**
++ * @brief Update the predecessor information of old and new BB
++ * @details This only switches predecessors, unlike dvmCompilerCalculatePredecessors()
++ * which calculates predecessor information for the whole cUnit.
++ * @param parent The basic block whose children are changing
++ * @param oldChild The basic block which is losing the parent
++ * @param newChild The basic block which is gaining the parent
++ */
++void dvmCompilerUpdatePredecessors (BasicBlock *parent, BasicBlock *oldChild, BasicBlock *newChild) {
++    assert(parent != 0);
++
++    //Remove association from old child
++    if ((oldChild != 0) && (dvmIsBitSet(oldChild->predecessors, parent->id) == true))
++    {
++        dvmCompilerClearBit (oldChild->predecessors, parent->id);
++    }
++
++    //Add information for newChild
++    if (newChild != 0)
++    {
++        dvmCompilerSetBit (newChild->predecessors, parent->id);
++    }
++}
++
++/**
+  * @brief Handle the insertion of the pre-loop header
+  * @param cUnit the CompilationUnit
+  * @param newBlock the new block to be added
+@@ -268,6 +292,7 @@ static void insertLoopExitBlock (CompilationUnit *cUnit, LoopInformation *info,
+     if (cur->taken == exitBB)
+     {
+         cur->taken = exitBlock;
++        dvmCompilerUpdatePredecessors (cur, exitBB, exitBlock);
+     }
+     else
+     {
+@@ -275,6 +300,7 @@ static void insertLoopExitBlock (CompilationUnit *cUnit, LoopInformation *info,
+         assert (cur->fallThrough == exitBB);
+ 
+         cur->fallThrough = exitBlock;
++        dvmCompilerUpdatePredecessors (cur, exitBB, exitBlock);
+     }
+ 
+     //Finally add it to the loop information
+@@ -324,6 +350,7 @@ static void handleTopLoop (CompilationUnit *cUnit, LoopInformation *info, BasicB
+     if (predBB->taken == bb)
+     {
+         predBB->taken = backward;
++        dvmCompilerUpdatePredecessors (predBB, bb, backward);
+     }
+     else
+     {
+@@ -331,9 +358,17 @@ static void handleTopLoop (CompilationUnit *cUnit, LoopInformation *info, BasicB
+         if (predBB->fallThrough == bb)
+         {
+             predBB->fallThrough = backward;
++            dvmCompilerUpdatePredecessors (predBB, bb, backward);
+         }
+     }
+ 
++    //Does the predecessor go to notLoop?
++    //Insert a landing pad here if so
++    if ( (predBB->taken == notLoop) || (predBB->fallThrough == notLoop) )
++    {
++        insertLoopExitBlock (cUnit, info, predBB, notLoop);
++    }
++
+     //Now, we must copy the if statements for the loop
+     BasicBlock *cur = bb;
+ 
+@@ -354,15 +389,20 @@ static void handleTopLoop (CompilationUnit *cUnit, LoopInformation *info, BasicB
+             predBB->fallThrough = newBB;
+         }
+ 
++        //Update the predecessor information
++        dvmCompilerUpdatePredecessors (predBB, backward, newBB);
++
+         //Now attach newBB to backward, we attach the not notLoop branch
+         if (newBB->taken != notLoop)
+         {
+-            //Taken is thus going to the backward
++            //Taken is thus going to the backward (OK if newBB is NULL)
++            dvmCompilerUpdatePredecessors (newBB, newBB->taken, backward);
+             newBB->taken = backward;
+         }
+         else
+         {
+-            //FallThrough is thus going to the backward
++            //FallThrough is thus going to the backward (OK if newBB is NULL)
++            dvmCompilerUpdatePredecessors (newBB, newBB->fallThrough, backward);
+             newBB->fallThrough = backward;
+         }
+ 
+@@ -372,7 +412,7 @@ static void handleTopLoop (CompilationUnit *cUnit, LoopInformation *info, BasicB
+         //If we only have one child, go there
+         if (
+             (cur->taken == 0 && cur->fallThrough != 0) ||
+-            (cur->taken != 0 && cur->taken == 0))
++            (cur->taken != 0 && cur->fallThrough == 0))
+         {
+             if (cur->taken != 0)
+             {
+@@ -402,6 +442,7 @@ static void handleTopLoop (CompilationUnit *cUnit, LoopInformation *info, BasicB
+ 
+     //When we are done, we've copied the chain of BasicBlocks that form the continuation test
+     //Now redirect backward to cur, we don't want to do the tests twice each iteration
++    dvmCompilerUpdatePredecessors (backward, backward->fallThrough, cur);
+     backward->fallThrough = cur;
+ 
+     //Paranoid
+@@ -418,6 +459,80 @@ static void handleTopLoop (CompilationUnit *cUnit, LoopInformation *info, BasicB
+ }
+ 
+ /**
++ * @brief Handle the bottom loop case
++ * @param cUnit the CompilationUnit
++ * @param info the LoopInformation
++ * @param bb the BasicBlock that represents the head of the loop for the top formed loop
++ * @param predBB the predecessor of bb currently being handled
++ * @param backward the backward chaining cell
++ */
++static void handleBottomLoop (CompilationUnit *cUnit, LoopInformation *info, BasicBlock *bb, BasicBlock *predBB, BasicBlock *backward)
++{
++    BasicBlock *notLoop = 0;
++
++    //Handle links from predBB to bb
++    if (predBB->taken == bb)
++    {
++        //Link taken to backward, it will go to bb
++        predBB->taken = backward;
++        dvmCompilerUpdatePredecessors (predBB, bb, backward);
++        //The not loop is predBB->fallThrough, it is the exit
++        notLoop = predBB->fallThrough;
++    }
++    else
++    {
++        if (predBB->fallThrough == bb)
++        {
++            //Link FT to backward, it will go to bb
++            predBB->fallThrough = backward;
++            dvmCompilerUpdatePredecessors (predBB, bb, backward);
++            //The not loop is predBB->taken, it is the exit
++            notLoop = predBB->taken;
++        }
++    }
++
++    //There is a case where notLoop can be 0:
++    //  - If bb directly goes to itself and it's an infinite loop
++    if (notLoop != 0)
++    {
++        //Inform loop information
++        info->setPostExitBlock (notLoop);
++
++        //Insert a landing pad for predBB
++        insertLoopExitBlock (cUnit, info, predBB, notLoop);
++
++        //It may happen that other blocks are also leading to
++        //notLoop. All blocks should then lead to notLoop
++        if ( (bb->taken == notLoop) || (bb->fallThrough == notLoop) )
++        {
++            //Check every block down to predBB
++            BasicBlock *inLoop = bb;
++            while (inLoop != predBB)
++            {
++                if (inLoop->taken == notLoop)
++                {
++                    insertLoopExitBlock (cUnit, info, inLoop, notLoop);
++                    inLoop = inLoop->fallThrough;
++                }
++                else
++                {
++                    if (inLoop->fallThrough == notLoop)
++                    {
++                        insertLoopExitBlock (cUnit, info, inLoop, notLoop);
++                        inLoop = inLoop->taken;
++                    }
++                    else
++                    {
++                        ALOGI("LOOP_INFO: Too many exits of the loop");
++                        cUnit->quitLoopMode = true;
++                    }
++                }
++            }
++        }
++    }
++}
++
++/**
+  * Form a loop if bb is a loop head
+  *  - If it is, make sure it is a bottom formed loop (or make it so), add a preloop block and an exit block
+  */
+@@ -482,8 +597,194 @@ void dvmCompilerFormOldLoop (CompilationUnit *cUnit, Pass *pass)
+ }
+ 
+ /**
+- * Form a loop if bb is a loop head
+- *  - If it is, make sure it is a bottom formed loop (or make it so), add a preloop block and an exit block
++ * @brief Helper to test if the loop has been formed properly
++ * @param cUnit the CompilationUnit
++ * @param info the LoopInformation
++ * @return whether the loop is formed properly
++ */
++static bool testLoopHelper (CompilationUnit *cUnit, const LoopInformation *info)
++{
++    static int depth = 0;
++    depth++;
++
++    //Standard message to append in case of error
++    char message[256];
++    snprintf (message, sizeof(message), "LOOP_INFO: loop for trace  %s%s, offset %02x at depth %d",
++            cUnit->method->clazz->descriptor, cUnit->method->name,
++            cUnit->traceDesc->trace[0].info.frag.startOffset, depth);
++
++
++    //First, check all the information about this loop level
++    if (info == 0)
++    {
++        ALOGE ("%s - info is null at testLoop", message);
++        depth--;
++        return false;
++    }
++
++    //Gather all the required information
++    BitVector *backwardBlocks = const_cast<BitVector *>(info->getBackwardBranches());
++    BitVector *exitLoopBlocks = const_cast<BitVector *>(info->getExitLoops());
++    BitVector *allBlocks = const_cast<BitVector *>(info->getBasicBlocks());
++
++    BasicBlock *preHeader = info->getPreHeader();
++    BasicBlock *entry = info->getEntryBlock();
++
++    //Loop should have at least one basic block:
++    if (dvmCountSetBits (allBlocks) == 0)
++    {
++        ALOGE ("%s - Not even a single basic block in info", message);
++        depth--;
++        return false;
++    }
++
++    //Loop should have a pre-header
++    if (preHeader == 0)
++    {
++        ALOGE ("%s - Loop has no pre-header", message);
++        depth--;
++        return false;
++    }
++
++    //Loop should have an entry block
++    if (entry == 0)
++    {
++        ALOGE ("%s - Loop has no entry block", message);
++        depth--;
++        return false;
++    }
++
++    //Preheader should go to entry
++    if (preHeader->fallThrough != entry)
++    {
++        ALOGE ("%s - PreHeader %d does not go to loop entry %d", message, preHeader->id, entry->id);
++        depth--;
++        return false;
++    }
++
++    //Now check all the basic blocks in the loop
++    BitVectorIterator bvIterator;
++
++    dvmBitVectorIteratorInit (const_cast < BitVector* >(allBlocks), &bvIterator);
++
++    while (true)
++    {
++        //Get the next iterator
++        int blockIdx = dvmBitVectorIteratorNext (&bvIterator);
++
++        //If it is finished, exit
++        if (blockIdx == -1)
++        {
++            break;
++        }
++
++        BasicBlock *loopBB = (BasicBlock*) (dvmGrowableListGetElement (&cUnit->blockList, blockIdx));
++
++        //Paranoid
++        assert (loopBB != 0);
++
++        //Check if the block only connects to blocks in the loop, backward block, or loop exit block
++        if ( (loopBB->taken != 0) &&
++                (info->contains (loopBB->taken) == false) &&
++                (dvmIsBitSet (exitLoopBlocks, loopBB->taken->id) == false) &&
++                (dvmIsBitSet (backwardBlocks, loopBB->taken->id) == false) )
++        {
++            ALOGE ("%s - Basic block %d exits loop through taken %d", message, loopBB->id, loopBB->taken->id);
++            depth--;
++            return false;
++        }
++
++        if ( (loopBB->fallThrough != 0) &&
++                (info->contains (loopBB->fallThrough) == false) &&
++                (dvmIsBitSet (exitLoopBlocks, loopBB->fallThrough->id) == false) &&
++                (dvmIsBitSet (backwardBlocks, loopBB->fallThrough->id) == false) )
++        {
++            ALOGE ("%s - Basic block %d exits loop through fallThrough %d", message, loopBB->id, loopBB->fallThrough->id);
++            depth--;
++            return false;
++        }
++
++    }
++
++    //Check if all backward blocks go to the entry
++    dvmBitVectorIteratorInit (const_cast < BitVector* > (backwardBlocks), &bvIterator);
++    while (true)
++    {
++        //Get the next iterator
++        int blockIdx = dvmBitVectorIteratorNext (&bvIterator);
++
++        //If it is finished, exit
++        if (blockIdx == -1)
++        {
++            break;
++        }
++
++        BasicBlock *backBB = (BasicBlock*) (dvmGrowableListGetElement(&cUnit->blockList, blockIdx));
++
++        //Paranoid
++        assert (backBB != 0);
++
++        if (backBB->fallThrough != entry)
++        {
++            ALOGE ("%s - Backward block %d does not go to entry %d", message, backBB->id, entry->id);
++            depth--;
++            return false;
++        }
++    }
++
++    //Now get the nested loops and check them as well (recurse)
++    unsigned int numNested = info->getNestedNbr ();
++    while (numNested > 0)
++    {
++        if ( testLoopHelper (cUnit, info->getNested (numNested - 1) ) == false)
++        {
++            depth--;
++            return false;
++        }
++        numNested--;
++    }
++
++    //All good!
++    depth--;
++    return true;
++}
++
++/**
++ * @brief Test if the loop has been formed properly
++ * @param cUnit the CompilationUnit
++ * @param pass the current pass
++ */
++void dvmCompilerTestLoop (CompilationUnit *cUnit, Pass *pass)
++{
++
++    if (gDvmJit.testLoops == false)
++    {
++        return;
++    }
++
++    LoopInformation *info = cUnit->loopInformation;
++
++    //Then call loop information fill
++    if (cUnit->loopInformation != 0)
++    {
++        cUnit->loopInformation->fillLoopInformation ();
++    }
++
++    if ( testLoopHelper (cUnit, info) == false )
++    {
++        cUnit->quitLoopMode = true;
++    }
++
++    (void) pass;
++}
++
++/**
++ * @brief Form a loop if bb is a loop head
++ * @details If it is, make sure it is a bottom formed
++ * loop (or make it so), add a preloop block and an exit block
++ * @param cUnit the CompilationUnit
++ * @param bb the basic block which is a loop head
++ * @return whether we changed anything (always false)
+  */
+ bool dvmCompilerFormLoop (CompilationUnit *cUnit, BasicBlock *bb)
+ {
+@@ -497,7 +798,8 @@ bool dvmCompilerFormLoop (CompilationUnit *cUnit, BasicBlock *bb)
+ 
+     //Get predecessors
+     dvmBitVectorIteratorInit(bb->predecessors, &bvIterator);
+-    while (true) {
++    while (true)
++    {
+         //Get the next iterator
+         int blockIdx = dvmBitVectorIteratorNext(&bvIterator);
+ 
+@@ -576,9 +878,45 @@ bool dvmCompilerFormLoop (CompilationUnit *cUnit, BasicBlock *bb)
+ 
+             //There is a corner case where the bb might be also going to where we aren't
+             //It must be not hidden though
+-            if (notLoop != 0 && notLoop->blockType == kDalvikByteCode && (notLoop == bb->taken || notLoop == bb->fallThrough))
++            if (notLoop != 0 && (notLoop == bb->taken || notLoop == bb->fallThrough))
+             {
+-                topLoop = true;
++                //Definitely a top loop if not going to a normal chaining cell
++                if (notLoop->blockType == kDalvikByteCode)
++                {
++                    topLoop = true;
++                }
++                else
++                {
++                    //Maybe all the BBs go to the notLoop. This is then both a bottom and
++                    // top loop. We then consider it as a bottom loop
++                    BasicBlock *inLoop = ( notLoop == bb->taken ? bb->fallThrough : bb->taken) ;
++
++                    //Paranoid
++                    assert(inLoop != 0);
++
++                    //Assume bottomLoop to begin with
++                    topLoop = false;
++                    while (inLoop != bb)
++                    {
++                        if (inLoop->taken == notLoop)
++                        {
++                            inLoop = inLoop->fallThrough;
++                        }
++                        else
++                        {
++                            if (inLoop->fallThrough == notLoop)
++                            {
++                                inLoop = inLoop->taken;
++                            }
++                            else
++                            {
++                                topLoop = true;
++                                break;
++                            }
++                        }
++                        assert (inLoop != 0);
++                    }
++                }
+             }
+ 
+             //Last case: if predBB is bb then it isn't a top loop at all
+@@ -595,37 +933,7 @@ bool dvmCompilerFormLoop (CompilationUnit *cUnit, BasicBlock *bb)
+             else
+             {
+                 //Otherwise, it is already a bottom loop
+-                BasicBlock *notLoop = 0;
+-
+-                //Handle links from predBB to bb
+-                if (predBB->taken == bb)
+-                {
+-                    //Link taken to backward, it will go to bb
+-                    predBB->taken = backward;
+-                    //The not loop is predBB->fallThrough, it is the exit
+-                    notLoop = predBB->fallThrough;
+-                }
+-                else
+-                {
+-                    if (predBB->fallThrough == bb)
+-                    {
+-                        //Link FT to backward, it will go to bb
+-                        predBB->fallThrough = backward;
+-                        //The not loop is predBB->taken, it is the exit
+-                        notLoop = predBB->taken;
+-                    }
+-                }
+-
+-                //There is a case where notLoop can be 0:
+-                //  - If bb directly goes to itself and it's an infinite loop
+-                if (notLoop != 0)
+-                {
+-                    //Inform loop information
+-                    info->setPostExitBlock (notLoop);
+-
+-                    //Add a landing pad here
+-                    insertLoopExitBlock (cUnit, info, predBB, notLoop);
+-                }
++                handleBottomLoop(cUnit, info, bb, predBB, backward);
+             }
+ 
+             //Fill in the last information about the loop
+@@ -639,12 +947,16 @@ bool dvmCompilerFormLoop (CompilationUnit *cUnit, BasicBlock *bb)
+             else
+             {
+                 //Nest it with the current loop information
+-                cUnit->loopInformation = cUnit->loopInformation->nest (info);
++                LoopInformation *nested = cUnit->loopInformation->nest (info);
++                if (nested == 0) {
++                    cUnit->quitLoopMode = true;
++                    return false;
++                }
++                cUnit->loopInformation = nested;
+             }
+         }
+     }
+ 
+-
+     //If we have a backward chaining cell, insert the preheader now
+     if (backward != 0)
+     {
+diff --git a/vm/compiler/BBOptimization.h b/vm/compiler/BBOptimization.h
+index 2e89089..875098e 100644
+--- a/vm/compiler/BBOptimization.h
++++ b/vm/compiler/BBOptimization.h
+@@ -51,6 +51,13 @@ void dvmCompilerInsertPreBackward (CompilationUnit *cUnit, Pass *currentPass);
+ bool dvmCompilerFormLoop (CompilationUnit *cUnit, BasicBlock *bb);
+ 
+ /**
++ * @brief Test if the loop has been formed properly
++ * @param cUnit the CompilationUnit
++ * @param pass the current pass
++ */
++void dvmCompilerTestLoop (CompilationUnit *cunit, Pass *pass);
++
++/**
+  * @brief Form the loop by inserting pre/post blocks and backward branches for loops
+  * @param cUnit the CompilationUnit
+  * @param pass the Pass
+diff --git a/vm/compiler/CompilerIR.h b/vm/compiler/CompilerIR.h
+index 50967b9..d23b97d 100644
+--- a/vm/compiler/CompilerIR.h
++++ b/vm/compiler/CompilerIR.h
+@@ -195,8 +195,11 @@ typedef enum BlockListType {
+ typedef struct BasicBlock {
+     int id;
+     bool visited;
+-    bool topLoop;                       //Is this a loop head and is it a top loop?
+-    bool bottomLoop;                    //Is this a loop head and is it a bottom loop?
++    struct {                            // Define behavior in a loop
++        bool walkForward;               // Do we go to children to traverse the loop?
++        bool walkBackward;              // Do we go to predecessor to traverse the loop?
++        BasicBlock *relativeTo;
++    } loopTraversalType;
+     BitVector *requestWriteBack;        //Request a write back from the BE
+     bool hidden;
+     unsigned int startOffset;
+@@ -395,6 +398,9 @@ bool dvmCompilerInsertBasicBlockBetween (BasicBlock *newBlock, BasicBlock *paren
+ /* Insert a BasicBlock between a parent and child */
+ BasicBlock *dvmCompilerCopyBasicBlock (CompilationUnit *cUnit, const BasicBlock *old, bool addIt = true);
+ 
++/* Update the predecessor information of old and new BB */
++void dvmCompilerUpdatePredecessors(BasicBlock *parent, BasicBlock *oldChild, BasicBlock *newChild);
++
+ /* Debug Utilities */
+ void dvmCompilerDumpCompilationUnit(CompilationUnit *cUnit);
+ 
+diff --git a/vm/compiler/IntermediateRep.cpp b/vm/compiler/IntermediateRep.cpp
+index b0922db..b5b32dd 100644
+--- a/vm/compiler/IntermediateRep.cpp
++++ b/vm/compiler/IntermediateRep.cpp
+@@ -242,16 +242,19 @@ bool dvmCompilerInsertBasicBlockBetween (BasicBlock *newBlock, BasicBlock *paren
+     if (parent->taken == child)
+     {
+         parent->taken = newBlock;
++        dvmCompilerUpdatePredecessors (parent, child, newBlock);
+     }
+     else
+     {
+         if (parent->fallThrough == child)
+         {
+             parent->fallThrough = newBlock;
++            dvmCompilerUpdatePredecessors (parent, child, newBlock);
+         }
+     }
+ 
+     //Link to child
++    dvmCompilerUpdatePredecessors (newBlock, newBlock->fallThrough, newBlock);
+     newBlock->fallThrough = child;
+     newBlock->taken = 0;
+ 
+diff --git a/vm/compiler/Loop.cpp b/vm/compiler/Loop.cpp
+index 7f438d8..37d58f4 100644
+--- a/vm/compiler/Loop.cpp
++++ b/vm/compiler/Loop.cpp
+@@ -841,7 +841,7 @@ static bool walkTheLoop (CompilationUnit *cUnit, BasicBlock *bb)
+     BasicBlock *first = cUnit->entryBlock->fallThrough;
+ 
+     //Is it a backward branch
+-    if (bb->bottomLoop == true)
++    if (bb->loopTraversalType.walkBackward == true)
+     {
+         climbTheLoopHelper (cUnit, bb, first);
+ 
+@@ -859,11 +859,11 @@ static bool walkTheLoop (CompilationUnit *cUnit, BasicBlock *bb)
+     else
+     {
+         //Or is it a forward loop
+-        if (bb->topLoop == true)
++        if (bb->loopTraversalType.walkForward == true)
+         {
+-            //A BB could be both, but we reject the double case if it is a bottomLoop
++            //A BB could be both, but we reject the double case if we are walking backwards
+             //To the first BB
+-            if (bb->bottomLoop == true &&
++            if (bb->loopTraversalType.walkBackward == true &&
+                     (bb->taken == first || bb->fallThrough == first))
+             {
+                 return false;
+@@ -1041,7 +1041,7 @@ bool acceptOldLoops (CompilationUnit *cUnit)
+ }
+ 
+ /**
+- * @brief Accept a CFG as a loop (Helper function
++ * @brief Accept a CFG as a loop
+  * @param cUnit the CompilationUnit
+  * @return whether or not the trace is a loop
+  */
+@@ -1127,6 +1127,9 @@ bool dvmCompilerFilterLoopBlocks(CompilationUnit *cUnit)
+ {
+     BasicBlock *firstBB = cUnit->entryBlock->fallThrough;
+ 
++    //We should only have one exit chaining cell of the loop
++    bool normalChainingAdded = false;
++
+     int numPred = dvmCountSetBits(firstBB->predecessors);
+     /*
+      * A loop body should have at least two incoming edges.
+@@ -1184,7 +1187,13 @@ bool dvmCompilerFilterLoopBlocks(CompilationUnit *cUnit)
+                     return false;
+                 }
+                 if (bb->taken->hidden) {
++                    //We should only be adding one loop exit
++                    if (normalChainingAdded == true)
++                    {
++                        return false;
++                    }
+                     bb->taken->blockType = kChainingCellNormal;
++                    normalChainingAdded = true;
+                     bb->taken->hidden = false;
+                 }
+                 dvmCompilerSetBit(bb->taken->predecessors, bb->id);
+@@ -1198,7 +1207,12 @@ bool dvmCompilerFilterLoopBlocks(CompilationUnit *cUnit)
+                     return false;
+                 }
+                 if (bb->fallThrough->hidden) {
++                    //We should only be adding one loop exit
++                    if (normalChainingAdded == true) {
++                        return false;
++                    }
+                     bb->fallThrough->blockType = kChainingCellNormal;
++                    normalChainingAdded = true;
+                     bb->fallThrough->hidden = false;
+                 }
+                 dvmCompilerSetBit(bb->fallThrough->predecessors, bb->id);
+@@ -1465,7 +1479,8 @@ static bool markOffNonHeadersHelper (CompilationUnit *cUnit, BasicBlock *bb)
+             // If bb is the startOffset of cUnit->entryBlock, it is the original head
+             if (entryOffset == bb->startOffset)
+             {
+-                predBB->bottomLoop = true;
++                predBB->loopTraversalType.walkBackward = true;
++                predBB->loopTraversalType.relativeTo = bb;
+             }
+             else
+             {
+@@ -1476,19 +1491,22 @@ static bool markOffNonHeadersHelper (CompilationUnit *cUnit, BasicBlock *bb)
+                 //First do we have only one branch towards it:
+                 if (bb->taken != 0 && bb->fallThrough == 0 && bb->taken->startOffset == entryOffset)
+                 {
+-                    bb->topLoop = true;
++                    bb->loopTraversalType.walkForward = true;
++                    bb->loopTraversalType.relativeTo = bb->taken;
+                 }
+                 else
+                 {
+                     //Same but the other side
+                     if (bb->fallThrough != 0 && bb->taken == 0 && bb->fallThrough->startOffset == entryOffset)
+                     {
+-                        bb->topLoop = true;
++                        bb->loopTraversalType.walkForward = true;
++                        bb->loopTraversalType.relativeTo = bb->fallThrough;
+                     }
+                     else
+                     {
+                         //Otherwise, we have two children and that means this is exiting the loop
+-                        bb->bottomLoop = true;
++                        bb->loopTraversalType.walkBackward = true;
++                        bb->loopTraversalType.relativeTo = predBB;
+                     }
+                 }
+             }
+diff --git a/vm/compiler/LoopInformation.cpp b/vm/compiler/LoopInformation.cpp
+index 0f53fb8..656f59d 100644
+--- a/vm/compiler/LoopInformation.cpp
++++ b/vm/compiler/LoopInformation.cpp
+@@ -37,7 +37,6 @@ void LoopInformation::init (const Method *method)
+     parent = 0;
+     depth = 0;
+     basicBlocks = 0;
+-    exitLoop = 0;
+     backward = 0;
+     entry = 0;
+     preHeader = 0;
+@@ -65,6 +64,10 @@ void LoopInformation::init (const Method *method)
+     // Initialize growable lists
+     dvmInitGrowableList (&nested, 1);
+     dvmInitGrowableList (&inductionVariableList, 1);
++
++
++    //Initialize the BitVectors:
++    exitLoop = dvmCompilerAllocBitVector (1, true);
+ }
+ 
+ /**
+@@ -83,9 +86,35 @@ LoopInformation *LoopInformation::nest (LoopInformation *info)
+         return this;
+     }
+ 
+-    //Are we included in the current loop ?
++    //Do we include the current loop ?
+     if (contains (entry) == true)
+     {
++        //We contain them, so they should not contain us
++        if (info->contains (getEntryBlock ()))
++        {
++            //The two loops are overlapping. We need to select
++            //the outer one.
++            if (dvmIsBitSet (entry->dominators, getEntryBlock ()->id))
++            {
++                //We dominate the loop, so we are the outer loop
++                return this;
++            }
++            else
++            {
++                if (dvmIsBitSet (getEntryBlock ()->dominators, entry->id))
++                {
++                    //The loop dominates us
++                    return info;
++                }
++                else
++                {
++                    //Something is very wrong
++                    ALOGI ("LOOP_INFO: Invalid loop overlap detected while trying to nest");
++                    return 0;
++                }
++            }
++        }
++
+         //Search in the children if anybody includes them
+         GrowableListIterator iterator;
+         dvmGrowableListIteratorInit (&nested, &iterator);
+@@ -103,6 +132,12 @@ LoopInformation *LoopInformation::nest (LoopInformation *info)
+                 //This loop goes there
+                 inner = inner->nest (info);
+ 
++                //If something went wrong in the inner loops
++                if (inner == 0)
++                {
++                    return inner;
++                }
++
+                 //Update entry
+                 dvmGrowableListSetLastIterator (&iterator, (intptr_t) inner);
+ 
+@@ -195,6 +230,7 @@ LoopInformation *LoopInformation::getLoopInformationByEntry (const BasicBlock *e
+  */
+ void LoopInformation::fillBasicBlockVector (BasicBlock *current)
+ {
++
+     //If 0, exit, get out
+     if (current == 0 || current == postExitLoop)
+     {
+@@ -213,30 +249,36 @@ void LoopInformation::fillBasicBlockVector (BasicBlock *current)
+     //Mark it as visited
+     dvmSetBit (basicBlocks, current->id);
+ 
+-    //If we are going back to first, we are a backward
++    //If we are going back to first, we should be backward
++    //But, we can also be a top loop with multiple backward branches
++    //coming into us, and we are not done processing all our
++    //predecessors. We fallthrough to the entry, and we still
++    //have links from the loop.
+     if (current->fallThrough == entry)
+     {
+-        //Normally backwards are only fallThrough
+-        assert (current->taken == 0);
+-        addBackwardBlock (current);
++        if (dvmIsBitSet (entry->dominators, current->id) == false)
++        {
++            //Normally backwards are only fallThrough
++            assert (current->taken == 0);
++            addBackwardBlock (current);
+ 
+-        //Backward is not considered in the loop
+-        isInLoop = false;
++            //Current is outside of the loop
++            isInLoop = false;
++        }
+     }
++    //Other question is anything that leads to exit is a exitLoop
+     else
+     {
+-        //Other question is anything that leads to exit is a exitLoop
+         if (current->fallThrough == postExitLoop)
+         {
+-            assert (current->taken == 0);
+-            addExitLoop (current);
+-            //Post is not considered in the loop
+-            isInLoop = false;
+-        }
+-        else
+-        {
+-            //Otherwise, go there
+-            fillBasicBlockVector (current->fallThrough);
++            //postExit is null for infinite loops
++            if (postExitLoop != 0)
++            {
++                assert (current->taken == 0);
++                addExitLoop (current);
++                //Post is not considered in the loop
++                isInLoop = false;
++            }
+         }
+     }
+ 
+@@ -245,6 +287,7 @@ void LoopInformation::fillBasicBlockVector (BasicBlock *current)
+     {
+         //Look at children: taken first, then fallThrough
+         fillBasicBlockVector (current->taken);
++        fillBasicBlockVector (current->fallThrough);
+     }
+     else
+     {
+diff --git a/vm/compiler/LoopOpt.cpp b/vm/compiler/LoopOpt.cpp
+index 24d78a4..52340fe 100644
+--- a/vm/compiler/LoopOpt.cpp
++++ b/vm/compiler/LoopOpt.cpp
+@@ -48,7 +48,7 @@ static void clearPHIInformation (CompilationUnit *cUnit);
+ START_PASSES
+     //This loop formation is used when the new loop filtering is active
+     NEW_PASS ("Form Loop", kAllNodes, 0, dvmCompilerTraceIsLoopNewSystem,
+-                0, 0, dvmCompilerFormLoop, 0, kOptimizationBasicBlockChange),
++                0, dvmCompilerTestLoop, dvmCompilerFormLoop, 0, kOptimizationBasicBlockChange),
+     //This loop formation is used when the old loop filtering is active
+     NEW_PASS ("Old Loop Formation", kAllNodes, 0, dvmCompilerTraceIsLoopOldSystem,
+                 dvmCompilerFormOldLoop, 0, 0, 0, kOptimizationBasicBlockChange),
+-- 
+1.7.4.1
+

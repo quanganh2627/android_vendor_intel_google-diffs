@@ -1,0 +1,436 @@
+From 402a4e6500450ef463fc3a9c20b4942c24359064 Mon Sep 17 00:00:00 2001
+From: Jianxun Zhang <jianxun.zhang@intel.com>
+Date: Thu, 20 Dec 2012 15:49:35 -0800
+Subject: Support module alias in insmod_by_dep
+
+() The job of parsing alias has been moved into libcutils. The
+ueventd doesn't need to do parsing and searching module aliases
+any more. It can just give insmod_by_dep() a string and its
+extra black list.
+
+() Add alias support in insmod_by_dep() API. It will search alias
+list to see if the "module name" passed from caller is an alias
+actually, and then load the module by the name found in alias list.
+If there is no matched alias, it treats the string as the name of
+module as what it handled before.
+
+() Defer module loading is still in ueventd since it is a specific
+case for ueventd.
+
+The original author of defer loading, and handling module alias logic
+is:
+
+Daniel Leung <daniel.leung@intel.com>
+
+The code is merged into module parser in libcutils now.
+
+Note:
+Only the first matched alias will be used in loading. Further plan is
+loading modules for all of matched alias.
+
+For: AXIA-653
+Change-Id: Idcee19f3e6bb973f5ba20f0519a8ec6970b3a0a8
+Depends-Change-Id: I4dc060b3dc540284d8063826b221717902094f91
+Depends-Change-Id: Ifaec8e535f6647912f76256c7f77aef450c66949
+Signed-off-by: Jianxun Zhang <jianxun.zhang@intel.com>
+---
+ include/cutils/module_parsers.h |    9 ++++
+ init/devices.c                  |  101 ++++++++-------------------------------
+ libcutils/module_parsers.c      |   68 ++++++++++++++++++--------
+ libcutils/probe_module.c        |   18 +++++++
+ 4 files changed, 94 insertions(+), 102 deletions(-)
+
+diff --git a/include/cutils/module_parsers.h b/include/cutils/module_parsers.h
+index 4814ff0..694fbde 100644
+--- a/include/cutils/module_parsers.h
++++ b/include/cutils/module_parsers.h
+@@ -34,3 +34,12 @@ int parse_alias_to_list(const char *file_name, struct listnode *head);
+ int parse_blacklist_to_list(const char *file_name, struct listnode *head);
+ void free_alias_list(struct listnode *head);
+ void free_black_list(struct listnode *head);
++/* return a module's name from its alias.
++ * id           : alias string passed by caller
++ * name         : allocated string of module name, caller is responsible to free it.
++ * alias_list   : list head of an alias map. The map is a list of struct module_alias_node.
++ * return       : 0 when module name is found and name holds the valid content.
++ *              : -1 when it failed to allocate name string's memory, or the module name
++ *                cannot be found in alias list. Content of name is NULL.
++ */
++int get_module_name_from_alias(const char *id, char **name, struct listnode *alias_list);
+diff --git a/init/devices.c b/init/devices.c
+index 92f134a..f9f3c65 100644
+--- a/init/devices.c
++++ b/init/devices.c
+@@ -43,19 +43,17 @@
+ #include <cutils/list.h>
+ #include <cutils/probe_module.h>
+ #include <cutils/uevent.h>
++#include <cutils/module_parsers.h>
+ 
+ #include "devices.h"
+ #include "util.h"
+ #include "log.h"
+ #include "parser.h"
+ 
+-#include <cutils/module_parsers.h>
+-
+ #define SYSFS_PREFIX    "/sys"
+ #define FIRMWARE_DIR1   "/etc/firmware"
+ #define FIRMWARE_DIR2   "/vendor/firmware"
+ #define FIRMWARE_DIR3   "/firmware/image"
+-#define MODULES_ALIAS   "/system/lib/modules/modules.alias"
+ #define MODULES_BLKLST  "/system/etc/ueventd.modules.blacklist"
+ 
+ extern struct selabel_handle *sehandle;
+@@ -99,7 +97,6 @@ struct platform_node {
+ static list_declare(sys_perms);
+ static list_declare(dev_perms);
+ static list_declare(platform_names);
+-static list_declare(modules_aliases_map);
+ static list_declare(deferred_module_loading_list);
+ 
+ int add_dev_perms(const char *name, const char *attr,
+@@ -674,42 +671,6 @@ static void handle_generic_device_event(struct uevent *uevent)
+              uevent->major, uevent->minor, links);
+ }
+ 
+-static int load_module_by_device_modalias(const char *id)
+-{
+-    struct listnode *alias_node;
+-    struct module_alias_node *alias;
+-    int ret = MOD_DEP_NOT_FOUND;
+-
+-    if (!id) goto out;
+-
+-    list_for_each(alias_node, &modules_aliases_map) {
+-        alias = node_to_item(alias_node, struct module_alias_node, list);
+-
+-        if (alias && alias->name && alias->pattern) {
+-            if (fnmatch(alias->pattern, id, 0) == 0) {
+-                INFO("trying to load module %s due to uevents\n", alias->name);
+-                ret = insmod_by_dep(alias->name, "", NULL, 1, NULL, MODULES_BLKLST);
+-                if (ret != MOD_NO_ERR) {
+-                    /* cannot load module. try another one since
+-                     * there may be another match.
+-                     */
+-                    INFO("cannot load module %s due to uevents\n",
+-                            alias->name);
+-                } else {
+-                    /* loading was successful */
+-                    INFO("loaded module %s due to uevents\n", alias->name);
+-                    ret = 0;
+-                    goto out;
+-                }
+-
+-            }
+-        }
+-    }
+-
+-out:
+-    return ret;
+-}
+-
+ static void handle_deferred_module_loading()
+ {
+     struct listnode *node = NULL;
+@@ -717,23 +678,19 @@ static void handle_deferred_module_loading()
+     struct module_alias_node *alias = NULL;
+     int ret = -1;
+ 
+-    /* try to read the module alias mapping if map is empty
+-     * if succeed, loading all the modules in the queue
+-     */
+-    if (!list_empty(&modules_aliases_map)) {
+-        list_for_each_safe(node, next, &deferred_module_loading_list) {
+-            alias = node_to_item(node, struct module_alias_node, list);
+-
+-            if (alias && alias->pattern) {
+-                INFO("deferred loading of module for %s\n", alias->pattern);
+-                ret = load_module_by_device_modalias(alias->pattern);
+-                /* if it looks like file system where these files are is not
+-                 * ready, keep the module in defer list for retry. */
+-                if (!(ret & (MOD_BAD_DEP | MOD_INVALID_CALLER_BLACK | MOD_BAD_ALIAS))) {
+-                    free(alias->pattern);
+-                    list_remove(node);
+-                    free(alias);
+-                }
++    list_for_each_safe(node, next, &deferred_module_loading_list) {
++        alias = node_to_item(node, struct module_alias_node, list);
++
++        if (alias && alias->pattern) {
++            INFO("deferred loading of module for %s\n", alias->pattern);
++            ret = insmod_by_dep(alias->pattern, "", NULL, 1, NULL,
++                    MODULES_BLKLST);
++            /* if it looks like file system where these files are is not
++             * ready, keep the module in defer list for retry. */
++            if (!(ret & (MOD_BAD_DEP | MOD_INVALID_CALLER_BLACK | MOD_BAD_ALIAS))) {
++                free(alias->pattern);
++                list_remove(node);
++                free(alias);
+             }
+         }
+     }
+@@ -741,33 +698,23 @@ static void handle_deferred_module_loading()
+ 
+ int module_probe(const char *modalias)
+ {
+-    if (list_empty(&modules_aliases_map))
+-        if (parse_alias_to_list(MODULES_ALIAS, &modules_aliases_map) != 0)
+-            return -1;
+-
+-    return load_module_by_device_modalias(modalias);
++    return insmod_by_dep(modalias, "", NULL, 1, NULL, NULL);    /* not to reuse ueventd's black list. */
+ }
+ 
+ static void handle_module_loading(const char *modalias)
+ {
+     char *tmp;
+     struct module_alias_node *node;
++    int ret;
+ 
+-    /* once modules.alias can be read,
+-     * we load all the deferred ones
+-     */
+-    if (list_empty(&modules_aliases_map)) {
+-        if (parse_alias_to_list(MODULES_ALIAS, &modules_aliases_map) == 0) {
+-            handle_deferred_module_loading();
+-        }
+-    }
++
++    handle_deferred_module_loading();
+ 
+     if (!modalias) return;
+ 
+-    if (list_empty(&modules_aliases_map)) {
+-        /* if module alias mapping is empty,
+-         * queue it for loading later
+-         */
++    ret = insmod_by_dep(modalias, "", NULL, 1, NULL, MODULES_BLKLST);
++
++    if (ret & (MOD_BAD_DEP | MOD_INVALID_CALLER_BLACK | MOD_BAD_ALIAS)) {
+         node = calloc(1, sizeof(*node));
+         if (node) {
+             node->pattern = strdup(modalias);
+@@ -781,13 +728,7 @@ static void handle_module_loading(const char *modalias)
+         } else {
+             ERROR("failed to allocate memory to store device id for deferred module loading.\n");
+         }
+-    } else {
+-        /* TODO: we don't check ret here because we have checked if alias list is ready.
+-         * so the black list and dep file should be ready too on FS, this logic will be
+-         * refined in further patches with the change of alias parsing. */
+-        load_module_by_device_modalias(modalias);
+     }
+-
+ }
+ 
+ static void handle_device_event(struct uevent *uevent)
+diff --git a/libcutils/module_parsers.c b/libcutils/module_parsers.c
+index 4fc4041..4a744b9 100644
+--- a/libcutils/module_parsers.c
++++ b/libcutils/module_parsers.c
+@@ -25,6 +25,7 @@
+ #include <string.h>
+ #include <cutils/list.h>
+ #include <stdlib.h>
++#include <fnmatch.h>
+ 
+ #define LOG_TAG "ModuleParsers"
+ #include <cutils/log.h>
+@@ -182,7 +183,6 @@ void free_alias_list(struct listnode *head)
+     {
+         alias = node_to_item(node, struct module_alias_node, list);
+         if (alias) {
+-            ALOGI("free alias name [%s] pattern [%s]\n", alias->name, alias->pattern);
+             free(alias->pattern);
+             free(alias->name);
+             list_remove(node);
+@@ -209,6 +209,32 @@ void free_black_list(struct listnode *head)
+     }
+ }
+ 
++int get_module_name_from_alias(const char *id, char **name, struct listnode *alias_list)
++{
++    struct listnode *alias_node;
++    struct module_alias_node *alias;
++    int ret = -1;
++
++    if (!id)
++        return ret;
++
++    list_for_each(alias_node, alias_list)
++    {
++        alias = node_to_item(alias_node, struct module_alias_node, list);
++        if (alias && alias->name && alias->pattern) {
++            if (fnmatch(alias->pattern, id, 0) == 0) {
++                if (asprintf(name, "%s", alias->name) < 0)
++                    *name = NULL;
++                else
++                    ret = 0;
++
++                break;
++            }
++        }
++    }
++
++    return ret;
++}
+ 
+ int is_module_blacklisted(const char *name, struct listnode *black_list_head)
+ {
+@@ -216,7 +242,8 @@ int is_module_blacklisted(const char *name, struct listnode *black_list_head)
+     struct module_blacklist_node *blacklist;
+     int ret = 0;
+ 
+-    if (!name) goto out;
++    if (!name)
++        return ret;
+ 
+     /* See if module is blacklisted, skip if it is */
+     list_for_each(blklst_node, black_list_head) {
+@@ -226,11 +253,11 @@ int is_module_blacklisted(const char *name, struct listnode *black_list_head)
+         if (!strcmp(name, blacklist->name)) {
+             ALOGI("modules %s is blacklisted\n", name);
+             ret = 1;
+-            goto out;
++
++            break;
+         }
+     }
+ 
+-out:
+     return ret;
+ }
+ 
+@@ -238,18 +265,19 @@ static void parse_line_module_blacklist(struct parse_state *state, int nargs, ch
+ {
+     struct module_blacklist_node *node;
+ 
++    /* empty line or not enough arguments */
+     if (!args ||
+         (nargs != 2) ||
+-        !args[0] || !args[1]) {
+-        /* empty line or not enough arguments */
++            !args[0] || !args[1])
+         return;
+-    }
+ 
+     /* this line does not begin with "blacklist" */
+-    if (strncmp(args[0], "blacklist", 9)) return;
++    if (strncmp(args[0], "blacklist", 9))
++        return;
+ 
+     node = calloc(1, sizeof(*node));
+-    if (!node) return;
++    if (!node)
++        return;
+ 
+     node->name = strdup(args[1]);
+     if (!node->name) {
+@@ -264,15 +292,15 @@ static void parse_line_module_alias(struct parse_state *state, int nargs, char *
+ {
+     struct module_alias_node *node;
+ 
++    /* empty line or not enough arguments */
+     if (!args ||
+         (nargs != 3) ||
+-        !args[0] || !args[1] || !args[2]) {
+-        /* empty line or not enough arguments */
++            !args[0] || !args[1] || !args[2])
+         return;
+-    }
+ 
+     node = calloc(1, sizeof(*node));
+-    if (!node) return;
++    if (!node)
++        return;
+ 
+     node->name = strdup(args[2]);
+     if (!node->name) {
+@@ -303,24 +331,20 @@ int module_parser(const char *file_name, int mode, struct listnode *head)
+ 
+     if (mode == READ_MODULES_ALIAS) {
+         /* read modules.alias */
+-        if (asprintf(&fn, "%s", file_name) <= 0) {
++        if (asprintf(&fn, "%s", file_name) <= 0)
+             goto out;
+-        }
++
+     } else if (mode == READ_MODULES_BLKLST) {
+         /* read modules.blacklist */
+-        if (asprintf(&fn, "%s", file_name) <= 0) {
++        if (asprintf(&fn, "%s", file_name) <= 0)
+             goto out;
+-        }
+-    } else {
+-        /* unknown mode */
++    } else /* unknown mode */
+         return ret;
+-    }
+ 
+     /* read the whole file */
+     data = load_file(fn, 0);
+-    if (!data) {
++    if (!data)
+         goto out;
+-    }
+ 
+     /* invoke tokenizer */
+     nargs = 0;
+diff --git a/libcutils/probe_module.c b/libcutils/probe_module.c
+index 874e2fc..9fe886a 100644
+--- a/libcutils/probe_module.c
++++ b/libcutils/probe_module.c
+@@ -447,15 +447,27 @@ int insmod_by_dep(const char *module_name,
+ {
+     void *dep_file = NULL;
+     char **dep = NULL;
++    char *mod_name = NULL;
+     int ret = MOD_UNKNOWN;
+     list_declare(base_blacklist);
+     list_declare(extra_blacklist);
++    list_declare(alias_list);
+ 
+     if (!module_name || *module_name == '\0') {
+         ALOGE("need valid module name\n");
++
+         return MOD_INVALID_NAME;
+     }
+ 
++    ret = parse_alias_to_list("/system/lib/modules/modules.alias", &alias_list);
++
++    if (ret) {
++        ALOGE("%s: parse alias error %d\n", __FUNCTION__, ret);
++        ret = MOD_BAD_ALIAS;
++
++        goto free_file;
++    }
++
+     /* We allow no base blacklist. */
+     /* TODO: tell different cases between no caller black list and parsing failures. */
+     ret = parse_blacklist_to_list("/system/etc/modules.blacklist", &base_blacklist);
+@@ -484,6 +496,10 @@ int insmod_by_dep(const char *module_name,
+         goto free_file;
+     }
+ 
++    /* check if module name is an alias. */
++    if (!get_module_name_from_alias(module_name, &mod_name, &alias_list))
++        module_name = mod_name;
++
+     dep = look_up_dep(module_name, dep_file);
+ 
+     if (!dep) {
+@@ -510,8 +526,10 @@ int insmod_by_dep(const char *module_name,
+     ret = insmod_s(dep, args, strip, base);
+ 
+ free_file:
++    free(mod_name);
+     free(dep);
+     free(dep_file);
++    free_alias_list(&alias_list);
+     free_black_list(&base_blacklist);
+     free_black_list(&extra_blacklist);
+ 
+-- 
+1.7.4.1
+

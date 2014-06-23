@@ -1,0 +1,245 @@
+From 9060b398d65ada41d35dcd6de8fa58077202cde7 Mon Sep 17 00:00:00 2001
+From: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Date: Fri, 25 Jan 2013 14:52:39 -0800
+Subject: Dalvik: Fixing SSA Formation
+
+BZ: 81173
+
+The current implementation of SSA does not take into account complex CFG traces.
+Therefore the numbering scheme gets badly passed down the CFG.
+This patch fixes the issue and correctly handles the SSA numbering.
+
+CompilerIR.h:
+  - Added an array to keep track of subscripts per VR
+
+Dataflow.cpp:
+  - Made dvmCompilerDoSSAConversion a recursive function
+  - Added a per VR subscript handling for each new definition
+  - Handling the new ssaSubScripts field
+
+SSATransformation.cpp, Dataflow.cpp:
+  - Fixed the call sites for dvmCompilerDoSSAConversion to handle the new
+    coloring scheme
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Iedd208157d6fdd22882a61060d629b87adde7867
+Orig-MCG-Change-Id: I686ddc7aa60ea45e205a3e4e472e61390892b2a2
+Signed-off-by: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/CompilerIR.h          |    1 +
+ vm/compiler/Dataflow.cpp          |   84 ++++++++++++++++++++++++++++++++-----
+ vm/compiler/SSATransformation.cpp |   18 +++++---
+ 3 files changed, 86 insertions(+), 17 deletions(-)
+
+diff --git a/vm/compiler/CompilerIR.h b/vm/compiler/CompilerIR.h
+index e6c034d..89d2c4a 100644
+--- a/vm/compiler/CompilerIR.h
++++ b/vm/compiler/CompilerIR.h
+@@ -278,6 +278,7 @@ typedef struct CompilationUnit {
+     /* The following are new data structures to support SSA representations */
+     /* Map original Dalvik reg i to the SSA[15..0]/Sub[31..16] pair */
+     int *dalvikToSSAMap;                // length == method->registersSize
++    int *ssaSubScripts;                 // Subscript definition counters for each Dalvik Register
+     BitVector *isConstantV;             // length == numSSAReg
+     int *constantValues;                // length == numSSAReg
+ 
+diff --git a/vm/compiler/Dataflow.cpp b/vm/compiler/Dataflow.cpp
+index d42b8b5..234799e 100644
+--- a/vm/compiler/Dataflow.cpp
++++ b/vm/compiler/Dataflow.cpp
+@@ -1361,14 +1361,30 @@ static void handleSSAUse(CompilationUnit *cUnit, int *uses, int dalvikReg,
+     uses[regIndex] = ssaReg;
+ }
+ 
++/**
++ * @brief Get the next subscript available for a given register
++ * @param cUnit the CompilationUnit
++ * @param dalvikReg the register we want a new subscript for
++ * @return the new subscript for the given register
++ */
++static int getNextSubScript (CompilationUnit *cUnit, int dalvikReg)
++{
++    //Paranoid
++    assert (cUnit != 0 && cUnit->ssaSubScripts != 0 && dalvikReg < cUnit->numDalvikRegisters);
++
++    //Increment counter, then return it
++    cUnit->ssaSubScripts[dalvikReg]++;
++    return cUnit->ssaSubScripts[dalvikReg];
++}
++
+ /* Setup a new SSA register for a given Dalvik register */
+ static void handleSSADef(CompilationUnit *cUnit, int *defs, int dalvikReg,
+                          int regIndex)
+ {
+-    int encodedValue = cUnit->dalvikToSSAMap[dalvikReg];
+     int ssaReg = cUnit->numSSARegs++;
++
+     /* Bump up the subscript */
+-    int dalvikSub = DECODE_SUB(encodedValue) + 1;
++    int dalvikSub = getNextSubScript (cUnit, dalvikReg);
+     int newD2SMapping = ENCODE_REG_SUB(ssaReg, dalvikSub);
+ 
+     cUnit->dalvikToSSAMap[dalvikReg] = newD2SMapping;
+@@ -1424,6 +1440,23 @@ bool dvmCompilerDoSSAConversion(CompilationUnit *cUnit, BasicBlock *bb)
+ 
+     if (bb->dataFlowInfo == NULL) return false;
+ 
++    //Check if visited
++    if (bb->visited == true)
++    {
++        return false;
++    }
++    bb->visited = true;
++
++    //Next remember SSA state at entrance
++    if (bb->dataFlowInfo->dalvikToSSAMap == 0)
++    {
++        bb->dataFlowInfo->dalvikToSSAMap = static_cast<int *> (dvmCompilerNew (sizeof (* (bb->dataFlowInfo->dalvikToSSAMap)) * cUnit->method->registersSize, false));
++    }
++
++    //Remember the state we were at when starting the BasicBlock
++    memcpy(bb->dataFlowInfo->dalvikToSSAMap, cUnit->dalvikToSSAMap,
++           sizeof (* (bb->dataFlowInfo->dalvikToSSAMap)) * cUnit->method->registersSize);
++
+     for (mir = bb->firstMIRInsn; mir; mir = mir->next) {
+         //If not yet generated
+         if (mir->ssaRep == NULL)
+@@ -1527,18 +1560,25 @@ bool dvmCompilerDoSSAConversion(CompilationUnit *cUnit, BasicBlock *bb)
+         }
+     }
+ 
+-    /*
+-     * Take a snapshot of Dalvik->SSA mapping at the end of each block. The
+-     * input to PHI nodes can be derived from the snapshot of all predecessor
+-     * blocks.
+-     */
+-    if (bb->dataFlowInfo->dalvikToSSAMap == 0)
++    //Now call for the children
++    if (bb->taken != 0)
+     {
+-        bb->dataFlowInfo->dalvikToSSAMap = static_cast<int *> (dvmCompilerNew (sizeof (* (bb->dataFlowInfo->dalvikToSSAMap)) * cUnit->method->registersSize, false));
++        dvmCompilerDoSSAConversion (cUnit, bb->taken);
+     }
+ 
+-    memcpy(bb->dataFlowInfo->dalvikToSSAMap, cUnit->dalvikToSSAMap,
+-           sizeof (* (bb->dataFlowInfo->dalvikToSSAMap)) * cUnit->method->registersSize);
++    if (bb->fallThrough != 0)
++    {
++        dvmCompilerDoSSAConversion (cUnit, bb->fallThrough);
++    }
++
++
++    //For a lot of reasons we want to swap now bb->dataFlowInfo->dalvikToSSAMap and the cUnit->dalvikToSSAMap:
++    //  1) We want to pop back to the state we were in when we started the BasicBlock (thus bb -> cUnit)
++    //  2) We want the BB's children to be able to know what was the last state when doing this BasicBlock (thus cUnit -> bb)
++    int *tmp = cUnit->dalvikToSSAMap;
++    cUnit->dalvikToSSAMap = bb->dataFlowInfo->dalvikToSSAMap;
++    bb->dataFlowInfo->dalvikToSSAMap = tmp;
++
+     return true;
+ }
+ 
+@@ -1798,6 +1838,7 @@ void dvmInitializeSSAConversion(CompilationUnit *cUnit)
+         cUnit->ssaToDalvikMap = 0;
+         cUnit->dalvikToSSAMap = 0;
+         cUnit->defBlockMatrix = 0;
++        cUnit->ssaSubScripts = 0;
+ 
+         //For tempDalvikRegisterV, we don't have to set it to 0, we can just expand it
+         if (cUnit->tempDalvikRegisterV != 0)
+@@ -1836,6 +1877,23 @@ void dvmInitializeSSAConversion(CompilationUnit *cUnit)
+         cUnit->dalvikToSSAMap = static_cast<int *> (dvmCompilerNew (sizeof (* (cUnit->dalvikToSSAMap)) * numDalvikReg, false));
+     }
+ 
++    /**
++     * Initialize the SSA subscript array. This provides a means to get a unique subscript
++     * for each register and start them all at 0. A unique counter is also possible but it
++     * makes debugging difficult to read on large traces
++     */
++    if (cUnit->ssaSubScripts == 0)
++    {
++        cUnit->ssaSubScripts = static_cast<int *> (dvmCompilerNew (sizeof (* (cUnit->ssaSubScripts)) * numDalvikReg, true));
++    }
++    else
++    {
++        //Otherwise set it back to 0
++        for (i = 0; i < numDalvikReg; i++) {
++            cUnit->ssaSubScripts[i] = 0;
++        }
++    }
++
+     /*
+      * Initial number of SSA registers is equal to the number of Dalvik
+      * registers.
+@@ -2027,6 +2085,10 @@ void dvmCompilerDataFlowAnalysisDispatcher(CompilationUnit *cUnit,
+ /* Main entry point to do SSA conversion for non-loop traces */
+ void dvmCompilerNonLoopAnalysis(CompilationUnit *cUnit)
+ {
++    //Clear the nodes
++    dvmCompilerDataFlowAnalysisDispatcher (cUnit,
++            dvmCompilerClearVisitedFlag, kAllNodes, false);
++
+     dvmCompilerDataFlowAnalysisDispatcher(cUnit, dvmCompilerDoSSAConversion,
+                                           kAllNodes,
+                                           false /* isIterative */);
+diff --git a/vm/compiler/SSATransformation.cpp b/vm/compiler/SSATransformation.cpp
+index ca0f823..a1b270b 100644
+--- a/vm/compiler/SSATransformation.cpp
++++ b/vm/compiler/SSATransformation.cpp
+@@ -481,6 +481,7 @@ static void insertPhiNodes(CompilationUnit *cUnit)
+         /* Calculate the phi blocks for each Dalvik register */
+         do {
+             change = false;
++
+             dvmClearAllBits(tmpBlocks);
+             dvmBitVectorIteratorInit(inputBlocks, &iterator);
+ 
+@@ -493,6 +494,7 @@ static void insertPhiNodes(CompilationUnit *cUnit)
+                 /* Merge the dominance frontier to tmpBlocks */
+                 dvmUnifyBitVectors(tmpBlocks, tmpBlocks, defBB->domFrontier);
+             }
++
+             if (dvmCompareBitVectors(phiBlocks, tmpBlocks)) {
+                 change = true;
+                 dvmCopyBitVector(phiBlocks, tmpBlocks);
+@@ -605,10 +607,12 @@ void dvmCompilerMethodSSATransformation(CompilationUnit *cUnit)
+     /* Insert phi nodes to dominance frontiers for all variables */
+     insertPhiNodes(cUnit);
+ 
++    //Clear the nodes
++    dvmCompilerDataFlowAnalysisDispatcher (cUnit,
++            dvmCompilerClearVisitedFlag, kAllNodes, false);
++
+     /* Rename register names by local defs and phi nodes */
+-    dvmCompilerDataFlowAnalysisDispatcher(cUnit, dvmCompilerDoSSAConversion,
+-                                          kPreOrderDFSTraversal,
+-                                          false /* isIterative */);
++    dvmCompilerDoSSAConversion (cUnit, cUnit->entryBlock);
+ 
+     /*
+      * Shared temp bit vector used by each block to count the number of defs
+@@ -660,10 +664,12 @@ bool dvmCompilerBuildLoop(CompilationUnit *cUnit, bool filter)
+     /* Insert phi nodes to dominance frontiers for all variables */
+     insertPhiNodes(cUnit);
+ 
++    //Clear the nodes
++    dvmCompilerDataFlowAnalysisDispatcher (cUnit,
++            dvmCompilerClearVisitedFlag, kAllNodes, false);
++
+     /* Rename register names by local defs and phi nodes */
+-    dvmCompilerDataFlowAnalysisDispatcher(cUnit, dvmCompilerDoSSAConversion,
+-                                          kAllNodes,
+-                                          false /* isIterative */);
++    dvmCompilerDoSSAConversion (cUnit, cUnit->entryBlock);
+ 
+     /*
+      * Shared temp bit vector used by each block to count the number of defs
+-- 
+1.7.4.1
+

@@ -1,0 +1,227 @@
+From 66b898b61baa9a2a6f417028e242cbfc62122a8d Mon Sep 17 00:00:00 2001
+From: Serguei Katkov <serguei.i.katkov@intel.com>
+Date: Mon, 10 Jun 2013 12:19:33 +0700
+Subject: Dalvik: Building def-use chains does not set uses in handleNoDefinitions pass
+
+BZ: 115069
+
+handleNoDefinitions pass updates the mir with information where use
+was defined. But it misses the update of def where the use is.
+Specifically we miss the defs used in Phi nodes.
+With this patch the mir will have a use corresponding to Phi node.
+
+The patch also fixes Invariant Removal optimization which
+does not expect a Phi op if uses chain.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I3090d10654e4092b85fa9df17b8864b05857ebcd
+Orig-MCG-Change-Id: Ic1185ebea83f4bccafab3f517c8cfc8448f2b16f
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/SSATransformation.cpp |   53 +----------------------------
+ vm/compiler/SSAWalkData.cpp       |   66 +++++++++++++++++++++++++++++++++----
+ vm/compiler/SSAWalkData.h         |   10 +++++-
+ 3 files changed, 70 insertions(+), 59 deletions(-)
+
+diff --git a/vm/compiler/SSATransformation.cpp b/vm/compiler/SSATransformation.cpp
+index 5c28c6e..2054e68 100644
+--- a/vm/compiler/SSATransformation.cpp
++++ b/vm/compiler/SSATransformation.cpp
+@@ -785,67 +785,18 @@ bool dvmCompilerBuildDefUseChain (CompilationUnit *cUnit, BasicBlock *bb)
+                 //Get use value
+                 int value = ssaRep->uses[i];
+ 
+-                //We have a need of a new chain element, do we have one still available?
+-                SUsedChain *elem = data->getUsedChain ();
+-
+-                //Set its mir and bb
+-                elem->mir = insn;
+-
+-                //Get the last use for this element
+-                SUsedChain *last = data->getLastChain (value);
+-
+                 //Set defWhere for this instruction
+                 MIR *defined = data->getDefinition (value);
+ 
+-                ssaRep->defWhere[i] = defined;
+-
+                 //In case there is no define yet, let's remember it to handle it afterwards
+                 if (defined == 0)
+                 {
+                     data->addNoDefine (insn, i);
+                 }
+-
+-                //If we have one
+-                if (last != 0)
++                else
+                 {
+-                    //Link it
+-                    last->nextUse = elem;
+-                    elem->prevUse = last;
++                    data->addUseToDefChain (i, insn, defined);
+                 }
+-
+-                //We might not have a define
+-                if (defined != 0)
+-                {
+-                    //It's the first, tell defined about it
+-                    SSARepresentation *defSSA = defined->ssaRep;
+-
+-                    //Paranoid
+-                    assert (defSSA != 0);
+-
+-                    //Go through the defines and find value
+-                    int max = defSSA->numDefs;
+-                    int j;
+-                    for (j = 0; j < max; j++)
+-                    {
+-                        if (defSSA->defs[j] == value)
+-                        {
+-                            //If not yet set
+-                            if (defSSA->usedNext[j] == 0)
+-                            {
+-                                defSSA->usedNext[j] = elem;
+-                            }
+-
+-                            //We are done here
+-                            break;
+-                        }
+-                    }
+-
+-                    //We should have found it
+-                    assert (j != max);
+-                }
+-
+-                //Last, set it as the new last
+-                data->setLastChain (elem, value);
+             }
+ 
+             //Now handle defs
+diff --git a/vm/compiler/SSAWalkData.cpp b/vm/compiler/SSAWalkData.cpp
+index 0b86417..761ab46 100644
+--- a/vm/compiler/SSAWalkData.cpp
++++ b/vm/compiler/SSAWalkData.cpp
+@@ -86,7 +86,63 @@ MIR *SSAWalkData::getDefinition (int value) const
+     return it->second;
+ }
+ 
+-void SSAWalkData::handleNoDefinitions (void) const
++void SSAWalkData::addUseToDefChain (int useIdx, MIR *used, MIR *defined)
++{
++    SSARepresentation *ssaRep = used->ssaRep;
++
++    //Set defWhere for this instruction
++    ssaRep->defWhere[useIdx] = defined;
++
++    if (defined == 0)
++    {
++        return;
++    }
++
++    //We have a need of a new chain element
++    SUsedChain *elem = getUsedChain ();
++
++    //Set its mir
++    elem->mir = used;
++
++    //Get use value
++    int value = ssaRep->uses[useIdx];
++
++    //Get the last use for this element
++    SUsedChain *last = getLastChain (value);
++
++    //Last, set it as the new last
++    setLastChain (elem, value);
++
++    //If we have one, just chain
++    if (last != 0)
++    {
++        last->nextUse = elem;
++        elem->prevUse = last;
++        return;
++    }
++
++    //It's the first, tell defined about it
++    SSARepresentation *defSSA = defined->ssaRep;
++
++    //Paranoid
++    assert (defSSA != 0);
++
++    //Go through the defines and find value
++    int max = defSSA->numDefs;
++    for (int j = 0; j < max; j++)
++    {
++        if (defSSA->defs[j] == value)
++        {
++             defSSA->usedNext[j] = elem;
++             return;
++        }
++    }
++
++    //We should have found it
++    assert (false);
++}
++
++void SSAWalkData::handleNoDefinitions (void)
+ {
+     //Go through each no definition
+     for (std::vector<SWalkDataNoDefine>::const_iterator it = noDefine.begin ();
+@@ -101,10 +157,7 @@ void SSAWalkData::handleNoDefinitions (void) const
+         SSARepresentation *ssaRep = mir->ssaRep;
+ 
+         //Paranoid
+-        if (ssaRep == 0 || idx >= ssaRep->numUses)
+-        {
+-            continue;
+-        }
++        assert (ssaRep == 0 || idx >= ssaRep->numUses);
+ 
+         //Get use value
+         int value = ssaRep->uses[idx];
+@@ -112,8 +165,7 @@ void SSAWalkData::handleNoDefinitions (void) const
+         //Set defWhere for this instruction
+         MIR *defined = getDefinition (value);
+ 
+-        //Set it now
+-        ssaRep->defWhere[idx] = defined;
++        addUseToDefChain (idx, mir, defined);
+     }
+ }
+ 
+diff --git a/vm/compiler/SSAWalkData.h b/vm/compiler/SSAWalkData.h
+index 0aa548d..de61fa6 100644
+--- a/vm/compiler/SSAWalkData.h
++++ b/vm/compiler/SSAWalkData.h
+@@ -82,7 +82,7 @@ class SSAWalkData
+           /**
+            * @brief Handle the SSA registers without a definition during the parsing
+            */
+-          void handleNoDefinitions (void) const;
++          void handleNoDefinitions (void);
+ 
+           /**
+            * @brief Add a SSA register that does not have a definition during the parsing
+@@ -91,6 +91,14 @@ class SSAWalkData
+            */
+           void addNoDefine (MIR  *mir, int idx);
+ 
++          /**
++           * @brief update Def chain with new use
++           * @param useIdx the uses index
++           * @param used the MIR corresponding to Use
++           * @param defined the MIR corresponding to Def
++           */
++          void addUseToDefChain (int useIdx, MIR *used, MIR *defined);
++
+     protected:
+           /** @brief Association SSA register <-> where it is defined */
+           std::map<int, MIR *> definitions;
+-- 
+1.7.4.1
+

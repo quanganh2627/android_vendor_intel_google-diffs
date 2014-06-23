@@ -1,0 +1,605 @@
+From 9c75e57e6fba389708cb189ca172a6ac4061809a Mon Sep 17 00:00:00 2001
+From: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Date: Fri, 18 Jan 2013 10:41:11 -0800
+Subject: Dalvik: BitVector should be extended to handle more complex operations
+
+BZ: 75677
+
+BitVector should be extended to handle more complex operations
+
+Patch reimplements parts of the BitVector implementation.
+
+BitVector.cpp:
+
+- There is a merge of the allocation code between BitVectors allocated from the
+  compiler world and those from outside
+- dvmSetBit has been extended to not automatically abort when trying to set a
+  bit that would not fit in a non-expandable BitVector
+- dvmClearBit and dvmIsBitSet are made safe, they used to be protected only with
+  an assert and would thus overflow
+- dvmIntersectBitVectors and dvmUnifyBitVectors were entirely rewritten to allow
+  different sized vectors to be handled
+- Added a dumpBitVector function to dump a BitVector
+
+BitVector.h:
+- Added a isFromCompiler flag to differenciate between from the compiler world
+  and outside of it for allocation
+- Added a parameter to dvmAllocBitVector to handle the compiler allocation
+- Added a parameter to dvmSetBit to abortOnFail or not
+- Added the prototype of dumpBitVector
+
+Utility.cpp:
+- Made the compiler versions of allocation and set bit into only wrappers to the
+  common bitvector code
+  - We could remove them but it would require a lot of function call changes
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I18a15d8afbc1d0fe4b33ac76ede90794fb99acef
+Orig-MCG-Change-Id: I6dbd6a0c30223661a5228d4a57339a1cc3baccdf
+Signed-off-by: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/BitVector.cpp        |  334 ++++++++++++++++++++++++++++++++++++++++++-----
+ vm/BitVector.h          |   17 ++-
+ vm/compiler/Utility.cpp |   43 +-----
+ 3 files changed, 322 insertions(+), 72 deletions(-)
+
+diff --git a/vm/BitVector.cpp b/vm/BitVector.cpp
+index 8b1d141..13ef1b7 100644
+--- a/vm/BitVector.cpp
++++ b/vm/BitVector.cpp
+@@ -19,30 +19,79 @@
+  */
+ #include "Dalvik.h"
+ 
++#ifdef WITH_JIT
++#include "compiler/CompilerUtility.h"
++#endif
++
+ #include <stdlib.h>
+ #include <strings.h>
++#include <sstream>
+ 
+ #define kBitVectorGrowth    4   /* increase by 4 u4s when limit hit */
+ 
++/**
++ * Reallocation of the BitVector storage depending on whether for the compiler or not
++ */
++static void reallocateStorage (BitVector *bv, size_t newSize)
++{
++    if (bv->isFromCompiler == true)
++    {
++        //The compiler version just allocates a new size, the arena will handle it
++        //False because we are doing like the realloc version
++#ifdef WITH_JIT
++        void *newPtr = dvmCompilerNew (newSize, false);
++        //Copy now
++        memcpy (newPtr, bv->storage, bv->storageSize * sizeof (* (bv->storage)));
++        //Assign it now in the BitVector
++        bv->storage = static_cast<u4*> (newPtr);
++#else
++        assert ("Trying to resize a compiler BitVector without the Jit" == 0);
++        //If not in assert mode, at least allocate it really
++        bv->isFromCompiler = false;
++        reallocateStorage (bv, newSize);
++#endif
++    }
++    else
++    {
++        bv->storage = static_cast<u4 *> (realloc (bv->storage, newSize));
++        assert (bv->storage != 0);
++    }
++}
+ 
+ /*
+  * Allocate a bit vector with enough space to hold at least the specified
+  * number of bits.
+  */
+-BitVector* dvmAllocBitVector(unsigned int startBits, bool expandable)
++BitVector* dvmAllocBitVector(unsigned int startBits, bool expandable, bool fromCompiler)
+ {
+     BitVector* bv;
+-    unsigned int count;
++    unsigned int count = (startBits + 31) >> 5;
+ 
+     assert(sizeof(bv->storage[0]) == 4);        /* assuming 32-bit units */
+ 
+-    bv = (BitVector*) malloc(sizeof(BitVector));
+-
+-    count = (startBits + 31) >> 5;
++    //Decide on the allocation scheme
++    if (fromCompiler == true)
++    {
++#ifdef WITH_JIT
++        bv = static_cast<BitVector*> (dvmCompilerNew (sizeof (*bv), false));
++        bv->isFromCompiler = true;
++        //True for this call to be like calloc below
++        bv->storage = static_cast<u4*> (dvmCompilerNew (count * sizeof( * (bv->storage)), true));
++#else
++        assert ("Trying to allocate a compiler BitVector without the Jit" == 0);
++        //If not in assert mode, at least allocate it really
++        return dvmAllocBitVector (startBits, expandable, false);
++#endif
++    }
++    else
++    {
++        bv = (BitVector*) malloc(sizeof(BitVector));
++        bv->isFromCompiler = false;
++        bv->storage = (u4*) calloc(count, sizeof(u4));
++    }
+ 
+     bv->storageSize = count;
+     bv->expandable = expandable;
+-    bv->storage = (u4*) calloc(count, sizeof(u4));
+     return bv;
+ }
+ 
+@@ -54,8 +103,12 @@ void dvmFreeBitVector(BitVector* pBits)
+     if (pBits == NULL)
+         return;
+ 
+-    free(pBits->storage);
+-    free(pBits);
++    //If not from the compiler, we do have things to free up
++    if (pBits->isFromCompiler == false)
++    {
++        free(pBits->storage);
++        free(pBits);
++    }
+ }
+ 
+ /*
+@@ -88,8 +141,7 @@ retry:
+     if (!pBits->expandable)
+         return -1;
+ 
+-    pBits->storage = (u4*)realloc(pBits->storage,
+-                    (pBits->storageSize + kBitVectorGrowth) * sizeof(u4));
++    reallocateStorage (pBits, (pBits->storageSize + kBitVectorGrowth) * sizeof(u4));
+     memset(&pBits->storage[pBits->storageSize], 0x00,
+         kBitVectorGrowth * sizeof(u4));
+     pBits->storageSize += kBitVectorGrowth;
+@@ -99,19 +151,25 @@ retry:
+ /*
+  * Mark the specified bit as "set".
+  */
+-void dvmSetBit(BitVector* pBits, unsigned int num)
++bool dvmSetBit(BitVector* pBits, unsigned int num, bool abortOnFail)
+ {
+     if (num >= pBits->storageSize * sizeof(u4) * 8) {
+-        if (!pBits->expandable) {
++        if (pBits->expandable == false) {
+             ALOGE("Attempt to set bit outside valid range (%d, limit is %d)",
+                 num, pBits->storageSize * sizeof(u4) * 8);
+-            dvmAbort();
++
++            //Do we want to abort (keeps common code transparent to the change)
++            if (abortOnFail == true)
++            {
++                dvmAbort ();
++            }
++            return false;
+         }
+ 
+         /* Round up to word boundaries for "num+1" bits */
+         unsigned int newSize = (num + 1 + 31) >> 5;
+         assert(newSize > pBits->storageSize);
+-        pBits->storage = (u4*)realloc(pBits->storage, newSize * sizeof(u4));
++        reallocateStorage (pBits, newSize * sizeof(u4));
+         if (pBits->storage == NULL) {
+             ALOGE("BitVector expansion to %d failed", newSize * sizeof(u4));
+             dvmAbort();
+@@ -122,6 +180,9 @@ void dvmSetBit(BitVector* pBits, unsigned int num)
+     }
+ 
+     pBits->storage[num >> 5] |= 1 << (num & 0x1f);
++
++    //Success, we set the bit
++    return true;
+ }
+ 
+ /*
+@@ -129,8 +190,14 @@ void dvmSetBit(BitVector* pBits, unsigned int num)
+  */
+ void dvmClearBit(BitVector* pBits, unsigned int num)
+ {
+-    assert(num < pBits->storageSize * sizeof(u4) * 8);
++    //If the index is over the size
++    if (num >= pBits->storageSize * sizeof(u4) * 8)
++    {
++        //If a set has not been done yet, we don't have to do anything, it is cleared
++        return;
++    }
+ 
++    //Otherwise we have a bit more work to do
+     pBits->storage[num >> 5] &= ~(1 << (num & 0x1f));
+ }
+ 
+@@ -166,7 +233,12 @@ void dvmSetInitialBits(BitVector* pBits, unsigned int numBits)
+  */
+ bool dvmIsBitSet(const BitVector* pBits, unsigned int num)
+ {
+-    assert(num < pBits->storageSize * sizeof(u4) * 8);
++    //If the index is over the size
++    if (num >= pBits->storageSize * sizeof(u4) * 8)
++    {
++        //Whether it is expandable or not, this bit does not exist: thus it is not set
++        return false;
++    }
+ 
+     unsigned int val = pBits->storage[num >> 5] & (1 << (num & 0x1f));
+     return (val != 0);
+@@ -229,35 +301,203 @@ void dvmCopyBitVector(BitVector *dest, const BitVector *src)
+ bool dvmIntersectBitVectors(BitVector *dest, const BitVector *src1,
+                             const BitVector *src2)
+ {
+-    if (dest->storageSize != src1->storageSize ||
+-        dest->storageSize != src2->storageSize ||
+-        dest->expandable != src1->expandable ||
+-        dest->expandable != src2->expandable)
+-        return false;
++    int destSize = dest->storageSize;
++    int src1Size = src1->storageSize;
++    int src2Size = src2->storageSize;
++
++    //Are the sizes different?
++    if (destSize != src1Size || destSize != src2Size)
++    {
++        //Get the minimum between both, the excess automatically is 0 for an intersection
++        int minSize = (src1Size < src2Size) ? src1Size : src2Size;
++
++        //Calculate the highest possible bit position
++        unsigned int nbrBitsPerBlock = sizeof ( * (dest->storage)) * 8;
++        int highestBit = minSize * nbrBitsPerBlock - 1;
++
++        //Find out if the bit is set at the highest bit: if it is, we know dest is big enough
++        bool isSet = dvmIsBitSet (dest, highestBit);
++
++        //Is the bit set? If not, we have to check dest for size
++        if (isSet == false)
++        {
++            //Set it and capture the answer: can dest hold the highest bit
++            bool res = dvmSetBit (dest, highestBit, false);
++
++            //Clear is safe even if highestBit is too big
++            dvmClearBit (dest, highestBit);
++
++            //If dvmSetBit returned false, then we cannot do anything here
++            // - It means that dest is non expandable and src1/src2 are too big
++            if (res == false)
++            {
++                return false;
++            }
++        }
+ 
+-    unsigned int idx;
+-    for (idx = 0; idx < dest->storageSize; idx++) {
+-        dest->storage[idx] = src1->storage[idx] & src2->storage[idx];
++        //Paranoid: dest storage size should be at least highest now
++        assert (dest->storageSize >= static_cast<unsigned int> (destSize));
++
++        //Intersect until num
++        //Note: we know here that num is smaller or equal than either src1 and src2's sizes
++        int idx;
++        for (idx = 0; idx < minSize; idx++)
++        {
++            dest->storage[idx] = src1->storage[idx] & src2->storage[idx];
++        }
++
++        //Now highest is going to be dest->storageSize, and we are going to reset the rest
++        int max = dest->storageSize;
++        for (; idx < max; idx++) {
++            dest->storage[idx] = 0;
++        }
++    }
++    else
++    {
++        unsigned int idx;
++        for (idx = 0; idx < dest->storageSize; idx++) {
++            dest->storage[idx] = src1->storage[idx] & src2->storage[idx];
++        }
+     }
+     return true;
+ }
+ 
++/**
++ * Calculate the highest bit set index
++ */
++int dvmHighestBitSet (const BitVector *bv)
++{
++    unsigned int max = bv->storageSize;
++    for (int idx = max - 1; idx >= 0; idx--)
++    {
++        //If not 0, we have more work
++        u4 value = bv->storage[idx];
++
++        if (value != 0)
++        {
++            //Shift right for the counting
++            value /= 2;
++
++            int cnt = 0;
++
++            //Count the bits
++            while (value > 0)
++            {
++                value /= 2;
++                cnt++;
++            }
++
++            //Return cnt + how many storage units still remain * the number of bits per unit
++            int res = cnt + (idx * (sizeof (* (bv->storage)) * 8));
++            return res;
++        }
++    }
++
++    //All zero
++    return -1;
++}
++
+ /*
+  * Unify two bit vectors and store the result to the dest vector.
+  */
+ bool dvmUnifyBitVectors(BitVector *dest, const BitVector *src1,
+                         const BitVector *src2)
+ {
+-    if (dest->storageSize != src1->storageSize ||
+-        dest->storageSize != src2->storageSize ||
+-        dest->expandable != src1->expandable ||
+-        dest->expandable != src2->expandable)
+-        return false;
++    int destSize = dest->storageSize;
++    int src1Size = src1->storageSize;
++    int src2Size = src2->storageSize;
++
++    //Are the sizes different?
++    if (destSize != src1Size || destSize != src2Size)
++    {
++        //Ok, first question is what size do we really need for dest ?
++        int src1Size = dvmHighestBitSet (src1);
++        int src2Size = dvmHighestBitSet (src2);
++
++        //Get the maximum value for a union
++        int highestBit = (src1Size > src2Size) ? src1Size : src2Size;
++
++        //If nothing, we can clear and return
++        if (highestBit == -1)
++        {
++            dvmClearAllBits (dest);
++            return true;
++        }
+ 
+-    unsigned int idx;
+-    for (idx = 0; idx < dest->storageSize; idx++) {
+-        dest->storage[idx] = src1->storage[idx] | src2->storage[idx];
++        //Find out if the bit is set at the highest bit: if it is, we know dest is big enough
++        bool isSet = dvmIsBitSet (dest, highestBit);
++
++        //Is the bit set? If not, we have to check dest for size
++        if (isSet == false)
++        {
++            //Set it and capture the answer (this is to see if the size is ok, it will reallocate if possible):
++            bool res = dvmSetBit (dest, highestBit, false);
++
++            //Clear it back because dest might be src1 or src2
++            //Clear is safe even if highestBit is too big
++            dvmClearBit (dest, highestBit);
++
++            //If dvmSetBit returned false, then we cannot do anything here
++            // - It means that dest is non expandable and src1/src2 are too big
++            if (res == false)
++            {
++                return false;
++            }
++        }
++
++        //Paranoid: dest storage size should be at least highest now
++        assert (dest->storageSize >=
++                ( (highestBit + (sizeof (* (dest->storage)) * 8 - 1)) / (sizeof (* (dest->storage)) * 8))
++               );
++
++        //Now do the union
++        unsigned int idx = 0;
++
++        //First step, copy the minimum accepted size
++        unsigned int max = src1->storageSize;
++
++        if (src1->storageSize > src2->storageSize)
++        {
++            max = src2->storageSize;
++        }
++
++        //Copy until max, we know both accept it
++        while (idx < max)
++        {
++            dest->storage[idx] = src1->storage[idx] | src2->storage[idx];
++            idx++;
++        }
++
++        //Now it depends on the sizes, we can just do both sibling loops
++        max = src1->storageSize;
++        while (idx < max)
++        {
++            dest->storage[idx] = src1->storage[idx];
++            idx++;
++        }
++        max = src2->storageSize;
++        while (idx < max)
++        {
++            dest->storage[idx] = src2->storage[idx];
++            idx++;
++        }
++
++        //Finally reset anything remaining in dest
++        max = dest->storageSize;
++        while (idx < max)
++        {
++            dest->storage[idx] = 0;
++            idx++;
++        }
++    }
++    else
++    {
++        unsigned int idx;
++        for (idx = 0; idx < dest->storageSize; idx++) {
++            dest->storage[idx] = src1->storage[idx] | src2->storage[idx];
++        }
+     }
++
+     return true;
+ }
+ 
+@@ -330,3 +570,33 @@ bool dvmCheckMergeBitVectors(BitVector* dst, const BitVector* src)
+ 
+     return changed;
+ }
++
++void dvmDumpBitVector (const char *prefix, const BitVector *bitVector, bool printIndices)
++{
++    if (prefix != 0)
++        ALOGW ("%s", prefix);
++
++    int max = dvmHighestBitSet (bitVector);
++
++    std::string buffer = "";
++
++    for (int i = max - 1; i >= 0; i--)
++    {
++        bool res = dvmIsBitSet (bitVector, i);
++
++        if (printIndices == true && res == true)
++        {
++            std::ostringstream oss;
++            oss << i << " ";
++            buffer += oss.str ();
++        }
++        else
++        {
++            char c = res + '0';
++            buffer += c;
++        }
++    }
++
++    ALOGW ("Contents of BitVector %p: %s", bitVector, buffer.c_str ());
++}
++
+diff --git a/vm/BitVector.h b/vm/BitVector.h
+index 2ac0ddf..d36e9da 100644
+--- a/vm/BitVector.h
++++ b/vm/BitVector.h
+@@ -28,6 +28,7 @@
+  */
+ struct BitVector {
+     bool    expandable;     /* expand bitmap if we run out? */
++    bool    isFromCompiler; /* is the allocation from the compiler world? */
+     u4      storageSize;    /* current size, in 32-bit words */
+     u4*     storage;
+ };
+@@ -39,8 +40,11 @@ struct BitVectorIterator {
+     u4 bitSize;
+ };
+ 
+-/* allocate a bit vector with enough space to hold "startBits" bits */
+-BitVector* dvmAllocBitVector(unsigned int startBits, bool expandable);
++/**
++ * Allocate a BitVector
++ */
++BitVector* dvmAllocBitVector(unsigned int startBits, bool expandable, bool fromCompiler = false);
++
+ void dvmFreeBitVector(BitVector* pBits);
+ 
+ /*
+@@ -57,7 +61,7 @@ void dvmFreeBitVector(BitVector* pBits);
+  * dvmIsBitSet returns "true" if the bit is set.
+  */
+ int dvmAllocBit(BitVector* pBits);
+-void dvmSetBit(BitVector* pBits, unsigned int num);
++bool dvmSetBit(BitVector* pBits, unsigned int num, bool abortOnFail = true);
+ void dvmClearBit(BitVector* pBits, unsigned int num);
+ void dvmClearAllBits(BitVector* pBits);
+ void dvmSetInitialBits(BitVector* pBits, unsigned int numBits);
+@@ -100,4 +104,11 @@ void dvmBitVectorIteratorInit(BitVector* pBits, BitVectorIterator* iterator);
+ /* Return the next position set to 1. -1 means end-of-vector reached */
+ int dvmBitVectorIteratorNext(BitVectorIterator* iterator);
+ 
++/* Return the highest set position, -1 means no bit is set */
++int dvmHighestBitSet (const BitVector *bv);
++
++/**
++ * Dump out a BitVector
++ */
++void dvmDumpBitVector (const char *prefix, const BitVector *bitVector, bool printIndices = false);
+ #endif  // DALVIK_BITVECTOR_H_
+diff --git a/vm/compiler/Utility.cpp b/vm/compiler/Utility.cpp
+index 3ab75ea..70260d9 100644
+--- a/vm/compiler/Utility.cpp
++++ b/vm/compiler/Utility.cpp
+@@ -374,54 +374,23 @@ void dvmCompilerDumpStats(void)
+  * Allocate a bit vector with enough space to hold at least the specified
+  * number of bits.
+  *
+- * NOTE: this is the sister implementation of dvmAllocBitVector. In this version
+- * memory is allocated from the compiler arena.
++ * NOTE: this function is now obsolete but instead of changing a lot of common
++ * code, it seems simpler for the moment to wrap around it
+  */
+ BitVector* dvmCompilerAllocBitVector(unsigned int startBits, bool expandable)
+ {
+-    BitVector* bv;
+-    unsigned int count;
+-
+-    assert(sizeof(bv->storage[0]) == 4);        /* assuming 32-bit units */
+-
+-    bv = (BitVector*) dvmCompilerNew(sizeof(BitVector), false);
+-
+-    count = (startBits + 31) >> 5;
+-
+-    bv->storageSize = count;
+-    bv->expandable = expandable;
+-    bv->storage = (u4*) dvmCompilerNew(count * sizeof(u4), true);
+-    return bv;
++    return dvmAllocBitVector (startBits, expandable, true);
+ }
+ 
+ /*
+  * Mark the specified bit as "set".
+  *
+- * Returns "false" if the bit is outside the range of the vector and we're
+- * not allowed to expand.
+- *
+- * NOTE: this is the sister implementation of dvmSetBit. In this version
+- * memory is allocated from the compiler arena.
++ * NOTE: this function is now obsolete but instead of changing a lot of common
++ * code, it seems simpler to wrap around it for now
+  */
+ bool dvmCompilerSetBit(BitVector *pBits, unsigned int num)
+ {
+-    if (num >= pBits->storageSize * sizeof(u4) * 8) {
+-        if (!pBits->expandable)
+-            dvmAbort();
+-
+-        /* Round up to word boundaries for "num+1" bits */
+-        unsigned int newSize = (num + 1 + 31) >> 5;
+-        assert(newSize > pBits->storageSize);
+-        u4 *newStorage = (u4*)dvmCompilerNew(newSize * sizeof(u4), false);
+-        memcpy(newStorage, pBits->storage, pBits->storageSize * sizeof(u4));
+-        memset(&newStorage[pBits->storageSize], 0,
+-               (newSize - pBits->storageSize) * sizeof(u4));
+-        pBits->storage = newStorage;
+-        pBits->storageSize = newSize;
+-    }
+-
+-    pBits->storage[num >> 5] |= 1 << (num & 0x1f);
+-    return true;
++    return dvmSetBit (pBits, num);
+ }
+ 
+ /*
+-- 
+1.7.4.1
+

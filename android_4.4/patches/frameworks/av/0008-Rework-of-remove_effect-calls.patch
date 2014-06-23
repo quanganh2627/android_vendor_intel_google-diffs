@@ -1,0 +1,140 @@
+From 081094c2fde39573b00186c5b5e56bcb9290da43 Mon Sep 17 00:00:00 2001
+From: Andrei V. FOMITCHEV <andreix.fomitchev@intel.com>
+Date: Fri, 19 Oct 2012 18:17:10 +0200
+Subject: Rework of remove_effect calls
+
+BZ: 61296
+[CLEAN]
+
+There is a SEGFAULT crash issue caused by a desynchronization of threads:
+a thread indirectly frees memory of an "input stream" object then another
+thread continues to use "intput stream" object. Because these threads do
+not share Mutex::Autolock object, the solution to issue is rework of "input
+stream" usage. I.e. currently, a thread calls a first time a function of
+"input stream" and later, the same threads recalls a second time the same
+function of "input stream". This second call is useless and can be avoided.
+
+So the purpose of this patch is
+ - addition of a boolean attribute to "thread" which indicates if
+"input stream" function has been called or not
+ - pooling of calls to "input stream" function following boolean
+
+Category: aosp improvement
+Domain: AUDIO_MEDIA-Audio Effects
+Origin: internal
+Upstream-Candidate: yes
+Change-Id: Ia5abbaa5241cf521a857e257b64062b0d81c4e84
+Orig-Change-Id: I5b6ea27ff5e44f6036ba7a1bfaa0d5abda1553b9
+Signed-off-by: Andrei V. FOMITCHEV <andreix.fomitchev@intel.com>
+---
+ services/audioflinger/Effects.cpp |   28 +++++++++++++++++++---------
+ services/audioflinger/Effects.h   |    4 +++-
+ 2 files changed, 22 insertions(+), 10 deletions(-)
+
+diff --git a/services/audioflinger/Effects.cpp b/services/audioflinger/Effects.cpp
+index a8a5169..c19670b 100644
+--- a/services/audioflinger/Effects.cpp
++++ b/services/audioflinger/Effects.cpp
+@@ -66,7 +66,7 @@ AudioFlinger::EffectModule::EffectModule(ThreadBase *thread,
+       mStatus(NO_INIT), mState(IDLE),
+       // mMaxDisableWaitCnt is set by configure() and not used before then
+       // mDisableWaitCnt is set by process() and updateState() and not used before then
+-      mSuspended(false)
++      mSuspended(false), mStopped(false)
+ {
+     ALOGV("Constructor %p", this);
+     int lStatus;
+@@ -93,9 +93,12 @@ Error:
+ 
+ AudioFlinger::EffectModule::~EffectModule()
+ {
++    Mutex::Autolock _l(mLock);
++
+     ALOGV("Destructor %p", this);
+     if (mEffectInterface != NULL) {
+-        remove_effect_from_hal_l();
++        //stop effect if it has not already stopped
++        stop_effect_l();
+         // release effect engine
+         EffectRelease(mEffectInterface);
+     }
+@@ -459,6 +462,7 @@ status_t AudioFlinger::EffectModule::start_l()
+             audio_stream_t *stream = thread->stream();
+             if (stream != NULL) {
+                 stream->add_audio_effect(stream, mEffectInterface);
++                mStopped = false;
+             }
+         }
+     }
+@@ -479,7 +483,7 @@ status_t AudioFlinger::EffectModule::stop_l()
+     if (mStatus != NO_ERROR) {
+         return mStatus;
+     }
+-    status_t cmdStatus = NO_ERROR;
++    status_t cmdStatus = 0;
+     uint32_t size = sizeof(status_t);
+     status_t status = (*mEffectInterface)->command(mEffectInterface,
+                                                    EFFECT_CMD_DISABLE,
+@@ -490,25 +494,31 @@ status_t AudioFlinger::EffectModule::stop_l()
+     if (status == NO_ERROR) {
+         status = cmdStatus;
+     }
+-    if (status == NO_ERROR) {
+-        status = remove_effect_from_hal_l();
++    if (status == 0) {
++        stop_effect_l();
+     }
+     return status;
+ }
+ 
+-status_t AudioFlinger::EffectModule::remove_effect_from_hal_l()
++status_t AudioFlinger::EffectModule::stop_effect_l()
+ {
+-    if ((mDescriptor.flags & EFFECT_FLAG_TYPE_MASK) == EFFECT_FLAG_TYPE_PRE_PROC ||
+-             (mDescriptor.flags & EFFECT_FLAG_TYPE_MASK) == EFFECT_FLAG_TYPE_POST_PROC) {
++    if (mEffectInterface == NULL) {
++        return NO_INIT;
++    }
++
++    if (mStopped == false &&
++            ((mDescriptor.flags & EFFECT_FLAG_TYPE_MASK) == EFFECT_FLAG_TYPE_PRE_PROC ||
++             (mDescriptor.flags & EFFECT_FLAG_TYPE_MASK) == EFFECT_FLAG_TYPE_POST_PROC)) {
+         sp<ThreadBase> thread = mThread.promote();
+         if (thread != 0) {
+             audio_stream_t *stream = thread->stream();
+             if (stream != NULL) {
+                 stream->remove_audio_effect(stream, mEffectInterface);
++                mStopped = true;
+             }
+         }
+     }
+-    return NO_ERROR;
++    return 0;
+ }
+ 
+ status_t AudioFlinger::EffectModule::command(uint32_t cmdCode,
+diff --git a/services/audioflinger/Effects.h b/services/audioflinger/Effects.h
+index b717857..f5100ff 100644
+--- a/services/audioflinger/Effects.h
++++ b/services/audioflinger/Effects.h
+@@ -134,7 +134,8 @@ protected:
+ 
+     status_t start_l();
+     status_t stop_l();
+-    status_t remove_effect_from_hal_l();
++    status_t stop_effect_l();
++
+ 
+ mutable Mutex               mLock;      // mutex for process, commands and handles list protection
+     wp<ThreadBase>      mThread;    // parent thread
+@@ -153,6 +154,7 @@ mutable Mutex               mLock;      // mutex for process, commands and handl
+     uint32_t mDisableWaitCnt;       // current process() calls count during disable period.
+     bool     mSuspended;            // effect is suspended: temporarily disabled by framework
+     bool     mOffloaded;            // effect is currently offloaded to the audio DSP
++    bool     mStopped;              // effect has been stopped. permamently disabled by framework
+ };
+ 
+ // The EffectHandle class implements the IEffect interface. It provides resources
+-- 
+1.7.4.1
+

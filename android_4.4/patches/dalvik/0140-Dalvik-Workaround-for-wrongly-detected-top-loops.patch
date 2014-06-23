@@ -1,0 +1,283 @@
+From c7b4525340cb9f33fdbb7407c0dc185c252f77e8 Mon Sep 17 00:00:00 2001
+From: Vladimir Kostyukov <vladimir.kostyukov@intel.com>
+Date: Mon, 15 Apr 2013 13:55:36 +0700
+Subject: Dalvik: Workaround for wrongly detected top loops
+
+BZ: 92379
+
+There are wrongly detected top loops at loop analysis phase. This situation should
+never happens - the compiler should skip these loops and report warning message.
+The fix contains additional checks that allow to skip wrong loops. The main idea is the
+compiler should skip loops that has only one child-branch and this branch is dominator
+for previous basic block (loop header in common case).
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I957712d8c0dee8d1c2c3f53fa3442fc20944b355
+Orig-MCG-Change-Id: Ide7b4d67d8d0afe055709d2f352d6911681189d4
+Signed-off-by: Vladimir Kostyukov <vladimir.kostyukov@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/BBOptimization.cpp |  128 ++++++++++++++++++++++++++++++---------
+ 1 files changed, 98 insertions(+), 30 deletions(-)
+
+diff --git a/vm/compiler/BBOptimization.cpp b/vm/compiler/BBOptimization.cpp
+index 27bef4b..280c3e1 100644
+--- a/vm/compiler/BBOptimization.cpp
++++ b/vm/compiler/BBOptimization.cpp
+@@ -237,8 +237,9 @@ static bool handlePreLoopInsertion (CompilationUnit *cUnit, BasicBlock *newBlock
+  * @param cUnit the CompilationUnit
+  * @param info the LoopInformation for the loop
+  * @param backward the current backward branch
++ * @return whether we succeeded
+  */
+-static void insertPreLoopHeader (CompilationUnit *cUnit, LoopInformation *info, BasicBlock *backward)
++static bool insertPreLoopHeader (CompilationUnit *cUnit, LoopInformation *info, BasicBlock *backward)
+ {
+     //Now, we have a little bit of work: we want to create a preheader
+     //Don't define its ID or add it yet, we might not use it
+@@ -259,17 +260,13 @@ static void insertPreLoopHeader (CompilationUnit *cUnit, LoopInformation *info,
+ 
+         //Add to the information
+         info->setPreHeader (preHeader);
+-    }
+-    else
+-    {
+-        //This should never happen
+-        ALOGD ("Warning: Loop does not have a header: %s%s, for %x",
+-                        cUnit->method->clazz->descriptor, cUnit->method->name, backward->startOffset);
+-        cUnit->quitLoopMode = true;
+ 
+-        //In the assert world, we'd prefer this never happens
+-        assert (0);
++        //Report success
++        return true;
+     }
++
++    //Report failure
++    return false;
+ }
+ 
+ /**
+@@ -306,6 +303,26 @@ static void insertLoopExitBlock (CompilationUnit *cUnit, LoopInformation *info,
+     //Finally add it to the loop information
+     info->addExitLoop (exitBlock);
+ }
++/**
++ * @brief Create and insert a loop backward block into compilation unit
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock that represents the head of the loop
++ * @return inserted backward block
++*/
++static BasicBlock* insertLoopBackwardBlock (CompilationUnit *cUnit, BasicBlock *bb)
++{
++    //Paranoid
++    assert (bb != 0);
++
++    BasicBlock *backward = dvmCompilerNewBB(kChainingCellBackwardBranch, cUnit->numBlocks++);
++    dvmInsertGrowableList(&cUnit->blockList, (intptr_t) backward);
++
++    backward->startOffset = bb->startOffset;
++    //Backward will fall through to the current BasicBlock directly
++    backward->fallThrough = bb;
++
++    return backward;
++}
+ 
+ /**
+  * @brief Handle the top loop case and push down the test to make it a bottom loop
+@@ -313,14 +330,17 @@ static void insertLoopExitBlock (CompilationUnit *cUnit, LoopInformation *info,
+  * @param info the LoopInformation
+  * @param bb the BasicBlock that represents the head of the loop for the top formed loop
+  * @param predBB the predecessor of bb currently being handled
+- * @param backward the backward chaining cell
++ * @param ptrBackward pointer to the backward chaining cell
++ * @return whether we succeeded or not
+  */
+-static void handleTopLoop (CompilationUnit *cUnit, LoopInformation *info, BasicBlock *bb, BasicBlock *predBB, BasicBlock *backward)
++static bool handleTopLoop (CompilationUnit *cUnit, LoopInformation *info, BasicBlock *bb, BasicBlock *predBB, BasicBlock **ptrBackward)
+ {
+     //Paranoid on bb
+     if (bb == 0)
+     {
+-        return;
++        //Make sure null will be returned
++        (*ptrBackward) = 0;
++        return false;
+     }
+ 
+     //Paranoid: we should have a branch
+@@ -329,6 +349,7 @@ static void handleTopLoop (CompilationUnit *cUnit, LoopInformation *info, BasicB
+     //First find if taken or fallthrough is the loop
+     //By default, let's suppose it is bb->taken
+     BasicBlock *notLoop = bb->taken;
++    BasicBlock *backward = 0;
+ 
+     if (notLoop == 0)
+     {
+@@ -343,6 +364,19 @@ static void handleTopLoop (CompilationUnit *cUnit, LoopInformation *info, BasicB
+         }
+     }
+ 
++    //If there is a problem with notLoop, report failure
++    if (notLoop == 0)
++    {
++        //Make sure null will be returned
++        (*ptrBackward) = 0;
++        return false;
++    }
++
++    //Create and insert loop backward block into compilation unit
++    backward = insertLoopBackwardBlock (cUnit, bb);
++    //Add info about it
++    info->addBackwardBlock (backward);
++
+     //Inform loop information
+     info->setPostExitBlock (notLoop);
+ 
+@@ -448,7 +482,9 @@ static void handleTopLoop (CompilationUnit *cUnit, LoopInformation *info, BasicB
+     //Paranoid
+     if (cur == 0)
+     {
+-        return;
++        //Make sure null will be returned
++        (*ptrBackward) = 0;
++        return false;
+     }
+ 
+     //Also set its offset, it might have changed and the chaining cell needs this
+@@ -456,6 +492,12 @@ static void handleTopLoop (CompilationUnit *cUnit, LoopInformation *info, BasicB
+ 
+     //Update the information for the entry
+     info->setEntryBlock (cur);
++
++    //Return backward block via argument
++    (*ptrBackward) = backward;
++
++    //Report success
++    return true;
+ }
+ 
+ /**
+@@ -465,9 +507,16 @@ static void handleTopLoop (CompilationUnit *cUnit, LoopInformation *info, BasicB
+  * @param bb the BasicBlock that represents the head of the loop for the top formed loop
+  * @param predBB the predecessor of bb currently being handled
+  * @param backward the backward chaining cell
++ * @return whether we succeeded or not
+  */
+-static void handleBottomLoop (CompilationUnit *cUnit, LoopInformation *info, BasicBlock *bb, BasicBlock *predBB, BasicBlock *backward)
++static bool handleBottomLoop (CompilationUnit *cUnit, LoopInformation *info, BasicBlock *bb, BasicBlock *predBB, BasicBlock **ptrBackward)
+ {
++    //If we don't already have a BasicBlock for it, create it and insert into compilation unit
++    BasicBlock *backward = insertLoopBackwardBlock (cUnit, bb);
++
++    //Add information about it
++    info->addBackwardBlock (backward);
++
+     BasicBlock *notLoop = 0;
+ 
+     //Handle links from predBB to bb
+@@ -525,11 +574,21 @@ static void handleBottomLoop (CompilationUnit *cUnit, LoopInformation *info, Bas
+                     {
+                         ALOGI("LOOP_INFO: Too many exits of the loop");
+                         cUnit->quitLoopMode = true;
++
++                        //Make sure null will be returned
++                        (*ptrBackward) = 0;
++                        return false;
+                     }
+                 }
+             }
+         }
+     }
++
++    //Return backward block via argument
++    (*ptrBackward) = backward;
++
++    //Report success
++    return true;
+ }
+ 
+ /**
+@@ -788,6 +847,7 @@ void dvmCompilerTestLoop (CompilationUnit *cUnit, Pass *pass)
+  */
+ bool dvmCompilerFormLoop (CompilationUnit *cUnit, BasicBlock *bb)
+ {
++    bool success = true;
+     BasicBlock *backward = 0;
+     LoopInformation *info = 0;
+ 
+@@ -846,17 +906,6 @@ bool dvmCompilerFormLoop (CompilationUnit *cUnit, BasicBlock *bb)
+                 info->setEntryBlock (bb);
+             }
+ 
+-            //If we don't already have a BasicBlock for it, create it
+-            backward = dvmCompilerNewBB(kChainingCellBackwardBranch, cUnit->numBlocks++);
+-            dvmInsertGrowableList(&cUnit->blockList, (intptr_t) backward);
+-            backward->startOffset = bb->startOffset;
+-
+-            //Backward will fall through to the current BasicBlock directly
+-            backward->fallThrough = bb;
+-
+-            //Add information about it
+-            info->addBackwardBlock (backward);
+-
+             //Is the loop a top loop or not? Suppose it is
+             bool topLoop = true;
+ 
+@@ -928,12 +977,18 @@ bool dvmCompilerFormLoop (CompilationUnit *cUnit, BasicBlock *bb)
+             if (topLoop == true)
+             {
+                 //We have a top loop case here
+-                handleTopLoop (cUnit, info, bb, predBB, backward);
++                success = handleTopLoop (cUnit, info, bb, predBB, &backward);
+             }
+             else
+             {
+                 //Otherwise, it is already a bottom loop
+-                handleBottomLoop(cUnit, info, bb, predBB, backward);
++                success = handleBottomLoop (cUnit, info, bb, predBB, &backward);
++            }
++
++            if (success == false)
++            {
++                //Bail if failed
++                break;
+             }
+ 
+             //Fill in the last information about the loop
+@@ -958,12 +1013,25 @@ bool dvmCompilerFormLoop (CompilationUnit *cUnit, BasicBlock *bb)
+     }
+ 
+     //If we have a backward chaining cell, insert the preheader now
+-    if (backward != 0)
++    //Only care if we succeeded previously
++    if (backward != 0 && success == true)
+     {
+         //Now create a pre loop header
+-        insertPreLoopHeader (cUnit, info, backward);
++        success = insertPreLoopHeader (cUnit, info, backward);
+     }
+ 
++    //If there was a failure, report it
++    if (success == false)
++    {
++        //This should never happen
++        ALOGD ("JIT_INFO: Problem when forming loop for %s%s and offset %x",
++                cUnit->method->clazz->descriptor, cUnit->method->name, bb->startOffset);
++        cUnit->quitLoopMode = true;
++
++        //In the assert world, we'd prefer this never happens
++        assert (0);
++     }
++
+     //We don't want to iterate on the changes
+     return false;
+ }
+-- 
+1.7.4.1
+

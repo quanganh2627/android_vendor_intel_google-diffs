@@ -1,0 +1,229 @@
+From 37ae23ecaa55b56ec7ef0e00450d59f293feaa72 Mon Sep 17 00:00:00 2001
+From: chenchunbo <chunbo.chen@intel.com>
+Date: Thu, 26 Sep 2013 14:40:37 +0800
+Subject: Enable video software decoder render for NuPlayer
+
+CTS verifier test, video cannot display for RTSP streaming when using h263 software decoder.
+Integrate SoftwareRender in NuplayerRender, check native window handle in ACodec, if NULL, create
+SoftwareRender and send the render object pointer to ACodec. In ACodec, if native window is NULL,
+try to get software render to render the decoded buffer directly.
+
+HSD: 5180613
+Issue: AXIA-3793
+
+Category: AOSP Enhancement
+Domain: MEDIA
+Upstream-Candidate: yes
+
+Change-Id: I56c1f28767454c88986241bfedcec2c1de836952
+Signed-off-by: chenchunbo <chunbo.chen@intel.com>
+---
+ media/libmediaplayerservice/nuplayer/NuPlayer.cpp  |   15 +++++++++
+ .../nuplayer/NuPlayerRenderer.cpp                  |   34 +++++++++++++++++++-
+ .../nuplayer/NuPlayerRenderer.h                    |   10 ++++++
+ media/libstagefright/ACodec.cpp                    |   31 ++++++++++++------
+ 4 files changed, 79 insertions(+), 11 deletions(-)
+
+diff --git a/media/libmediaplayerservice/nuplayer/NuPlayer.cpp b/media/libmediaplayerservice/nuplayer/NuPlayer.cpp
+index ca2a4f5..a0ff290 100644
+--- a/media/libmediaplayerservice/nuplayer/NuPlayer.cpp
++++ b/media/libmediaplayerservice/nuplayer/NuPlayer.cpp
+@@ -543,6 +543,10 @@ void NuPlayer::onMessageReceived(const sp<AMessage> &msg) {
+             }
+ 
+             processDeferredActions();
++
++            if(mRenderer.get())
++                mRenderer->setNativeWindow(mNativeWindow->getNativeWindow());
++
+             break;
+         }
+ 
+@@ -769,8 +773,19 @@ void NuPlayer::onMessageReceived(const sp<AMessage> &msg) {
+                     // video
+ 
+                     int32_t width, height;
++                    int32_t colorformat;
+                     CHECK(codecRequest->findInt32("width", &width));
+                     CHECK(codecRequest->findInt32("height", &height));
++                    CHECK(codecRequest->findInt32("color-format", &colorformat));
++
++                    if(mRenderer.get()) {
++                        sp<MetaData> meta = new MetaData;
++                        meta->setInt32(kKeyColorFormat, colorformat);
++                        meta->setInt32(kKeyWidth, width);
++                        meta->setInt32(kKeyHeight, height);
++                        mRenderer->setNativeWindow(mNativeWindow->getNativeWindow());
++                        mRenderer->setVideoSinkParam(meta);
++                    }
+ 
+                     int32_t cropLeft, cropTop, cropRight, cropBottom;
+                     CHECK(codecRequest->findRect(
+diff --git a/media/libmediaplayerservice/nuplayer/NuPlayerRenderer.cpp b/media/libmediaplayerservice/nuplayer/NuPlayerRenderer.cpp
+index 486c5cf..41f7f5d 100644
+--- a/media/libmediaplayerservice/nuplayer/NuPlayerRenderer.cpp
++++ b/media/libmediaplayerservice/nuplayer/NuPlayerRenderer.cpp
+@@ -23,6 +23,7 @@
+ #include <media/stagefright/foundation/ABuffer.h>
+ #include <media/stagefright/foundation/ADebug.h>
+ #include <media/stagefright/foundation/AMessage.h>
++#include <media/stagefright/MetaData.h>
+ 
+ namespace android {
+ 
+@@ -59,7 +60,8 @@ NuPlayer::Renderer::Renderer(
+       mVPPRenderCount(0),
+       mVPPProcessor(NULL),
+ #endif
+-      mVideoLateByUs(0ll) {
++      mVideoLateByUs(0ll),
++      mpSoftRender(NULL) {
+ }
+ 
+ NuPlayer::Renderer::~Renderer() {
+@@ -67,6 +69,9 @@ NuPlayer::Renderer::~Renderer() {
+     LOGI("===== mVPPProcCount = %d, mVPPRenderCount = %d =====", mVPPProcCount, mVPPRenderCount);
+     LOGI("===== decode %d frames totally =====", mDecodeCount);
+ #endif
++    if(mpSoftRender)
++        delete mpSoftRender;
++    mpSoftRender = NULL;
+ }
+ 
+ void NuPlayer::Renderer::queueBuffer(
+@@ -480,6 +485,14 @@ void NuPlayer::Renderer::onDrainVideoQueue() {
+         ALOGV("rendering video at media time %.2f secs", mediaTimeUs / 1E6);
+     }
+ 
++    void* pNativeWindow;
++    if(entry->mNotifyConsumed->findPointer("native-window", &pNativeWindow) && pNativeWindow == NULL) {
++        if(mpSoftRender == NULL && mNativeWindow.get() && mMetaData.get())
++            mpSoftRender = new SoftwareRenderer(mNativeWindow, mMetaData);
++        if(mpSoftRender)
++            entry->mNotifyConsumed->setPointer("soft-render", mpSoftRender);
++    }
++
+     entry->mNotifyConsumed->setInt32("render", !tooLate);
+     entry->mNotifyConsumed->post();
+     mVideoQueue.erase(mVideoQueue.begin());
+@@ -935,5 +948,24 @@ void NuPlayer::Renderer::onResume() {
+     }
+ }
+ 
++void NuPlayer::Renderer::setNativeWindow(sp < ANativeWindow > nativeWindow)
++{
++    if(nativeWindow.get())
++        mNativeWindow = nativeWindow;
++
++    if(mpSoftRender)
++        delete mpSoftRender;
++    mpSoftRender = NULL;
++}
++void NuPlayer::Renderer::setVideoSinkParam(sp<MetaData> meta)
++{
++    if(meta.get())
++        mMetaData = meta;
++
++    if(mpSoftRender)
++        delete mpSoftRender;
++    mpSoftRender = NULL;
++}
++
+ }  // namespace android
+ 
+diff --git a/media/libmediaplayerservice/nuplayer/NuPlayerRenderer.h b/media/libmediaplayerservice/nuplayer/NuPlayerRenderer.h
+index f1c67e7..71b3b75 100644
+--- a/media/libmediaplayerservice/nuplayer/NuPlayerRenderer.h
++++ b/media/libmediaplayerservice/nuplayer/NuPlayerRenderer.h
+@@ -24,6 +24,8 @@
+ #include <VPPBuffer.h>
+ #endif
+ 
++#include "../../libstagefright/include/SoftwareRenderer.h"
++
+ namespace android {
+ 
+ struct ABuffer;
+@@ -57,6 +59,9 @@ struct NuPlayer::Renderer : public AHandler {
+     void releaseVppProcessor();
+ #endif
+ 
++    void setNativeWindow(sp<ANativeWindow> nativeWindow);
++    void setVideoSinkParam(sp<MetaData> meta);
++
+     enum {
+         kWhatEOS                 = 'eos ',
+         kWhatFlushComplete       = 'fluC',
+@@ -133,6 +138,11 @@ private:
+     void onUpdateVideoQueue(const sp<AMessage> &msg);
+     void onUpdateVPPInput(const sp<AMessage> &msg);
+ #endif
++
++    SoftwareRenderer *mpSoftRender;
++    sp<ANativeWindow> mNativeWindow;
++    sp<MetaData> mMetaData;
++
+     bool onDrainAudioQueue();
+     void postDrainAudioQueue(int64_t delayUs = 0);
+ 
+diff --git a/media/libstagefright/ACodec.cpp b/media/libstagefright/ACodec.cpp
+index 05e5a10..2100a94 100644
+--- a/media/libstagefright/ACodec.cpp
++++ b/media/libstagefright/ACodec.cpp
+@@ -38,6 +38,7 @@
+ #include <OMX_Component.h>
+ 
+ #include "include/avc_utils.h"
++#include "include/SoftwareRenderer.h"
+ 
+ #ifdef TARGET_HAS_VPP
+ #include <NuPlayerVPPProcessor.h>
+@@ -3548,6 +3549,7 @@ bool ACodec::BaseState::onOMXFillBufferDone(
+             notify->setInt32("flags", flags);
+ 
+             reply->setPointer("buffer-id", info->mBufferID);
++            reply->setPointer("native-window", mCodec->mNativeWindow.get());
+ 
+             notify->setMessage("reply", reply);
+ 
+@@ -3844,18 +3846,27 @@ void ACodec::BaseState::onOutputBufferDrained(const sp<AMessage> &msg) {
+     }
+ 
+     int32_t render;
+-    if (mCodec->mNativeWindow != NULL
+-            && msg->findInt32("render", &render) && render != 0
++
++    if (msg->findInt32("render", &render) && render != 0
+             && (info->mData == NULL || info->mData->size() != 0)) {
+         // The client wants this buffer to be rendered.
+-
+-        status_t err;
+-        if ((err = mCodec->mNativeWindow->queueBuffer(
+-                    mCodec->mNativeWindow.get(),
+-                    info->mGraphicBuffer.get(), -1)) == OK) {
+-            info->mStatus = BufferInfo::OWNED_BY_NATIVE_WINDOW;
+-        } else {
+-            mCodec->signalError(OMX_ErrorUndefined, err);
++        if(mCodec->mNativeWindow != NULL) {
++            status_t err;
++            if ((err = mCodec->mNativeWindow->queueBuffer(
++                        mCodec->mNativeWindow.get(),
++                        info->mGraphicBuffer.get(), -1)) == OK) {
++                info->mStatus = BufferInfo::OWNED_BY_NATIVE_WINDOW;
++            } else {
++                mCodec->signalError(OMX_ErrorUndefined, err);
++                info->mStatus = BufferInfo::OWNED_BY_US;
++            }
++        }else {
++                void* pRender;
++            if(msg->findPointer("soft-render", &pRender) && pRender != NULL) {
++                SoftwareRenderer* pSoftRender = (SoftwareRenderer*)pRender;
++                OMX_BUFFERHEADERTYPE *pBuffer = (OMX_BUFFERHEADERTYPE *)bufferID;
++                pSoftRender->render(pBuffer->pBuffer, pBuffer->nFilledLen, NULL);
++            }
+             info->mStatus = BufferInfo::OWNED_BY_US;
+         }
+     } else {
+-- 
+1.7.4.1
+

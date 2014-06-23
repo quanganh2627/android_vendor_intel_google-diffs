@@ -1,0 +1,537 @@
+From 160755e94240e016d82c1b436cfb5775c8dbaae8 Mon Sep 17 00:00:00 2001
+From: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Date: Mon, 21 Jan 2013 14:56:08 -0800
+Subject: Dalvik: Code for code generation rewrite
+
+BZ: 75105
+
+Backend Code generation
+
+The setupLoopEntryBlock function was empty and was still getting called.
+This pushed to clean up a bit the code generation code to make it more
+  maintainable in general without changing code semantics.
+
+CodegenInterface.cpp:
+  - Cleaned up code generation code to make it more maintainable
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I9789cc9716bf5ba9b2c943b143e931b4a45bf21b
+Orig-MCG-Change-Id: I4fbf33d23134fa9aabf9229ffbc9f3e30336eed9
+Signed-off-by: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/codegen/x86/CodegenInterface.cpp |  436 ++++++++++++--------------
+ 1 files changed, 206 insertions(+), 230 deletions(-)
+
+diff --git a/vm/compiler/codegen/x86/CodegenInterface.cpp b/vm/compiler/codegen/x86/CodegenInterface.cpp
+index aa4a124..d82ade9 100644
+--- a/vm/compiler/codegen/x86/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/CodegenInterface.cpp
+@@ -992,26 +992,6 @@ void handleExtendedMIR(CompilationUnit *cUnit, MIR *mir)
+     gDvm.executionMode = origMode;
+ }
+ 
+-static void setupLoopEntryBlock(CompilationUnit *cUnit, BasicBlock *entry,
+-                                int bodyId)
+-{
+-    /*
+-     * Next, create two branches - one branch over to the loop body and the
+-     * other branch to the PCR cell to punt.
+-     */
+-    //LowOp* branchToBody = jumpToBasicBlock(stream, bodyId);
+-    //setupResourceMasks(branchToBody);
+-    //cUnit->loopAnalysis->branchToBody = ((LIR*)branchToBody);
+-
+-#if 0
+-    LowOp *branchToPCR = dvmCompilerNew(sizeof(ArmLIR), true);
+-    branchToPCR->opCode = kThumbBUncond;
+-    branchToPCR->generic.target = (LIR *) pcrLabel;
+-    setupResourceMasks(branchToPCR);
+-    cUnit->loopAnalysis->branchToPCR = (LIR *) branchToPCR;
+-#endif
+-}
+-
+ /* check whether we can merge the block at index i with its target block */
+ bool mergeBlock(BasicBlock *bb, CompilationUnit *cUnit) {
+     if(bb->blockType == kDalvikByteCode &&
+@@ -1117,6 +1097,124 @@ bool hasBranchInLoop(CompilationUnit *cUnit)
+     return true;
+ }
+ 
++
++/**
++ * @brief Generate the code for the BasicBlock
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock
++ * @return whether the generation went well
++ */
++static bool generateCode (CompilationUnit *cUnit, BasicBlock *bb)
++{
++    ALOGV("Get ready to handle JIT bb %d type %d hidden %d",
++            bb->id, bb->blockType, bb->hidden);
++
++    //If in O1, not the entry block, and actually have an instruction
++    if(gDvm.executionMode == kExecutionModeNcgO1 &&
++            bb->blockType != kEntryBlock &&
++            bb->firstMIRInsn != NULL) {
++
++        //Generate the code
++        startOfBasicBlock(bb);
++        int cg_ret = codeGenBasicBlockJit(cUnit->method, bb);
++        endOfBasicBlock(bb);
++
++        //Error handling, we return false
++        if(cg_ret < 0) {
++            ALOGI("Could not compile trace for %s%s, offset %d",
++                    cUnit->method->clazz->descriptor, cUnit->method->name,
++                    cUnit->traceDesc->trace[0].info.frag.startOffset);
++            SET_JIT_ERROR(kJitErrorCodegen);
++            endOfTrace(true/*freeOnly*/);
++            cUnit->baseAddr = NULL;
++            PROTECT_CODE_CACHE(stream, unprotected_code_cache_bytes);
++            return false;
++        }
++    }
++    else {
++        //Not O1 or iti s the entry block
++        for (MIR *mir = bb->firstMIRInsn; mir; mir = mir->next) {
++            // Global variable rPC that's holding the Dalvik PC
++            // needs to be updated here because we are iterating
++            // through the MIRs of this BB.
++            rPC = const_cast<u2 *>(cUnit->method->insns) + mir->offset;
++            startOfBasicBlock(bb); //why here for O0
++            Opcode dalvikOpCode = mir->dalvikInsn.opcode;
++
++            //If extended, send it off and go to the next instruction
++            if((int)dalvikOpCode >= (int)kMirOpFirst) {
++                handleExtendedMIR(cUnit, mir);
++                continue;
++            }
++
++            //A normal instruction is handled here
++            InstructionFormat dalvikFormat = dexGetFormatFromOpcode(dalvikOpCode);
++            ALOGV("ready to handle bytecode at offset %x: opcode %d format %d",
++                    mir->offset, dalvikOpCode, dalvikFormat);
++
++            // Before: A boundary LIR with Atom pseudo-mnemonic named
++            //      ATOM_PSEUDO_DALVIK_BYTECODE_BOUNDARY was being created
++            //      at this point. The allocation of the Atom LIR used to
++            //      update the global variable named lowOpTimeStamp.
++            // After: LIRs are now only allocated through the Instruction
++            //      scheduling interface and LIRs with only pseudo-mnemonics
++            //      are not supported. In order to keep semantics, the
++            //      timestamp will be updated here manually since it affects
++            //      register allocation.
++            lowOpTimeStamp++;
++
++            bool notHandled = true;
++            /*
++             * Debugging: screen the opcode first to see if it is in the
++             * do[-not]-compile list
++             */
++            bool singleStepMe =
++                gDvmJit.includeSelectedOp !=
++                ((gDvmJit.opList[dalvikOpCode >> 3] &
++                  (1 << (dalvikOpCode & 0x7))) !=
++                 0);
++
++            if (singleStepMe == false && cUnit->allSingleStep == false)
++            {
++                //lower each byte code, update LIR
++                notHandled = lowerByteCodeJit(cUnit->method, mir, rPC);
++
++                //Look if the code cache is full
++                if(gDvmJit.codeCacheByteUsed + (stream - streamStart) +
++                        CODE_CACHE_PADDING > gDvmJit.codeCacheSize) {
++                    ALOGE("JIT_ERROR: Code cache full after lowerByteCodeJit (trace uses %uB)", (stream - streamStart));
++                    SET_JIT_ERROR(kJitErrorCodeCacheFull);
++                    gDvmJit.codeCacheFull = true;
++                    cUnit->baseAddr = NULL;
++                    endOfTrace(true/*freeOnly*/);
++                    PROTECT_CODE_CACHE(stream, unprotected_code_cache_bytes);
++                    return false;
++                }
++            }
++
++            //If not handle, error flag setting and return false
++            if (notHandled) {
++                ALOGE("JIT_ERROR: Opcode 0x%x (%s) / Fmt %d at offset %#06x not handled\n",
++                        dalvikOpCode, dexGetOpcodeName(dalvikOpCode), dalvikFormat, mir->offset);
++                SET_JIT_ERROR(kJitErrorUnsupportedBytecode);
++                cUnit->baseAddr = NULL;
++                endOfTrace(true); /* need to free structures */
++                return false;
++            }
++        } // end for
++    } // end else //JIT + O0 code generator
++
++    /*
++     * Check if the block is terminated due to trace length constraint -
++     * insert an unconditional branch to the chaining cell.
++     */
++    if (bb->needFallThroughBranch) {
++        jumpToBasicBlock(stream, bb->fallThrough->id);
++    }
++
++    return true;
++}
++
+ /* 4 is the number of additional bytes needed for chaining information for trace:
+  * 2 bytes for chaining cell count offset and 2 bytes for chaining cell offset */
+ #define EXTRA_BYTES_FOR_CHAINING 4
+@@ -1129,10 +1227,8 @@ bool hasBranchInLoop(CompilationUnit *cUnit)
+ //! \param info: JitTranslationInfo. Holds generated code address on success
+ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+ {
+-    const u2* startCodePtr;
+-    const DexCode* dexCode;
+-
+     dump_x86_inst = cUnit->printMe;
++
+     /* Used to hold the labels of each block */
+     LowOpBlockLabel *labelList =
+         (LowOpBlockLabel *)dvmCompilerNew(sizeof(LowOpBlockLabel) * cUnit->numBlocks, true); //Utility.c
+@@ -1148,10 +1244,6 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+         dvmInitGrowableList(&chainingListByType[i], 2);
+     }
+ 
+-    /* Clear the visited flag for each block */
+-    dvmCompilerDataFlowAnalysisDispatcher(cUnit, dvmCompilerClearVisitedFlag,
+-                                          kAllNodes, false /* isIterative */);
+-
+     GrowableListIterator iterator;
+     dvmGrowableListIteratorInit(&cUnit->blockList, &iterator);
+ 
+@@ -1216,12 +1308,15 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+     branchInLoop = cUnit->jitMode == kJitLoop && hasBranchInLoop(cUnit);
+ 
+     /* Handle the content in each basic block */
+-    for (i = 0; ; i++) {
+-        MIR *mir;
+-        bb = (BasicBlock *) dvmGrowableListIteratorNext(&iterator);
+-        if (bb == NULL) break;
+-        if (bb->visited == true) continue;
+-
++    for (bb = (BasicBlock *) (dvmGrowableListIteratorNext (&iterator)),
++         i = 0;
++         //We stop when bb is 0
++         bb != 0;
++         //Induction variables: bb goes to next iterator, i is incremented
++         bb = (BasicBlock *) (dvmGrowableListIteratorNext (&iterator)),
++         i++) {
++
++        //Set label information
+         labelList[i].immOpnd.value = bb->startOffset;
+ 
+         if (bb->blockType >= kChainingCellLast) {
+@@ -1232,203 +1327,91 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+             dvmCompilerAppendLIR(cUnit, (LIR *) &labelList[i]);
+         }
+ 
+-        if (bb->blockType == kEntryBlock) {
+-            labelList[i].lop.opCode2 = ATOM_PSEUDO_ENTRY_BLOCK;
+-            if (bb->firstMIRInsn == NULL) {
+-                continue;
+-            } else {
+-                setupLoopEntryBlock(cUnit, bb, bb->fallThrough->id);
+-            }
+-        } else if (bb->blockType == kExitBlock) {
+-            labelList[i].lop.opCode2 = ATOM_PSEUDO_EXIT_BLOCK;
+-            labelList[i].lop.generic.offset = (stream - streamMethodStart);
+-            goto gen_fallthrough;
+-        } else if (bb->blockType == kDalvikByteCode) {
+-            if (bb->hidden == true) continue;
+-            labelList[i].lop.opCode2 = ATOM_PSEUDO_NORMAL_BLOCK_LABEL;
+-            /* Reset the register state */
+-#if 0
+-            resetRegisterScoreboard(cUnit);
+-#endif
+-        } else {
+-            switch (bb->blockType) {
+-                case kChainingCellNormal:
+-                    labelList[i].lop.opCode2 = ATOM_PSEUDO_CHAINING_CELL_NORMAL;
+-                    /* handle the codegen later */
+-                    dvmInsertGrowableList(
+-                        &chainingListByType[kChainingCellNormal], i);
+-                    break;
+-                case kChainingCellInvokeSingleton:
+-                    labelList[i].lop.opCode2 =
+-                        ATOM_PSEUDO_CHAINING_CELL_INVOKE_SINGLETON;
+-                    labelList[i].immOpnd.value =
+-                        (int) bb->containingMethod;
+-                    /* handle the codegen later */
+-                    dvmInsertGrowableList(
+-                        &chainingListByType[kChainingCellInvokeSingleton], i);
+-                    break;
+-                case kChainingCellInvokePredicted:
+-                    labelList[i].lop.opCode2 =
+-                        ATOM_PSEUDO_CHAINING_CELL_INVOKE_PREDICTED;
+-                   /*
+-                     * Move the cached method pointer from operand 1 to 0.
+-                     * Operand 0 was clobbered earlier in this routine to store
+-                     * the block starting offset, which is not applicable to
+-                     * predicted chaining cell.
+-                     */
+-                    //TODO
+-                    //labelList[i].operands[0] = labelList[i].operands[1];
++        //Switch depending on the BasicBlock type
++        switch (bb->blockType)
++        {
++            case kEntryBlock:
++                labelList[i].lop.opCode2 = ATOM_PSEUDO_ENTRY_BLOCK;
+ 
+-                    /* handle the codegen later */
+-                    dvmInsertGrowableList(
+-                        &chainingListByType[kChainingCellInvokePredicted], i);
+-                    break;
+-                case kChainingCellHot:
+-                    labelList[i].lop.opCode2 =
+-                        ATOM_PSEUDO_CHAINING_CELL_HOT;
+-                    /* handle the codegen later */
+-                    dvmInsertGrowableList(
+-                        &chainingListByType[kChainingCellHot], i);
+-                    break;
+-                case kPCReconstruction:
+-                    /* Make sure exception handling block is next */
+-                    labelList[i].lop.opCode2 =
+-                        ATOM_PSEUDO_PC_RECONSTRUCTION_BLOCK_LABEL;
+-                    //assert (i == cUnit->numBlocks - 2);
+-                    labelList[i].lop.generic.offset = (stream - streamMethodStart);
+-                    handlePCReconstruction(cUnit,
+-                                           &labelList[cUnit->puntBlock->id]);
+-                    break;
+-                case kExceptionHandling:
+-                    labelList[i].lop.opCode2 = ATOM_PSEUDO_EH_BLOCK_LABEL;
+-                    labelList[i].lop.generic.offset = (stream - streamMethodStart);
+-                    //if (cUnit->pcReconstructionList.numUsed) {
+-                        scratchRegs[0] = PhysicalReg_EAX;
+-                        jumpToInterpPunt();
+-                        //call_dvmJitToInterpPunt();
+-                    //}
+-                    break;
+-                case kChainingCellBackwardBranch:
+-                    labelList[i].lop.opCode2 = ATOM_PSEUDO_CHAINING_CELL_BACKWARD_BRANCH;
+-                    /* handle the codegen later */
+-                    dvmInsertGrowableList(
+-                        &chainingListByType[kChainingCellBackwardBranch],
+-                        i);
+-                    break;
+-                default:
+-                    break;
+-            }
+-            continue;
+-        }
++                //Set label offset
++                labelList[i].lop.generic.offset = (stream - streamMethodStart);
+ 
+-        //LowOp *headLIR = NULL;
+-        dexCode = dvmGetMethodCode(cUnit->method);
+-        startCodePtr = dexCode->insns;
+-        labelList[i].lop.generic.offset = (stream - streamMethodStart);
+-        ALOGV("get ready to handle JIT bb %d type %d hidden %d",
+-              bb->id, bb->blockType, bb->hidden);
+-        for (BasicBlock *nextBB = bb; nextBB != NULL; nextBB = cUnit->nextCodegenBlock) {
+-                bb = nextBB;
+-                bb->visited = true;
+-                cUnit->nextCodegenBlock = NULL;
+-
+-            if(gDvm.executionMode == kExecutionModeNcgO1 &&
+-               bb->blockType != kEntryBlock &&
+-               bb->firstMIRInsn != NULL) {
+-                startOfBasicBlock(bb);
+-                int cg_ret = codeGenBasicBlockJit(cUnit->method, bb);
+-                endOfBasicBlock(bb);
+-                if(cg_ret < 0) {
+-                    ALOGI("Could not compile trace for %s%s, offset %d",
+-                            cUnit->method->clazz->descriptor, cUnit->method->name,
+-                            cUnit->traceDesc->trace[0].info.frag.startOffset);
+-                    SET_JIT_ERROR(kJitErrorCodegen);
+-                    endOfTrace(true/*freeOnly*/);
+-                    cUnit->baseAddr = NULL;
+-                    PROTECT_CODE_CACHE(stream, unprotected_code_cache_bytes);
++                if (generateCode (cUnit, bb) == false)
++                {
++                    //Generate code set an error for the jit, we can just return
+                     return;
+                 }
+-            }
+-            else {
+-                for (mir = bb->firstMIRInsn; mir; mir = mir->next) {
+-                    // Global variable rPC that's holding the Dalvik PC
+-                    // needs to be updated here because we are iterating
+-                    // through the MIRs of this BB.
+-                    rPC = const_cast<u2 *>(cUnit->method->insns) + mir->offset;
+-                    startOfBasicBlock(bb); //why here for O0
+-                    Opcode dalvikOpCode = mir->dalvikInsn.opcode;
+-                    if((int)dalvikOpCode >= (int)kMirOpFirst) {
+-                        handleExtendedMIR(cUnit, mir);
+-                        continue;
+-                    }
+-                    InstructionFormat dalvikFormat =
+-                        dexGetFormatFromOpcode(dalvikOpCode);
+-                    ALOGV("ready to handle bytecode at offset %x: opcode %d format %d",
+-                          mir->offset, dalvikOpCode, dalvikFormat);
+-
+-                    // Before: A boundary LIR with Atom pseudo-mnemonic named
+-                    //      ATOM_PSEUDO_DALVIK_BYTECODE_BOUNDARY was being created
+-                    //      at this point. The allocation of the Atom LIR used to
+-                    //      update the global variable named lowOpTimeStamp.
+-                    // After: LIRs are now only allocated through the Instruction
+-                    //      scheduling interface and LIRs with only pseudo-mnemonics
+-                    //      are not supported. In order to keep semantics, the
+-                    //      timestamp will be updated here manually since it affects
+-                    //      register allocation.
+-                    lowOpTimeStamp++;
+-
+-                    bool notHandled = true;
+-                    /*
+-                     * Debugging: screen the opcode first to see if it is in the
+-                     * do[-not]-compile list
+-                     */
+-                    bool singleStepMe =
+-                        gDvmJit.includeSelectedOp !=
+-                        ((gDvmJit.opList[dalvikOpCode >> 3] &
+-                          (1 << (dalvikOpCode & 0x7))) !=
+-                         0);
+-                    if (singleStepMe || cUnit->allSingleStep) {
+-                    } else {
+-                        //lower each byte code, update LIR
+-                        notHandled = lowerByteCodeJit(cUnit->method, mir, rPC);
+-                        if(gDvmJit.codeCacheByteUsed + (stream - streamStart) +
+-                           CODE_CACHE_PADDING > gDvmJit.codeCacheSize) {
+-                            ALOGE("JIT_ERROR: Code cache full after lowerByteCodeJit (trace uses %uB)", (stream - streamStart));
+-                            SET_JIT_ERROR(kJitErrorCodeCacheFull);
+-                            gDvmJit.codeCacheFull = true;
+-                            cUnit->baseAddr = NULL;
+-                            endOfTrace(true/*freeOnly*/);
+-                            PROTECT_CODE_CACHE(stream, unprotected_code_cache_bytes);
+-                            return;
+-                        }
+-                    }
+-                    if (notHandled) {
+-                        ALOGE("JIT_ERROR: Opcode 0x%x (%s) / Fmt %d at offset %#06x not handled\n",
+-                            dalvikOpCode, dexGetOpcodeName(dalvikOpCode), dalvikFormat, mir->offset);
+-                        SET_JIT_ERROR(kJitErrorUnsupportedBytecode);
+-                        cUnit->baseAddr = NULL;
+-                        endOfTrace(true); /* need to free structures */
+-                        break;
++                break;
++            case kExitBlock:
++                labelList[i].lop.opCode2 = ATOM_PSEUDO_EXIT_BLOCK;
++                //Set label offset
++                labelList[i].lop.generic.offset = (stream - streamMethodStart);
++
++                if (generateCode (cUnit, bb) == false)
++                {
++                    //Generate code set an error for the jit, we can just return
++                    return;
++                }
++                break;
++            case kDalvikByteCode:
++                //If hidden, we don't generate code
++                if (bb->hidden == false)
++                {
++                    labelList[i].lop.opCode2 = ATOM_PSEUDO_NORMAL_BLOCK_LABEL;
++                    //Set label offset
++                    labelList[i].lop.generic.offset = (stream - streamMethodStart);
++
++                    if (generateCode (cUnit, bb) == false)
++                    {
++                        //Generate code set an error for the jit, we can just return
++                        return;
+                     }
+-                } // end for
+-            } // end else //JIT + O0 code generator
+-        } // end for
+-        /* Eliminate redundant loads/stores and delay stores into later slots */
+-#if 0
+-        dvmCompilerApplyLocalOptimizations(cUnit, (LIR *) headLIR,
+-                                           cUnit->lastLIRInsn);
+-#endif
+-gen_fallthrough:
+-        /*
+-         * Check if the block is terminated due to trace length constraint -
+-         * insert an unconditional branch to the chaining cell.
+-         */
+-        if (bb->needFallThroughBranch) {
+-            jumpToBasicBlock(stream, bb->fallThrough->id);
++                }
++                break;
++            case kChainingCellNormal:
++                labelList[i].lop.opCode2 = ATOM_PSEUDO_CHAINING_CELL_NORMAL;
++                /* Handle the codegen later */
++                dvmInsertGrowableList(&chainingListByType[kChainingCellNormal], i);
++                break;
++            case kChainingCellInvokeSingleton:
++                labelList[i].lop.opCode2 = ATOM_PSEUDO_CHAINING_CELL_INVOKE_SINGLETON;
++                labelList[i].immOpnd.value = (int) bb->containingMethod;
++                /* Handle the codegen later */
++                dvmInsertGrowableList(
++                        &chainingListByType[kChainingCellInvokeSingleton], i);
++                break;
++            case kChainingCellInvokePredicted:
++                labelList[i].lop.opCode2 = ATOM_PSEUDO_CHAINING_CELL_INVOKE_PREDICTED;
++                /* Handle the codegen later */
++                dvmInsertGrowableList(&chainingListByType[kChainingCellInvokePredicted], i);
++                break;
++            case kChainingCellHot:
++                labelList[i].lop.opCode2 = ATOM_PSEUDO_CHAINING_CELL_HOT;
++                /* Handle the codegen later */
++                dvmInsertGrowableList(&chainingListByType[kChainingCellHot], i);
++                break;
++            case kPCReconstruction:
++                /* Make sure exception handling block is next */
++                labelList[i].lop.opCode2 = ATOM_PSEUDO_PC_RECONSTRUCTION_BLOCK_LABEL;
++                labelList[i].lop.generic.offset = (stream - streamMethodStart);
++                handlePCReconstruction(cUnit, &labelList[cUnit->puntBlock->id]);
++                break;
++            case kExceptionHandling:
++                labelList[i].lop.opCode2 = ATOM_PSEUDO_EH_BLOCK_LABEL;
++                labelList[i].lop.generic.offset = (stream - streamMethodStart);
++                scratchRegs[0] = PhysicalReg_EAX;
++                jumpToInterpPunt();
++                break;
++            case kChainingCellBackwardBranch:
++                labelList[i].lop.opCode2 = ATOM_PSEUDO_CHAINING_CELL_BACKWARD_BRANCH;
++                /* Handle the codegen later */
++                dvmInsertGrowableList(&chainingListByType[kChainingCellBackwardBranch], i);
++                break;
++            default:
++                break;
++            }
+         }
+ 
+-    }
+-
+     char* streamChainingStart = (char*)stream;
+     /* Handle the chaining cells in predefined order */
+     for (i = 0; i < kChainingCellGap; i++) {
+@@ -1451,10 +1434,6 @@ gen_fallthrough:
+ 
+             labelList[blockId].lop.generic.offset = (stream - streamMethodStart);
+ 
+-            /* Align this chaining cell first */
+-#if 0
+-            newLIR0(cUnit, ATOM_PSEUDO_ALIGN4);
+-#endif
+             /* Insert the pseudo chaining instruction */
+             dvmCompilerAppendLIR(cUnit, (LIR *) &labelList[blockId]);
+ 
+@@ -1508,9 +1487,6 @@ gen_fallthrough:
+     // restore state to the code stream
+     singletonPtr<ExceptionHandlingRestoreState>()->dumpAllExceptionHandlingRestoreState();
+ 
+-#if 0
+-    dvmCompilerApplyGlobalOptimizations(cUnit);
+-#endif
+     endOfTrace(false);
+ 
+     if (gDvmJit.codeCacheFull) {
+-- 
+1.7.4.1
+

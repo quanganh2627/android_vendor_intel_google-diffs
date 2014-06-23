@@ -1,0 +1,189 @@
+From d505607e6f9c09a276d21222dfd8aea5cb8de169 Mon Sep 17 00:00:00 2001
+From: Dan Liang <dan.liang@intel.com>
+Date: Tue, 30 Apr 2013 14:27:27 +0800
+Subject: Enable dynamic resolution change on JellyBean
+
+BZ: 49730
+
+Original patch:
+46646 (BZ: 34019)
+
+support dynamic resolution change both for local playback and streaming
+
+Category: aosp improvement
+Domain: Video.Media-video codec
+Origin: internal
+Upstream-Candidate: yes
+
+Change-Id: I42c1d7ae51f9642b7f319b024e8c419b7c3caa78
+Orig-Change-Id: I7be1ea94f71a3b9b946a8aedbbd6578825943cf3
+Signed-off-by: Weian Chen <weian.chen@intel.com>
+Signed-off-by: ywan171 <yi.a.wang@intel.com>
+Signed-off-by: Dan Liang <dan.liang@intel.com>
+---
+ include/media/stagefright/MetaData.h |    1 +
+ include/media/stagefright/OMXCodec.h |    2 +
+ media/libstagefright/ACodec.cpp      |    2 -
+ media/libstagefright/OMXCodec.cpp    |   42 ++++++++++++++++++++++++++++++---
+ 4 files changed, 41 insertions(+), 6 deletions(-)
+
+diff --git a/include/media/stagefright/MetaData.h b/include/media/stagefright/MetaData.h
+index b82a4ca..c00a701 100644
+--- a/include/media/stagefright/MetaData.h
++++ b/include/media/stagefright/MetaData.h
+@@ -95,6 +95,7 @@ enum {
+     kKeyCompilation       = 'cpil',  // cstring
+     kKeyLocation          = 'loc ',  // cstring
+     kKeyTimeScale         = 'tmsl',  // int32_t
++    KKeyCropChange        = 'crch',  // int32_t (bool)
+ 
+     // video profile and level
+     kKeyVideoProfile      = 'vprf',  // int32_t
+diff --git a/include/media/stagefright/OMXCodec.h b/include/media/stagefright/OMXCodec.h
+index fe42cb0..1597e9c 100644
+--- a/include/media/stagefright/OMXCodec.h
++++ b/include/media/stagefright/OMXCodec.h
+@@ -203,6 +203,8 @@ private:
+     status_t mFinalStatus;
+     bool mNoMoreOutputData;
+     bool mOutputPortSettingsHaveChanged;
++    bool mFirstFrame;
++    bool mCropInfoChanged;
+     int64_t mSeekTimeUs;
+     ReadOptions::SeekMode mSeekMode;
+     int64_t mTargetTimeUs;
+diff --git a/media/libstagefright/ACodec.cpp b/media/libstagefright/ACodec.cpp
+index e70893a..e217168 100644
+--- a/media/libstagefright/ACodec.cpp
++++ b/media/libstagefright/ACodec.cpp
+@@ -2548,8 +2548,6 @@ void ACodec::sendFormatChange(const sp<AMessage> &reply) {
+                 CHECK_GE(rect.nTop, 0);
+                 CHECK_GE(rect.nWidth, 0u);
+                 CHECK_GE(rect.nHeight, 0u);
+-                CHECK_LE(rect.nLeft + rect.nWidth - 1, videoDef->nFrameWidth);
+-                CHECK_LE(rect.nTop + rect.nHeight - 1, videoDef->nFrameHeight);
+ 
+                 notify->setRect(
+                         "crop",
+diff --git a/media/libstagefright/OMXCodec.cpp b/media/libstagefright/OMXCodec.cpp
+index 49a17db..8cb90fb 100644
+--- a/media/libstagefright/OMXCodec.cpp
++++ b/media/libstagefright/OMXCodec.cpp
+@@ -1447,6 +1447,8 @@ OMXCodec::OMXCodec(
+       mSignalledEOS(false),
+       mNoMoreOutputData(false),
+       mOutputPortSettingsHaveChanged(false),
++      mCropInfoChanged(false),
++      mFirstFrame(true),
+       mSeekTimeUs(-1),
+       mSeekMode(ReadOptions::SEEK_CLOSEST_SYNC),
+       mTargetTimeUs(-1),
+@@ -2339,6 +2341,11 @@ void OMXCodec::on_message(const omx_message &msg) {
+                 buffer->meta_data()->setInt64(
+                         kKeyTime, msg.u.extended_buffer_data.timestamp);
+ 
++                if (mCropInfoChanged) {
++                    buffer->meta_data()->setInt32(KKeyCropChange, true);
++                    mCropInfoChanged = false;
++                }
++
+                 if (msg.u.extended_buffer_data.flags & OMX_BUFFERFLAG_SYNCFRAME) {
+                     buffer->meta_data()->setInt32(kKeyIsSyncFrame, true);
+                 }
+@@ -2514,6 +2521,7 @@ void OMXCodec::onEvent(OMX_EVENTTYPE event, OMX_U32 data1, OMX_U32 data2) {
+                 // when the OMX_EventPortSettingsChanged is not meant for reallocating
+                 // the output buffers.
+                 if (data1 == kPortIndexOutput) {
++                    mFilledBuffers.clear();
+                     CHECK(mFilledBuffers.empty());
+                 }
+                 onPortSettingsChanged(data1);
+@@ -2521,8 +2529,19 @@ void OMXCodec::onEvent(OMX_EVENTTYPE event, OMX_U32 data1, OMX_U32 data2) {
+                         (data2 == OMX_IndexConfigCommonOutputCrop ||
+                          data2 == OMX_IndexConfigCommonScale)) {
+ 
++                if (data2 == OMX_IndexConfigCommonOutputCrop) {
++                    mCropInfoChanged = true;
++                    // Do cropping for the first frame before
++                    // the frame is send out. For the subsequent frames
++                    // the cropping has to be done AFTER the frame is send
++                    if (!mFirstFrame) {
++                        break;
++                    }
++                }
++
+                 sp<MetaData> oldOutputFormat = mOutputFormat;
+                 initOutputFormat(mSource->getFormat());
++                mCropInfoChanged = false;
+ 
+                 if (data2 == OMX_IndexConfigCommonOutputCrop &&
+                     formatHasNotablyChanged(oldOutputFormat, mOutputFormat)) {
+@@ -2853,7 +2872,7 @@ status_t OMXCodec::freeBuffersOnPort(
+     for (size_t i = buffers->size(); i-- > 0;) {
+         BufferInfo *info = &buffers->editItemAt(i);
+ 
+-        if (onlyThoseWeOwn && info->mStatus == OWNED_BY_COMPONENT) {
++        if (onlyThoseWeOwn && (info->mStatus == OWNED_BY_COMPONENT || info->mStatus==OWNED_BY_CLIENT)) {
+             continue;
+         }
+ 
+@@ -3759,6 +3778,8 @@ status_t OMXCodec::start(MetaData *meta) {
+     mSignalledEOS = false;
+     mNoMoreOutputData = false;
+     mOutputPortSettingsHaveChanged = false;
++    mCropInfoChanged = false;
++    mFirstFrame = true;
+     mSeekTimeUs = -1;
+     mSeekMode = ReadOptions::SEEK_CLOSEST_SYNC;
+     mTargetTimeUs = -1;
+@@ -4024,22 +4045,37 @@ status_t OMXCodec::read(
+         mSkipCutBuffer->submit(info->mMediaBuffer);
+     }
+     *buffer = info->mMediaBuffer;
++    mFirstFrame = false;
+ 
+     return OK;
+ }
+ 
+ void OMXCodec::signalBufferReturned(MediaBuffer *buffer) {
+     Mutex::Autolock autoLock(mLock);
++    int cropchange = 0;
+ 
+     Vector<BufferInfo> *buffers = &mPortBuffers[kPortIndexOutput];
+     for (size_t i = 0; i < buffers->size(); ++i) {
+         BufferInfo *info = &buffers->editItemAt(i);
+ 
+         if (info->mMediaBuffer == buffer) {
+-            CHECK_EQ((int)mPortStatus[kPortIndexOutput], (int)ENABLED);
+             CHECK_EQ((int)info->mStatus, (int)OWNED_BY_CLIENT);
++            if (mPortStatus[kPortIndexOutput] == DISABLING) {
++                CODEC_LOGV("Port is disabled, freeing buffer %p", buffer);
++                status_t err = freeBuffer(kPortIndexOutput, i);
++                CHECK_EQ(err, (status_t)OK);
++                return;
++            }
++            CHECK_EQ((int)mPortStatus[kPortIndexOutput], (int)ENABLED);
+ 
+             info->mStatus = OWNED_BY_US;
++            if (buffer->meta_data()->findInt32(KKeyCropChange, &cropchange) && cropchange) {
++                sp<MetaData> oldOutputFormat = mOutputFormat;
++                initOutputFormat(mSource->getFormat());
++                if (formatHasNotablyChanged(oldOutputFormat, mOutputFormat)) {
++                    mOutputPortSettingsHaveChanged = true;
++                }
++             }
+ 
+             if (buffer->graphicBuffer() == 0) {
+                 fillOutputBuffer(info);
+@@ -4594,8 +4630,6 @@ void OMXCodec::initOutputFormat(const sp<MetaData> &inputFormat) {
+                     CHECK_GE(rect.nTop, 0);
+                     CHECK_GE(rect.nWidth, 0u);
+                     CHECK_GE(rect.nHeight, 0u);
+-                    CHECK_LE(rect.nLeft + rect.nWidth - 1, video_def->nFrameWidth);
+-                    CHECK_LE(rect.nTop + rect.nHeight - 1, video_def->nFrameHeight);
+ 
+                     mOutputFormat->setRect(
+                             kKeyCropRect,
+-- 
+1.7.4.1
+

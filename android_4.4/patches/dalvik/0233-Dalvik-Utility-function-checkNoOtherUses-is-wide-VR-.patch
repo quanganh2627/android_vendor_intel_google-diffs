@@ -1,0 +1,303 @@
+From 646b70c66edb678cfaafa0d68581736bfdb3aea3 Mon Sep 17 00:00:00 2001
+From: Serguei Katkov <serguei.i.katkov@intel.com>
+Date: Wed, 26 Jun 2013 01:10:23 +0700
+Subject: Dalvik: Utility function checkNoOtherUses is wide VR aware
+
+BZ: 118838
+
+The utility function checkNoOtherUses for wide VR checks that
+both VR are used only together and there are no other uses
+for both of them.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Ic48f7bab44f82aa1e11624dd861492759da3a089
+Orig-MCG-Change-Id: I66751fa584cc58ec69101ba9da3fbe1cf744f0e2
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/AccumulationSinking.cpp |  231 +++++++++++++++++++++++++++++------
+ 1 files changed, 194 insertions(+), 37 deletions(-)
+
+diff --git a/vm/compiler/AccumulationSinking.cpp b/vm/compiler/AccumulationSinking.cpp
+index 485454b..ea95ddc 100644
+--- a/vm/compiler/AccumulationSinking.cpp
++++ b/vm/compiler/AccumulationSinking.cpp
+@@ -199,65 +199,213 @@ static bool fillAccumulatorMap (CompilationUnit *cUnit, LoopInformation *info, u
+     return true;
+ }
+ 
++/**
++ * This enum represetents a position in wide VR of the VR defined by Phi node
++ */
++enum PositionInWideVR {
++    vrNotWidePosition = 0,      /**< VR is 32-bit */
++    vrLowPosition,              /**< VR is low part of 64-bit VR */
++    vrHighPosition,             /**< VR is high part of 64-bit VR */
++    vrAmbigousPosition,         /**< defined VR has uses of different types
++                                     This is a specific case for Phi node where one use is 32-bit
++                                     another one is part of 64-bit, so it means the rigister is dead here,
++                                     otherwise it is a problem in a program or very complex case. */
++    vrUnknownPosition,          /**< Cannot determine position, mostly is used internally. */
++};
+ 
+ /**
+- * @brief check whether given VR has Phi node and is used as input for def of other VRs
++ * @brief Get the position of VR defined by Phi node in possible Wide VR.
+  * @param cUnit the CompilationUnit
+- * @param info the LoopInformation
+- * @param vr Virtual Register to check
+- * @param defMIR MIR defines our VR
+- * @return whether VR is not used in other calculations except itself
++ * @param phi node to exersise
++ * @param seen already seen mirs
++ * @return detected position
+  */
+-static bool checkNoOtherUses(CompilationUnit *cUnit, LoopInformation *info, unsigned int vr, MIR *defMIR)
++static PositionInWideVR getPhiPositionInWideVR (CompilationUnit *cUnit, MIR* phi, BitVector *seen = 0)
+ {
+-    if (defMIR == 0)
+-    {
+-        return false;
+-    }
+-
+-    assert(defMIR->ssaRep);
+-    assert(defMIR->ssaRep->numDefs > 0);
++    assert (phi->dalvikInsn.opcode == kMirOpPhi);
+ 
+-    assert(dvmExtractSSARegister(cUnit, defMIR->ssaRep->defs[0]) == vr
+-            || (defMIR->ssaRep->numDefs > 1 && dvmExtractSSARegister(cUnit, defMIR->ssaRep->defs[1]) == vr));
++    assert (phi->ssaRep != 0);
++    assert (phi->ssaRep->numDefs == 1);
+ 
+     //Get the SSA representation
+-    SSARepresentation *ssa = defMIR->ssaRep;
++    SSARepresentation *ssa = phi->ssaRep;
+ 
+-    int numDefs = ssa->numDefs;
+-    SUsedChain **chains = ssa->usedNext;
++    // Are we in recursion ?
++    if (seen != 0)
++    {
++        // We are iterating over Phi nodes corresponding to the same VR
++        // So SSA subscript uniquely defines a Phi node
++        unsigned int subScript = dvmExtractSSASubscript (cUnit, ssa->defs[0]);
+ 
+-    for (int i = 0; i < numDefs; i++)
++        // Check whether we have already visited this Phi node
++        if (dvmIsBitSet (seen, subScript) == true)
++        {
++            return vrUnknownPosition;
++        }
++    }
++
++    // At this moment we do not know result
++    PositionInWideVR result = vrUnknownPosition;
++
++    for (int i = 0; i < ssa->numUses; i++)
+     {
+-        for (SUsedChain *chain = chains[i]; chain != 0; chain = chain->nextUse)
++        MIR *mir = ssa->defWhere [i];
++
++        // If mir is 0 then def comes to use from beginning of the trace
++        // and we do not know what type this register is, let's base on other definitions.
++        if (mir != 0)
+         {
+-            MIR* mir = chain->mir;
++            PositionInWideVR tmp;
+ 
+-            if (info->isBasicBlockInLoop(mir->bb) == true)
++            if (static_cast<ExtendedMIROpcode>(mir->dalvikInsn.opcode) == kMirOpPhi)
+             {
+-                if (static_cast<int>(mir->dalvikInsn.opcode) == static_cast<int>(kMirOpPhi))
++                // Rare case, don't worry about allocation
++                if (seen == 0)
+                 {
+-                    continue;
++                    seen = dvmCompilerAllocBitVector (1, true);
++                    dvmClearAllBits (seen);
+                 }
++                // Mark that there is no sense to ask us
++                unsigned int subScript = dvmExtractSSASubscript (cUnit, ssa->defs[0]);
++                dvmSetBit (seen, subScript);
+ 
+-                SSARepresentation *ssaMir = mir->ssaRep;
+-                bool ok = false;
+-                for (int i = 0; i < ssaMir->numDefs; i++)
++                // Ask phi node about its position
++                tmp = getPhiPositionInWideVR (cUnit, mir, seen);
++            }
++            else
++            {
++                // 0 defs is not possible because we came here as use of this def
++                assert (mir->ssaRep->numDefs > 0);
++
++                if (mir->ssaRep->numDefs == 1)
+                 {
+-                    if (dvmExtractSSARegister(cUnit, ssaMir->defs[i]) == vr)
+-                    {
+-                        ok |= checkNoOtherUses(cUnit, info, vr, mir);
+-                        break;
+-                    }
++                    tmp = vrNotWidePosition;
+                 }
++                else
++                {
++                    tmp = (mir->ssaRep->defs[0] == ssa->uses[i]) ? vrLowPosition : vrHighPosition;
++                }
++            }
+ 
+-                if (ok == false)
++            // Now merge results
++            if (result == vrUnknownPosition)
++            {
++                result = tmp;
++            }
++            else
++            {
++                if (tmp != vrUnknownPosition)
+                 {
+-                    return false;
++                    // Results are different ?
++                    if (result != tmp)
++                    {
++                        return vrAmbigousPosition;
++                    }
++                    // otherwise tmp == result and there is no sense to update
+                 }
+             }
+         }
+     }
++
++    return result;
++}
++
++/**
++ * @brief Find an alone use in the loop of specified def
++ * @param cUnit the CompilationUnit
++ * @param info the LoopInformation
++ * @param def MIR to find an alone use
++ * @param defPos the position inf ssa->defs array
++ * @return MIR if single use is found, 0 otherwise
++ */
++static MIR *findAloneDefInALoop(CompilationUnit *cUnit, LoopInformation *info, MIR *def, int defPos)
++{
++    SSARepresentation *ssa = def->ssaRep;
++
++    assert (ssa != 0);
++    assert (ssa->usedNext != 0);
++    assert (ssa->numDefs > defPos);
++
++    MIR *result = 0;
++
++    for (SUsedChain *chain = ssa->usedNext[defPos]; chain != 0; chain = chain->nextUse)
++    {
++        MIR* mir = chain->mir;
++
++        if (info->isBasicBlockInLoop(mir->bb) == true)
++        {
++            if (result != 0)
++            {
++                // It is not alone use
++                return 0;
++            }
++
++            result = mir;
++        }
++    }
++    return result;
++}
++
++/**
++ * @brief check whether given VR has Phi node and is used as input for def of other VRs
++ * @param cUnit the CompilationUnit
++ * @param info the LoopInformation
++ * @param vrLow Virtual Register to check, low part for wide VR
++ * @param vrHigh high part of wide VR or 0 for non-wide VR
++ * @return whether VR is not used in other calculations except itself
++ */
++static bool checkNoOtherUses(CompilationUnit *cUnit, LoopInformation *info, unsigned int vrLow, unsigned int vrHigh)
++{
++    bool isWide = vrHigh != 0;
++
++    MIR *phiLow = info->getPhiInstruction (cUnit, vrLow);
++
++    if (phiLow == 0)
++    {
++        return false;
++    }
++
++    MIR *phiHigh = (isWide == false) ? 0 : info->getPhiInstruction (cUnit, vrHigh);
++
++    if ((isWide == true) && (phiHigh == 0))
++    {
++        return false;
++    }
++
++    MIR *defLow = findAloneDefInALoop (cUnit, info, phiLow, 0);
++    MIR *defHigh = (isWide == false) ? 0 : findAloneDefInALoop (cUnit, info, phiHigh, 0);
++
++    // iterate over re-assignments until we return to our phi nodes
++    do
++    {
++        // alone def should be and it should be the same for wide VR
++        if (defLow == 0 || ((isWide == true) && (defLow != defHigh)))
++        {
++            return false;
++        }
++
++        SSARepresentation *ssa = defLow->ssaRep;
++        int expectedNumberOfDefs = (isWide == true) ? 2 : 1;
++        if (ssa->numDefs != expectedNumberOfDefs)
++        {
++            return false;
++        }
++
++        if (vrLow != dvmExtractSSARegister (cUnit, ssa->defs[0]))
++        {
++            return false;
++        }
++
++        if ((isWide == true) && (vrHigh != dvmExtractSSARegister (cUnit, ssa->defs[1])))
++        {
++            return false;
++        }
++
++        defLow = findAloneDefInALoop (cUnit, info, defLow, 0);
++        defHigh = (isWide == false) ? 0 : findAloneDefInALoop (cUnit, info, defHigh, 1);
++
++    } while ((defLow != phiLow) || ((isWide == true) && (defHigh != phiHigh)));
++
+     return true;
+ }
+ 
+@@ -299,10 +447,19 @@ static void filterVRs (CompilationUnit *cUnit, LoopInformation *info, std::vecto
+         //Is that register an induction variable?
+         if (info->isAnInductionVariable (cUnit, vr) == false)
+         {
+-            if (checkNoOtherUses(cUnit, info, vr, info->getPhiInstruction (cUnit, vr)) == true)
++            MIR *phi = info->getPhiInstruction (cUnit, vr);
++            PositionInWideVR position = getPhiPositionInWideVR (cUnit, phi);
++
++            // if it is ambigous position we skip it
++            // if it is a high position, it has already been checked in low position
++            if (position == vrNotWidePosition || position == vrLowPosition)
+             {
+-                //Add it now
+-                vrElements.push_back (vr);
++                unsigned int vrHigh = (position == vrLowPosition) ? vr + 1 : 0;
++                if (checkNoOtherUses(cUnit, info, vr, vrHigh) == true)
++                {
++                    //Add it now
++                    vrElements.push_back (vr);
++                }
+             }
+         }
+     }
+-- 
+1.7.4.1
+

@@ -1,0 +1,149 @@
+From 210ddbd47a1c1b833c4947b555e5883188549d0a Mon Sep 17 00:00:00 2001
+From: Jeevaka Badrappan <jeevaka.badrappan@intel.com>
+Date: Wed, 5 Dec 2012 14:35:43 +0200
+Subject: [PATCH 51/62] [PORT FROM MAIN] Telephony: Add suspend/resume and MS
+ class handling
+
+BZ: 37735 44153
+
+In 2G networks which doesn't support simultaneous voice
+and data, data will be suspended on voice call and sms
+operations.
+
+This patch adds the handling of this case by MS Class information
+based concurrent data support and data suspend/resume state handling
+via properties expossed by telephony oemhooks.
+
+Change-Id: I22e01c32ea697dae3d9afa480829025a002791cf
+Orig-Change-Id: Ieae771e66640aef9120441e4f9574419cc8bedd2
+Orig-Change-Id: I652b9c3406eb5bdef1882827b84907437f431ece
+Signed-off-by: Arun Ravindran <arun.ravindran@intel.com>
+Signed-off-by: Jeevaka Badrappan <jeevaka.badrappan@intel.com>
+Reviewed-on: http://android.intel.com:8080/79185
+Reviewed-by: Fremaux, Pascal <pascal.fremaux@intel.com>
+Reviewed-by: Yao, Yong <yong.yao@intel.com>
+Reviewed-by: Lucas, Guillaume <guillaume.lucas@intel.com>
+Reviewed-by: Lebsir, SamiX <samix.lebsir@intel.com>
+Tested-by: Lebsir, SamiX <samix.lebsir@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+---
+ .../android/internal/telephony/gsm/GSMPhone.java   |   17 +++++++++++++
+ .../telephony/gsm/GsmDataConnectionTracker.java    |   25 ++++++++++++++++++++
+ .../telephony/gsm/GsmServiceStateTracker.java      |   22 ++++++++++++++++-
+ 3 files changed, 63 insertions(+), 1 deletions(-)
+
+diff --git a/src/java/com/android/internal/telephony/gsm/GSMPhone.java b/src/java/com/android/internal/telephony/gsm/GSMPhone.java
+index 6178d24..5ee7999 100644
+--- a/src/java/com/android/internal/telephony/gsm/GSMPhone.java
++++ b/src/java/com/android/internal/telephony/gsm/GSMPhone.java
+@@ -18,6 +18,7 @@ package com.android.internal.telephony.gsm;
+ 
+ import android.content.ContentValues;
+ import android.content.Context;
++import android.content.res.Resources;
+ import android.content.SharedPreferences;
+ import android.database.SQLException;
+ import android.net.Uri;
+@@ -281,6 +282,19 @@ public class GSMPhone extends PhoneBase {
+     public PhoneConstants.DataState getDataConnectionState(String apnType) {
+         PhoneConstants.DataState ret = PhoneConstants.DataState.DISCONNECTED;
+ 
++        String dataState = "";
++        try {
++            if (mContext.getResources().getBoolean(
++                    com.android.internal.R.bool.config_usage_oem_hooks_supported)) {
++
++                String oemproperty = mContext
++                        .getText(com.android.internal.R.string.oemhook_datastate_property)
++                        .toString();
++                dataState = SystemProperties.get(oemproperty,"");
++            }
++        } catch (Resources.NotFoundException ex) {
++        }
++
+         if (mSST == null) {
+             // Radio Technology Change is ongoning, dispose() and removeReferences() have
+             // already been called
+@@ -292,6 +306,9 @@ public class GSMPhone extends PhoneBase {
+             //      Dataconnection or not. Checking each ApnState below should
+             //      provide the same state. Calling isApnTypeActive() can be removed.
+             ret = PhoneConstants.DataState.DISCONNECTED;
++        } else if (dataState.equals("suspended")) {
++            Log.d(LOG_TAG, "Data state is suspended");
++            ret = PhoneConstants.DataState.SUSPENDED;
+         } else { /* mSST.gprsState == ServiceState.STATE_IN_SERVICE */
+             switch (mDataConnectionTracker.getState(apnType)) {
+                 case FAILED:
+diff --git a/src/java/com/android/internal/telephony/gsm/GsmDataConnectionTracker.java b/src/java/com/android/internal/telephony/gsm/GsmDataConnectionTracker.java
+index 71f69a2..11a4581 100644
+--- a/src/java/com/android/internal/telephony/gsm/GsmDataConnectionTracker.java
++++ b/src/java/com/android/internal/telephony/gsm/GsmDataConnectionTracker.java
+@@ -2420,6 +2420,31 @@ public final class GsmDataConnectionTracker extends DataConnectionTracker {
+         }
+     }
+ 
++    public void onDataSuspended() {
++        if (DBG) log("onDataSuspended");
++        if (isConnected()) {
++            if (DBG) log("onDataSuspended stop polling");
++            stopNetStatPoll();
++            stopDataStallAlarm();
++            notifyDataConnection(null);
++        }
++
++        notifyOffApnsOfAvailability(null);
++    }
++
++    public void onDataResumed() {
++        if (DBG) log("onDataResumed");
++        if (isConnected()) {
++            startNetStatPoll();
++            startDataStallAlarm(DATA_STALL_NOT_SUSPECTED);
++            notifyDataConnection(null);
++        } else {
++            // reset reconnect timer
++            setupDataOnReadyApns(null);
++        }
++        notifyOffApnsOfAvailability(null);
++    }
++
+     @Override
+     protected void log(String s) {
+         Log.d(LOG_TAG, "[GsmDCT] "+ s);
+diff --git a/src/java/com/android/internal/telephony/gsm/GsmServiceStateTracker.java b/src/java/com/android/internal/telephony/gsm/GsmServiceStateTracker.java
+index cc71011..882a935 100644
+--- a/src/java/com/android/internal/telephony/gsm/GsmServiceStateTracker.java
++++ b/src/java/com/android/internal/telephony/gsm/GsmServiceStateTracker.java
+@@ -1334,7 +1334,27 @@ final class GsmServiceStateTracker extends ServiceStateTracker {
+      * that could support voice and data simultaneously.
+      */
+     public boolean isConcurrentVoiceAndDataAllowed() {
+-        return (mRilRadioTechnology >= ServiceState.RIL_RADIO_TECHNOLOGY_UMTS);
++        // when tech is UMTS return true always
++        if (mRilRadioTechnology >= ServiceState.RIL_RADIO_TECHNOLOGY_UMTS) {
++            return true;
++        }
++        // If tech is not UMTS, check the MS Class info based property
++        String ccdata = "";
++        try {
++            if (phone.getContext().getResources().getBoolean(
++                    com.android.internal.R.bool.config_usage_oem_hooks_supported)) {
++                String oemproperty = phone.getContext().getText(
++                        com.android.internal.R.string.oemhook_concurrentdata_property).toString();
++                ccdata = SystemProperties.get(oemproperty,"");
++            }
++        } catch (Resources.NotFoundException ex) {
++            log("ignore exception");
++        }
++        if (!ccdata.equals("")) {
++            log("Concurrent data set as:" + ccdata);
++            return ccdata.equals("allowed");
++        }
++        return false;
+     }
+ 
+     /**
+-- 
+1.7.9
+

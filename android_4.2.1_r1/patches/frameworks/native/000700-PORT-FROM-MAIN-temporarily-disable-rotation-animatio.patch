@@ -1,0 +1,198 @@
+From 4052d5a3adeae2a27a8286a8b357bb42ebcadf39 Mon Sep 17 00:00:00 2001
+From: Jason Hu <jason.hu@intel.com>
+Date: Wed, 21 Nov 2012 17:01:00 -0500
+Subject: [PATCH 07/39] [PORT FROM MAIN] temporarily disable rotation
+ animation for WV DRM UC
+
+BZ: 50798
+
+Add an interface to notify window manager to disable rotation screen
+animation only for WV DRM UC. mTransitionAnimationScale would be temporarily
+set to 0 during screen rotation. It should be no harmful for common situation.
+
+DO NOT UPSTREAM
+
+Change-Id: Ia58543b90a55a9a2bb676445016cf56efffbc55e
+Signed-off-by: Jason Hu <jason.hu@intel.com>
+Reviewed-on: http://android.intel.com:8080/75177
+Reviewed-by: lab_cactus <lab_cactus@intel.com>
+Reviewed-by: Yao, Yong <yong.yao@intel.com>
+Tested-by: Ding, Haitao <haitao.ding@intel.com>
+Tested-by: Tong, BoX <box.tong@intel.com>
+Reviewed-by: Tong, BoX <box.tong@intel.com>
+---
+ include/gui/ISurfaceComposer.h             |    2 ++
+ include/gui/SurfaceComposerClient.h        |    1 +
+ libs/gui/ISurfaceComposer.cpp              |   14 ++++++++++++++
+ libs/gui/SurfaceComposerClient.cpp         |    4 ++++
+ services/surfaceflinger/SurfaceFlinger.cpp |   19 +++++++++++++++----
+ services/surfaceflinger/SurfaceFlinger.h   |    2 ++
+ 6 files changed, 38 insertions(+), 4 deletions(-)
+
+diff --git a/include/gui/ISurfaceComposer.h b/include/gui/ISurfaceComposer.h
+index 6500ad5..ecc0506 100644
+--- a/include/gui/ISurfaceComposer.h
++++ b/include/gui/ISurfaceComposer.h
+@@ -109,6 +109,7 @@ public:
+     /* returns information about a display
+      * intended to be used to get information about built-in displays */
+     virtual status_t getDisplayInfo(const sp<IBinder>& display, DisplayInfo* info) = 0;
++    virtual bool isAnimationPermitted() = 0;
+ };
+ 
+ // ----------------------------------------------------------------------------
+@@ -130,6 +131,7 @@ public:
+         BLANK,
+         UNBLANK,
+         GET_DISPLAY_INFO,
++        IS_ANIMATION_PERMITTED,
+         CONNECT_DISPLAY,
+     };
+ 
+diff --git a/include/gui/SurfaceComposerClient.h b/include/gui/SurfaceComposerClient.h
+index ae5d69a..cbe399f 100644
+--- a/include/gui/SurfaceComposerClient.h
++++ b/include/gui/SurfaceComposerClient.h
+@@ -66,6 +66,7 @@ public:
+ 
+     // Get information about a display
+     static status_t getDisplayInfo(const sp<IBinder>& display, DisplayInfo* info);
++    static bool isAnimationPermitted();
+ 
+     /* triggers screen off and waits for it to complete */
+     static void blankDisplay(const sp<IBinder>& display);
+diff --git a/libs/gui/ISurfaceComposer.cpp b/libs/gui/ISurfaceComposer.cpp
+index 85a9488..bb0bf92 100644
+--- a/libs/gui/ISurfaceComposer.cpp
++++ b/libs/gui/ISurfaceComposer.cpp
+@@ -223,6 +223,15 @@ public:
+         memcpy(info, reply.readInplace(sizeof(DisplayInfo)), sizeof(DisplayInfo));
+         return reply.readInt32();
+     }
++
++    virtual bool isAnimationPermitted()
++    {
++        Parcel data, reply;
++        data.writeInterfaceToken(ISurfaceComposer::getInterfaceDescriptor());
++        remote()->transact(BnSurfaceComposer::IS_ANIMATION_PERMITTED, data, &reply);
++        bool result = reply.readInt32();
++        return result;
++    }
+ };
+ 
+ IMPLEMENT_META_INTERFACE(SurfaceComposer, "android.ui.ISurfaceComposer");
+@@ -332,6 +341,11 @@ status_t BnSurfaceComposer::onTransact(
+             memcpy(reply->writeInplace(sizeof(DisplayInfo)), &info, sizeof(DisplayInfo));
+             reply->writeInt32(result);
+         } break;
++        case IS_ANIMATION_PERMITTED: {
++            CHECK_INTERFACE(ISurfaceComposer, data, reply);
++            int32_t result = isAnimationPermitted() ? 1 : 0;
++            reply->writeInt32(result);
++        } break;
+         default:
+             return BBinder::onTransact(code, data, reply, flags);
+     }
+diff --git a/libs/gui/SurfaceComposerClient.cpp b/libs/gui/SurfaceComposerClient.cpp
+index 80dd6ee..f549578 100644
+--- a/libs/gui/SurfaceComposerClient.cpp
++++ b/libs/gui/SurfaceComposerClient.cpp
+@@ -583,6 +583,10 @@ void SurfaceComposerClient::unblankDisplay(const sp<IBinder>& token) {
+     ComposerService::getComposerService()->unblank(token);
+ }
+ 
++bool SurfaceComposerClient::isAnimationPermitted()
++{
++    return ComposerService::getComposerService()->isAnimationPermitted();
++}
+ // ----------------------------------------------------------------------------
+ 
+ ScreenshotClient::ScreenshotClient()
+diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinger/SurfaceFlinger.cpp
+index ce10c78..742ce9b 100644
+--- a/services/surfaceflinger/SurfaceFlinger.cpp
++++ b/services/surfaceflinger/SurfaceFlinger.cpp
+@@ -101,7 +101,8 @@ SurfaceFlinger::SurfaceFlinger()
+         mLastSwapBufferTime(0),
+         mDebugInTransaction(0),
+         mLastTransactionTime(0),
+-        mBootFinished(false)
++        mBootFinished(false),
++        mAnimFlag(true)
+ {
+     ALOGI("SurfaceFlinger is starting");
+ 
+@@ -1533,6 +1534,7 @@ void SurfaceFlinger::doComposeSurfaces(const sp<const DisplayDevice>& hw, const
+     const Transform& tr = hw->getTransform();
+     if (cur != end) {
+         // we're using h/w composer
++        bool needDisableAnimation = false;
+         for (size_t i=0 ; i<count && cur!=end ; ++i, ++cur) {
+             const sp<LayerBase>& layer(layers[i]);
+             const Region clip(dirty.intersect(tr.transform(layer->visibleRegion)));
+@@ -1547,6 +1549,8 @@ void SurfaceFlinger::doComposeSurfaces(const sp<const DisplayDevice>& hw, const
+                             // guaranteed the FB is already cleared
+                             layer->clearWithOpenGL(hw, clip);
+                         }
++                        if ((cur->getHints() & HWC_HINT_DISABLE_ANIMATION))
++                            needDisableAnimation = true;
+                         break;
+                     }
+                     case HWC_FRAMEBUFFER: {
+@@ -1561,6 +1565,7 @@ void SurfaceFlinger::doComposeSurfaces(const sp<const DisplayDevice>& hw, const
+                     }
+                 }
+             }
++            mAnimFlag = needDisableAnimation ? false : true;
+             layer->setAcquireFence(hw, *cur);
+         }
+     } else {
+@@ -2582,9 +2587,11 @@ status_t SurfaceFlinger::renderScreenToTextureLocked(uint32_t layerStack,
+     glLoadIdentity();
+     const Vector< sp<LayerBase> >& layers(hw->getVisibleLayersSortedByZ());
+     const size_t count = layers.size();
+-    for (size_t i=0 ; i<count ; ++i) {
+-        const sp<LayerBase>& layer(layers[i]);
+-        layer->draw(hw);
++    if (mAnimFlag) {
++        for (size_t i=0 ; i<count ; ++i) {
++            const sp<LayerBase>& layer(layers[i]);
++            layer->draw(hw);
++        }
+     }
+ 
+     hw->compositionComplete();
+@@ -2784,6 +2791,10 @@ status_t SurfaceFlinger::captureScreen(const sp<IBinder>& display,
+     return res;
+ }
+ 
++bool SurfaceFlinger::isAnimationPermitted() {
++    return mAnimFlag;
++}
++
+ // ---------------------------------------------------------------------------
+ 
+ SurfaceFlinger::LayerVector::LayerVector() {
+diff --git a/services/surfaceflinger/SurfaceFlinger.h b/services/surfaceflinger/SurfaceFlinger.h
+index b0d3bac..b71d4dd 100644
+--- a/services/surfaceflinger/SurfaceFlinger.h
++++ b/services/surfaceflinger/SurfaceFlinger.h
+@@ -206,6 +206,7 @@ private:
+     // called when screen is turning back on
+     virtual void unblank(const sp<IBinder>& display);
+     virtual status_t getDisplayInfo(const sp<IBinder>& display, DisplayInfo* info);
++    virtual bool isAnimationPermitted();
+ 
+     /* ------------------------------------------------------------------------
+      * DeathRecipient interface
+@@ -444,6 +445,7 @@ private:
+     volatile nsecs_t mDebugInTransaction;
+     nsecs_t mLastTransactionTime;
+     bool mBootFinished;
++    bool mAnimFlag;
+ 
+     // these are thread safe
+     mutable MessageQueue mEventQueue;
+-- 
+1.7.9
+

@@ -1,0 +1,151 @@
+From b18ac5d4d1bab6af6d8dbe7d98d7ea3bd41435a6 Mon Sep 17 00:00:00 2001
+From: wangzuo <zuo.wang@intel.com>
+Date: Tue, 3 Dec 2013 17:45:56 -0500
+Subject: Dalvik: Implement configurable buffer size for TLA
+
+BZ: 156440
+
+Huge buffer size will cause lots of wasted pages (initialized by not used yet) for
+TLA, thus introduces memory pressure issue on low-memory-device. This patch reduces the
+default buffer size and also implements the configurable buffer size so that we can
+tune it on different platforms.
+
+Change-Id: Ia4c857f625b6a9905ea026b2a764ceef86c413ec
+Category: device enablement
+Domain: AOSP.Dalvik-GC
+Origin: internal
+Upstream-Candidate: no, need rework
+Signed-off-by: Wang Zuo <zuo.wang@intel.com>
+---
+ vm/Globals.h                      |    3 +++
+ vm/Init.cpp                       |   23 +++++++++++++++++++++++
+ vm/alloc/ThreadLocalAllocator.cpp |   10 +++++-----
+ vm/alloc/ThreadLocalAllocator.h   |    1 +
+ 4 files changed, 32 insertions(+), 5 deletions(-)
+
+diff --git a/vm/Globals.h b/vm/Globals.h
+index c6a9f8e..1ed9a41 100644
+--- a/vm/Globals.h
++++ b/vm/Globals.h
+@@ -781,6 +781,9 @@ struct DvmGlobals {
+     char *niceName;
+ 
+ #ifdef WITH_TLA
++    /* configurable slot number limit */
++    unsigned int tlaSlotNumber;
++
+     /* Do we want TLA enabled? */
+     bool withTLA;
+ 
+diff --git a/vm/Init.cpp b/vm/Init.cpp
+index f456feb..d36bc6c 100644
+--- a/vm/Init.cpp
++++ b/vm/Init.cpp
+@@ -55,6 +55,10 @@
+ #include "compiler/codegen/Optimizer.h"
+ #endif
+ 
++#ifdef WITH_TLA
++#include "alloc/ThreadLocalAllocator.h"
++#endif
++
+ #define kMinHeapStartSize   (1*1024*1024)
+ #define kMinHeapSize        (2*1024*1024)
+ #define kMaxHeapSize        (1*1024*1024*1024)
+@@ -1837,6 +1841,24 @@ int processOptions(int argc, const char* const argv[], bool ignoreUnrecognized)
+ #ifdef WITH_TLA
+         } else if (strncmp(argv[i], "-Xdisabletla", 12) == 0) {
+             gDvm.withTLA = false;
++        } else if (strncmp(argv[i], "-XX:tlaslotnumber=", 18) == 0) {
++            long val = strtol(argv[i] + 18, NULL, 10);
++            if (val > 0) {
++                // assignment
++                gDvm.tlaSlotNumber = val;
++
++                // check max limit
++                if (gDvm.tlaSlotNumber > TLA_MAX_SLOT_NUM ) {
++                    gDvm.tlaSlotNumber = TLA_MAX_SLOT_NUM;
++                }
++
++                // check min limit
++                if (gDvm.tlaSlotNumber < TLA_MIN_SLOT_NUM ) {
++                    gDvm.tlaSlotNumber = TLA_MIN_SLOT_NUM;
++                }
++            } else {
++                dvmFprintf(stderr, "Invalid -XX:tlaslotnumber option '%s'\n", argv[i]);
++            }
+ #endif
+         } else if (strncmp(argv[i], "-Xstacktracefile:", 17) == 0) {
+             gDvm.stackTraceFile = strdup(argv[i]+17);
+@@ -1992,6 +2014,7 @@ static void setCommandLineDefaults()
+ 
+ #ifdef WITH_TLA
+     gDvm.withTLA = true;
++    gDvm.tlaSlotNumber = TLA_MIN_SLOT_NUM;
+ #endif
+ 
+     /*
+diff --git a/vm/alloc/ThreadLocalAllocator.cpp b/vm/alloc/ThreadLocalAllocator.cpp
+index b2542dd..25ed563 100644
+--- a/vm/alloc/ThreadLocalAllocator.cpp
++++ b/vm/alloc/ThreadLocalAllocator.cpp
+@@ -418,7 +418,7 @@ __inline__ static unsigned char* getDataEndpos (unsigned int tableIndex, unsigne
+     unsigned char *result = block->startDataPos;
+ 
+     //Add the slot size times the maximum number of slots
+-    result += getSlotSize (sizeOffset) * TLA_MAX_SLOT_NUM;
++    result += getSlotSize (sizeOffset) * gDvm.tlaSlotNumber;
+ 
+     //Finally add what needs to be added to align to 64 bytes
+     result += TLA_ADDRESS_ALIGN_TO_64_BYTE;
+@@ -720,7 +720,7 @@ static void buildSlotList (void* startDataPos, unsigned int sizeOffset)
+     unsigned char* start = getAlignedPtr (startDataPos, TLA_ADDRESS_ALIGN_TO_64_BYTE);
+ 
+     //Calculate the end address
+-    unsigned char* end = start + slotSize * TLA_MAX_SLOT_NUM;
++    unsigned char* end = start + slotSize * gDvm.tlaSlotNumber;
+ 
+     //Now walk it to link everyone
+     while (start < end)
+@@ -933,7 +933,7 @@ static void* allocSlot (mspace msp, unsigned int tableIndex, unsigned int size)
+         {
+             //We do not have a start here, so let's try to get one
+             //First: calculate how much data we want
+-            unsigned int requestSize = getSlotSize (sizeOffset) * TLA_MAX_SLOT_NUM + TLA_ADDRESS_ALIGN_TO_64_BYTE;
++            unsigned int requestSize = getSlotSize (sizeOffset) * gDvm.tlaSlotNumber + TLA_ADDRESS_ALIGN_TO_64_BYTE;
+ 
+             //Try to allocate it
+             void* result = mspaceCalloc (msp, requestSize);
+@@ -952,7 +952,7 @@ static void* allocSlot (mspace msp, unsigned int tableIndex, unsigned int size)
+                 block->headSlotList = getAlignedPtr (result, TLA_ADDRESS_ALIGN_TO_64_BYTE);
+ 
+                 //Update heap->bytesAllocated and heap->objectsAllocated for small Objects
+-                dvmCountAllocationForSmallObject (result, TLA_MAX_SLOT_NUM, requestSize);
++                dvmCountAllocationForSmallObject (result, gDvm.tlaSlotNumber, requestSize);
+ 
+                 //Log it
+                 TLA_LOG (2, "TLA Info: allocSlot (): create slot list, tableIndex %u sizeOffset %u blockIndex %u", tableIndex, sizeOffset, blockIndex);
+@@ -1347,7 +1347,7 @@ void dvmTLARecyclePrivateBuffer (unsigned int tableIndex, unsigned int sizeOffse
+ 
+         //Now get the start
+         unsigned char *start = block->startDataPos;
+-        dvmCountFreeForSmallObject (start, TLA_MAX_SLOT_NUM, TLA_MAX_SLOT_NUM * getSlotSize (sizeOffset) + TLA_ADDRESS_ALIGN_TO_64_BYTE);
++        dvmCountFreeForSmallObject (start, gDvm.tlaSlotNumber, gDvm.tlaSlotNumber * getSlotSize (sizeOffset) + TLA_ADDRESS_ALIGN_TO_64_BYTE);
+ 
+         //Use the mspace bulk free function
+         mspace_bulk_free (msp,  (void**)& (start), 1);
+diff --git a/vm/alloc/ThreadLocalAllocator.h b/vm/alloc/ThreadLocalAllocator.h
+index 3bad1a0..20db02f 100644
+--- a/vm/alloc/ThreadLocalAllocator.h
++++ b/vm/alloc/ThreadLocalAllocator.h
+@@ -22,6 +22,7 @@
+ //A few macros to define sizes
+ #define TLA_MAX_ALLOC_THREAD_NUM          32
+ #define TLA_MAX_SLOT_NUM                  1024
++#define TLA_MIN_SLOT_NUM                  128
+ #define TLA_INTERCEPT_OBJECT_NUM              5
+ 
+ /**
+-- 
+1.7.4.1
+

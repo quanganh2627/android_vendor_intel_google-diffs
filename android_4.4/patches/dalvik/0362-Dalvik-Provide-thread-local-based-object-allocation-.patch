@@ -1,0 +1,2365 @@
+From f7b7f0ec4a653c6e230ea713aedd94fec0095184 Mon Sep 17 00:00:00 2001
+From: wangzuo <zuo.wang@intel.com>
+Date: Mon, 2 Sep 2013 02:31:09 -0400
+Subject: Dalvik: Provide thread local based object allocation for small objects
+
+BZ: 139206
+
+Provide a thread local based object allocation for small objects is
+ important for certain cases where a lot of small, 16-byte to 32-byte objects,
+ are being allocated by the various threads.
+
+This implementation handles this by providing a better implementation for such
+ cases and results show a boost of 65% on AndEbench, 12% on Smartbench on Baytrail
+ with the r42b-ww35 release.
+
+Preliminary results show that it improves AndEbench by 65% and Smartbench by 12% on Baytrail
+platform with r42b-ww35 release.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-GC; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I99282388c5825c75618e127a39c212b202792f21
+Orig-MCG-Change-Id: I826dd988a42f36274492547db4d936c8a5128be3
+Signed-off-by: Wang Zuo <zuo.wang@intel.com>
+Signed-off-by: Li Yu L <yu.l.li@intel.com>
+Signed-off-by: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Reviewed-on: http://android.intel.com:8080/129136
+Reviewed-by: Tasson, Sebastien <sebastien.tasson@intel.com>
+Reviewed-by: lab_aqa <lab_aqa@intel.com>
+Reviewed-by: Lupusoru, Razvan A <razvan.a.lupusoru@intel.com>
+Reviewed-by: Semukhina, Elena V <elena.v.semukhina@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: Banerji, Udayan <udayan.banerji@intel.com>
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ Android.mk                        |   10 +
+ vm/Dvm.mk                         |    6 +
+ vm/Globals.h                      |   12 +
+ vm/Init.cpp                       |    9 +
+ vm/Thread.cpp                     |   43 ++
+ vm/Thread.h                       |   19 +
+ vm/alloc/Heap.cpp                 |   19 +-
+ vm/alloc/HeapBitmap.cpp           |  109 +++-
+ vm/alloc/HeapBitmap.h             |   24 +-
+ vm/alloc/HeapSource.cpp           |  147 ++++-
+ vm/alloc/HeapSource.h             |   38 +
+ vm/alloc/MarkSweep.cpp            |   62 ++-
+ vm/alloc/MarkSweep.h              |   11 +
+ vm/alloc/ThreadLocalAllocator.cpp | 1355 +++++++++++++++++++++++++++++++++++++
+ vm/alloc/ThreadLocalAllocator.h   |  132 ++++
+ 15 files changed, 1981 insertions(+), 15 deletions(-)
+ create mode 100644 vm/alloc/ThreadLocalAllocator.cpp
+ create mode 100644 vm/alloc/ThreadLocalAllocator.h
+
+diff --git a/Android.mk b/Android.mk
+index e474671..cd8451d 100644
+--- a/Android.mk
++++ b/Android.mk
+@@ -58,6 +58,16 @@ ifeq ($(WITH_REGION_GC),)
+   endif
+ endif
+ 
++# TLA is an optimization in DalvikVM to provide thread local allocation for small objects.
++WITH_TLA := $(strip $(WITH_TLA))
++ifeq ($(WITH_TLA),)
++  ifeq ($(TARGET_ARCH),x86)
++    WITH_TLA := true
++  else
++    WITH_TLA := false
++  endif
++endif
++
+ subdirs := $(addprefix $(LOCAL_PATH)/,$(addsuffix /Android.mk, \
+ 		libdex \
+ 		vm \
+diff --git a/vm/Dvm.mk b/vm/Dvm.mk
+index d537fc1..ddd536b 100644
+--- a/vm/Dvm.mk
++++ b/vm/Dvm.mk
+@@ -217,6 +217,12 @@ LOCAL_SRC_FILES := \
+ 	test/TestHash.cpp \
+ 	test/TestIndirectRefTable.cpp
+ 
++#Add TLA support if needed
++ifeq ($(WITH_TLA), true)
++  LOCAL_CFLAGS += -DWITH_TLA
++  LOCAL_SRC_FILES += alloc/ThreadLocalAllocator.cpp
++endif
++
+ ifeq ($(WITH_REGION_GC), true)
+   LOCAL_CFLAGS += -DWITH_REGION_GC
+   LOCAL_SRC_FILES += alloc/RegionGC.cpp
+diff --git a/vm/Globals.h b/vm/Globals.h
+index 3b20ff7..fc4e6d5 100644
+--- a/vm/Globals.h
++++ b/vm/Globals.h
+@@ -37,6 +37,10 @@
+ #include <pthread.h>
+ #include <signal.h>
+ 
++#ifdef WITH_TLA
++#include "alloc/ThreadLocalAllocator.h"
++#endif
++
+ /* private structures */
+ struct GcHeap;
+ struct BreakpointSet;
+@@ -763,6 +767,14 @@ struct DvmGlobals {
+ 
+     /* String containing the nice name to appear in ps */
+     char *niceName;
++
++#ifdef WITH_TLA
++    /* Do we want TLA enabled? */
++    bool withTLA;
++
++    /* Global TLA structure */
++    struct ThreadLocalAllocator tlaInformation;
++#endif
+ };
+ 
+ extern struct DvmGlobals gDvm;
+diff --git a/vm/Init.cpp b/vm/Init.cpp
+index dd8cca7..1ded570 100644
+--- a/vm/Init.cpp
++++ b/vm/Init.cpp
+@@ -175,6 +175,7 @@ static void usage(const char* progName)
+     dvmFprintf(stderr, "  -Xjitbranchloops (Allows branches in loops, only tested if nestedloops is also off)\n");
+     dvmFprintf(stderr, "  -Xjitextraoptsfile:<file> handling extra options via a process filtering file\n");
+     dvmFprintf(stderr, "  -Xjitoldloops (Only accept the old loop detection system)\n");
++    dvmFprintf(stderr, "  -Xdisabletla (Disable TLA allocation for small objects)");
+     dvmFprintf(stderr, "  -Xjitignorepasses:<value> (Used to ignore loop passes. The full name of the pass must be included "
+             "and each pass separated by comma, see -Xjitlooppasses to get a list)\n");
+     dvmFprintf(stderr, "  -Xjitdebugpasses:<value> (Enable verbosity for optimization passes. The full name of the pass must "
+@@ -1791,6 +1792,10 @@ int processOptions(int argc, const char* const argv[], bool ignoreUnrecognized)
+ #endif
+ #endif
+ 
++#ifdef WITH_TLA
++        } else if (strncmp(argv[i], "-Xdisabletla", 12) == 0) {
++            gDvm.withTLA = false;
++#endif
+         } else if (strncmp(argv[i], "-Xstacktracefile:", 17) == 0) {
+             gDvm.stackTraceFile = strdup(argv[i]+17);
+ 
+@@ -1938,6 +1943,10 @@ static void setCommandLineDefaults()
+     gDvm.generateRegisterMaps = true;
+     gDvm.registerMapMode = kRegisterMapModeTypePrecise;
+ 
++#ifdef WITH_TLA
++    gDvm.withTLA = true;
++#endif
++
+     /*
+      * Default execution mode.
+      *
+diff --git a/vm/Thread.cpp b/vm/Thread.cpp
+index d580b19..e4b1b4a 100644
+--- a/vm/Thread.cpp
++++ b/vm/Thread.cpp
+@@ -33,6 +33,10 @@
+ #include <errno.h>
+ #include <fcntl.h>
+ 
++#ifdef WITH_TLA
++#include "alloc/ThreadLocalAllocator.h"
++#endif
++
+ #if defined(HAVE_PRCTL)
+ #include <sys/prctl.h>
+ #endif
+@@ -872,6 +876,11 @@ static Thread* allocThread(int interpStackSize)
+     /* One-time setup for interpreter/JIT state */
+     dvmInitInterpreterState(thread);
+ 
++#ifdef WITH_TLA
++    //Set TLA table index
++    thread->tlaTableIndex = TLA_MAX_ALLOC_THREAD_NUM;
++#endif
++
+     return thread;
+ }
+ 
+@@ -3562,6 +3571,40 @@ void dvmDumpAllThreadsEx(const DebugOutputTarget* target, bool grabLock)
+         dvmUnlockThreadList();
+ }
+ 
++#ifdef WITH_TLA
++/**
++ * @details Set the thread information with the TLA table index to use
++ */
++void dvmSetTLAThreadIndex (u4 tableIndex)
++{
++    Thread *thread = static_cast<Thread *> (pthread_getspecific (gDvm.pthreadKeySelf));
++
++    //Paranoid and to make klocwork happy
++    if (thread != 0)
++    {
++        thread->tlaTableIndex = tableIndex;
++    }
++}
++
++/**
++ * @details Get the thread information's TLA table index
++ */
++int dvmGetTLAThreadIndex (void)
++{
++    Thread *thread = static_cast<Thread *> (pthread_getspecific (gDvm.pthreadKeySelf));
++
++    //Paranoid and to make klocwork happy
++    if (thread != 0)
++    {
++        //Return the TLA index
++        return thread->tlaTableIndex;
++    }
++
++    //Return error code
++    return -1;
++}
++#endif
++
+ /*
+  * Nuke the target thread from orbit.
+  *
+diff --git a/vm/Thread.h b/vm/Thread.h
+index a1826f2..c77f04b 100644
+--- a/vm/Thread.h
++++ b/vm/Thread.h
+@@ -69,6 +69,20 @@ bool dvmThreadStartup(void);
+ void dvmThreadShutdown(void);
+ void dvmSlayDaemons(void);
+ 
++#ifdef WITH_TLA
++/**
++ * @brief Set the TLA table index in the thread information
++ * @param tableIndex the table index for the thread
++ */
++void dvmSetTLAThreadIndex (u4 tableIndex);
++
++/**
++ * @brief Get the TLA table index from the thread information
++ * @return the TLA table index, -1 if an error occured
++ */
++int dvmGetTLAThreadIndex(void);
++#endif
++
+ 
+ #define kJniLocalRefMin         64
+ #define kJniLocalRefMax         512     /* arbitrary; should be plenty */
+@@ -311,6 +325,11 @@ struct Thread {
+ #if defined(ARCH_IA32) && defined(WITH_JIT)
+     u4 spillRegion[MAX_SPILL_JIT_IA];
+ #endif
++
++#ifdef WITH_TLA
++    /** @brief Index in alloc thread table for current thread */
++    u4 tlaTableIndex;
++#endif
+ };
+ 
+ /* start point for an internal thread; mimics pthread args */
+diff --git a/vm/alloc/Heap.cpp b/vm/alloc/Heap.cpp
+index 01020ad..97e723f 100644
+--- a/vm/alloc/Heap.cpp
++++ b/vm/alloc/Heap.cpp
+@@ -38,6 +38,10 @@
+ 
+ #include <cutils/trace.h>
+ 
++#ifdef WITH_TLA
++#include "ThreadLocalAllocator.h"
++#endif
++
+ static const GcSpec kGcForMallocSpec = {
+ #ifdef WITH_REGION_GC
+     false,  /* isPartial */
+@@ -128,7 +132,17 @@ bool dvmHeapStartup()
+ 
+ bool dvmHeapStartupAfterZygote()
+ {
+-    return dvmHeapSourceStartupAfterZygote();
++    bool result = dvmHeapSourceStartupAfterZygote();
++
++#ifdef WITH_TLA
++    if (result == true)
++    {
++        //With TLA, we want to initialize it
++        return dvmTLAInit();
++    }
++#endif
++
++    return result;
+ }
+ 
+ void dvmHeapShutdown()
+@@ -142,6 +156,9 @@ void dvmHeapShutdown()
+          */
+         dvmHeapSourceShutdown(&gDvm.gcHeap);
+     }
++#ifdef WITH_TLA
++    dvmTLADestroy ();
++#endif
+ }
+ 
+ /*
+diff --git a/vm/alloc/HeapBitmap.cpp b/vm/alloc/HeapBitmap.cpp
+index 6162ff8..bfaccf6 100644
+--- a/vm/alloc/HeapBitmap.cpp
++++ b/vm/alloc/HeapBitmap.cpp
+@@ -18,6 +18,15 @@
+ #include "HeapBitmap.h"
+ #include <sys/mman.h>   /* for PROT_* */
+ 
++#ifdef WITH_TLA
++#include "alloc/Heap.h"
++#include "alloc/HeapInternal.h"
++#include "alloc/HeapSource.h"
++#include "alloc/MarkSweep.h"
++#include "alloc/DlMalloc.h"
++#include "alloc/ThreadLocalAllocator.h"
++#endif
++
+ /*
+  * Initialize a HeapBitmap so that it points to a bitmap large
+  * enough to cover a heap at <base> of <maxSize> bytes, where
+@@ -190,10 +199,13 @@ void dvmHeapBitmapScanWalk(HeapBitmap *bitmap,
+  * <callback> zero or more times with lists of these object pointers.
+  *
+  * The callback is not permitted to increase the max of either bitmap.
++ *
++ * This implementation contains the TLA version if requested or not
+  */
+ void dvmHeapBitmapSweepWalk(const HeapBitmap *liveHb, const HeapBitmap *markHb,
+                             uintptr_t base, uintptr_t max,
+-                            BitmapSweepCallback *callback, void *callbackArg)
++                            BitmapSweepCallback *callback, void *callbackArg,
++                            bool withTLA, bool isConcurrent, mspace msp)
+ {
+     assert(liveHb != NULL);
+     assert(liveHb->bits != NULL);
+@@ -210,12 +222,23 @@ void dvmHeapBitmapSweepWalk(const HeapBitmap *liveHb, const HeapBitmap *markHb,
+          */
+         return;
+     }
++
++#ifdef WITH_TLA
++    void* blockEndPos = 0;
++    u4 tableIndex;
++    u4 sizeOffset;
++    u4 blockIndex;
++    u4 numPtrs = 0;
++    void* smallObjectBuffer[TLA_MAX_SLOT_NUM];
++#endif
++
+     void *pointerBuf[4 * HB_BITS_PER_WORD];
+     void **pb = pointerBuf;
+     size_t start = HB_OFFSET_TO_INDEX(base - liveHb->base);
+     size_t end = HB_OFFSET_TO_INDEX(max - liveHb->base);
+     unsigned long *live = liveHb->bits;
+     unsigned long *mark = markHb->bits;
++
+     for (size_t i = start; i <= end; i++) {
+         unsigned long garbage = live[i] & ~mark[i];
+         if (UNLIKELY(garbage != 0)) {
+@@ -224,8 +247,80 @@ void dvmHeapBitmapSweepWalk(const HeapBitmap *liveHb, const HeapBitmap *markHb,
+             while (garbage != 0) {
+                 int shift = CLZ(garbage);
+                 garbage &= ~(highBit >> shift);
+-                *pb++ = (void *)(ptrBase + shift * HB_OBJECT_ALIGNMENT);
++
++#ifdef WITH_TLA
++                //Is the Thread local allocation for small objects requested?
++                if (withTLA == true)
++                {
++                    //Get the target address: pointer base + shift using heap base object alignment
++                    void* targetAddress = (void *) (ptrBase + shift * HB_OBJECT_ALIGNMENT);
++
++                    //If we don't have a block end position
++                    if(blockEndPos == 0)
++                    {
++                        //Get one
++                        blockEndPos = dvmTLAGetBlockEndPos(targetAddress, &tableIndex, &sizeOffset, &blockIndex);
++                    }
++
++                    //If we still don't have one, then go to the next spot
++                    if (blockEndPos == 0)
++                    {
++                        //Set pointer
++                        *pb = targetAddress;
++
++                        //Increment it
++                        pb++;
++                    }
++                    else
++                    {
++                        //Is our target address under the block's end position?
++                        if(targetAddress < blockEndPos)
++                        {
++                            //Then add it to the small object buffer
++                            smallObjectBuffer[numPtrs] = targetAddress;
++                            //Augment number of pointers
++                            numPtrs++;
++                        }
++                        else
++                        {
++                            //Ok, otherwise we need to first recycle the private buffer
++                            dvmTLARecyclePrivateBuffer(tableIndex, sizeOffset, blockIndex, smallObjectBuffer, numPtrs, isConcurrent, callbackArg, msp);
++
++                            //Reset the number of pointers
++                            numPtrs = 0;
++
++                            //Then, get a new block end position
++                            blockEndPos = dvmTLAGetBlockEndPos(targetAddress, &tableIndex, &sizeOffset, &blockIndex);
++
++                            //Hopefully, we have one now
++                            if (blockEndPos  == 0)
++                            {
++                                //Set target address
++                                *pb = targetAddress;
++
++                                //Increment it
++                                pb++;
++                            }
++                            else
++                            {
++                                //Finally, add it to the small object buffer
++                                smallObjectBuffer[numPtrs] = targetAddress;
++                                //Augment number of pointers
++                                numPtrs++;
++                            }
++                        }
++                    }
++                }
++                else //Otherwise we go to the non-TLA version
++#endif
++                {
++                    //Set private buffer
++                    *pb = (void *)(ptrBase + shift * HB_OBJECT_ALIGNMENT);
++                    //Increment private buffer
++                    pb++;
++                }
+             }
++
+             /* Make sure that there are always enough slots available */
+             /* for an entire word of 1s. */
+             if (pb >= &pointerBuf[NELEM(pointerBuf) - HB_BITS_PER_WORD]) {
+@@ -234,6 +329,16 @@ void dvmHeapBitmapSweepWalk(const HeapBitmap *liveHb, const HeapBitmap *markHb,
+             }
+         }
+     }
++
++#ifdef WITH_TLA
++    //Finally, with TLA, we need to check if we have an end block position
++    if (blockEndPos != 0)
++    {
++        /* If we do, recycle the private buffer */
++        dvmTLARecyclePrivateBuffer(tableIndex, sizeOffset, blockIndex, smallObjectBuffer, numPtrs, isConcurrent, callbackArg, msp);
++    }
++#endif
++
+     if (pb > pointerBuf) {
+         (*callback)(pb - pointerBuf, pointerBuf, callbackArg);
+     }
+diff --git a/vm/alloc/HeapBitmap.h b/vm/alloc/HeapBitmap.h
+index 9385686..5bb41f0 100644
+--- a/vm/alloc/HeapBitmap.h
++++ b/vm/alloc/HeapBitmap.h
+@@ -19,6 +19,10 @@
+ #include <limits.h>
+ #include <stdint.h>
+ 
++#ifdef WITH_TLA
++#include "alloc/DlMalloc.h"
++#endif
++
+ #define HB_OBJECT_ALIGNMENT 8
+ #define HB_BITS_PER_WORD (sizeof(unsigned long) * CHAR_BIT)
+ 
+@@ -128,8 +132,24 @@ void dvmHeapBitmapScanWalk(HeapBitmap *bitmap,
+  *
+  * The callback is not permitted to increase the max of either bitmap.
+  */
++/**
++ * @brief walk bitmap to sweep
++ * @param liveHB the live HeapBitmap
++ * @param markHB the marked elements in the heap
++ * @param base the base pointer
++ * @param max the maximum address for the heap
++ * @param callback the callback function for the bitmap sweep
++ * @param callbackArg the callback arguments
++ * @param withTLA do we want TLA on or off
++ * @param isConcurrent is the GC concurrent
++ * @param msp the memory space holder
++ * @details first check whether the recycled object is allocated by TLA;
++ * if so, get the end pos of current private buffer and check the following objects
++ * by directly comparing address; when moving to the objects from another private buffer or
++ * the object allocated by dlmalloc, call dvmTLARecyclePrivateBuffer() to recycle current private buffer
++ */
+ void dvmHeapBitmapSweepWalk(const HeapBitmap *liveHb, const HeapBitmap *markHb,
+                             uintptr_t base, uintptr_t max,
+-                            BitmapSweepCallback *callback, void *callbackArg);
+-
++                            BitmapSweepCallback *callback, void *callbackArg,
++                            bool withTLA, bool isConcurrent, mspace msp);
+ #endif  // DALVIK_HEAP_BITMAP_H_
+diff --git a/vm/alloc/HeapSource.cpp b/vm/alloc/HeapSource.cpp
+index 1b58ab2..9807907 100644
+--- a/vm/alloc/HeapSource.cpp
++++ b/vm/alloc/HeapSource.cpp
+@@ -29,6 +29,10 @@
+ #include "alloc/HeapBitmap.h"
+ #include "alloc/HeapBitmapInlines.h"
+ 
++#ifdef WITH_TLA
++#include "alloc/ThreadLocalAllocator.h"
++#endif
++
+ static void dvmHeapSourceUpdateMaxNativeFootprint();
+ static void snapIdealFootprint();
+ static void setIdealFootprint(size_t max);
+@@ -318,19 +322,106 @@ void hsCheckPointer2AppHeap(Object *from, Object *to){
+  *
+  * These aren't exact, and should not be treated as such.
+  */
+-static void countAllocation(Heap *heap, const void *ptr)
++static void countAllocation(Heap *heap, const void *ptr, bool isSmallObject = false)
+ {
+     assert(heap->bytesAllocated < mspace_footprint(heap->msp));
+ 
+-    heap->bytesAllocated += mspace_usable_size(ptr) +
+-            HEAP_SOURCE_CHUNK_OVERHEAD;
+-    heap->objectsAllocated++;
++    /* Only update bytesAllocated and objectsAllocated for dlmalloc ptr,
++     *  ie not for small objects
++     */
++    if(isSmallObject == false)
++    {
++        //Get the delta for the allocation
++        size_t delta = mspace_usable_size(ptr) + HEAP_SOURCE_CHUNK_OVERHEAD;
++
++        //Increment the number of bytes allocated for the allocation
++        heap->bytesAllocated += delta;
++
++        //Increment the number of allocated objects
++        heap->objectsAllocated++;
++    }
++
+     HeapSource* hs = gDvm.gcHeap->heapSource;
+     dvmHeapBitmapSetObjectBit(&hs->liveBits, ptr);
+ 
+     assert(heap->bytesAllocated < mspace_footprint(heap->msp));
+ }
+ 
++#ifdef WITH_TLA
++mspace dvmHeapSourceGetHeapMsp (void)
++{
++    HeapSource *hs = gHs;
++    return (hs2heap(hs))->msp;
++}
++
++void dvmCleanBitmapForSmallObject(void** ptr, size_t num, bool isConcurrent)
++{
++    //If concurrent, we need a lock
++    if(isConcurrent == true)
++    {
++        dvmLockHeap();
++    }
++
++    //Get the heap source
++    HeapSource* hs = gDvm.gcHeap->heapSource;
++    for(size_t index = 0; index < num; index++)
++    {
++        //Clear the object bits
++        dvmHeapBitmapClearObjectBit (&hs->liveBits, ptr[index]);
++    }
++
++    //If concurrent, let's not forget to unlock
++    if(isConcurrent == true)
++    {
++        dvmUnlockHeap();
++    }
++}
++
++void dvmCountFreeForSmallObject(void* ptr, u4 objectNum, u4 delta)
++{
++    //Get the heap
++    Heap* heap = ptr2heap(gHs, ptr);
++
++    //If we have enough space, we can reduce its allocated bytes
++    if (delta < heap->bytesAllocated)
++    {
++        heap->bytesAllocated -= delta;
++    }
++    else
++    {
++        //Otherwise set it to 0
++        heap->bytesAllocated = 0;
++    }
++
++    //If we still have enough objects, reduce it
++    if (heap->objectsAllocated > objectNum)
++    {
++        heap->objectsAllocated -= objectNum;
++    }
++    else
++    {
++        //Otherwise set it to 0
++        heap->objectsAllocated = 0;
++    }
++}
++
++void dvmCountAllocationForSmallObject(void * ptr, u4 objectNum, u4 delta)
++{
++    //Lock mutex for the heap
++    dvmLockHeap();
++
++    //Now get the heap
++    Heap* heap = ptr2heap(gHs, ptr);
++
++    //Add bytes and objects for it
++    heap->bytesAllocated += delta;
++    heap->objectsAllocated += objectNum;
++
++    //Unock mutex for the heap
++    dvmUnlockHeap();
++}
++#endif
++
+ static void countFree(Heap *heap, const void *ptr, size_t *numBytes)
+ {
+     size_t delta = mspace_usable_size(ptr) + HEAP_SOURCE_CHUNK_OVERHEAD;
+@@ -985,6 +1076,7 @@ void* dvmHeapSourceAlloc(size_t n)
+ 
+     HeapSource *hs = gHs;
+     Heap* heap = hs2heap(hs);
++    bool isSmallObject = false;
+     if (heap->bytesAllocated + n > hs->softLimit) {
+         /*
+          * This allocation would push us over the soft limit; act as
+@@ -1027,13 +1119,35 @@ void* dvmHeapSourceAlloc(size_t n)
+         }
+         memset((void*)zero_begin, 0, zero_end - zero_begin);
+     } else {
+-        ptr = mspace_calloc(heap->msp, 1, n);
++        ptr = 0;
++
++#ifdef WITH_TLA
++        if (gDvm.withTLA == true)
++        {
++            // TODO: parallel allocation is not fully enabled with extra lock overhead
++            dvmUnlockHeap();
++            ptr = dvmTLAMalloc (heap->msp, n, &isSmallObject);
++            dvmLockHeap();
++        }
++        else
++        {
++#endif
++
++            //Default version
++            ptr = mspace_calloc (heap->msp, 1, n);
++
++#ifdef WITH_TLA
++            //Close the block
++        }
++#endif
++
+         if (ptr == NULL) {
+             return NULL;
+         }
+     }
+ 
+-    countAllocation(heap, ptr);
++    countAllocation(heap, ptr, isSmallObject);
++
+     /*
+      * Check to see if a concurrent GC should be initiated.
+      */
+@@ -1223,8 +1337,25 @@ size_t dvmHeapSourceChunkSize(const void *ptr)
+     HS_BOILERPLATE();
+ 
+     Heap* heap = ptr2heap(gHs, ptr);
+-    if (heap != NULL) {
+-        return mspace_usable_size(ptr);
++    if (heap != NULL)
++    {
++#ifdef WITH_TLA
++        if (gDvm.withTLA == true)
++        {
++            /* Call dvmTLAGetSlotSize() to get the pure size of target object */
++            size_t delta = dvmTLAGetSlotSize (ptr, true);
++
++            //If delta is different than 0, we have a spot and can return it
++            if (delta != 0)
++            {
++                return delta;
++            }
++
++            //Otherwise fall through the normal behavior
++        }
++#endif
++
++        return mspace_usable_size (ptr);
+     }
+     return 0;
+ }
+diff --git a/vm/alloc/HeapSource.h b/vm/alloc/HeapSource.h
+index a03ac5b..8aa0fda 100644
+--- a/vm/alloc/HeapSource.h
++++ b/vm/alloc/HeapSource.h
+@@ -237,4 +237,42 @@ char* dvmGetZygoteHeapBase();
+  */
+ void hsCheckPointer2AppHeap(Object *from, Object *to);
+ #endif //WITH_REGION_GC
++
++#ifdef WITH_TLA
++//Forward declaration
++struct Heap;
++
++/**
++ * @brief Get memory space
++ * @return the memory space from the heap source
++ */
++mspace dvmHeapSourceGetHeapMsp (void);
++
++/**
++ * @brief Clean bitmap for small object
++ * @param ptr Pointer to void* array
++ * @param num The number of pointers
++ * @param isConcurrent Whether it is concurrent GC or not
++ */
++void dvmCleanBitmapForSmallObject (void** ptr, size_t num, bool isConcurrent);
++
++/**
++ * @brief Count free for small objects
++ * @param ptr the pointer containing object information
++ * @param objectNum the number of objects
++ * @param delta
++ * @details it is only called when recycling private buffer
++ */
++void dvmCountFreeForSmallObject (void* ptr, u4 objectNum, u4 delta);
++
++/**
++ * @brief Count allocation for smallobjects
++ * @param ptr the pointer containing object information
++ * @param objectNum the number of objects
++ * @param delta
++ * @details it is only called when creating a new private buffer
++ */
++void dvmCountAllocationForSmallObject(void * ptr, u4 objectNum, u4 delta);
++#endif
++
+ #endif  // DALVIK_HEAP_SOURCE_H_
+diff --git a/vm/alloc/MarkSweep.cpp b/vm/alloc/MarkSweep.cpp
+index 1450e6f..4c4dd45 100644
+--- a/vm/alloc/MarkSweep.cpp
++++ b/vm/alloc/MarkSweep.cpp
+@@ -26,6 +26,11 @@
+ #include <sys/mman.h>   // for madvise(), mmap()
+ #include <errno.h>
+ 
++#ifdef WITH_TLA
++#include "alloc/DlMalloc.h"
++#include "alloc/ThreadLocalAllocator.h"
++#endif
++
+ typedef unsigned long Word;
+ const size_t kWordSize = sizeof(Word);
+ 
+@@ -992,10 +997,48 @@ void dvmHeapSweepUnmarkedObjects(bool isPartial, bool isConcurrent,
+     ctx.isConcurrent = isConcurrent;
+     prevLive = dvmHeapSourceGetMarkBits();
+     prevMark = dvmHeapSourceGetLiveBits();
++
++    bool withTLA = false;
++
++#ifdef WITH_TLA
++    bool resultIntercept = false;
++
++    //Do we want TLA?
++    if (gDvm.withTLA == true)
++    {
++        //Oh, we do want TLA
++        withTLA = true;
++
++        /* Diable TLAMalloc */
++        resultIntercept = dvmTLADisableMalloc();
++    }
++#endif
++
+     for (size_t i = 0; i < numSweepHeaps; ++i) {
+-        dvmHeapBitmapSweepWalk(prevLive, prevMark, base[i], max[i],
+-                               sweepBitmapCallback, &ctx);
++        /*
++         * During the walking, empty slots as well as priavte buffer will be recycled,
++         *   - Depending on compilation options and command-line options, we might want TLA
++         *     Reflect that via the last arguments
++         */
++        dvmHeapBitmapSweepWalk (prevLive, prevMark, base[i], max[i],
++                                sweepBitmapCallback, &ctx,
++                                withTLA, isConcurrent, dvmHeapSourceGetHeapMsp());
+     }
++
++#ifdef WITH_TLA
++    if (gDvm.withTLA == true)
++    {
++        /* Recycle available entries */
++        dvmTLARecycleThreadTableEntry ();
++
++        /* Enable TLAMalloc depending on the disable's return */
++        if(resultIntercept == true)
++        {
++            dvmTLAEnableMalloc ();
++        }
++    }
++#endif
++
+     *numObjects = ctx.numObjects;
+     *numBytes = ctx.numBytes;
+     if (gDvm.allocProf.enabled) {
+@@ -1003,3 +1046,18 @@ void dvmHeapSweepUnmarkedObjects(bool isPartial, bool isConcurrent,
+         gDvm.allocProf.freeSize += ctx.numBytes;
+     }
+ }
++
++#ifdef WITH_TLA
++void dvmSweepBitmapForSmallObject(size_t numPtrs, size_t bytesPtrs, void *arg)
++{
++    //Paranoid
++    assert(arg != 0);
++
++    //Get the sweep context
++    SweepContext *ctx = static_cast<SweepContext *> (arg);
++
++    //Add context number of bytes and number of objects
++    ctx->numBytes += bytesPtrs;
++    ctx->numObjects += numPtrs;
++}
++#endif
+diff --git a/vm/alloc/MarkSweep.h b/vm/alloc/MarkSweep.h
+index edb464a..0178515 100644
+--- a/vm/alloc/MarkSweep.h
++++ b/vm/alloc/MarkSweep.h
+@@ -67,4 +67,15 @@ void dvmEnqueueClearedReferences(Object **references);
+ #ifdef WITH_REGION_GC
+ void dvmSetEnableCrossHeapPointerCheck(bool status);
+ #endif //WITH_REGION_GC
++
++#ifdef WITH_TLA
++/**
++ * @brief update context info with no call to dvmHeapSourceFreeList
++ * @param numPtrs The number of pointers
++ * @param bytesPtrs The total size of data allocated at pointer's address
++ * @param arg the sweep context passed as an argument via the dispatcher
++ */
++void dvmSweepBitmapForSmallObject(size_t numPtrs, size_t bytesPtrs, void *arg);
++#endif
++
+ #endif  // DALVIK_ALLOC_MARK_SWEEP_H_
+diff --git a/vm/alloc/ThreadLocalAllocator.cpp b/vm/alloc/ThreadLocalAllocator.cpp
+new file mode 100644
+index 0000000..33167bc
+--- /dev/null
++++ b/vm/alloc/ThreadLocalAllocator.cpp
+@@ -0,0 +1,1355 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0  (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#include <stdlib.h>
++#include <stdio.h>
++#include <string.h>
++#include <assert.h>
++#include <unistd.h>
++#include <malloc.h>
++#include "cutils/log.h"
++
++#include "alloc/DlMalloc.h"
++#include "alloc/ThreadLocalAllocator.h"
++
++#include "Dalvik.h"
++#include "alloc/Heap.h"
++#include "alloc/HeapInternal.h"
++#include "alloc/HeapSource.h"
++
++#include "Thread.h"
++
++/*
++ *  Thread Local Allocation  (TLA) acts as a wrapper around dlmalloc. It does not change the management policy of the java heap.
++ *  TLA intercepts the allocation requests to dlmalloc, and allocates a slot in a private buffer.
++ *  TLA also intercepts the free requests to dlmalloc, and recycles the objects allocated by TLA.
++
++ *  According to the analysis of 75 market apps, most object allocations concentrates on the range 16~32 bytes.
++ *  TLA prepares private buffers for each of 16, 20, 24, 28 and 32 bytes. Since extra data is used to store allocation info,
++ *  the slot size is larger than the request size. Taking 16-byte request for example, the slot size is 24 bytes.
++ *  The empty slots in private buffers are managed as a single list. The operation to allocate a slot in private buffer
++ *  is simplified as fetching an element at the head of list. Only after all slots in a private buffer are cycled,
++ *  the private buffer will be cycled.
++
++ *  When an allocation request arrives at the TLA entry point, TLA checks the tid and request size: if tid does
++ *  not exist in allocThreadTable, allocates a new entry in allocThreadTable to save the tid,
++ *  if the traversal and allocNum arrays for the request size do not exist, prepare them;
++ *  if both of the above conditions are ready, try to allocate a slot in target private buffer.
++ *  If there is no empty slot in target private buffer, allocate a new private buffer first then do the allocations.
++ */
++
++//Lower this value to get more debug information, minimum is 0
++#define TLA_DEBUG_LEVEL 4
++
++//A few macros for the TLA allocation system
++#define TLA_MAX_BLOCK_NUM                 512
++
++#define TLA_SIZE_SHIFT                        2
++#define TLA_SHIFT_TO_OFFSET                   4
++/* the first slot in private buffer is 64-byte align */
++#define TLA_ADDRESS_ALIGN_TO_64_BYTE          64
++
++/* address return by malloc is 4096-byte align */
++#define TLA_PHYSICAL_PAGE_SIZE                4096
++
++#define TLA_ERROR_PRIVATE_BUFFER_FULL         0xFFFFFFFF
++
++/**
++ * @brief control data for private buffer
++ */
++struct BlockTraversalStructure
++{
++    unsigned char* startDataPos;         //!< @brief pointer to current private buffer
++
++    void* headSlotList;                  //!< @brief head of empty slot list for current private buffe
++};
++
++/**
++ * @brief allocNum for private buffer
++ */
++struct BlockAllocNumStructure
++{
++    unsigned int allocNum;               //!< @brief allocNum for current private buffer
++};
++
++#define TLA_LOG(Verbosity,format,...) \
++   do \
++   { \
++      /* Should we be printing this out? */ \
++      if  (TLA_DEBUG_LEVEL <= Verbosity) \
++      { \
++        ALOGD  ("TLA ### %x ### "format,  (unsigned int)  (pthread_self  ()), ##__VA_ARGS__);\
++      } \
++   } while  (0)
++
++/** @brief The TLA status enumeration */
++enum TLAStatusDefine
++{
++    TLASuccess,         /**< @brief Success */
++    TLAErrorCmpxchg,    /**< @brief There was a problem with the compare and set */
++    TLAErrorTableFull /**< @brief Error in the allocation */
++};
++
++/**
++ * @brief Allocate some space using the mspace and size
++ * @param msp the mspace
++ * @param size the size we wish to allocate
++ * @return the allocated space
++ */
++static void* mspaceCalloc (mspace msp, size_t size)
++{
++    //Start by locking the heap
++    dvmLockHeap ();
++
++    //Now allocate the space
++    void *result =  mspace_calloc (msp, 1, size);
++
++    //Finish by unlocking the heap
++    dvmUnlockHeap ();
++
++    //Return the result
++    return result;
++}
++
++/**
++ * @brief Compare-and-swap, without any explicit barriers
++ * @details Note that this function returns 0 on success, and 1 on failure. The opposite convention is typically used on other platforms.
++ * @param old_value the oldvalue of the pointer to compare with
++ * @param new_value the new value to set
++ * @param ptr the memory location to fetch/compare/set
++ * @return whether the value in memory is the old value
++ */
++static __inline__ __attribute__ ( (always_inline)) bool assemblyCmpxchgU4  (unsigned int old_value, unsigned int new_value, volatile unsigned int* ptr)
++{
++    unsigned int prev;
++    __asm__ __volatile__  ("lock; cmpxchgl %1, %2"
++                          : "=a"  (prev)
++                          : "q"  (new_value), "m"  (*ptr), "0"  (old_value)
++                          : "memory");
++   return (prev == old_value);
++}
++
++/**
++ * @brief return slot size
++ * @param sizeOffset The size offset
++ * @return the slot size
++ */
++__inline__ static unsigned int getSlotSize (size_t sizeOffset)
++{
++    //Paranoid
++    assert  (sizeOffset < TLA_INTERCEPT_OBJECT_NUM);
++
++    return gDvm.tlaInformation.slotSizeTable[sizeOffset];
++}
++
++/**
++ * @brief Check whether we should intercept the allocation based on the size
++ * @param size The request size
++ * @return whether we should intercept based on size
++ */
++__inline__ static bool isInterceptSize (size_t size)
++{
++    //If we have not disabled the malloc intercept
++    if  (gDvm.tlaInformation.isDisableMallocIntercept != 0)
++    {
++        //Check if the size is the right multiple so we can use small object allocations
++        if ( (size %  (1 << TLA_SIZE_SHIFT)) == 0)
++        {
++            //Now check if the size if not too small
++            bool result =  ( (TLA_SHIFT_TO_OFFSET << TLA_SIZE_SHIFT) <= size);
++
++            //And if it is not too big
++            result =  (result == true) &&  (size <  ( (TLA_INTERCEPT_OBJECT_NUM + TLA_SHIFT_TO_OFFSET) << TLA_SIZE_SHIFT));
++
++            //Finally return that we do or not want to intercept
++            return result;
++        }
++    }
++
++    //In this case we do not want to intercept
++    return false;
++}
++
++/**
++ * @brief Enable free intercept
++ * @return whether the intercepting was enabled
++ */
++static bool TLAEnableFree  (void)
++{
++    //Compare and set the flag for the disable free intercept
++    bool result = assemblyCmpxchgU4 (0, 1, & (gDvm.tlaInformation.isDisableFreeIntercept));
++
++    //Print out some things depending on the result
++    if (result == true)
++    {
++        TLA_LOG  (2, "SmallObjectEnableIntercept () : Enable Free Intercepting ");
++    }
++    else
++    {
++        TLA_LOG  (2, "SmallObjectEnableIntercept () : Free Intercepting is already enabled ");
++    }
++
++    //Return the result
++    return result;
++}
++
++/**
++ * @brief Enable free intercept
++ * @return whether or not TLA Free Intercepting was already enabled
++ */
++static bool TLADisableFree (void)
++{
++    //Compare and set the flag for the disable free intercept
++    bool result = assemblyCmpxchgU4 (1, 0, & (gDvm.tlaInformation.isDisableFreeIntercept));
++
++    //Print out some things depending on the result
++    if (result == true)
++    {
++        TLA_LOG  (2, "SmallObjectDisableIntercept () : Disable Free Intercepting ");
++    }
++    else
++    {
++        TLA_LOG  (2, "SmallObjectDisableIntercept () : Free Intercepting is already disable");
++    }
++
++    //Return the result
++    return result;
++}
++
++bool dvmTLAEnableMalloc (void)
++{
++    //Compare and set the flag for the disable malloc intercept
++    bool result = assemblyCmpxchgU4 (0, 1, & (gDvm.tlaInformation.isDisableMallocIntercept));
++
++    if (result == true)
++    {
++        TLA_LOG (2, "SmallObjectEnableIntercept () : Enable Malloc Intercepting ");
++    }
++    else
++    {
++        TLA_LOG (2, "SmallObjectEnableIntercept () : Malloc Intercepting is already enabled ");
++    }
++
++    //Return the result
++    return result;
++}
++
++bool dvmTLADisableMalloc (void)
++{
++    //Compare and set the flag for the disable malloc intercept
++    bool result = assemblyCmpxchgU4 (1, 0, & (gDvm.tlaInformation.isDisableMallocIntercept));
++
++    if (result == true)
++    {
++        TLA_LOG (2, "SmallObjectDisableIntercept () : Disable Malloc Intercepting ");
++    }
++    else
++    {
++        TLA_LOG (2, "SmallObjectDisableIntercept () : Malloc Intercepting is already disabled ");
++    }
++
++    return result;
++}
++
++/**
++ * @brief init slot size array
++ */
++__inline__ static void initSlotSizeTable (void)
++{
++    gDvm.tlaInformation.slotSizeTable[0] = 24;  /* 16-byte slot size */
++    gDvm.tlaInformation.slotSizeTable[1] = 24;  /* 20-byte slot size */
++    gDvm.tlaInformation.slotSizeTable[2] = 32;  /* 24-byte slot size */
++    gDvm.tlaInformation.slotSizeTable[3] = 32;  /* 28-byte slot size */
++    gDvm.tlaInformation.slotSizeTable[4] = 40;  /* 32-byte slot size */
++}
++
++/**
++ * @brief return tid value from allocThreadTable by index
++ * @param tableIndex the table index
++ * @return return the TID value from the allocThreadTable using the table index
++ */
++__inline__ static unsigned int getTidFromThreadTable (unsigned int tableIndex)
++{
++    assert (tableIndex < TLA_MAX_ALLOC_THREAD_NUM);
++    return gDvm.tlaInformation.accTidArray[tableIndex];
++}
++
++/**
++ * @brief return the traversal block head
++ * @param tableIndex the table index
++ * @param sizeOffset the sizeOffset we want to consider
++ * @return returns traversal block head using the right table index and size offset
++ */
++__inline__ static void* getTraversalBlockHead (unsigned int tableIndex,unsigned int sizeOffset)
++{
++    assert (tableIndex < TLA_MAX_ALLOC_THREAD_NUM);
++    assert (sizeOffset < TLA_INTERCEPT_OBJECT_NUM);
++    return gDvm.tlaInformation.allocThreadTable[tableIndex].blockTraversalArray[sizeOffset];
++}
++
++/**
++ * @brief return the AllocNumblock head
++ * @param tableIndex the table index
++ * @param sizeOffset the sizeOffset we want to consider
++ * @return returns the alloc number block head using the right table index and size offset
++ */
++__inline__ static void* getAllocNumBlockHead (unsigned int tableIndex, unsigned int sizeOffset)
++{
++    assert (tableIndex < TLA_MAX_ALLOC_THREAD_NUM);
++    assert (sizeOffset < TLA_INTERCEPT_OBJECT_NUM);
++    return gDvm.tlaInformation.allocThreadTable[tableIndex].blockAllocNumArray[sizeOffset];
++}
++
++/**
++ * @brief Get the traversal block by index
++ * @param blockArrayHead the block array head
++ * @param blockIndex the block index
++ * @return the BlockTraversalStructure regarding the right block array head and block index
++ */
++__inline__ static struct BlockTraversalStructure* getTraversalBlock (void* blockArrayHead, unsigned int blockIndex)
++{
++    assert (blockIndex < TLA_MAX_BLOCK_NUM);
++    return ( (struct BlockTraversalStructure*)blockArrayHead + blockIndex);
++}
++
++/**
++ * @brief Get the BlockAllocNumStructure
++ * @param blockArrayHead the block array head
++ * @param blockIndex the block index
++ * @return the BlockAllocNumStructure regarding the right block array head and block index
++ */
++__inline__ static struct BlockAllocNumStructure* getAllocNumBlock (void* blockArrayHead, unsigned int blockIndex)
++{
++    assert (blockIndex < TLA_MAX_BLOCK_NUM);
++    return ( (struct BlockAllocNumStructure*)blockArrayHead + blockIndex);
++}
++
++/**
++ * @brief return the aligned ptr by alignedByte, alignedByte must be pow (2, n)
++ * @param ptr The target address
++ * @param alignedByte The #num of bytes to aligned
++ * @return Return the aligned address
++ */
++__inline__ static unsigned char* getAlignedPtr (void* ptr, unsigned int alignedByte)
++{
++    return (unsigned char*) ( (unsigned int) ( (unsigned char*)ptr + alignedByte) &  (0xFFFFFFFF^ (alignedByte-1)));
++}
++
++/**
++ * @brief get next node of slot list
++ * @param ptr the pointer
++ * @return Return the next node
++ */
++__inline__ static void* getNextNode (void* ptr)
++{
++    //Paranoid
++    assert (ptr != 0);
++
++    //Get an unsigned int pointer
++    unsigned int *iptr = static_cast<unsigned int *> (ptr);
++
++    //Its dereference is the next node's address
++    unsigned int newValue = *iptr;
++
++    //Transform it into a void *
++    void *result = (void *) newValue;
++
++    //And return it
++    return result;
++}
++
++/**
++ * @brief Insert node into slot list
++ * @param headSlotList the head of the slot list
++ * @param ptr the new node to insert
++ */
++__inline__ static void insertNode (void **headSlotList, void *ptr)
++{
++    //Paranoid
++    assert (ptr != 0);
++    assert (headSlotList != 0);
++
++    //Get the elements as if they are unsigned int
++    unsigned int *iptr = static_cast<unsigned int *> (ptr);
++
++    //Get the address of the current head
++    unsigned int currentHead = (unsigned int) (*headSlotList);
++
++    //Set next for new head
++    *iptr = currentHead;
++
++    //Set new head
++    *headSlotList = ptr;
++}
++
++/**
++ * @brief return endpos of the block
++ * @param tableIndex the index to the table
++ * @param sizeOffset the size offset for the table
++ * @param blockIndex the block index
++ */
++__inline__ static unsigned char* getDataEndpos (unsigned int tableIndex, unsigned int sizeOffset, unsigned int blockIndex)
++{
++    //Get the head of the block lists
++    void *head = getTraversalBlockHead (tableIndex,sizeOffset);
++
++    //Paranoid
++    assert (head != 0);
++
++    //Now get the block we care about
++    BlockTraversalStructure *block = getTraversalBlock (head, blockIndex);
++
++    //Paranoid
++    assert (block != 0);
++
++    //Now calculate the end position: get the start
++    unsigned char *result = block->startDataPos;
++
++    //Add the slot size times the maximum number of slots
++    result += getSlotSize (sizeOffset) * TLA_MAX_SLOT_NUM;
++
++    //Finally add what needs to be added to align to 64 bytes
++    result += TLA_ADDRESS_ALIGN_TO_64_BYTE;
++
++    //Now return
++    return result;
++}
++
++/**
++ * @brief Check whether it is valid pointer for TLA
++ * @param ptr the pointer we want to check
++ * @param tableIndex the index to the TLA table
++ * @param sizeOffset the size offset index
++ * @param blockIndex the block index
++ * @return whether or not this pointer is a valid TLA pointer
++ */
++__inline__ static bool isValidPtr (const void* ptr, unsigned int tableIndex, unsigned int sizeOffset, unsigned int blockIndex)
++{
++    //Start by checking if blockIndex is even valid
++    if (blockIndex >= TLA_MAX_BLOCK_NUM)
++    {
++        return false;
++    }
++
++    //Get the head of the block lists
++    void *head = getTraversalBlockHead (tableIndex,sizeOffset);
++
++    //Paranoid
++    assert (head != 0);
++
++    //Now get the block we care about
++    BlockTraversalStructure *block = getTraversalBlock (head, blockIndex);
++
++    //Paranoid
++    assert (block != 0);
++
++    //Now calculate the end position: get the start
++    unsigned char *start = block->startDataPos;
++
++    //Now check it is valid
++    if (start == 0)
++    {
++        return false;
++    }
++
++    //Is pointer at least above the start?
++    if (start <= ptr)
++    {
++        //Ok, it is, so let's get the end position
++        unsigned char *end = getDataEndpos (tableIndex, sizeOffset, blockIndex);
++
++        //Compare ptr to the end, is it between start and end?
++        return (ptr < end);
++    }
++
++    //It wasn't so bail
++    return false;
++}
++
++/**
++ * @brief A bitfield structure to handle the slot head information
++ */
++struct SlotHeadInformationExplicit
++{
++    /** @brief The block index */
++    unsigned int blockIndex : 12;
++    /** @brief The table index */
++    unsigned int tableIndex : 10;
++    /** @brief The size offset */
++    unsigned int sizeOffset : 10;
++};
++
++/**
++ * @brief The Slot head information
++ */
++union SlotHeadInformation
++{
++    /** @brief The value in unsigned int fashion */
++    unsigned int value;
++
++    /** @brief The information exploded for easier access */
++    SlotHeadInformationExplicit exploded;
++};
++
++
++/**
++ * @brief Read the slot head info
++ * @param returnAddress the return address we care about
++ * @param tableIndex the index to the TLA table
++ * @param sizeOffset the size offset index
++ * @param blockIndex the block index
++ */
++__inline__ static void readSlotHead (const void* returnAddress, unsigned int* tableIndex, unsigned int* sizeOffset, unsigned int* blockIndex)
++{
++    //Get the previous element compared to the returnAddress, it contains all the information we need
++    unsigned int* head =  (unsigned int*)returnAddress - 1;
++
++    //Get the data there into a slot information union
++    SlotHeadInformation info;
++    info.value = *head;
++
++    //Now set each element if they are available
++    if (blockIndex != 0)
++    {
++        *blockIndex = info.exploded.blockIndex;
++    }
++
++    if (tableIndex != 0)
++    {
++        *tableIndex = info.exploded.tableIndex;
++    }
++
++    if (sizeOffset != 0)
++    {
++        *sizeOffset = info.exploded.sizeOffset;
++    }
++}
++
++/**
++ * @brief Check whether the private buffer is valid
++ */
++static bool isValidPrivateBuffer (unsigned int tableIndex, unsigned int sizeOffset)
++{
++    //Check if we can't find the traversal block head or the allocation number for the given parameters
++    if (getTraversalBlockHead (tableIndex, sizeOffset) == 0 || getAllocNumBlockHead (tableIndex, sizeOffset) == 0)
++    {
++        TLA_LOG (1, "TLA Info: isValidPrivateBuffer () : can not find tableIndex %u with sizeOffset %u in thread table ", tableIndex, sizeOffset);
++        return false;
++    }
++
++    //It is valid
++    return true;
++}
++
++/**
++ * @brief Create a BlockTraversalStructure Array
++ * @return a BlockTraversalStructure array
++ */
++static void* createBlockTraversalArray (void)
++{
++    //Allocate it
++    BlockTraversalStructure *result = static_cast<BlockTraversalStructure *> (memalign (TLA_PHYSICAL_PAGE_SIZE, sizeof (*result) * TLA_MAX_BLOCK_NUM));
++
++    //If the allocation succeeded
++    if (result != 0)
++    {
++        //Set it to 0
++        memset (result, 0, sizeof (*result) * TLA_MAX_BLOCK_NUM);
++    }
++    else
++    {
++        //Log it as an error
++        TLA_LOG (3, "TLA Info: createBlockTraversalArray () memalign fail");
++    }
++
++    //Return result, whether success or not
++    return result;
++}
++
++/**
++ * @brief Create a BlockAllocNumStructure Array
++ * @return a BlockAllocNumStructure array
++ */
++static void* createBlockAllocNumArray (void)
++{
++    BlockAllocNumStructure *result = static_cast<BlockAllocNumStructure *> (memalign (TLA_PHYSICAL_PAGE_SIZE, sizeof (*result) * TLA_MAX_BLOCK_NUM));
++
++    //If the allocation succeeded
++    if (result != 0)
++    {
++        //Set it to 0
++        memset (result, 0, sizeof (*result) * TLA_MAX_BLOCK_NUM);
++    }
++    else
++    {
++        //Log it as an error
++        TLA_LOG (3, "TLA Info: createBlockAllocNumArray () memalign fail");
++    }
++
++    //Return result, whether success or not
++    return result;
++}
++
++/**
++ * @brief Get an entry from allocThreadTable
++ * @param tid The threadID
++ * @param ptrTableIndex The pointer to the index of allocated entry
++ * @param size The request size
++ * @return return TLASuccess if success, TLAErrorCmpxchg if the compare and set failed, TLAErrorTableFull if the table is full
++ */
++static unsigned int getAllocThreadEntryFromTable (unsigned int tid, unsigned int* ptrTableIndex, size_t size)
++{
++
++    //If the table is already full, then we bail
++    if (gDvm.tlaInformation.isAllocThreadTableFullTag == TLAErrorTableFull)
++    {
++        return TLAErrorTableFull;
++    }
++
++    /* Find an empty entry */
++    for (unsigned int tableIndex = 0; tableIndex < TLA_MAX_ALLOC_THREAD_NUM; tableIndex++)
++    {
++        //Is the entry empty?
++        if (gDvm.tlaInformation.accTidArray[tableIndex] == 0)
++        {
++            //Ok we have an entry, let's try to get it for us
++            int result = assemblyCmpxchgU4 (0, tid, & (gDvm.tlaInformation.accTidArray[tableIndex]));
++
++            //If the comparison was false, the slot wasn't actually free
++            if (result == false)
++            {
++                TLA_LOG (2, "TLA Info: getAllocThreadEntryFromTable () fail to entry tableIndex %u tid %x", tableIndex, tid);
++                return TLAErrorCmpxchg;
++            }
++
++            //We did get it, log it for verbosity
++            TLA_LOG (2, "TLA Info: getAllocThreadEntryFromTable () create entry tableIndex %u tid %x", tableIndex, tid);
++
++            //Now set our thread so it knows
++            dvmSetTLAThreadIndex (tableIndex);
++
++            //Set our pointer table index to it
++            *ptrTableIndex = tableIndex;
++
++            //And signify success
++            return TLASuccess;
++        }
++    }
++
++    //If we got here, the allocation table is full, bail now
++    TLA_LOG (3, "TLA Info: getAllocThreadEntryFromTable () : alloc thread table is full");
++    /* Set full tag to thread table for future queries */
++    gDvm.tlaInformation.isAllocThreadTableFullTag = TLAErrorTableFull;
++
++    //Now return the error
++    return TLAErrorTableFull;
++}
++
++/**
++ * @brief Prepare traversal and allocNum array
++ * @param tableIndex the table's index
++ * @param size the size we are interested in
++ */
++static void prepareTraversalAndAllocNumArray (unsigned int tableIndex, size_t size)
++{
++    //Go from size to size offset:
++    unsigned int sizeOffset =  (size >> TLA_SIZE_SHIFT) - TLA_SHIFT_TO_OFFSET;
++
++    if (isValidPrivateBuffer (tableIndex, sizeOffset) == true)
++    {
++        return;
++    }
++
++    // TODO: the request for the same slot size will share the same private buffer, i.e. 16-byte and 20 byte will share the private buffer.
++    //Now try to create a block traversal array
++    void *blockTraversalArray = createBlockTraversalArray ();
++
++    //If that failed, bail
++    if (blockTraversalArray == 0)
++    {
++        TLA_LOG (3, "TLA Info: prepareTraversalAndAllocNumArray () CreateBlockTraversalArray fail");
++        dvmAbort ();
++    }
++
++    //Now set it for our information
++    gDvm.tlaInformation.allocThreadTable[tableIndex].blockTraversalArray[sizeOffset] = blockTraversalArray;
++
++    //Log it so we know
++    TLA_LOG (1, "TLA Info: prepareTraversalAndAllocNumArray () create traversal array tableIndex %u sizeOffset %u", tableIndex, sizeOffset);
++
++    //Now try to create the block allocation number array
++    void *blockAllocNumArray = createBlockAllocNumArray ();
++
++    //If that failed, bail
++    if (blockAllocNumArray == 0)
++    {
++        TLA_LOG (3, "TLA Info: prepareTraversalAndAllocNumArray () CreateBlockAllocNumArray fail");
++        dvmAbort ();
++    }
++
++    //Now set it
++    gDvm.tlaInformation.allocThreadTable[tableIndex].blockAllocNumArray[sizeOffset] = createBlockAllocNumArray ();
++
++    //Log it for verbosity
++    TLA_LOG (1, "TLA INFO: prepareTraversalAndAllocNumArray () create AllocNum array tableIndex %u sizeOffset %u", tableIndex, sizeOffset);
++}
++
++/**
++ * @brief Create empty slot list for the private buffer
++ * @param startDataPos the start of the data position
++ * @param sizeOffset the size offset
++ */
++static void buildSlotList (void* startDataPos, unsigned int sizeOffset)
++{
++    //Get the slot size
++    unsigned int slotSize = getSlotSize (sizeOffset);
++
++    //Get the aligned pointer for this address
++    unsigned char* start = getAlignedPtr (startDataPos, TLA_ADDRESS_ALIGN_TO_64_BYTE);
++
++    //Calculate the end address
++    unsigned char* end = start + slotSize * TLA_MAX_SLOT_NUM;
++
++    //Now walk it to link everyone
++    while (start < end)
++    {
++        //Get the node in an unsigned fashion
++        unsigned int *iNode = (unsigned int *) (start);
++
++        //Save the address of next empty slot
++        *iNode =  (unsigned int) (start + slotSize);
++
++        /* Increment start */
++        start = start + slotSize;
++    }
++
++    //Finally go back one to set it to 0 so that it becomes the tail
++    unsigned int *iNode = (unsigned int *) (start - slotSize);
++    *iNode = 0;
++}
++
++/**
++ * @brief Rebuild the empty slot list
++ * @details after GC, some private buffers may have available empty slots to rebuild a new empty slot
++ * @param smallObjectBuffer The buffer to store recycled slots
++ * @param numPtrs The number of recycled slots
++ * @param tableIndex the table index
++ * @param sizeOffset the size offset index
++ * @param blockIndex the block index
++ */
++static void rebuildSlotList (void** smallObjectBuffer, unsigned int numPtrs, unsigned int tableIndex, unsigned int sizeOffset, unsigned int blockIndex)
++{
++    //Walk the number of pointers
++    while (numPtrs > 0)
++    {
++        //Decrement it now because we are going to use it -1 afterwards and when it hits 0, we will handle the last case before exiting the loop
++        numPtrs--;
++
++        //Get the head of the block lists
++        void *head = getTraversalBlockHead (tableIndex,sizeOffset);
++
++        //Paranoid
++        assert (head != 0);
++
++        //Now get the block we care about
++        BlockTraversalStructure *block = getTraversalBlock (head, blockIndex);
++
++        //Paranoid
++        assert (block != 0);
++
++        //Get the slot head list
++        void *headSlotList = block->headSlotList;
++
++        //Now insert a node here
++        insertNode (&headSlotList, smallObjectBuffer[numPtrs]);
++    }
++}
++
++/**
++ * @brief try alloc a slot by hint
++ * @details if headSlotList is no 0, fetch a node at the head of list, then update related info and return address
++ * @param tableIndex the table index
++ * @param sizeOffset the size offset index
++ * @param blockIndex the block index
++ * @return Return target address if success, return 0 if fail
++ */
++static void* tryAllocRecentBlock (unsigned int tableIndex, unsigned int sizeOffset, unsigned int blockIndex)
++{
++    //Get the head of the block lists
++    void *head = getTraversalBlockHead (tableIndex,sizeOffset);
++
++    //Paranoid
++    assert (head != 0);
++
++    //Now get the block we care about
++    BlockTraversalStructure *block = getTraversalBlock (head, blockIndex);
++
++    //Paranoid
++    assert (block != 0);
++
++    //Get the slot head list
++    void *currentNode = block->headSlotList;
++
++    //Is it 0?
++    if (currentNode == 0)
++    {
++        return 0;
++    }
++
++    //Also if the start data position is 0, we bail
++    if (block->startDataPos == 0)
++    {
++        //Then bail
++        return 0;
++    }
++
++    //Otherwise, we can work with it, start by updating the head list
++    void *nextNode = getNextNode (currentNode);
++
++    //Update head for empty slot list
++    block->headSlotList = nextNode;
++
++    /* Clear object data area */
++    memset (currentNode, 0,  ( (sizeOffset+TLA_SHIFT_TO_OFFSET)<<TLA_SIZE_SHIFT));
++
++    //Set the head information
++    SlotHeadInformation info;
++
++    //Fill it
++    info.exploded.blockIndex = blockIndex;
++    info.exploded.tableIndex = tableIndex;
++    info.exploded.sizeOffset = sizeOffset;
++
++    //Get address where to set all this (right before currentNode)
++    unsigned int* infoPtr =  (unsigned int*) currentNode - 1;
++
++    //Now set it in place
++    *infoPtr = info.value;
++
++    //Log it for verbosity
++    TLA_LOG (0, "updateSlotHead () : %x tableIndex %u sizeOffset %u blockIndex %u", (unsigned int)currentNode ,tableIndex, sizeOffset, blockIndex);
++
++    //Update alloc history hint
++    assert (tableIndex < TLA_MAX_ALLOC_THREAD_NUM);
++    assert (sizeOffset < TLA_INTERCEPT_OBJECT_NUM);
++
++    //Update the right entry using the table index and size offset
++    gDvm.tlaInformation.allocThreadTable[tableIndex].allocHistoryHint[sizeOffset] = blockIndex;
++
++    //Get the allocation number block head
++    void *allocNumBlockHead = getAllocNumBlockHead (tableIndex, sizeOffset);
++
++    //Now get the right block
++    BlockAllocNumStructure *allocNumBlock = getAllocNumBlock (allocNumBlockHead, blockIndex);
++
++    //Increment the block's allocNum
++    allocNumBlock->allocNum++;
++
++    //Increment the thread's allocNum
++    gDvm.tlaInformation.allocThreadTable[tableIndex].totalAllocNum++;
++
++    //Log for verbosity
++    TLA_LOG (0, "tryAllocRecentBlock (): address %x tableIndex %u sizeOffset %u blockIndex %u",  (unsigned int)currentNode, tableIndex, sizeOffset, blockIndex);
++
++    //Return current node
++    return currentNode;
++}
++
++/**
++ * @brief Allocate a slot in TLA
++ * @details first try tryAllocRecentBlock (), then try the next private buffer if next private buffer is 0, allocate a new private buffer
++ * @param tableIndex the table index
++ * @param size the size of the allocation
++ * @return return allocated address if success, 0 if mspace_calloc fail, TLA_ERROR_PRIVATE_BUFFER_FULL if all slots are consumed
++ */
++static void* allocSlot (mspace msp, unsigned int tableIndex, unsigned int size)
++{
++    //First transform the size to the sizeOffset
++    unsigned int sizeOffset =  (size>>TLA_SIZE_SHIFT) - TLA_SHIFT_TO_OFFSET;
++
++    //Paranoid
++    assert (tableIndex < TLA_MAX_ALLOC_THREAD_NUM);
++    assert (sizeOffset < TLA_INTERCEPT_OBJECT_NUM);
++
++    //Now get the recent block index, what has been used before to not have to search again
++    unsigned int recentBlockIndex = gDvm.tlaInformation.allocThreadTable[tableIndex].allocHistoryHint[sizeOffset];
++
++    //Paranoid
++    assert (recentBlockIndex < TLA_MAX_BLOCK_NUM);
++
++    //Now is the private buffer full?
++    if (gDvm.tlaInformation.isPrivateBufferFullTag[tableIndex][sizeOffset] == TLA_ERROR_PRIVATE_BUFFER_FULL)
++    {
++        return (void*) TLA_ERROR_PRIVATE_BUFFER_FULL;
++    }
++
++    //Ok, it is not, try the recentBlockIndex first
++    void *slot = tryAllocRecentBlock (tableIndex, sizeOffset, recentBlockIndex);
++
++    //Did it work?
++    if (slot != 0)
++    {
++        return slot;
++    }
++
++    //Get the head of the block lists
++    void *head = getTraversalBlockHead (tableIndex, sizeOffset);
++
++    //Paranoid
++    assert (head != 0);
++
++    /* Too bad, we have to go the long way: a traversal to find an empty slot */
++    for (unsigned int blockIndex = recentBlockIndex + 1; blockIndex < TLA_MAX_BLOCK_NUM; blockIndex++)
++    {
++        //Now get the block we care about
++        BlockTraversalStructure *block = getTraversalBlock (head, blockIndex);
++
++        //Paranoid
++        assert (block != 0);
++
++        void *start = block->startDataPos;
++
++        if (start != 0)
++        {
++            //Try to get something
++            slot = tryAllocRecentBlock (tableIndex, sizeOffset, blockIndex);
++
++            //Did it work?
++            if (slot != 0)
++            {
++                return slot;
++            }
++        }
++        else
++        {
++            //We do not have a start here, so let's try to get one
++            //First: calculate how much data we want
++            unsigned int requestSize = getSlotSize (sizeOffset) * TLA_MAX_SLOT_NUM + TLA_ADDRESS_ALIGN_TO_64_BYTE;
++
++            //Try to allocate it
++            void* result = mspaceCalloc (msp, requestSize);
++
++            if (result != 0)
++            {
++                //Request a new block and create slot list
++                block->startDataPos = static_cast<unsigned char *> (result);
++
++                //Build slot list
++                buildSlotList (result, sizeOffset);
++
++                //Update head for slot list
++                block->headSlotList = getAlignedPtr (result, TLA_ADDRESS_ALIGN_TO_64_BYTE);
++
++                //Update heap->bytesAllocated and heap->objectsAllocated for small Objects
++                dvmCountAllocationForSmallObject (result, TLA_MAX_SLOT_NUM, requestSize);
++
++                //Log it
++                TLA_LOG (2, "TLA Info: allocSlot (): create slot list, tableIndex %u sizeOffset %u blockIndex %u", tableIndex, sizeOffset, blockIndex);
++
++                //Now try to allocate it there
++                return tryAllocRecentBlock (tableIndex, sizeOffset, blockIndex);
++            }
++            else
++            {
++                //If mspaceCalloc failed ,we bail
++                TLA_LOG (2, "TLA Info: allocSlot (): create new block fail, tableIndex %u sizeOffset %u blockIndex %u", tableIndex, sizeOffset, blockIndex);
++                return 0;
++            }
++        }
++    }
++
++    //If we got here, there really is no more space
++    gDvm.tlaInformation.isPrivateBufferFullTag[tableIndex][sizeOffset] = TLA_ERROR_PRIVATE_BUFFER_FULL;
++    return (void*) TLA_ERROR_PRIVATE_BUFFER_FULL;
++}
++
++/**
++ * @details first check whether the request should be handled by TLA, then get an entry in TLA and valid traversal and allocNum array, then call allocSlot () to get a slot
++ */
++void* dvmTLAMalloc (mspace msp, size_t size, bool* isSmallObject)
++{
++    //Log for verbosity
++    TLA_LOG (0, "TLA Info: TLAMalloc () request size %u", size);
++
++    /* Check intercept condition: do we have a table and do we want to intercept? */
++    if (gDvm.tlaInformation.allocThreadTable != 0 && isInterceptSize (size) == true)
++    {
++        //Let's be optimistic
++        unsigned int result = TLASuccess;
++
++        //Read tid from struct Thread
++        unsigned int tid = pthread_self ();
++
++        //Read tableIndex from struct Thread
++        unsigned int tableIndex = dvmGetTLAThreadIndex ();
++
++        // TODO: enable threads competition for the entry in alloc thread table, only the winner can call TLA
++
++        //If the table index is the maximum allocated or the TID for the array does not match
++        if (TLA_MAX_ALLOC_THREAD_NUM == tableIndex || gDvm.tlaInformation.accTidArray[tableIndex] != tid)
++        {
++            //We will try to get one
++            do
++            {
++                //Try to allocate a thread entry from the table
++                result = getAllocThreadEntryFromTable (tid, &tableIndex, size);
++            }
++            while (TLAErrorCmpxchg == result);
++        }
++
++        //Did we succeed?
++        if (result == TLASuccess)
++        {
++            //Prepare traversal array and AllocNum array
++            prepareTraversalAndAllocNumArray (tableIndex, size);
++
++            //Allocate a slot from TLA
++            void *slot = allocSlot (msp, tableIndex, size);
++
++            //Is the private buffer full?
++            if (slot == (void *) TLA_ERROR_PRIVATE_BUFFER_FULL)
++            {
++                //Then we try via mspaceCalloc
++                return mspaceCalloc (msp, size);
++            }
++
++            //Did it fail, if it did, we bail
++            if (slot == 0)
++            {
++                return 0;
++            }
++
++            //Otherwise, we are good and it is a small object so mark it
++            *isSmallObject = true;
++
++            return slot;
++        }
++        else
++        {
++            //The result was not a success, was it a TLA error in the allocation?
++            if (result == TLAErrorTableFull)
++            {
++                //If so, use mspaceCalloc
++                return mspaceCalloc (msp, size);
++            }
++        }
++    }
++
++    //By default call mspaceCalloc
++    return mspaceCalloc (msp, size);
++}
++
++bool dvmTLAInit (void)
++{
++    //Log it
++    TLA_LOG (3, "TLAInit () ... ");
++
++    //Initialize gDvm.tlaInformation
++    memset (&gDvm.tlaInformation, 0, sizeof (gDvm.tlaInformation));
++
++    //Initialize the slot size array
++    initSlotSizeTable ();
++
++    //Initialize the allocThreadTable
++    //First get the size we want: a number of allocation threads and the alloc thread table entry with an unsigned int for each
++    unsigned int requestSize = TLA_MAX_ALLOC_THREAD_NUM *  (sizeof (AllocThreadTableEntry) + sizeof (unsigned int));
++    gDvm.tlaInformation.allocThreadTable =  (AllocThreadTableEntry *) memalign (TLA_PHYSICAL_PAGE_SIZE, requestSize);
++
++    //Paranoid
++    if (gDvm.tlaInformation.allocThreadTable == 0)
++    {
++        TLA_LOG (3, "TLA Info: CreateallocThreadTable () : memalign fail ");
++        return false;
++    }
++
++    //Set it to 0
++    memset (gDvm.tlaInformation.allocThreadTable, 0, requestSize);
++
++    //Initialize accTidArray
++    gDvm.tlaInformation.accTidArray =  (unsigned int*) (gDvm.tlaInformation.allocThreadTable + TLA_MAX_ALLOC_THREAD_NUM);
++
++    //Trigger TLA to work
++    dvmTLAEnableMalloc ();
++    TLAEnableFree ();
++
++    //Success
++    return true;
++}
++
++void dvmTLADestroy (void)
++{
++    //Log it
++    TLA_LOG (3, "TLADestroy () ... ");
++
++    //If we don't have the table, just bail
++    if (gDvm.tlaInformation.allocThreadTable == 0)
++    {
++        return;
++    }
++
++    //Disable everything so we can do this happily
++    dvmTLADisableMalloc ();
++    TLADisableFree ();
++
++    //Now walk it
++    for (unsigned int tableIndex = 0;tableIndex < TLA_MAX_ALLOC_THREAD_NUM;tableIndex++)
++    {
++        //Does this entrance have something?
++        if (getTidFromThreadTable (tableIndex) != 0)
++        {
++            //Now free traversalArray[0~TLA_INTERCEPT_OBJECT_NUM]
++            for (unsigned int sizeOffset = 0; sizeOffset < TLA_INTERCEPT_OBJECT_NUM;sizeOffset++)
++            {
++                //Take care of the traversal head
++              if (getTraversalBlockHead (tableIndex, sizeOffset) != 0)
++              {
++                  void *ptr = gDvm.tlaInformation.allocThreadTable[tableIndex].blockTraversalArray[sizeOffset];
++
++                  //Free the pointer and set it to 0
++                  free (ptr), gDvm.tlaInformation.allocThreadTable[tableIndex].blockTraversalArray[sizeOffset] = 0;
++              }
++
++              //Now handle the allocation number block head
++              if (getAllocNumBlockHead (tableIndex, sizeOffset) != 0)
++              {
++                  //Get the pointer
++                  void *ptr = gDvm.tlaInformation.allocThreadTable[tableIndex].blockAllocNumArray[sizeOffset];
++
++                  //Free the pointer and set it to 0
++                  free (ptr), gDvm.tlaInformation.allocThreadTable[tableIndex].blockAllocNumArray[sizeOffset] = 0;
++              }
++            }
++        }
++    }
++
++    // Free data, and set to 0
++    free (gDvm.tlaInformation.allocThreadTable), gDvm.tlaInformation.allocThreadTable = 0;
++}
++
++/**
++ * @details first read the info in slot head, then check whether it is allocated in TLA and last return the
++ */
++void* dvmTLAGetBlockEndPos (void* ptr, unsigned int* ptrTableIndex, unsigned int* ptrSizeOffset, unsigned int* ptrBlockIndex)
++{
++    //If not allocated, bail
++    if (gDvm.tlaInformation.allocThreadTable == 0)
++    {
++        return 0;
++    }
++
++    //Paranoid
++    assert (ptrTableIndex != 0);
++    assert (ptrBlockIndex != 0);
++    assert (ptrSizeOffset != 0);
++
++    //Get holders
++    unsigned int tableIndex;
++    unsigned int sizeOffset;
++    unsigned int blockIndex;
++
++    //Read the slot head
++    readSlotHead (ptr, &tableIndex, &sizeOffset, &blockIndex);
++
++    //Check if it is valid for each element
++    if (sizeOffset < TLA_INTERCEPT_OBJECT_NUM && tableIndex < TLA_MAX_ALLOC_THREAD_NUM && blockIndex < TLA_MAX_BLOCK_NUM)
++    {
++        //Ok, does this lead to a valid private buffer?
++        if (isValidPrivateBuffer (tableIndex,sizeOffset) == true)
++        {
++            //Now is the pointer to it valid?
++            if (isValidPtr (ptr, tableIndex, sizeOffset, blockIndex) == true)
++            {
++                //Log it then
++                TLA_LOG (1, "TLA INFO: TLAGetBlockEndPos () address %x tableIndex %u sizeOffset %u blockIndex %u size %u ", (unsigned int)ptr, tableIndex, sizeOffset, blockIndex, getSlotSize (sizeOffset));
++
++                //And now set it for the arguments
++                *ptrTableIndex = tableIndex;
++                *ptrSizeOffset = sizeOffset;
++                *ptrBlockIndex = blockIndex;
++
++                //And now return the end position
++                return getDataEndpos (tableIndex, sizeOffset, blockIndex);
++            }
++        }
++    }
++
++    //Return a failure in any other case
++    return 0;
++}
++
++unsigned int dvmTLAGetSlotSize (const void* ptr, bool isPureSize)
++{
++    //Paranoid
++    if (gDvm.tlaInformation.allocThreadTable == 0)
++    {
++        return 0;
++    }
++
++    //Holders
++    unsigned int tableIndex;
++    unsigned int sizeOffset;
++    unsigned int blockIndex;
++
++    //Read slot head
++    readSlotHead (ptr, &tableIndex, &sizeOffset, &blockIndex);
++
++    //Check if it is valid for each element
++    if (sizeOffset < TLA_INTERCEPT_OBJECT_NUM && tableIndex < TLA_MAX_ALLOC_THREAD_NUM && blockIndex < TLA_MAX_BLOCK_NUM)
++    {
++        //Ok, does this lead to a valid private buffer?
++        if (isValidPrivateBuffer (tableIndex,sizeOffset) == true)
++        {
++            //Now is the pointer to it valid?
++            if (isValidPtr (ptr, tableIndex, sizeOffset, blockIndex) == true)
++            {
++                TLA_LOG (1, "TLA INFO: TLACount address %x size %u pureSize %u isPureSize %u", (unsigned int)ptr, getSlotSize (sizeOffset),  ( (sizeOffset + TLA_SHIFT_TO_OFFSET)<<TLA_SIZE_SHIFT), isPureSize);
++
++                //Do we want the pure size?
++                if (true == isPureSize)
++                {
++                    //Otherwise return it via the calculation used when allocating
++                    return ( (sizeOffset + TLA_SHIFT_TO_OFFSET)<<TLA_SIZE_SHIFT);
++                }
++                else
++                {
++                    //Use the API to get the slot size
++                    return getSlotSize (sizeOffset);
++                }
++            }
++        }
++    }
++
++    //Report failure otherwise
++    return 0;
++}
++
++/**
++ * @details this function will be called after GC to recycle available table entries, and force the allocations after GC to start at the first private
++ */
++void dvmTLARecycleThreadTableEntry (void)
++{
++    //Paranoid
++    if (gDvm.tlaInformation.allocThreadTable == 0)
++    {
++        return;
++    }
++
++    //Walk the table index
++    for (unsigned int tableIndex = 0; tableIndex < TLA_MAX_ALLOC_THREAD_NUM; tableIndex++)
++    {
++        //Is the tid from the table ours at least?
++        if (getTidFromThreadTable (tableIndex) != 0)
++        {
++            //Now look at the different sizes
++            for (unsigned int sizeOffset = 0; sizeOffset < TLA_INTERCEPT_OBJECT_NUM; sizeOffset++)
++            {
++                //Force allocation after GC starting from block 0
++                if (isValidPrivateBuffer (tableIndex,sizeOffset) == true)
++                {
++                    //Reset the hint information
++                    gDvm.tlaInformation.allocThreadTable[tableIndex].allocHistoryHint[sizeOffset] = 0;
++                }
++            }
++
++            //Recycle thread table entry
++            if (gDvm.tlaInformation.allocThreadTable[tableIndex].totalAllocNum == 0)
++            {
++                //Only clear the entry
++                gDvm.tlaInformation.accTidArray[tableIndex] = 0;
++
++                //Reset full tag
++                gDvm.tlaInformation.isAllocThreadTableFullTag = 0;
++
++                //Log it
++                TLA_LOG (2, "TLA INFO: TLARecycleThreadTableEntry () : recycle a thread entry, tableIndex %u tid %x", tableIndex, gDvm.tlaInformation.accTidArray[tableIndex]);
++            }
++        }
++    }
++
++    //Log it
++    TLA_LOG (2, "TLARecycleThreadTableEntry () : finished");
++}
++
++void dvmTLARecyclePrivateBuffer (unsigned int tableIndex, unsigned int sizeOffset, unsigned int blockIndex, void** smallObjectBuffer,
++                                 unsigned int numPtrs, bool isConcurrent, void *callbackArg, mspace msp)
++{
++    //Clean the bitmap
++    dvmCleanBitmapForSmallObject (smallObjectBuffer, numPtrs, isConcurrent);
++
++    //Get the allocation number block head
++    void *allocNumBlockHead = getAllocNumBlockHead (tableIndex, sizeOffset);
++
++    //Now get the right block
++    BlockAllocNumStructure *allocNumBlock = getAllocNumBlock (allocNumBlockHead, blockIndex);
++
++    //Update block allocNum
++    allocNumBlock->allocNum -= numPtrs;
++
++    //If we still have something
++    if (allocNumBlock->allocNum != 0)
++    {
++        //Rebuild the slot list
++        rebuildSlotList (smallObjectBuffer, numPtrs, tableIndex, sizeOffset, blockIndex);
++    }
++    else
++    {
++        //Otherwise, if we are done, we will want to return the memory
++
++        //First if it is concurrent, then lock the heap mutex
++        if (isConcurrent == true)
++        {
++            dvmLockHeap ();
++        }
++
++        //Return space ASAP
++        //Get the head of the block lists
++        void *head = getTraversalBlockHead (tableIndex,sizeOffset);
++
++        //Paranoid
++        assert (head != 0);
++
++        //Now get the block we care about
++        BlockTraversalStructure *block = getTraversalBlock (head, blockIndex);
++
++        //Paranoid
++        assert (block != 0);
++
++        //Now get the start
++        unsigned char *start = block->startDataPos;
++        dvmCountFreeForSmallObject (start, TLA_MAX_SLOT_NUM, TLA_MAX_SLOT_NUM * getSlotSize (sizeOffset) + TLA_ADDRESS_ALIGN_TO_64_BYTE);
++
++        //Use the mspace bulk free function
++        mspace_bulk_free (msp,  (void**)& (start), 1);
++
++        //If we are concurrent, unlock the mutex
++        if (isConcurrent == true)
++        {
++            dvmUnlockHeap ();
++        }
++
++        //Reset current block
++        block->startDataPos = 0;
++        block->headSlotList = 0;
++
++        //Reset full tag for private buffer
++        gDvm.tlaInformation.isPrivateBufferFullTag[tableIndex][sizeOffset] = 0;
++    }
++
++    //Update total allocNum
++    gDvm.tlaInformation.allocThreadTable[tableIndex].totalAllocNum -= numPtrs;
++
++    //Update context
++    dvmSweepBitmapForSmallObject (numPtrs, numPtrs * getSlotSize (sizeOffset), callbackArg);
++}
+diff --git a/vm/alloc/ThreadLocalAllocator.h b/vm/alloc/ThreadLocalAllocator.h
+new file mode 100644
+index 0000000..8200762
+--- /dev/null
++++ b/vm/alloc/ThreadLocalAllocator.h
+@@ -0,0 +1,132 @@
++/*
++ * Copyright  (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0  (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef THREADLOCALALLOCATOR_H_
++#define THREADLOCALALLOCATOR_H_
++
++#include "alloc/DlMalloc.h"
++
++//A few macros to define sizes
++#define TLA_MAX_ALLOC_THREAD_NUM          32
++#define TLA_MAX_SLOT_NUM                  1024
++#define TLA_INTERCEPT_OBJECT_NUM              5
++
++/**
++ * @brief Structure to store information for alloc threads
++ */
++struct AllocThreadTableEntry
++{
++    unsigned int totalAllocNum;                            //!< @brief total alloc num for current thread
++
++    void* blockTraversalArray[TLA_INTERCEPT_OBJECT_NUM];       //!< @brief pointer to traversal array
++
++    void* blockAllocNumArray[TLA_INTERCEPT_OBJECT_NUM];        //!< @brief pointer to allocNum array
++
++    unsigned int allocHistoryHint[TLA_INTERCEPT_OBJECT_NUM];   //!< @brief index for recently used private buffer
++};
++
++/**
++ * @brief global structure for TLA
++ */
++struct ThreadLocalAllocator
++{
++    volatile unsigned int isDisableMallocIntercept;                                            //!< @brief on-off for TLA Malloc
++
++    volatile unsigned int isDisableFreeIntercept;                                              //!< @brief on-off for TLA free
++
++    volatile unsigned int isAllocThreadTableFullTag;                                           //!< @brief allocThreadTable full tag
++
++    volatile unsigned int isPrivateBufferFullTag[TLA_MAX_ALLOC_THREAD_NUM][TLA_INTERCEPT_OBJECT_NUM];  //!< @brief private buffer full tag
++
++    unsigned int slotSizeTable[TLA_INTERCEPT_OBJECT_NUM];                                          //!< @brief slot size lookup table
++
++    volatile unsigned int* accTidArray;                                                        //!< @brief tid array
++
++    struct AllocThreadTableEntry* allocThreadTable;                                            //!< @brief pointer to allocThreadTable
++};
++
++/**
++ * @brief Return the slot size by pointer
++ * @details first read the info in slot head, then check whether it is allocated in TLA and last return slot size by lookup table
++ * @param ptr the pointer
++ * @param isPureSize do we want the pure size without the data used to manage it
++ * @return the slot size
++ */
++unsigned int dvmTLAGetSlotSize (const void* ptr, bool isPureSize);
++
++/**
++ * @brief Recycle the empty slots in current private buffer
++ * @details Recycle the empty slots, if all slots in private buffer are recycled, recycle the current private buffer
++ * @param tableIndex The index of target entry in allocThreadTable
++ * @param sizeOffset The index of intercepted objects
++ * @param blockIndex The index of private buffer
++ * @param smallObjectBuffer Pointer buffer to store the addresses of the objects ready to free
++ * @param numPtrs The number of objects ready to free
++ * @param isConcurrent Whether there is a conCurrent GC or not
++ * @param callbackArg Callbck arg
++ * @param msp Current Mspace
++ */
++void dvmTLARecyclePrivateBuffer (unsigned int tableIndex, unsigned int sizeOffset, unsigned int blockIndex, void** smallObjectBuffer,
++                                 unsigned int numPtrs, bool isConcurrent, void *callbackArg, mspace msp);
++
++/**
++ * @brief Recydle the thread table entry
++ * @param msp Current Mspace
++ * @param isConcurrent Whether there is a conCurrent GC or not
++ */
++void dvmTLARecycleThreadTableEntry (void);
++
++/**
++ * @brief return the end pos for current private buffer as well as valid tableIndex, sizeOffset and blockIndex
++ * @details first read the info in slot head, then check whether it is allocated in TLA and last return the
++ * @param ptr The ptr to target java object
++ * @param ptrTableIndex The index of target entry in allocThreadTable
++ * @param ptrSizeOffset The index of intercepted objects
++ * @param ptrBlockIndex The index of current private buffer
++ */
++void* dvmTLAGetBlockEndPos (void* ptr, unsigned int* tableIndex, unsigned int* sizeOffset, unsigned int* blockIndex);
++
++/**
++ * @brief A wrapper to replace mspace_calloc ()
++ * @param msp the mspace
++ * @param size The request size
++ * @param isSmallObject Whether the returned object is allocated by TLA
++ * @return returns  the allocated address if success, 0 if mspace_call () fail to create a new block, mspace_calloc (size) if no more alloc thread table entry or target private buffer is full
++ */
++void* dvmTLAMalloc (mspace msp, size_t size, bool* isSmallObject);
++
++/**
++ * @brief Init TLA
++ * @return success or not
++ */
++bool dvmTLAInit (void);
++
++/**
++ * @brief Destroy TLA
++ */
++void dvmTLADestroy (void);
++
++/**
++ * @brief Enable TLA work
++ */
++bool dvmTLAEnableMalloc (void);
++
++/**
++ * @brief Disable TLA work
++ */
++bool dvmTLADisableMalloc (void);
++
++#endif
+-- 
+1.7.4.1
+

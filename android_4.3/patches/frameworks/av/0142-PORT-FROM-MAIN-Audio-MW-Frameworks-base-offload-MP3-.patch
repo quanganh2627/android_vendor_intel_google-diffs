@@ -1,0 +1,3437 @@
+From dfeddd283646e3c016008500c53537365765edc3 Mon Sep 17 00:00:00 2001
+From: samaga Prasanna Krishna <samaga.krishna@intel.com>
+Date: Tue, 4 Sep 2012 23:35:44 +0530
+Subject: [PORT FROM MAIN]Audio-MW: Frameworks base offload MP3 AAC_LC support
+
+BZ: 46225
+
+This patch will enable support for MP3 and AAC-LC music offload
+playback.
+
+This patch with other dependent middleware patches provides following
+features.
+
+Dynamic selection between codec offload and IA sw decoder
+Dynamic buffer size calculation
+Teardown codec offload playback on enabling effects, BT connection
+and long puase
+
+Orig-Change-Id: I1616e6018f955a1196fe9a99edda5526618ab649
+Signed-off-by: samaga Prasanna Krishna <samaga.krishna@intel.com>
+
+Change-Id: I32c092b0ac48d7a40319c938b07a26e72478319d
+Signed-off-by: Arulselvan M <arulselvan.m@intel.com>
+---
+ include/media/AudioSystem.h                        |   11 +
+ include/media/AudioTrack.h                         |   53 ++-
+ include/media/IAudioFlinger.h                      |    7 +
+ include/media/IAudioPolicyService.h                |    8 +
+ include/media/IAudioTrack.h                        |    2 +
+ include/media/MediaPlayerInterface.h               |    9 +
+ include/media/stagefright/AudioPlayer.h            |   18 +
+ include/private/media/AudioTrackShared.h           |   12 +
+ libvideoeditor/lvpp/VideoEditorPlayer.h            |    8 +
+ media/libmedia/Android.mk                          |    8 +
+ media/libmedia/AudioSystem.cpp                     |   41 ++-
+ media/libmedia/AudioTrack.cpp                      |  159 +++++-
+ media/libmedia/AudioTrackShared.cpp                |   10 +-
+ media/libmedia/IAudioFlinger.cpp                   |   54 ++
+ media/libmedia/IAudioPolicyService.cpp             |   46 ++-
+ media/libmedia/IAudioTrack.cpp                     |   20 +
+ media/libmediaplayerservice/Android.mk             |    8 +
+ media/libmediaplayerservice/MediaPlayerService.cpp |  123 ++++-
+ media/libmediaplayerservice/MediaPlayerService.h   |   18 +
+ media/libstagefright/AACExtractor.cpp              |    1 -
+ media/libstagefright/Android.mk                    |    5 +
+ media/libstagefright/AudioPlayer.cpp               |  266 +++++++-
+ media/libstagefright/AwesomePlayer.cpp             |  660 +++++++++++++++++++-
+ media/libstagefright/ESDS.cpp                      |   26 +
+ media/libstagefright/include/AwesomePlayer.h       |   41 ++-
+ media/libstagefright/include/ESDS.h                |    7 +-
+ services/audioflinger/Android.mk                   |   42 ++
+ services/audioflinger/AudioFlinger.cpp             |  129 ++++-
+ services/audioflinger/AudioFlinger.h               |   11 +-
+ services/audioflinger/AudioPolicyService.cpp       |   25 +
+ services/audioflinger/AudioPolicyService.h         |    7 +
+ services/audioflinger/Effects.cpp                  |   19 +
+ services/audioflinger/Effects.h                    |    1 +
+ services/audioflinger/PlaybackTracks.h             |    3 +-
+ services/audioflinger/Threads.cpp                  |  105 +++-
+ services/audioflinger/Threads.h                    |    6 +-
+ services/audioflinger/Tracks.cpp                   |   98 +++-
+ 37 files changed, 1984 insertions(+), 83 deletions(-)
+
+diff --git a/include/media/AudioSystem.h b/include/media/AudioSystem.h
+index b11c812..8de7964 100644
+--- a/include/media/AudioSystem.h
++++ b/include/media/AudioSystem.h
+@@ -128,6 +128,9 @@ public:
+     // - BAD_VALUE: invalid parameter
+     // NOTE: this feature is not supported on all hardware platforms and it is
+     // necessary to check returned status before using the returned values.
++    static status_t getRenderPosition(audio_io_handle_t ioHandle,
++                                      size_t *halFrames, size_t *dspFrames,
++                                      audio_stream_type_t stream = AUDIO_STREAM_DEFAULT);
+     static status_t getRenderPosition(size_t *halFrames, size_t *dspFrames,
+             audio_stream_type_t stream = AUDIO_STREAM_DEFAULT);
+ 
+@@ -246,7 +249,15 @@ public:
+     static size_t getPrimaryOutputFrameCount();
+ 
+     // ----------------------------------------------------------------------------
++    static bool isOffloadSupported(uint32_t format,
++                                    audio_stream_type_t stream,
++                                    uint32_t samplingRate,
++                                    uint32_t bitRate,
++                                    int64_t duration,
++                                    bool hasVideo = false,
++                                    bool hasStreaming = false);
+ 
++    // ----------------------------------------------------------------------------
+ private:
+ 
+     class AudioFlingerClient: public IBinder::DeathRecipient, public BnAudioFlingerClient
+diff --git a/include/media/AudioTrack.h b/include/media/AudioTrack.h
+index 64f82bb..c4e8aa4 100644
+--- a/include/media/AudioTrack.h
++++ b/include/media/AudioTrack.h
+@@ -64,7 +64,9 @@ public:
+                                     // (See setMarkerPosition()).
+         EVENT_NEW_POS = 4,          // Playback head is at a new position
+                                     // (See setPositionUpdatePeriod()).
+-        EVENT_BUFFER_END = 5        // Playback head is at the end of the buffer.
++        EVENT_BUFFER_END = 5,       // Playback head is at the end of the buffer.
++        EVENT_STREAM_END = 6,       // Sent after all the buffers queued in AF and HW are played back (after stop is called)
++        EVENT_TEAR_DOWN = 7         // AudioTrack needs to be flushed, deleted and new track to be created
+     };
+ 
+     /* Client should declare Buffer on the stack and pass address to obtainBuffer()
+@@ -187,6 +189,44 @@ public:
+                                     void* user          = NULL,
+                                     int notificationFrames = 0,
+                                     int sessionId       = 0);
++    /* Overload constructor for offload
++     * Creates an audio track and registers it with AudioFlinger.
++     * Once created, the track needs to be started before it can be used.
++     * Unspecified values are set to the audio hardware's current
++     * values.
++     *
++     * Parameters:
++     *
++     * streamType:         Select the type of audio stream this track is attached to
++     *                     (e.g. AUDIO_STREAM_MUSIC).
++     * bitRate             Required for offload buffer size calculation
++     * sampleRate:         Track sampling rate in Hz.
++     * format:             Audio format (e.g AUDIO_FORMAT_PCM_16_BIT for signed
++     *                     16 bits per sample).
++     * channelMask:        Channel mask: see audio_channels_t.
++     * frameCount:         Minimum size of track PCM buffer in frames. This defines the
++     *                     latency of the track. The actual size selected by the AudioTrack could be
++     *                     larger if the requested size is not compatible with current audio HAL
++     *                     latency.
++     * flags:              Reserved for future use.
++     * cbf:                Callback function. If not null, this function is called periodically
++     *                     to request new PCM data.
++     * notificationFrames: The callback function is called each time notificationFrames PCM
++     *                     frames have been comsumed from track input buffer.
++     * user                Context for use by the callback receiver.
++     */
++
++                        AudioTrack( audio_stream_type_t streamType,
++                                    int bitRate,
++                                    uint32_t sampleRate,
++                                    audio_format_t format,
++                                    int channelMask,
++                                    int frameCount,
++                                    audio_output_flags_t flags,
++                                    callback_t cbf,
++                                    void* user,
++                                    int notificationFrames,
++                                    int sessionId);
+ 
+     /* Terminates the AudioTrack and unregisters it from AudioFlinger.
+      * Also destroys all resources associated with the AudioTrack.
+@@ -459,6 +499,7 @@ public:
+ 
+         enum {
+             NO_MORE_BUFFERS = 0x80000001,   // same name in AudioFlinger.h, ok to be different value
++            TEAR_DOWN       = 0x80000002,
+             STOPPED = 1
+         };
+ 
+@@ -484,6 +525,13 @@ public:
+      * Dumps the state of an audio track.
+      */
+             status_t dump(int fd, const Vector<String16>& args) const;
++    /* Get offload buffer size based on bit rate, sample rate and channel count
++     * for each track
++     */
++            size_t     getOffloadBufferSize(uint32_t bitRate,
++                                            uint32_t sampleRate,
++                                            uint32_t channel,
++                                            audio_io_handle_t output = 0);
+ 
+ protected:
+     /* copying audio tracks is not allowed */
+@@ -600,6 +648,9 @@ protected:
+     SchedPolicy             mPreviousSchedulingGroup;
+     AudioTrackClientProxy*  mProxy;
+     bool                    mAwaitBoost;    // thread should wait for priority boost before running
++    int                     mWakeTimeMs;
++    audio_io_handle_t       mOutput;
++    int                     mBitRate;
+ };
+ 
+ class TimedAudioTrack : public AudioTrack
+diff --git a/include/media/IAudioFlinger.h b/include/media/IAudioFlinger.h
+index 9c3067e..17bafb1 100644
+--- a/include/media/IAudioFlinger.h
++++ b/include/media/IAudioFlinger.h
+@@ -192,6 +192,13 @@ public:
+     // that looks on primary device for a stream with fast flag, primary flag, or first one.
+     virtual uint32_t getPrimaryOutputSamplingRate() = 0;
+     virtual size_t getPrimaryOutputFrameCount() = 0;
++    virtual bool isAudioEffectEnabled(int sessionId) const = 0;
++
++    virtual size_t getOffloadBufferSize(
++            uint32_t bitRate,
++            uint32_t sampleRate,
++            uint32_t channel,
++            int output) = 0;
+ 
+ };
+ 
+diff --git a/include/media/IAudioPolicyService.h b/include/media/IAudioPolicyService.h
+index b5ad4ef..2bc3013 100644
+--- a/include/media/IAudioPolicyService.h
++++ b/include/media/IAudioPolicyService.h
+@@ -95,6 +95,14 @@ public:
+     virtual status_t queryDefaultPreProcessing(int audioSession,
+                                               effect_descriptor_t *descriptors,
+                                               uint32_t *count) = 0;
++
++    virtual bool isOffloadSupported(uint32_t format,
++                                    audio_stream_type_t stream,
++                                    uint32_t samplingRate,
++                                    uint32_t bitRate,
++                                    int64_t duration,
++                                    bool hasVideo = false,
++                                    bool hasStreaming = false) const = 0;
+ };
+ 
+ 
+diff --git a/include/media/IAudioTrack.h b/include/media/IAudioTrack.h
+index 144be0e..2ca03e0 100644
+--- a/include/media/IAudioTrack.h
++++ b/include/media/IAudioTrack.h
+@@ -82,6 +82,8 @@ public:
+        or Tungsten time. The values for target are defined in AudioTrack.h */
+     virtual status_t    setMediaTimeTransform(const LinearTransform& xform,
+                                               int target) = 0;
++    // For Offload
++    virtual void setVolume(float left, float right) = 0;
+ };
+ 
+ // ----------------------------------------------------------------------------
+diff --git a/include/media/MediaPlayerInterface.h b/include/media/MediaPlayerInterface.h
+index 61166fe..d644f9e 100644
+--- a/include/media/MediaPlayerInterface.h
++++ b/include/media/MediaPlayerInterface.h
+@@ -101,6 +101,15 @@ public:
+                 void *cookie = NULL,
+                 audio_output_flags_t flags = AUDIO_OUTPUT_FLAG_NONE) = 0;
+ 
++        // Over-loaded function for offload playback
++        virtual status_t    open(
++                uint32_t sampleRate, int channelCount, audio_channel_mask_t channelMask,
++                int bitRate,
++                audio_format_t format=AUDIO_FORMAT_PCM_16_BIT,
++                int bufferCount=DEFAULT_AUDIOSINK_BUFFERCOUNT,
++                AudioCallback cb = NULL,
++                void *cookie = NULL,
++                audio_output_flags_t flags = AUDIO_OUTPUT_FLAG_NONE) = 0;
+         virtual void        start() = 0;
+         virtual ssize_t     write(const void* buffer, size_t size) = 0;
+         virtual void        stop() = 0;
+diff --git a/include/media/stagefright/AudioPlayer.h b/include/media/stagefright/AudioPlayer.h
+index cfe4337..5922232 100644
+--- a/include/media/stagefright/AudioPlayer.h
++++ b/include/media/stagefright/AudioPlayer.h
+@@ -36,10 +36,21 @@ public:
+         SEEK_COMPLETE
+     };
+ 
++    enum create_flags_t {
++        ALLOW_DEEP_BUFFERING = 0x01,
++        USE_OFFLOAD = 0x02
++    };
++
+     AudioPlayer(const sp<MediaPlayerBase::AudioSink> &audioSink,
+                 bool allowDeepBuffering = false,
+                 AwesomePlayer *audioObserver = NULL);
+ 
++    // Overloaded constructor for offload
++    AudioPlayer(audio_format_t audioFormat,
++                const sp<MediaPlayerBase::AudioSink> &audioSink,
++                uint32_t flags,
++                AwesomePlayer *audioObserver = NULL);
++
+     virtual ~AudioPlayer();
+ 
+     // Caller retains ownership of "source".
+@@ -64,6 +75,7 @@ public:
+ 
+     bool isSeeking();
+     bool reachedEOS(status_t *finalStatus);
++    void notifyAudioEOS();
+ 
+     status_t setPlaybackRatePermille(int32_t ratePermille);
+ 
+@@ -105,6 +117,12 @@ private:
+     bool mAllowBackgroundPlayback;
+ #endif
+ 
++    // for compressed playback support
++    int mBitRate;
++    bool mOffload;
++    int mChannels;
++    audio_format_t mOffloadFormat;
++    int64_t mStartPos;
+     static void AudioCallback(int event, void *user, void *info);
+     void AudioCallback(int event, void *info);
+ 
+diff --git a/include/private/media/AudioTrackShared.h b/include/private/media/AudioTrackShared.h
+index 41e20f8..cb4b9cf 100644
+--- a/include/private/media/AudioTrackShared.h
++++ b/include/private/media/AudioTrackShared.h
+@@ -23,6 +23,8 @@
+ #include <utils/threads.h>
+ #include <utils/Log.h>
+ 
++#include <system/audio.h>
++
+ namespace android {
+ 
+ // ----------------------------------------------------------------------------
+@@ -52,6 +54,13 @@ struct AudioTrackSharedStatic {
+ 
+ // ----------------------------------------------------------------------------
+ 
++#define CBLK_OFFLOAD_TEAR_DOWN_MSK         0x0100
++#define CBLK_OFFLOAD_TEAR_DOWN_ON          0x0100  // track invalidated by AudioFlinger. Track to recreate
++#define CBLK_OFFLOAD_USES_DEEP_BUFFER      0x0200  // indicates that the track is deep buffered in the AudioFlinger
++#define CBLK_OFFLOAD_STREAM_END_DONE       0x0400  // Indicates stream end event has been generated
++#define MAX_OFFLOAD_DEEP_BUFFER_TIMEOUT_MS 20000 //assuming upto a maximum of 20 seconds of deep buffering
++#define WAIT_PERIOD_MUSIC_OFFLOAD_MS       6000
++
+ // Important: do not add any virtual methods, including ~
+ struct audio_track_cblk_t
+ {
+@@ -112,6 +121,9 @@ public:
+     volatile    int32_t     flags;
+ 
+                 // Cache line boundary (32 bytes)
++                // Cache the io handle for this audiotrack.
++                // Needed incase this is an offloaded track
++                audio_io_handle_t         mIoHandle;
+ 
+ #if 0
+                 union {
+diff --git a/libvideoeditor/lvpp/VideoEditorPlayer.h b/libvideoeditor/lvpp/VideoEditorPlayer.h
+index 77194ab..eb91ae4 100755
+--- a/libvideoeditor/lvpp/VideoEditorPlayer.h
++++ b/libvideoeditor/lvpp/VideoEditorPlayer.h
+@@ -54,6 +54,14 @@ class VideoEditorPlayer : public MediaPlayerInterface {
+                 audio_format_t format, int bufferCount,
+                 AudioCallback cb, void *cookie, audio_output_flags_t flags);
+ 
++        // Overloaded function
++        virtual status_t        open(
++                uint32_t sampleRate, int channelCount, audio_channel_mask_t channelMask,
++                int bitRate,
++                audio_format_t format, int bufferCount,
++                AudioCallback cb, void *cookie,
++                audio_output_flags_t flags) { return NO_ERROR; }
++
+         virtual void            start();
+         virtual ssize_t         write(const void* buffer, size_t size);
+         virtual void            stop();
+diff --git a/media/libmedia/Android.mk b/media/libmedia/Android.mk
+index 9936d47..9110bb2 100644
+--- a/media/libmedia/Android.mk
++++ b/media/libmedia/Android.mk
+@@ -5,6 +5,10 @@ LOCAL_PATH:= $(call my-dir)
+ 
+ include $(CLEAR_VARS)
+ 
++ifeq ($(strip $(INTEL_MUSIC_OFFLOAD_FEATURE)),true)
++  LOCAL_CFLAGS += -DINTEL_MUSIC_OFFLOAD_FEATURE
++endif
++
+ LOCAL_SRC_FILES:= \
+     AudioParameter.cpp
+ LOCAL_MODULE:= libmedia_helper
+@@ -33,6 +37,10 @@ include $(BUILD_HOST_STATIC_LIBRARY)
+ 
+ include $(CLEAR_VARS)
+ 
++ifeq ($(strip $(INTEL_MUSIC_OFFLOAD_FEATURE)),true)
++  LOCAL_CFLAGS += -DINTEL_MUSIC_OFFLOAD_FEATURE
++endif
++
+ LOCAL_SRC_FILES:= \
+     AudioTrack.cpp \
+     AudioTrackShared.cpp \
+diff --git a/media/libmedia/AudioSystem.cpp b/media/libmedia/AudioSystem.cpp
+index 693df60..d19d113 100644
+--- a/media/libmedia/AudioSystem.cpp
++++ b/media/libmedia/AudioSystem.cpp
+@@ -361,6 +361,23 @@ status_t AudioSystem::setVoiceVolume(float value)
+     return af->setVoiceVolume(value);
+ }
+ 
++status_t AudioSystem::getRenderPosition(audio_io_handle_t ioHandle, size_t *halFrames,
++                                        size_t *dspFrames, audio_stream_type_t stream)
++{
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    const sp<IAudioFlinger>& af = AudioSystem::get_audio_flinger();
++    if (af == 0) return PERMISSION_DENIED;
++
++    if (stream == AUDIO_STREAM_DEFAULT) {
++        stream = AUDIO_STREAM_MUSIC;
++    }
++    return af->getRenderPosition(halFrames, dspFrames, ioHandle);
++#else
++    ALOGI("getRenderPosition: is not supported");
++    return 0;
++#endif
++}
++
+ status_t AudioSystem::getRenderPosition(size_t *halFrames, size_t *dspFrames,
+         audio_stream_type_t stream)
+ {
+@@ -370,7 +387,6 @@ status_t AudioSystem::getRenderPosition(size_t *halFrames, size_t *dspFrames,
+     if (stream == AUDIO_STREAM_DEFAULT) {
+         stream = AUDIO_STREAM_MUSIC;
+     }
+-
+     return af->getRenderPosition(halFrames, dspFrames, getOutput(stream));
+ }
+ 
+@@ -771,6 +787,29 @@ void AudioSystem::clearAudioConfigCache()
+     gOutputs.clear();
+ }
+ 
++bool AudioSystem::isOffloadSupported(uint32_t format,
++                                    audio_stream_type_t stream,
++                                    uint32_t samplingRate,
++                                    uint32_t bitRate,
++                                    int64_t duration,
++                                    bool isVideo,
++                                    bool isStreaming)
++{
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    ALOGV("isOffloadSupported");
++    const sp<IAudioPolicyService>& aps = AudioSystem::get_audio_policy_service();
++    if (aps == 0) {
++        ALOGE("isOffloadSupported Error aps = 0");
++         return false;
++    }
++
++    return aps->isOffloadSupported(format, stream, samplingRate, bitRate,
++                duration, isVideo, isStreaming);
++#else
++    ALOGI("isOffloadSupported is not supported");
++    return false;
++#endif
++}
+ // ---------------------------------------------------------------------------
+ 
+ void AudioSystem::AudioPolicyServiceClient::binderDied(const wp<IBinder>& who) {
+diff --git a/media/libmedia/AudioTrack.cpp b/media/libmedia/AudioTrack.cpp
+index 2dc0619..575b7c2 100644
+--- a/media/libmedia/AudioTrack.cpp
++++ b/media/libmedia/AudioTrack.cpp
+@@ -106,6 +106,10 @@ AudioTrack::AudioTrack()
+       mPreviousSchedulingGroup(SP_DEFAULT),
+       mProxy(NULL)
+ {
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    mOutput = 0;
++    mBitRate = 0;
++#endif
+ }
+ 
+ AudioTrack::AudioTrack(
+@@ -125,6 +129,10 @@ AudioTrack::AudioTrack(
+       mPreviousSchedulingGroup(SP_DEFAULT),
+       mProxy(NULL)
+ {
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    mOutput = 0;
++    mBitRate = 0;
++#endif
+     mStatus = set(streamType, sampleRate, format, channelMask,
+             frameCount, flags, cbf, user, notificationFrames,
+             0 /*sharedBuffer*/, false /*threadCanCallJava*/, sessionId);
+@@ -147,6 +155,10 @@ AudioTrack::AudioTrack(
+       mPreviousSchedulingGroup(SP_DEFAULT),
+       mProxy(NULL)
+ {
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    mOutput = 0;
++    mBitRate = 0;
++#endif
+     if (sharedBuffer == 0) {
+         ALOGE("sharedBuffer must be non-0");
+         mStatus = BAD_VALUE;
+@@ -157,6 +169,35 @@ AudioTrack::AudioTrack(
+             sharedBuffer, false /*threadCanCallJava*/, sessionId);
+ }
+ 
++// Overloaded for offload support
++AudioTrack::AudioTrack(
++        audio_stream_type_t streamType,
++        int bitRate,
++        uint32_t sampleRate,
++        audio_format_t format,
++        int channelMask,
++        int frameCount,
++        audio_output_flags_t flags,
++        callback_t cbf,
++        void* user,
++        int notificationFrames,
++        int sessionId)
++    : mStatus(NO_INIT),
++      mIsTimed(false),
++      mPreviousPriority(ANDROID_PRIORITY_NORMAL),
++      mPreviousSchedulingGroup(SP_DEFAULT)
++{
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    mOutput = 0;
++    mBitRate = 0;
++    mStatus = set(streamType, sampleRate, format, channelMask,
++        frameCount, flags, cbf, user, notificationFrames,
++        0, false, sessionId);
++#else
++    ALOGI("This over loaded audio track is not supported.");
++#endif
++}
++
+ AudioTrack::~AudioTrack()
+ {
+     ALOGV_IF(mSharedBuffer != 0, "Destructor sharedBuffer: %p", mSharedBuffer->pointer());
+@@ -271,6 +312,21 @@ status_t AudioTrack::set(
+         mFrameSizeAF = sizeof(uint8_t);
+     }
+ 
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    if (flags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD) {
++        // Get offload buffer size and also sets bitrate for output stream in HAL
++        int bufferSize = 0;
++        bufferSize = getOffloadBufferSize(mBitRate, sampleRate, channelMask, NULL);
++        if (bufferSize == 0) {
++            // cannot offload with zero buffer size return track not initailized
++            ALOGE("Could not get offload buffer size for stream type %d", streamType);
++            return NO_INIT;
++        }
++        ALOGV("The offload buffer size is %d", bufferSize);
++        frameCount = bufferSize; // For offload, buffer size is used as frame count.
++    }
++#endif
++
+     audio_io_handle_t output = AudioSystem::getOutput(
+                                     streamType,
+                                     sampleRate, format, channelMask,
+@@ -302,6 +358,11 @@ status_t AudioTrack::set(
+                                   output);
+ 
+     if (status != NO_ERROR) {
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++        if (flags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD) {
++            AudioSystem::releaseOutput(output);
++        }
++#endif
+         if (mAudioTrackThread != 0) {
+             mAudioTrackThread->requestExit();
+             mAudioTrackThread.clear();
+@@ -329,9 +390,32 @@ status_t AudioTrack::set(
+     mUpdatePeriod = 0;
+     mFlushed = false;
+     AudioSystem::acquireAudioSessionId(mSessionId);
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    mOutput = output;
++#endif
+     return NO_ERROR;
+ }
+ 
++size_t AudioTrack::getOffloadBufferSize(
++        uint32_t bitRate,
++        uint32_t sampleRate,
++        uint32_t channel,
++        audio_io_handle_t output)
++{
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    ALOGV("getOffloadBufferSize");
++    const sp<IAudioFlinger>& audioFlinger = AudioSystem::get_audio_flinger();
++    if (audioFlinger == 0) {
++        ALOGE("Could not get audioflinger");
++        return 0;
++    }
++    return audioFlinger->getOffloadBufferSize(bitRate, sampleRate, channel, output);
++#else
++    ALOGI("getOffloadBufferSize is not supported");
++    return 0;
++#endif
++}
++
+ // -------------------------------------------------------------------------
+ 
+ void AudioTrack::start()
+@@ -424,7 +508,16 @@ void AudioTrack::stop()
+             set_sched_policy(0, mPreviousSchedulingGroup);
+         }
+     }
+-
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++      else if(mFlags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD) {
++        ALOGV("stop: Offload");
++        // For Offload, music may be in paused (!mActive) state. We have to issue stop.
++        // TODO need a check in AudioFlinger that stream_end is not delivered if stop is
++        // called after pause
++        mCblk->cv.signal();
++        mAudioTrack->stop();
++    }
++#endif
+ }
+ 
+ bool AudioTrack::stopped() const
+@@ -451,11 +544,17 @@ void AudioTrack::flush_l()
+     mMarkerReached = false;
+     mUpdatePeriod = 0;
+ 
+-    mFlushed = true;
+-    mAudioTrack->flush();
+-    // Release AudioTrack callback thread in case it was waiting for new buffers
+-    // in AudioTrack::obtainBuffer()
+-    mCblk->cv.signal();
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    if (!mActive || (mFlags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD)) {
++#else
++    if (!mActive ) {
++#endif
++        mFlushed = true;
++        mAudioTrack->flush();
++        // Release AudioTrack callback thread in case it was waiting for new buffers
++        // in AudioTrack::obtainBuffer()
++        mCblk->cv.signal();
++    }
+ }
+ 
+ void AudioTrack::pause()
+@@ -683,8 +782,21 @@ status_t AudioTrack::getPosition(uint32_t *position)
+         return BAD_VALUE;
+     }
+     AutoMutex lock(mLock);
+-    *position = mFlushed ? 0 : mCblk->server;
+ 
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    if (!(mFlags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD)) {
++        *position = mFlushed ? 0 : mCblk->server;
++    } else {
++        uint32_t dspFrames = 0;
++        if (mOutput != 0) {
++            uint32_t halFrames = 0;
++            AudioSystem::getRenderPosition(mOutput, &halFrames, &dspFrames);
++        }
++        *position = dspFrames;
++    }
++#else
++    *position = mFlushed ? 0 : mCblk->server;
++#endif
+     return NO_ERROR;
+ }
+ 
+@@ -788,6 +900,11 @@ status_t AudioTrack::createTrack_l(
+             }
+             frameCount = afFrameCount;
+         }
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++        if (mNotificationFramesAct == 0 && (flags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD)) {
++            mNotificationFramesAct = frameCount;
++        }
++#endif
+ 
+     } else if (sharedBuffer != 0) {
+ 
+@@ -1002,7 +1119,15 @@ status_t AudioTrack::obtainBuffer(Buffer* audioBuffer, int32_t waitCount)
+                 cblk->lock.lock();
+             }
+ 
+-            if (cblk->flags & CBLK_INVALID) {
++            if (cblk->flags & CBLK_INVALID_MSK) {
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++                cblk->lock.unlock();
++                // no need to clear the invalid flag as this cblk will not be used anymore
++                if (cblk->flags & CBLK_OFFLOAD_TEAR_DOWN_MSK) {
++                    ALOGW("obtainBuffer() track %p invalidated. Tear down stream", this);
++                    return TEAR_DOWN;
++                }
++#endif
+                 goto create_new_track;
+             }
+             if (CC_UNLIKELY(result != NO_ERROR)) {
+@@ -1320,8 +1445,20 @@ bool AudioTrack::processAudioBuffer(const sp<AudioTrackThread>& thread)
+         status_t err = obtainBuffer(&audioBuffer, waitCount);
+         if (err < NO_ERROR) {
+             if (err != TIMED_OUT) {
++    //To be Checked for offload how to handle 
+                 ALOGE_IF(err != status_t(NO_MORE_BUFFERS),
+                         "Error obtaining an audio buffer, giving up.");
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++                if (err == status_t(TEAR_DOWN)) {
++                    ALOGW("processAudioBuffer: Tear down in progress");
++                    mCbf(EVENT_TEAR_DOWN, mUserData, NULL);
++                }
++                else {
++                    ALOGE_IF(err != status_t(NO_MORE_BUFFERS), "Error obtaining an audio buffer, giving up.");
++                }
++#else
++                ALOGE_IF(err != status_t(NO_MORE_BUFFERS), "Error obtaining an audio buffer, giving up.");
++#endif
+                 return false;
+             }
+             break;
+@@ -1347,7 +1484,13 @@ bool AudioTrack::processAudioBuffer(const sp<AudioTrackThread>& thread)
+             // Keep this thread going to handle timed events and
+             // still try to get more data in intervals of WAIT_PERIOD_MS
+             // but don't just loop and block the CPU, so wait
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++            usleep( ((mFlags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD) ?
++                     OFFLOAD_MULTIPLIER : DEFAULT_MULTIPLIER) *
++                     WAIT_PERIOD_MS*1000 );
++#else
+             usleep(WAIT_PERIOD_MS*1000);
++#endif
+             break;
+         }
+ 
+diff --git a/media/libmedia/AudioTrackShared.cpp b/media/libmedia/AudioTrackShared.cpp
+index 13d47c9..bb3825e 100644
+--- a/media/libmedia/AudioTrackShared.cpp
++++ b/media/libmedia/AudioTrackShared.cpp
+@@ -40,7 +40,15 @@ uint32_t audio_track_cblk_t::stepUser(size_t stepCount, size_t frameCount, bool
+     if (isOut) {
+         // If stepServer() has been called once, switch to normal obtainBuffer() timeout period
+         if (bufferTimeoutMs == MAX_STARTUP_TIMEOUT_MS-1) {
+-            bufferTimeoutMs = MAX_RUN_TIMEOUT_MS;
++        // if your using larger buffers for offloading change the wait time accordingly.
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++            if (flags & CBLK_OFFLOAD_USES_DEEP_BUFFER) {
++                bufferTimeoutMs = MAX_OFFLOAD_DEEP_BUFFER_TIMEOUT_MS;
++            } else
++#endif
++            {
++                bufferTimeoutMs = MAX_RUN_TIMEOUT_MS;
++            }
+         }
+     } else if (u > server) {
+         ALOGW("stepUser occurred after track reset");
+diff --git a/media/libmedia/IAudioFlinger.cpp b/media/libmedia/IAudioFlinger.cpp
+index 2f18680..6ba95bd 100644
+--- a/media/libmedia/IAudioFlinger.cpp
++++ b/media/libmedia/IAudioFlinger.cpp
+@@ -73,6 +73,8 @@ enum {
+     LOAD_HW_MODULE,
+     GET_PRIMARY_OUTPUT_SAMPLING_RATE,
+     GET_PRIMARY_OUTPUT_FRAME_COUNT,
++    GET_OFFLOAD_BUFFER_SIZE,
++    IS_EFFECTS_ENABLED
+ };
+ 
+ class BpAudioFlinger : public BpInterface<IAudioFlinger>
+@@ -695,6 +697,38 @@ public:
+         return reply.readInt32();
+     }
+ 
++    virtual size_t getOffloadBufferSize(
++        uint32_t bitRate,
++        uint32_t SR,
++        uint32_t channel,
++        int output)
++    {
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++        Parcel data, reply;
++        data.writeInterfaceToken(IAudioFlinger::getInterfaceDescriptor());
++        data.writeInt32(bitRate);
++        data.writeInt32(SR);
++        data.writeInt32(channel);
++        data.writeInt32(output);
++        remote()->transact(GET_OFFLOAD_BUFFER_SIZE, data, &reply);
++        return reply.readInt32();
++#else
++        return 0;
++#endif
++    }
++
++    virtual bool isAudioEffectEnabled(int sessionId) const
++    {
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++        Parcel data, reply;
++        data.writeInterfaceToken(IAudioFlinger::getInterfaceDescriptor());
++        data.writeInt32(sessionId);
++        remote()->transact(IS_EFFECTS_ENABLED, data, &reply);
++        return reply.readInt32();
++#else
++        return 0;
++#endif
++    }
+ };
+ 
+ IMPLEMENT_META_INTERFACE(AudioFlinger, "android.media.IAudioFlinger");
+@@ -1056,6 +1090,26 @@ status_t BnAudioFlinger::onTransact(
+             reply->writeInt32(getPrimaryOutputFrameCount());
+             return NO_ERROR;
+         } break;
++        case GET_OFFLOAD_BUFFER_SIZE: {
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++            CHECK_INTERFACE(IAudioFlinger, data, reply);
++            uint32_t bitRate = data.readInt32();
++            uint32_t sampleRate = data.readInt32();
++            uint32_t channel = data.readInt32();
++            uint32_t output = data.readInt32();
++            reply->writeInt32(getOffloadBufferSize(bitRate,
++                                   sampleRate, channel, output));
++#endif
++            return NO_ERROR;
++        } break;
++        case IS_EFFECTS_ENABLED: {
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++            CHECK_INTERFACE(IAudioFlinger, data, reply);
++            int sessionId = data.readInt32();
++            reply->writeInt32(isAudioEffectEnabled(sessionId));
++#endif
++            return NO_ERROR;
++        } break;
+         default:
+             return BBinder::onTransact(code, data, reply, flags);
+     }
+diff --git a/media/libmedia/IAudioPolicyService.cpp b/media/libmedia/IAudioPolicyService.cpp
+index 386c351..a21da09 100644
+--- a/media/libmedia/IAudioPolicyService.cpp
++++ b/media/libmedia/IAudioPolicyService.cpp
+@@ -57,6 +57,7 @@ enum {
+     QUERY_DEFAULT_PRE_PROCESSING,
+     SET_EFFECT_ENABLED,
+     IS_STREAM_ACTIVE_REMOTELY
++    IS_OFFLOAD_SUPPORTED
+ };
+ 
+ class BpAudioPolicyService : public BpInterface<IAudioPolicyService>
+@@ -374,6 +375,31 @@ public:
+         *count = retCount;
+         return status;
+     }
++
++    virtual bool isOffloadSupported(uint32_t format,
++                                    audio_stream_type_t stream,
++                                    uint32_t samplingRate,
++                                    uint32_t bitRate,
++                                    int64_t duration,
++                                    bool isVideo,
++                                    bool isStreaming) const
++    {
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++        Parcel data, reply;
++        data.writeInterfaceToken(IAudioPolicyService::getInterfaceDescriptor());
++        data.writeInt32(static_cast <uint32_t>(format));
++        data.writeInt32(static_cast <uint32_t>(stream));
++        data.writeInt32(static_cast <uint32_t>(samplingRate));
++        data.writeInt32(static_cast <uint32_t>(bitRate));
++        data.writeInt64(static_cast <int64_t>(duration));
++        data.writeInt32(isVideo);
++        data.writeInt32(isStreaming);
++        remote()->transact(IS_OFFLOAD_SUPPORTED, data, &reply);
++        return reply.readInt32();
++#else
++        return 0;
++#endif
++    }
+ };
+ 
+ IMPLEMENT_META_INTERFACE(AudioPolicyService, "android.media.IAudioPolicyService");
+@@ -652,8 +678,24 @@ status_t BnAudioPolicyService::onTransact(
+             }
+             delete[] descriptors;
+             return status;
+-        }
+-
++        }break;
++        case IS_OFFLOAD_SUPPORTED: {
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++            CHECK_INTERFACE(IAudioPolicyService, data, reply);
++            uint32_t format = data.readInt32();
++            audio_stream_type_t stream =
++                    static_cast <audio_stream_type_t>(data.readInt32());
++            uint32_t samplingRate = data.readInt32();
++           uint32_t bitRate = data.readInt32();
++            int64_t duration = data.readInt64();
++            bool isVideo = data.readInt32();
++            bool isStreaming = data.readInt32();
++            bool isSupported = isOffloadSupported(format, stream, samplingRate,
++                                   bitRate, duration, isVideo, isStreaming);
++            reply->writeInt32(isSupported);
++#endif
++            return NO_ERROR;
++        }break;
+         default:
+             return BBinder::onTransact(code, data, reply, flags);
+     }
+diff --git a/media/libmedia/IAudioTrack.cpp b/media/libmedia/IAudioTrack.cpp
+index e92f8aa..5ce1600 100644
+--- a/media/libmedia/IAudioTrack.cpp
++++ b/media/libmedia/IAudioTrack.cpp
+@@ -39,6 +39,7 @@ enum {
+     ALLOCATE_TIMED_BUFFER,
+     QUEUE_TIMED_BUFFER,
+     SET_MEDIA_TIME_TRANSFORM,
++    SET_VOLUME
+ };
+ 
+ class BpAudioTrack : public BpInterface<IAudioTrack>
+@@ -154,6 +155,16 @@ public:
+         }
+         return status;
+     }
++    virtual void setVolume(float left,float right)
++    {
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++       Parcel data, reply;
++       data.writeInterfaceToken(IAudioTrack::getInterfaceDescriptor());
++       data.writeFloat(left);
++       data.writeFloat(right);
++       remote()->transact(SET_VOLUME, data, &reply);
++#endif
++    }
+ };
+ 
+ IMPLEMENT_META_INTERFACE(AudioTrack, "android.media.IAudioTrack");
+@@ -223,6 +234,15 @@ status_t BnAudioTrack::onTransact(
+             reply->writeInt32(setMediaTimeTransform(xform, target));
+             return NO_ERROR;
+         } break;
++        case SET_VOLUME:{
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++            CHECK_INTERFACE(IAudioTrack, data, reply);
++            float left = data.readFloat();
++            float right = data.readFloat();
++            setVolume(left, right) ;
++#endif
++            return NO_ERROR;
++        } break;
+         default:
+             return BBinder::onTransact(code, data, reply, flags);
+     }
+diff --git a/media/libmediaplayerservice/Android.mk b/media/libmediaplayerservice/Android.mk
+index d87bc7f..bc2c2f1 100644
+--- a/media/libmediaplayerservice/Android.mk
++++ b/media/libmediaplayerservice/Android.mk
+@@ -6,6 +6,10 @@ LOCAL_PATH:= $(call my-dir)
+ 
+ include $(CLEAR_VARS)
+ 
++ifeq ($(strip $(INTEL_MUSIC_OFFLOAD_FEATURE)),true)
++  LOCAL_CFLAGS += -DINTEL_MUSIC_OFFLOAD_FEATURE
++endif
++
+ LOCAL_SRC_FILES:=               \
+     ActivityManager.cpp         \
+     Crypto.cpp                  \
+@@ -51,6 +55,10 @@ LOCAL_C_INCLUDES :=                                                 \
+     $(TOP)/frameworks/native/include/media/openmax                  \
+     $(TOP)/external/tremolo/Tremolo                                 \
+ 
++ifeq ($(strip $(INTEL_MUSIC_OFFLOAD_FEATURE)),true)
++  LOCAL_CFLAGS += -DINTEL_MUSIC_OFFLOAD_FEATURE
++endif
++
+ LOCAL_MODULE:= libmediaplayerservice
+ 
+ include $(BUILD_SHARED_LIBRARY)
+diff --git a/media/libmediaplayerservice/MediaPlayerService.cpp b/media/libmediaplayerservice/MediaPlayerService.cpp
+index 91e5273..14f621b 100644
+--- a/media/libmediaplayerservice/MediaPlayerService.cpp
++++ b/media/libmediaplayerservice/MediaPlayerService.cpp
+@@ -890,15 +890,9 @@ status_t MediaPlayerService::Client::isPlaying(bool* state)
+ 
+ status_t MediaPlayerService::Client::getCurrentPosition(int *msec)
+ {
+-    ALOGV("getCurrentPosition");
+     sp<MediaPlayerBase> p = getPlayer();
+     if (p == 0) return UNKNOWN_ERROR;
+     status_t ret = p->getCurrentPosition(msec);
+-    if (ret == NO_ERROR) {
+-        ALOGV("[%d] getCurrentPosition = %d", mConnId, *msec);
+-    } else {
+-        ALOGE("getCurrentPosition returned %d", ret);
+-    }
+     return ret;
+ }
+ 
+@@ -1289,7 +1283,8 @@ MediaPlayerService::AudioOutput::AudioOutput(int sessionId)
+       mCallbackData(NULL),
+       mBytesWritten(0),
+       mSessionId(sessionId),
+-      mFlags(AUDIO_OUTPUT_FLAG_NONE) {
++      mFlags(AUDIO_OUTPUT_FLAG_NONE)
++{
+     ALOGV("AudioOutput(%d)", sessionId);
+     mTrack = 0;
+     mRecycledTrack = 0;
+@@ -1302,6 +1297,9 @@ MediaPlayerService::AudioOutput::AudioOutput(int sessionId)
+     mAuxEffectId = 0;
+     mSendLevel = 0.0;
+     setMinBufferCount();
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    mBitRate = 0;
++#endif
+ }
+ 
+ MediaPlayerService::AudioOutput::~AudioOutput()
+@@ -1380,6 +1378,25 @@ status_t MediaPlayerService::AudioOutput::getFramesWritten(uint32_t *frameswritt
+     return OK;
+ }
+ 
++// Overloaded open
++status_t MediaPlayerService::AudioOutput::open(
++        uint32_t sampleRate, int channelCount, audio_channel_mask_t channelMask,
++        int bitRate,
++        audio_format_t format, int bufferCount,
++        AudioCallback cb, void *cookie,
++        audio_output_flags_t flags)
++{
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    if (flags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD){
++        mBitRate = bitRate;
++     }
++     return open(sampleRate, channelCount, channelMask, format,
++                 bufferCount, cb, cookie, flags);
++#else
++    return 0;
++#endif
++}
++
+ status_t MediaPlayerService::AudioOutput::open(
+         uint32_t sampleRate, int channelCount, audio_channel_mask_t channelMask,
+         audio_format_t format, int bufferCount,
+@@ -1418,12 +1435,16 @@ status_t MediaPlayerService::AudioOutput::open(
+         }
+     }
+ 
++    // check the flag and call the appropriate audio track constructor. use bit rate
+     AudioTrack *t;
+     CallbackData *newcbd = NULL;
+-    if (mCallback != NULL) {
+-        newcbd = new CallbackData(this);
+-        t = new AudioTrack(
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    if (flags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD) {
++       if (mCallback != NULL) {
++            newcbd = new CallbackData(this);
++            t = new AudioTrack(
+                 mStreamType,
++                mBitRate,
+                 sampleRate,
+                 format,
+                 channelMask,
+@@ -1433,9 +1454,10 @@ status_t MediaPlayerService::AudioOutput::open(
+                 newcbd,
+                 0,  // notification frames
+                 mSessionId);
+-    } else {
+-        t = new AudioTrack(
++        } else {
++            t = new AudioTrack(
+                 mStreamType,
++                mBitRate,
+                 sampleRate,
+                 format,
+                 channelMask,
+@@ -1445,7 +1467,38 @@ status_t MediaPlayerService::AudioOutput::open(
+                 NULL,
+                 0,
+                 mSessionId);
++        }
+     }
++      else
++#endif
++      { //flags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD
++        if (mCallback != NULL) {
++            newcbd = new CallbackData(this);
++            t = new AudioTrack(
++                mStreamType,
++                sampleRate,
++                format,
++                channelMask,
++                frameCount,
++                flags,
++                CallbackWrapper,
++                newcbd,
++                0,  // notification frames
++                mSessionId);
++        } else {
++            t = new AudioTrack(
++                mStreamType,
++                sampleRate,
++                format,
++                channelMask,
++                frameCount,
++                flags,
++                NULL,
++                NULL,
++                0,
++                mSessionId);
++        }
++    } //flags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD
+ 
+     if ((t == 0) || (t->initCheck() != NO_ERROR)) {
+         ALOGE("Unable to create audio track");
+@@ -1457,7 +1510,6 @@ status_t MediaPlayerService::AudioOutput::open(
+ 
+     if (mRecycledTrack) {
+         // check if the existing track can be reused as-is, or if a new track needs to be created.
+-
+         bool reuse = true;
+         if ((mCallbackData == NULL && mCallback != NULL) ||
+                 (mCallbackData != NULL && mCallback == NULL)) {
+@@ -1647,6 +1699,50 @@ status_t MediaPlayerService::AudioOutput::attachAuxEffect(int effectId)
+ void MediaPlayerService::AudioOutput::CallbackWrapper(
+         int event, void *cookie, void *info) {
+     //ALOGV("callbackwrapper");
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    CallbackData *data = (CallbackData*)cookie;
++    data->lock();
++    AudioOutput *me = data->getOutput();
++    AudioTrack::Buffer *buffer = (AudioTrack::Buffer *)info;
++
++    if (me == NULL) {
++        // no output set, likely because the track was scheduled to be reused
++        // by another player, but the format turned out to be incompatible.
++        data->unlock();
++        buffer->size = 0;
++        return;
++    }
++
++    switch(event) {
++    case AudioTrack::EVENT_TEAR_DOWN:
++    {
++        // For AudioTrack events of Tear down  just call
++        // registered call back function and pass the event
++        AudioTrack::Buffer buffer;
++        buffer.flags = event;
++        buffer.size  = 4;
++        (*me->mCallback)(me, &buffer, buffer.size, me->mCallbackCookie);
++    } break;
++    case AudioTrack::EVENT_MORE_DATA:
++    {
++        size_t actualSize = (*me->mCallback)(
++            me, buffer->raw, buffer->size, me->mCallbackCookie);
++        if (actualSize == 0 && buffer->size > 0 && me->mNextOutput == NULL) {
++            // We've reached EOS but the audio track is not stopped yet,
++            // keep playing silence.
++            memset(buffer->raw, 0, buffer->size);
++            actualSize = buffer->size;
++       }
++       buffer->size = actualSize;
++    } break;
++    default:
++    {
++        LOGE("received unknown event type: %d inside CallbackWrapper !", event);
++        break;
++    }
++    }
++    data->unlock();
++#else
+     if (event != AudioTrack::EVENT_MORE_DATA) {
+         return;
+     }
+@@ -1676,6 +1772,7 @@ void MediaPlayerService::AudioOutput::CallbackWrapper(
+ 
+     buffer->size = actualSize;
+     data->unlock();
++#endif
+ }
+ 
+ int MediaPlayerService::AudioOutput::getSessionId() const
+diff --git a/media/libmediaplayerservice/MediaPlayerService.h b/media/libmediaplayerservice/MediaPlayerService.h
+index 82dc29b..4401215 100644
+--- a/media/libmediaplayerservice/MediaPlayerService.h
++++ b/media/libmediaplayerservice/MediaPlayerService.h
+@@ -96,6 +96,15 @@ class MediaPlayerService : public BnMediaPlayerService
+                 AudioCallback cb, void *cookie,
+                 audio_output_flags_t flags = AUDIO_OUTPUT_FLAG_NONE);
+ 
++        // Overloaded function
++        virtual status_t        open(
++                uint32_t sampleRate, int channelCount, audio_channel_mask_t channelMask,
++                int bitRate,
++                audio_format_t format, int bufferCount,
++                AudioCallback cb, void *cookie,
++                audio_output_flags_t flags = AUDIO_OUTPUT_FLAG_NONE);
++
++
+         virtual void            start();
+         virtual ssize_t         write(const void* buffer, size_t size);
+         virtual void            stop();
+@@ -139,6 +148,7 @@ class MediaPlayerService : public BnMediaPlayerService
+         static bool             mIsOnEmulator;
+         static int              mMinBufferCount;  // 12 for emulator; otherwise 4
+         audio_output_flags_t    mFlags;
++        int                     mBitRate;
+ 
+         // CallbackData is what is passed to the AudioTrack as the "user" data.
+         // We need to be able to target this to a different Output on the fly,
+@@ -197,6 +207,14 @@ class MediaPlayerService : public BnMediaPlayerService
+                 AudioCallback cb = NULL, void *cookie = NULL,
+                 audio_output_flags_t flags = AUDIO_OUTPUT_FLAG_NONE);
+ 
++        // overloaded function
++        virtual status_t        open(
++                uint32_t sampleRate, int channelCount, audio_channel_mask_t channelMask,
++                int bitRate,
++                audio_format_t format, int bufferCount,
++                AudioCallback cb, void *cookie,
++                audio_output_flags_t flags = AUDIO_OUTPUT_FLAG_NONE){return NO_ERROR;}
++
+         virtual void            start();
+         virtual ssize_t         write(const void* buffer, size_t size);
+         virtual void            stop();
+diff --git a/media/libstagefright/AACExtractor.cpp b/media/libstagefright/AACExtractor.cpp
+index 041cd58..9d01a24 100644
+--- a/media/libstagefright/AACExtractor.cpp
++++ b/media/libstagefright/AACExtractor.cpp
+@@ -166,7 +166,6 @@ AACExtractor::AACExtractor(
+     channel = (header[0] & 0x1) << 2 | (header[1] >> 6);
+ 
+     mMeta = MakeAACCodecSpecificData(profile, sf_index, channel);
+-
+     off64_t streamSize, numFrames = 0;
+     size_t frameSize = 0;
+     int64_t duration = 0;
+diff --git a/media/libstagefright/Android.mk b/media/libstagefright/Android.mk
+index 0165141..68a47c3 100644
+--- a/media/libstagefright/Android.mk
++++ b/media/libstagefright/Android.mk
+@@ -114,6 +114,11 @@ LOCAL_STATIC_LIBRARIES := \
+         libstagefright_httplive \
+         libstagefright_id3 \
+         libFLAC \
++        libmedia_helper \
++
++ifeq ($(strip $(INTEL_MUSIC_OFFLOAD_FEATURE)),true)
++  LOCAL_CFLAGS += -DINTEL_MUSIC_OFFLOAD_FEATURE
++endif
+ 
+ ifeq ($(ENABLE_BACKGROUND_MUSIC),true)
+   LOCAL_CFLAGS += -DBGM_ENABLED
+diff --git a/media/libstagefright/AudioPlayer.cpp b/media/libstagefright/AudioPlayer.cpp
+index bfb61c4..d5f9dfe 100644
+--- a/media/libstagefright/AudioPlayer.cpp
++++ b/media/libstagefright/AudioPlayer.cpp
+@@ -56,6 +56,44 @@ AudioPlayer::AudioPlayer(
+       mAllowDeepBuffering(allowDeepBuffering),
+       mObserver(observer),
+       mPinnedTimeUs(-1ll) {
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++      mOffload = false;
++      mOffloadFormat = AUDIO_FORMAT_PCM_16_BIT;
++      mStartPos = 0;
++#endif
++}
++
++AudioPlayer::AudioPlayer(
++        audio_format_t audioFormat,
++        const sp<MediaPlayerBase::AudioSink> &audioSink,
++        uint32_t flags,
++        AwesomePlayer *observer)
++    : mAudioTrack(NULL),
++      mInputBuffer(NULL),
++      mSampleRate(0),
++      mLatencyUs(0),
++      mFrameSize(0),
++      mNumFramesPlayed(0),
++      mNumFramesPlayedSysTimeUs(ALooper::GetNowUs()),
++      mPositionTimeMediaUs(-1),
++      mPositionTimeRealUs(-1),
++      mSeeking(false),
++      mReachedEOS(false),
++      mFinalStatus(OK),
++      mStarted(false),
++      mIsFirstBuffer(false),
++      mFirstBufferResult(OK),
++      mFirstBuffer(NULL),
++      mAudioSink(audioSink),
++      mAllowDeepBuffering(flags & ALLOW_DEEP_BUFFERING),
++      mObserver(observer),
++      mPinnedTimeUs(-1ll)
++{
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++      mOffload = flags & USE_OFFLOAD;
++      mOffloadFormat = audioFormat;
++      mStartPos = 0;
++#endif
+ }
+ 
+ AudioPlayer::~AudioPlayer() {
+@@ -69,6 +107,7 @@ void AudioPlayer::setSource(const sp<MediaSource> &source) {
+     mSource = source;
+ }
+ 
++
+ status_t AudioPlayer::start(bool sourceAlreadyStarted) {
+     CHECK(!mStarted);
+     CHECK(mSource != NULL);
+@@ -110,7 +149,12 @@ status_t AudioPlayer::start(bool sourceAlreadyStarted) {
+     const char *mime;
+     bool success = format->findCString(kKeyMIMEType, &mime);
+     CHECK(success);
++
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    CHECK( mOffload || (!strcasecmp(mime, MEDIA_MIMETYPE_AUDIO_RAW)) );
++#else
+     CHECK(!strcasecmp(mime, MEDIA_MIMETYPE_AUDIO_RAW));
++#endif
+ 
+     success = format->findInt32(kKeySampleRate, &mSampleRate);
+     CHECK(success);
+@@ -137,8 +181,22 @@ status_t AudioPlayer::start(bool sourceAlreadyStarted) {
+     mAllowBackgroundPlayback = strcmp(bgmKVpair,"true") ? false : true;
+     ALOGD("%s [BGMUSIC] mAllowBackgroundPlayback = %d",__func__,mAllowBackgroundPlayback);
+ #endif
+-    if (mAudioSink.get() != NULL) {
+ 
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    int avgBitRate = -1;
++    success = format->findInt32(kKeyBitRate, &avgBitRate);
++    if (mAudioSink.get() != NULL) {
++        if (mOffload) {
++            ALOGV("Opening compress offload sink");
++            err = mAudioSink->open(
++                mSampleRate, numChannels, channelMask,
++                avgBitRate,
++                mOffloadFormat,
++                DEFAULT_AUDIOSINK_BUFFERCOUNT,
++                &AudioPlayer::AudioSinkCallback,
++                this,
++                AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD);
++        } else {
+ #ifdef BGM_ENABLED
+        if((mAllowBackgroundPlayback) &&(!mAllowDeepBuffering)) {
+           status_t  err = mAudioSink->open(
+@@ -151,7 +209,7 @@ status_t AudioPlayer::start(bool sourceAlreadyStarted) {
+                             AUDIO_OUTPUT_FLAG_NONE));
+        } else {
+ #endif
+-        status_t err = mAudioSink->open(
++           err = mAudioSink->open(
+                 mSampleRate, numChannels, channelMask, AUDIO_FORMAT_PCM_16_BIT,
+                 DEFAULT_AUDIOSINK_BUFFERCOUNT,
+                 &AudioPlayer::AudioSinkCallback,
+@@ -159,10 +217,10 @@ status_t AudioPlayer::start(bool sourceAlreadyStarted) {
+                 (mAllowDeepBuffering ?
+                             AUDIO_OUTPUT_FLAG_DEEP_BUFFER :
+                             AUDIO_OUTPUT_FLAG_NONE));
+-
+-
+ #ifdef BGM_ENABLED
+-       }
++        }
++#endif
++
+ #endif
+         if (err != OK) {
+             if (mFirstBuffer != NULL) {
+@@ -178,7 +236,16 @@ status_t AudioPlayer::start(bool sourceAlreadyStarted) {
+         }
+ 
+         mLatencyUs = (int64_t)mAudioSink->latency() * 1000;
++
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++        if( mOffload ) {
++            mFrameSize = 1;
++        } else {
++            mFrameSize = mAudioSink->frameSize();
++        }
++#else
+         mFrameSize = mAudioSink->frameSize();
++#endif
+ 
+         mAudioSink->start();
+     } else {
+@@ -189,10 +256,22 @@ status_t AudioPlayer::start(bool sourceAlreadyStarted) {
+             return BAD_VALUE;
+         }
+ 
+-        mAudioTrack = new AudioTrack(
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++        if (mOffload) {
++            mAudioTrack = new AudioTrack(
++                AUDIO_STREAM_MUSIC, avgBitRate, mSampleRate, mOffloadFormat, audioMask,
++                0, AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD, &AudioCallback, this, 0, 0);
++        } else {
++            mAudioTrack = new AudioTrack(
+                 AUDIO_STREAM_MUSIC, mSampleRate, AUDIO_FORMAT_PCM_16_BIT, audioMask,
+                 0, AUDIO_OUTPUT_FLAG_NONE, &AudioCallback, this, 0);
+ 
++        }
++#else
++        mAudioTrack = new AudioTrack(
++                AUDIO_STREAM_MUSIC, mSampleRate, AUDIO_FORMAT_PCM_16_BIT, audioMask,
++                0, AUDIO_OUTPUT_FLAG_NONE, &AudioCallback, this, 0);
++#endif
+         if ((err = mAudioTrack->initCheck()) != OK) {
+             delete mAudioTrack;
+             mAudioTrack = NULL;
+@@ -210,7 +289,16 @@ status_t AudioPlayer::start(bool sourceAlreadyStarted) {
+         }
+ 
+         mLatencyUs = (int64_t)mAudioTrack->latency() * 1000;
++
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++        if( mOffload ) {
++            mFrameSize = 1;
++        } else {
++            mFrameSize = mAudioTrack->frameSize();
++        }
++#else
+         mFrameSize = mAudioTrack->frameSize();
++#endif
+ 
+         mAudioTrack->start();
+     }
+@@ -302,6 +390,10 @@ void AudioPlayer::reset() {
+     mReachedEOS = false;
+     mFinalStatus = OK;
+     mStarted = false;
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    mStartPos = 0;
++    mOffload = false;
++#endif
+ }
+ 
+ // static
+@@ -332,16 +424,60 @@ status_t AudioPlayer::setPlaybackRatePermille(int32_t ratePermille) {
+     }
+ }
+ 
++void AudioPlayer::notifyAudioEOS() {
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    if (mObserver != NULL) {
++        mObserver->postAudioEOS(NULL);
++        ALOGV("Notified observer about end of stream! ");
++    }
++#endif
++}
++
+ // static
+ size_t AudioPlayer::AudioSinkCallback(
+         MediaPlayerBase::AudioSink *audioSink,
+         void *buffer, size_t size, void *cookie) {
+     AudioPlayer *me = (AudioPlayer *)cookie;
+-
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    AudioTrack::Buffer *buff = (AudioTrack::Buffer *)buffer;
++
++    // Check for control events in this callback function
++    if((size == 4) && me->mObserver) {
++        if (buff->flags == AudioTrack::EVENT_TEAR_DOWN) {
++            ALOGV("AudioSinkCallback: Tear down event received");
++            me->mObserver->postAudioOffloadTearDown();
++        }
++        return 0;
++    }
++#endif
+     return me->fillBuffer(buffer, size);
+ }
+ 
+ void AudioPlayer::AudioCallback(int event, void *info) {
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++
++    switch (event) {
++    case AudioTrack::EVENT_MORE_DATA:
++    {
++        AudioTrack::Buffer *buffer = (AudioTrack::Buffer *)info;
++        if (info == NULL) {
++            ALOGE("AudioCallback received EVENT_MORE_DATA with *info=NULL !");
++        break;
++        }
++
++        size_t numBytesWritten = fillBuffer(buffer->raw, buffer->size);
++
++        buffer->size = numBytesWritten;
++    }
++    break;
++    case AudioTrack::EVENT_STREAM_END:
++        notifyAudioEOS();
++        break;
++    default:
++        ALOGE("received unknown event type: %d inside CallbackWrapper !", event);
++        break;
++    }
++#else
+     if (event != AudioTrack::EVENT_MORE_DATA) {
+         return;
+     }
+@@ -350,6 +486,8 @@ void AudioPlayer::AudioCallback(int event, void *info) {
+     size_t numBytesWritten = fillBuffer(buffer->raw, buffer->size);
+ 
+     buffer->size = numBytesWritten;
++
++#endif
+ }
+ 
+ uint32_t AudioPlayer::getNumFramesPendingPlayout() const {
+@@ -436,40 +574,69 @@ size_t AudioPlayer::fillBuffer(void *data, size_t size) {
+ 
+             if (err != OK) {
+                 if (mObserver && !mReachedEOS) {
+-                    // We don't want to post EOS right away but only
+-                    // after all frames have actually been played out.
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++                    if (mOffload) {
++                        int64_t totalTimeUs = 0, mediaTimeUs = 0;
++
++                        CHECK(mSource->getFormat()->findInt64(kKeyDuration, &totalTimeUs));
++
++                        uint32_t mediaPosition = 0;
++                        if (mAudioSink != NULL) {
++                            mAudioSink->getPosition(&mediaPosition);
++                        } else {
++                            mAudioTrack->getPosition(&mediaPosition);
++                        }
++
++                        mediaTimeUs = 1000 * (int64_t) mediaPosition;
++                        mediaTimeUs += mStartPos;
++
++                        ALOGV("totalTimeUs %lld, playback time %lld", totalTimeUs, mediaTimeUs);
++                        postEOSDelayUs = totalTimeUs -  mediaTimeUs;
++                        if (postEOSDelayUs < 0) {
++                           postEOSDelayUs = 0;
++                        }
++                        ALOGV("Posting EOS with %.2f secs delay", postEOSDelayUs / 1E6);
++                        mObserver->offloadPauseStartTimer(postEOSDelayUs);
++                    } else {
++#endif
++                        //Start of Google EOS handling
+ 
+-                    // These are the number of frames submitted to the
+-                    // AudioTrack that you haven't heard yet.
+-                    uint32_t numFramesPendingPlayout =
+-                        getNumFramesPendingPlayout();
++                        // We don't want to post EOS right away but only
++                        // after all frames have actually been played out.
++                        // These are the number of frames submitted to the
++                        // AudioTrack that you haven't heard yet.
++                        uint32_t numFramesPendingPlayout =
++                            getNumFramesPendingPlayout();
+ 
+-                    // These are the number of frames we're going to
+-                    // submit to the AudioTrack by returning from this
+-                    // callback.
+-                    uint32_t numAdditionalFrames = size_done / mFrameSize;
++                        // These are the number of frames we're going to
++                        // submit to the AudioTrack by returning from this
++                        // callback.
++                        uint32_t numAdditionalFrames = size_done / mFrameSize;
+ 
+-                    numFramesPendingPlayout += numAdditionalFrames;
++                        numFramesPendingPlayout += numAdditionalFrames;
+ 
+-                    int64_t timeToCompletionUs =
+-                        (1000000ll * numFramesPendingPlayout) / mSampleRate;
++                        int64_t timeToCompletionUs =
++                            (1000000ll * numFramesPendingPlayout) / mSampleRate;
+ 
+-                    ALOGV("total number of frames played: %lld (%lld us)",
++                        ALOGV("total number of frames played: %lld (%lld us)",
+                             (mNumFramesPlayed + numAdditionalFrames),
+                             1000000ll * (mNumFramesPlayed + numAdditionalFrames)
+                                 / mSampleRate);
+ 
+-                    ALOGV("%d frames left to play, %lld us (%.2f secs)",
+-                         numFramesPendingPlayout,
+-                         timeToCompletionUs, timeToCompletionUs / 1E6);
+-
+-                    postEOS = true;
+-                    if (mAudioSink->needsTrailingPadding()) {
+-                        postEOSDelayUs = timeToCompletionUs + mLatencyUs;
+-                    } else {
+-                        postEOSDelayUs = 0;
+-                    }
+-                }
++                        ALOGV("%d frames left to play, %lld us (%.2f secs)",
++                             numFramesPendingPlayout,
++                             timeToCompletionUs, timeToCompletionUs / 1E6);
++
++                        postEOS = true;
++                        if (mAudioSink->needsTrailingPadding()) {
++                            postEOSDelayUs = timeToCompletionUs + mLatencyUs;
++                        } else {
++                            postEOSDelayUs = 0;
++                        }
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++                   }
++#endif
++              }
+ 
+                 mReachedEOS = true;
+                 mFinalStatus = err;
+@@ -496,6 +663,20 @@ size_t AudioPlayer::fillBuffer(void *data, size_t size) {
+                  "mPositionTimeMediaUs=%.2f mPositionTimeRealUs=%.2f",
+                  mInputBuffer->range_length(),
+                  mPositionTimeMediaUs / 1E6, mPositionTimeRealUs / 1E6);
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++             // need to adjust the mStartPos for offload decoding since parser
++            // might not be able to get the exact seek time requested.
++            if (mSeeking && mOffload) {
++                mSeeking = false;
++                if (mObserver) {
++                    ALOGV("fillBuffer is going to post SEEK_COMPLETE");
++                    mObserver->postAudioSeekComplete();
++                }
++
++                mStartPos = mPositionTimeMediaUs;
++                ALOGV("adjust seek time to: %.2f", mStartPos/ 1E6);
++            }
++#endif
+         }
+ 
+         if (mInputBuffer->range_length() == 0) {
+@@ -579,7 +760,22 @@ int64_t AudioPlayer::getMediaTimeUs() {
+ 
+         return 0;
+     }
+-
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    if (mOffload) {
++        // For Offload as the bufferSizes are huge, query the timestamp
++        // from HAL. This is used for updating the progress bar.
++        int64_t  renderedDuration = 0;
++        uint32_t mediaPosition = 0;
++        if (mAudioSink != NULL) {
++            mAudioSink->getPosition(&mediaPosition);
++        } else {
++            mAudioTrack->getPosition(&mediaPosition);
++        }
++        renderedDuration = 1000 * (int64_t) mediaPosition;
++        renderedDuration += mStartPos;
++        return renderedDuration;
++    }
++#endif
+     int64_t realTimeOffset = getRealTimeUsLocked() - mPositionTimeRealUs;
+     if (realTimeOffset < 0) {
+         realTimeOffset = 0;
+@@ -605,6 +801,10 @@ status_t AudioPlayer::seekTo(int64_t time_us) {
+     mPositionTimeRealUs = mPositionTimeMediaUs = -1;
+     mReachedEOS = false;
+     mSeekTimeUs = time_us;
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    if (mOffload)
++        mStartPos = time_us;
++#endif
+ 
+     // Flush resets the number of played frames
+     mNumFramesPlayed = 0;
+diff --git a/media/libstagefright/AwesomePlayer.cpp b/media/libstagefright/AwesomePlayer.cpp
+index 3d7f83c..ded0e5b 100644
+--- a/media/libstagefright/AwesomePlayer.cpp
++++ b/media/libstagefright/AwesomePlayer.cpp
+@@ -56,6 +56,17 @@
+ #include <media/stagefright/foundation/AMessage.h>
+ 
+ #include <cutils/properties.h>
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++#include <hardware/audio.h>
++#include <hardware/audio_policy.h> // for AUDIO_POLICY_DEVICE_STATE_AVAILABLE
++
++#include <signal.h>
++#include <time.h>
++#include <errno.h>
++#include <string.h>
++
++#include "include/ESDS.h"
++#endif
+ 
+ #ifdef USE_INTEL_ASF_EXTRACTOR
+ #include "AsfExtractor.h"
+@@ -64,6 +75,9 @@
+ 
+ #define USE_SURFACE_ALLOC 1
+ #define FRAME_DROP_FREQ 0
++#define AOT_SBR 5
++#define AOT_PS 29
++#define AOT_AAC_LC 2
+ 
+ namespace android {
+ 
+@@ -202,6 +216,16 @@ AwesomePlayer::AwesomePlayer()
+       mDecryptHandle(NULL),
+       mLastVideoTimeUs(-1),
+       mTextDriver(NULL)
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++      ,mAudioFormat(AUDIO_FORMAT_INVALID),
++      mOffload(false),
++      mOffloadCalAudioEOS(false),
++      mOffloadPostAudioEOS(false),
++      mOffloadTearDown(false),
++      mOffloadTearDownForPause(false),
++      mOffloadPauseUs(0),
++      mOffloadSinkCreationError(false)
++#endif
+ #ifdef BGM_ENABLED
+       ,
+       mRemoteBGMsuspend(false),
+@@ -225,7 +249,11 @@ AwesomePlayer::AwesomePlayer()
+             this, &AwesomePlayer::onCheckAudioStatus);
+ 
+     mAudioStatusEventPending = false;
+-
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    mAudioOffloadTearDownEvent = new AwesomeEvent(this,
++                              &AwesomePlayer::onAudioOffloadTearDownEvent);
++    mAudioOffloadTearDownEventPending = false;
++#endif
+     reset();
+ }
+ 
+@@ -244,7 +272,17 @@ void AwesomePlayer::cancelPlayerEvents(bool keepNotifications) {
+     mVideoEventPending = false;
+     mQueue.cancelEvent(mVideoLagEvent->eventID());
+     mVideoLagEventPending = false;
+-
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    if (mOffload) {
++        /* Remove all the offload events that might be queued
++         * Teardown event and status event of EOS.
++         * Chances the EOS is posted with delay, user pauses.
++         * Then statusEvent has to be removed
++         */
++        mQueue.cancelEvent(mAudioOffloadTearDownEvent->eventID());
++        mAudioOffloadTearDownEventPending = false;
++    }
++#endif
+     if (!keepNotifications) {
+         mQueue.cancelEvent(mStreamDoneEvent->eventID());
+         mStreamDoneEventPending = false;
+@@ -574,7 +612,21 @@ void AwesomePlayer::reset_l() {
+     }
+ 
+     mDurationUs = -1;
+-    modifyFlags(0, ASSIGN);
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    if (mOffload) {
++        timer_delete(mPausedTimerId);
++        /* If the reset is called in long pause case, don't change the mOffload and
++        * mFlags. Which will be used when resume, i.e Play is called
++        */
++        if (!mOffloadTearDownForPause) {
++            modifyFlags(0, ASSIGN);
++            mOffload = false;
++        }
++    } else  // Non offload case use the default one
++#endif
++    {
++        modifyFlags(0, ASSIGN);
++    }
+     mExtractorFlags = 0;
+     mTimeSourceDeltaUs = 0;
+     mVideoTimeUs = 0;
+@@ -589,6 +641,9 @@ void AwesomePlayer::reset_l() {
+     mFileSource.clear();
+ 
+     mBitrate = -1;
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    mOffloadTearDown = false;
++#endif
+     mLastVideoTimeUs = -1;
+ 
+     {
+@@ -604,17 +659,28 @@ void AwesomePlayer::reset_l() {
+         mStats.mVideoHeight = -1;
+         mStats.mFlags = 0;
+         mStats.mTracks.clear();
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++        mStats.mOffloadSinkCreationError = false;
++#endif
+     }
+ 
+     mWatchForAudioSeekComplete = false;
+     mWatchForAudioEOS = false;
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    mOffloadCalAudioEOS = false;
++    mOffloadPostAudioEOS = false;
++    mOffloadSinkCreationError = false;
++#endif
+ }
+ 
+ void AwesomePlayer::notifyListener_l(int msg, int ext1, int ext2) {
+     if (mListener != NULL) {
+         sp<MediaPlayerBase> listener = mListener.promote();
+-
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++        if (listener != NULL && !mOffloadTearDown) {
++#else
+         if (listener != NULL) {
++#endif
+             listener->sendEvent(msg, ext1, ext2);
+         }
+     }
+@@ -880,6 +946,35 @@ void AwesomePlayer::onStreamDone() {
+ 
+ status_t AwesomePlayer::play() {
+     ATRACE_CALL();
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    status_t status = OK;
++
++    if ((mOffload == true) && ((mFlags & PLAYING) == 0)) {
++        ALOGV("Not playing");
++        /* Offload and the state is not playing stop the pause timer */
++        timer_delete(mPausedTimerId);
++        /* If the system is in supended mode because of long pause and
++         * then resume to continue playing
++         */
++        if(mOffloadTearDownForPause == true){
++            mOffloadTearDown = true;  // to avoid any events posting to upperlayer
++            offloadResume();
++            seekTo(mOffloadPauseUs);
++            mOffloadTearDown = false;
++            return OK;
++       }
++    }
++
++    //  Before play, we should query audio flinger to see if any effect is enabled.
++    //  if (effect is enabled) we should do another prepare w/ IA SW decoding
++    if (mOffload && (isAudioEffectEnabled() ||
++        AudioSystem::getDeviceConnectionState(AUDIO_DEVICE_OUT_AUX_DIGITAL, "") == AUDIO_POLICY_DEVICE_STATE_AVAILABLE)) {
++        ALOGV("Offload and effects are enabled or HDMI");
++        mAudioOffloadTearDownEventPending = true;
++        modifyFlags(PLAYING, CLEAR);
++        onAudioOffloadTearDownEvent();
++    }
++
+ #ifdef BGM_ENABLED
+     status_t err = UNKNOWN_ERROR;
+     // If BGM is enabled, then the output associated with the
+@@ -893,12 +988,32 @@ status_t AwesomePlayer::play() {
+        mRemoteBGMsuspend = false;
+     }
+ #endif //BGM_ENABLED
++    {
++        Mutex::Autolock autoLock(mLock);
++
++        modifyFlags(CACHE_UNDERRUN, CLEAR);
+ 
++        status = play_l();
++    }
++    if (mOffload && status != OK) {
++        ALOGV("Offload sink creation failed, create PCM sink");
++        mAudioOffloadTearDownEventPending = true;
++        mOffloadSinkCreationError = true;
++        modifyFlags(PLAYING, CLEAR);
++        onAudioOffloadTearDownEvent();
++        modifyFlags(CACHE_UNDERRUN, CLEAR);
++        mOffloadSinkCreationError = false;
++        return play_l();
++    }
++    ALOGV("returning from play_l()");
++    return status;
++
++#else
+     Mutex::Autolock autoLock(mLock);
+ 
+     modifyFlags(CACHE_UNDERRUN, CLEAR);
+-
+-    return play_l();
++	return play_l();
++#endif
+ }
+ 
+ status_t AwesomePlayer::play_l() {
+@@ -940,8 +1055,16 @@ status_t AwesomePlayer::play_l() {
+                 } else {
+                     allowDeepBuffering = false;
+                 }
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++                if (!mOffload) {
++                    mAudioPlayer = new AudioPlayer(mAudioSink, allowDeepBuffering, this);
++                } else {
++                    mAudioPlayer = new AudioPlayer(mAudioFormat, mAudioSink, AudioPlayer::USE_OFFLOAD, this);
+ 
++                }
++#else
+                 mAudioPlayer = new AudioPlayer(mAudioSink, allowDeepBuffering, this);
++#endif
+                 mAudioPlayer->setSource(mAudioSource);
+ 
+                 mTimeSource = mAudioPlayer;
+@@ -957,6 +1080,26 @@ status_t AwesomePlayer::play_l() {
+         CHECK(!(mFlags & AUDIO_RUNNING));
+ 
+         if (mVideoSource == NULL) {
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++            //Before resuming, check if offloadPauseStartTimer() was cancelled during
++            //last buffer playback due to pause request & calculate EOS delay time
++            if (mOffloadCalAudioEOS) {
++                ALOGV("play: mOffloadCalAudioEOS");
++                int64_t position;
++                getPosition(&position);
++                int64_t totalTimeUs = 0, postEOSDelayUs = 0;
++
++                CHECK(mAudioTrack->getFormat()->findInt64(kKeyDuration, &totalTimeUs));
++                postEOSDelayUs = totalTimeUs - position;
++
++                if (postEOSDelayUs < 0) {
++                    postEOSDelayUs = 0;
++                }
++                ALOGV("play: calc & posting new EOS delay with %.2f secs", postEOSDelayUs / 1E6);
++                offloadPauseStartTimer(postEOSDelayUs);
++                mOffloadCalAudioEOS = false;
++            }
++#endif
+             // We don't want to post an error notification at this point,
+             // the error returned from MediaPlayer::start() will suffice.
+ 
+@@ -1170,6 +1313,12 @@ status_t AwesomePlayer::pause() {
+     Mutex::Autolock autoLock(mLock);
+ 
+     modifyFlags(CACHE_UNDERRUN, CLEAR);
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    if (mOffload) {
++        timer_delete(mPausedTimerId);
++        offloadPauseStartTimer(OFFLOAD_PAUSED_TIMEOUT_DURATION);
++    }
++#endif
+ 
+     return pause_l();
+ }
+@@ -1363,7 +1512,14 @@ status_t AwesomePlayer::getPosition(int64_t *positionUs) {
+     } else {
+         *positionUs = 0;
+     }
+-
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    // During long pause, we need to return the posion calculated
++    // when paused. So that user gets indication as  stream paused.
++    // We know that we have closed it to save power.
++    if (mOffload && mOffloadTearDownForPause) {
++        *positionUs = mOffloadPauseUs;
++    }
++#endif
+     // set current position to duration when EOS.
+     if (mFlags & AT_EOS) {
+         *positionUs = mDurationUs;
+@@ -1398,6 +1554,18 @@ status_t AwesomePlayer::seekTo_l(int64_t timeUs) {
+ 
+         postVideoEvent_l();
+     }
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    if (mOffload) {
++        ALOGV("AwesomePlayer::seekToi_l deleting offload time if any");
++        timer_delete(mPausedTimerId);
++        mOffloadCalAudioEOS = false;
++        if (mOffloadTearDownForPause) {
++            mOffloadPauseUs = timeUs;
++            mStats.mPositionUs = timeUs;
++        }
++
++    }
++#endif
+ 
+     mSeeking = SEEK;
+     mSeekNotificationSent = false;
+@@ -1466,6 +1634,69 @@ status_t AwesomePlayer::initAudioDecoder() {
+     const char *mime;
+     CHECK(meta->findCString(kKeyMIMEType, &mime));
+ 
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    status_t mimemap;
++    int32_t sampleRate;
++    mimemap = mapMimeToAudioFormat(&mAudioFormat, mime);
++    if (!mAudioTrack->getFormat()->findInt32(kKeySampleRate, &sampleRate)) {
++        return NO_INIT;
++    }
++    int32_t channels;
++    if (!mAudioTrack->getFormat()->findInt32(kKeyChannelCount, &channels)) {
++        return NO_INIT;
++    }
++
++    int avgBitRate = -1;
++    mAudioTrack->getFormat()->findInt32(kKeyBitRate, &avgBitRate);
++    ALOGV("initAudioDecoder: the avgBitrate = %ld", avgBitRate);
++
++    if (!strcasecmp(mime, MEDIA_MIMETYPE_AUDIO_AAC)) {
++        ALOGV("initAudioDecoder: MEDIA_MIMETYPE_AUDIO_AAC");
++        uint32_t bitRate = -1;
++        if (setAACParameters(meta, &mAudioFormat, &bitRate) != OK) {
++                ALOGV("Failed to set AAC parameters/ADTS format, use non-offload");
++                mAudioFormat = AUDIO_FORMAT_PCM_16_BIT;
++        } else {
++                avgBitRate = (int)bitRate;
++        }
++    }
++
++    ALOGV("initAudioDecoder: sampleRate %d, channels %d", sampleRate, channels);
++    int64_t durationUs;
++    if (mAudioTrack->getFormat()->findInt64(kKeyDuration, &durationUs)) {
++        Mutex::Autolock autoLock(mMiscStateLock);
++        if (mDurationUs < 0 || durationUs > mDurationUs) {
++            mDurationUs = durationUs;
++        }
++    }
++
++    ALOGV("initAudioDecoder: Sink creation error value %d", mOffloadSinkCreationError);
++    status_t stat = OK;
++    if ( (!mOffloadSinkCreationError) && (AudioSystem::isOffloadSupported(
++                mAudioFormat,
++                AUDIO_STREAM_MUSIC,
++                sampleRate,
++                avgBitRate,
++                mDurationUs,
++                (mVideoTrack != NULL && mVideoSource != NULL),
++                isStreamingHTTP()) && !(isAudioEffectEnabled())) )
++    {
++        ALOGI("initAudioDecoder: Offload supported, creating AudioPlayer");
++        mOffload = true;
++        mAudioSource = mAudioTrack;
++    } else if (!strcasecmp(mime, MEDIA_MIMETYPE_AUDIO_RAW)) {
++        mAudioSource = mAudioTrack;
++    } else {
++        // For non PCM the out put format will be PCM 16 bit.
++        // Set it for player creation
++        ALOGI("initAudioDecoder: creating OMX decoder");
++        mAudioSource = OMXCodec::Create(
++                    mClient.interface(), mAudioTrack->getFormat(),
++                    false, // createEncoder
++                    mAudioTrack);
++        mAudioFormat = AUDIO_FORMAT_PCM_16_BIT;
++    }
++#else
+     if (!strcasecmp(mime, MEDIA_MIMETYPE_AUDIO_RAW)) {
+         mAudioSource = mAudioTrack;
+     } else {
+@@ -1474,6 +1705,7 @@ status_t AwesomePlayer::initAudioDecoder() {
+                 false, // createEncoder
+                 mAudioTrack);
+     }
++#endif
+ 
+     if (mAudioSource != NULL) {
+         int64_t durationUs;
+@@ -2042,11 +2274,29 @@ void AwesomePlayer::onCheckAudioStatus() {
+     }
+ 
+     status_t finalStatus;
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    if (!mOffload) {
++        if (mWatchForAudioEOS && mAudioPlayer->reachedEOS(&finalStatus)) {
++            mWatchForAudioEOS = false;
++            modifyFlags(AUDIO_AT_EOS, SET);
++            modifyFlags(FIRST_FRAME, SET);
++            postStreamDoneEvent_l(finalStatus);
++        }
++    } else {
++        if (mWatchForAudioEOS && mAudioPlayer->reachedEOS(&finalStatus) && mOffloadPostAudioEOS) {
++            mOffloadPostAudioEOS = false;
++            mWatchForAudioEOS = false;
++            modifyFlags(AUDIO_AT_EOS, SET);
++            modifyFlags(FIRST_FRAME, SET);
++            postStreamDoneEvent_l(finalStatus);
++        }
++#else
+     if (mWatchForAudioEOS && mAudioPlayer->reachedEOS(&finalStatus)) {
+         mWatchForAudioEOS = false;
+         modifyFlags(AUDIO_AT_EOS, SET);
+         modifyFlags(FIRST_FRAME, SET);
+         postStreamDoneEvent_l(finalStatus);
++#endif
+     }
+ }
+ 
+@@ -2803,6 +3053,39 @@ void AwesomePlayer::modifyFlags(unsigned value, FlagMode mode) {
+     }
+ }
+ 
++/* Store the current status and use it while starting for IA decoding
++ * Terminate the active stream by calling reset_l()
++ */
++status_t AwesomePlayer::offloadSuspend() {
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    ALOGV("offloadSuspend");
++    /* Store the current status and use it while starting for IA decoding
++     * Terminate the active stream by calling reset_l()
++     */
++    Stats stats;
++    uint32_t extractorFlags;
++    stats.mURI = mUri;
++    stats.mUriHeaders = mUriHeaders;
++    stats.mFileSource = mFileSource;
++    stats.mFlags = mFlags & (PLAYING | AUTO_LOOPING | LOOPING | AT_EOS);
++    getPosition(&stats.mPositionUs);
++    mOffloadPauseUs = stats.mPositionUs;
++    extractorFlags = mExtractorFlags;
++    if (mOffload && ((mFlags & PLAYING) == 0)) {
++         ALOGV("offloadSuspend(): Deleting timer");
++         mOffloadTearDownForPause = true;
++         timer_delete(mPausedTimerId);
++    }
++
++    reset_l();
++
++    mExtractorFlags = extractorFlags;
++    mStats = stats;
++    return OK;
++#endif
++    return OK;
++}
++
+ #ifdef BGM_ENABLED
+ status_t AwesomePlayer::remoteBGMSuspend() {
+ 
+@@ -2830,8 +3113,11 @@ status_t AwesomePlayer::remoteBGMSuspend() {
+ 
+     return OK;
+ }
+-status_t AwesomePlayer::remoteBGMResume() {
++#endif
+ 
++status_t AwesomePlayer::offloadResume() {
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    ALOGV("offloadResume");
+     Mutex::Autolock autoLock(mLock);
+ 
+     Stats stats = mStats;
+@@ -2853,13 +3139,369 @@ status_t AwesomePlayer::remoteBGMResume() {
+ 
+     seekTo_l(stats.mPositionUs);
+     mFlags = stats.mFlags & (AUTO_LOOPING | LOOPING | AT_EOS);
+-
++    play_l();
++    mOffloadTearDownForPause = false;
+     // Update the flag
+     mStats.mFlags = mFlags;
++    return OK;
++#endif
++    return OK;
++}
+ 
++#ifdef BGM_ENABLED
++status_t AwesomePlayer::remoteBGMResume() {
++    Mutex::Autolock autoLock(mLock);
++    Stats stats = mStats;
++
++    status_t err;
++    if (stats.mFileSource != NULL) {
++       err = setDataSource_l(stats.mFileSource);
++
++        if (err == OK) {
++            mFileSource = stats.mFileSource;
++        }
++    } else {
++        err = setDataSource_l(stats.mURI, &stats.mUriHeaders);
++    }
++
++    if (err != OK) {
++        return err;
++    }
++
++    seekTo_l(stats.mPositionUs);
++    mFlags = stats.mFlags & (AUTO_LOOPING | LOOPING | AT_EOS);
++
++    // Update the flag
++    mStats.mFlags = mFlags;
+     ALOGD("[BGMUSIC] audio track/sink recreated successfully");
+     return OK;
+ }
+ #endif //BGM_ENABLED
+ 
++void AwesomePlayer::postAudioOffloadTearDown() {
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    postAudioOffloadTearDownEvent_l();
++#endif
++}
++
++void AwesomePlayer::postAudioOffloadTearDownEvent_l() {
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    if (mAudioOffloadTearDownEventPending) {
++        return;
++    }
++    mAudioOffloadTearDownEventPending = true;
++    mQueue.postEvent(mAudioOffloadTearDownEvent);
++#endif
++}
++
++status_t AwesomePlayer::mapMimeToAudioFormat(audio_format_t *audioFormat, const char *mime) {
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    status_t val = OK;
++
++    if (mime != NULL && audioFormat != NULL) {
++        if (!strcasecmp(mime, MEDIA_MIMETYPE_AUDIO_MPEG)) {
++            ALOGV("MP3 format");
++            *audioFormat = AUDIO_FORMAT_MP3;
++        }
++
++        if (!strcasecmp(mime, MEDIA_MIMETYPE_AUDIO_RAW)) {
++            ALOGV("RAW format");
++            *audioFormat = AUDIO_FORMAT_PCM_16_BIT;
++        }
++
++        if (!strcasecmp(mime, MEDIA_MIMETYPE_AUDIO_AMR_NB)) {
++            *audioFormat = AUDIO_FORMAT_AMR_NB;
++        }
++
++        if (!strcasecmp(mime, MEDIA_MIMETYPE_AUDIO_AMR_WB)) {
++            *audioFormat = AUDIO_FORMAT_AMR_WB;
++        }
++
++        if (!strcasecmp(mime, MEDIA_MIMETYPE_AUDIO_AAC)) {
++            ALOGV("AAC format");
++            *audioFormat = AUDIO_FORMAT_AAC;
++        }
++
++
++        if (!strcasecmp(mime, MEDIA_MIMETYPE_AUDIO_VORBIS)) {
++            *audioFormat = AUDIO_FORMAT_VORBIS;
++        }
++        // Add other supported format as required
++    } else {
++        if(audioFormat != NULL) {
++            *audioFormat = AUDIO_FORMAT_INVALID;
++        }
++        val = BAD_VALUE;
++    }
++
++    return val;
++#endif
++    return OK;
++}
++
++status_t AwesomePlayer::setAACParameters(sp<MetaData> meta, audio_format_t *aFormat, uint32_t *avgBitRate) {
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    // Get ESDS and check its validity
++    const void *ed;    // ESDS query data
++    size_t es;         // ESDS query size
++    uint32_t type;     // meta type info
++    if((!meta->findData(kKeyESDS, &type, &ed, &es)) ||
++       (type != kTypeESDS) || (es < 14) || (es > 256)){
++        ALOGW("setAACParameters: ESDS Info malformed or absent - No offload");
++        return BAD_VALUE;
++    }
++    ESDS esds((uint8_t *)ed, (off_t) es);
++    CHECK_EQ(esds.InitCheck(), (status_t)OK);
++
++    // Get the bit-rate information from ESDS
++    uint32_t maxBitRate;
++    if (esds.getBitRate(&maxBitRate, avgBitRate) == OK) {
++        ALOGV("setAACParameters: Before set maxBitRate %d, avgBitRate %d", maxBitRate, *avgBitRate);
++        if((*avgBitRate == 0) && maxBitRate)
++            *avgBitRate = maxBitRate;
++    }
++
++    ALOGV("setAACParameters: After set maxBitRate %d, avgBitRate %d", maxBitRate, *avgBitRate);
++    // Get Codec specific information
++    size_t csd_offset;
++    size_t csd_size;
++    if ((esds.getCodecSpecificOffset(&csd_offset, &csd_size) != OK) ||
++        (csd_size < 2) ) {
++        LOGW("setAACParameters: Codec specific info not found! - No offload");
++        return BAD_VALUE;
++    }
++
++    // Backup the ESD to local array for easy processing to get further AAC info
++    uint8_t esd[256]= {0};
++    memcpy(esd, ed, es);
++
++    uint8_t *data = esd+csd_offset;
++    off_t size = (off_t)es-csd_offset; // CSD data size
++
++    // Start Parsing the CSD info as per the ISO:14496-Part3 specifications
++    uint32_t AOT = (data[0]>>3);  // First 5 bits
++    uint32_t freqIndex = (data[0] & 7) << 1 | (data[1] >> 7); // Bits 6,7,8,9
++    uint32_t numChannels = 0;
++    uint32_t downSamplingSBR = 0;
++    int      skip=0;
++
++    ALOGV("setAACParameters: AOT %d", AOT);
++    // TODO: Remove when HEv1 & HEv2 is supported by FW or AAC gets stable
++    if (AOT == AOT_SBR || AOT == AOT_PS) {
++        LOGV("setAACParameters: HEAAC");
++    }
++
++    // Frequency range of 96kHz to 8kHz (MPEG4-Part3-Standard has definition) supported
++    if (freqIndex > 11) {
++        ALOGW("setAACParameters: Unsupported freqIndex1 %d, no offload", freqIndex);
++        return BAD_VALUE;
++    }
++
++    // If channel info found is not suitable, return unsupported format
++    numChannels = (data[1] >> 3) & 15;  // Bits 10 to 13
++    if ((numChannels != 1) && (numChannels !=2)) {
++        ALOGW("setAACParameters: Unsupported channel_cnt %d, no offload", numChannels);
++        return BAD_VALUE;
++    }
++
++    // For Explicit signalling HEv1 and HEv2, get Extended frequency index
++    if (AOT == AOT_SBR || AOT == AOT_PS) {
++        uint32_t extFreqIndex =  (data[1] & 7) << 1 | (data[2] >> 7);
++        if (extFreqIndex > 11) {
++            ALOGW("setAACParameters: Unsupported freqIndex2 %d, no offload", freqIndex);
++            return BAD_VALUE;
++        }
++        if (extFreqIndex == freqIndex) {
++            downSamplingSBR = 1;
++            //Current TEL LPE has limitation it cannot play these SBR files
++            // Use IA OMX S/w decoder. When LPE supports, remove the return
++            ALOGW("setAACParameters: Downsampling");
++        }
++        freqIndex = extFreqIndex;
++    }
++    // SBR Explicit signaling with extended AOT information
++    if (AOT != AOT_SBR) {
++        // Scan ESDS for next audioObjectType to be HEv1 (SBR=5:00101)
++        // If HEv1 found, again scan for looking    HEv2 (PS=29:11101)
++        // Now, look for 11 bits of sync info+SBR 0, 01010110, 111-00101
++        if ( (!(data[1]&0x1)) && (data[2]==0x56) && (data[3]==0xE5)){
++            if (data[4] & 0x80){ // SBR present flag is set
++                AOT = AOT_SBR;
++                uint32_t extFreqIndex = (data[4] >>3) & 0xF;
++                if (extFreqIndex > 11) {
++                    ALOGW("setAACParameters: Unsupported freqIndex3 %d, no offload", freqIndex);
++                    return BAD_VALUE;
++                }
++                if (extFreqIndex == freqIndex){
++                    downSamplingSBR = 1;
++                    ALOGW("setAACParameters: Downsampling");
++                }
++
++                // Get next 11 sync bits. If it matches 0x548 and next bit PS=1, then its HEv2
++                // Bit stream to look for is  ....101, 01001000, 1 (the last 1 represents PS)..
++                if (((data[4]&0x7)==0x5) && (data[5]==0x48) && (data[6]&0x80)){
++                    AOT = AOT_PS;
++                }
++                freqIndex = extFreqIndex;
++            }
++        }
++    }
++
++    static uint32_t kSamplingRate[] = {96000, 88200, 64000, 48000, 44100, 32000, 24000,
++                                       22050, 16000, 12000, 11025, 8000, 7350, 0, 0, 0};
++
++    AudioParameter param = AudioParameter();
++    param.addInt(String8(AUDIO_OFFLOAD_CODEC_AVG_BIT_RATE), *avgBitRate);
++    param.addInt(String8(AUDIO_OFFLOAD_CODEC_SAMPLE_RATE), kSamplingRate[freqIndex]);
++    param.addInt(String8(AUDIO_OFFLOAD_CODEC_ID), AOT);
++    param.addInt(String8(AUDIO_OFFLOAD_CODEC_NUM_CHANNEL), numChannels);
++    param.addInt(String8(AUDIO_OFFLOAD_CODEC_DOWN_SAMPLING), downSamplingSBR);
++
++    ALOGV("setAACParameters: avgBitRate %d, sampleRate %d, AOT %d,"
++          "numChannels %d, downSamplingSBR %d", *avgBitRate,
++           kSamplingRate[freqIndex], AOT, numChannels, downSamplingSBR);
++
++    status_t status = NO_ERROR;
++    status = AudioSystem::setParameters(0, param.toString());
++
++    if (status != NO_ERROR) {
++        ALOGE("error in setting offload AAC parameters");
++        return status;
++    }
++
++    *aFormat = AUDIO_FORMAT_AAC;
++    return OK;
++#endif
++    return OK;
++}
++/* Function will start a timer, which will expire if resume does not happen
++ * in the configured duration. On timer expiry the callback function will
++ * be invoked
++ */
++void AwesomePlayer::offloadPauseStartTimer(int64_t time) {
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    struct sigevent  pausedEvent;
++    struct itimerspec its;
++    ALOGV("offloadPauseStartTimer with time = %lld ", time);
++    timer_delete(mPausedTimerId);
++    memset(&pausedEvent,0, sizeof(sigevent));
++    pausedEvent.sigev_notify = SIGEV_THREAD;
++    if( time == OFFLOAD_PAUSED_TIMEOUT_DURATION) {
++        pausedEvent.sigev_notify_function = &timerCallback;
++    } else {
++
++        pausedEvent.sigev_notify_function = &timerCallbackEOS;
++        mOffloadCalAudioEOS= true;
++        mOffloadPostAudioEOS = false;
++    }
++
++    pausedEvent.sigev_value.sival_ptr = this;
++    if (timer_create(CLOCK_REALTIME,&pausedEvent, &mPausedTimerId ) != 0) {
++        return ;
++    }
++    its.it_interval.tv_sec  = time / 1000000;
++    its.it_interval.tv_nsec = (time - (its.it_interval.tv_sec * 1000000)) * 1000;
++    its.it_value.tv_sec     = time / 1000000;
++    its.it_value.tv_nsec    = (time - (its.it_interval.tv_sec * 1000000)) * 1000;
++   /* Start the timer */
++
++    if (timer_settime(mPausedTimerId, 0, &its, NULL) == -1) {
++        return;
++    }
++    ALOGV("Stated timer with ID = %x", mPausedTimerId);
++#endif
++}
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++extern "C" {
++
++    void  timerCallback(union sigval sig) {
++        AwesomePlayer  *awesomePlayer = ((AwesomePlayer*)sig.sival_ptr);
++        awesomePlayer->offloadSuspend();
++    }
++
++    void  timerCallbackEOS(union sigval sig) {
++        AwesomePlayer  *awesomePlayer = ((AwesomePlayer*)sig.sival_ptr);
++        awesomePlayer->mOffloadPostAudioEOS = true;
++        awesomePlayer->postAudioEOS(0);
++        awesomePlayer->mOffloadCalAudioEOS= false;
++    }
++}
++#endif
++
++/* Posted by the AudioPlayer whenever the offload stream needs to be terminated
++ * After tearing down the offload, use IA-s/w decoder.
++ * First store the stream state of offload and call the reset.
++ * Resume using the stored state on IA decoding.
++ */
++void AwesomePlayer::onAudioOffloadTearDownEvent() {
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    status_t err;
++    ALOGV(" AwesomePlayer::onAudioOffloadTearDownEvent");
++    if (!mAudioOffloadTearDownEventPending) {
++        return;
++    }
++    mAudioOffloadTearDownEventPending = false;
++    /* Store the current status and use it while starting for IA decoding
++     * Terminate the active stream by calling reset_l()
++     */
++    {
++        Mutex::Autolock autoLock(mStatsLock);
++        mStats.mURI = mUri;
++        mStats.mUriHeaders = mUriHeaders;
++        mStats.mFileSource = mFileSource;
++        mStats.mFlags = mFlags & (PLAYING | AUTO_LOOPING | LOOPING | AT_EOS);
++        getPosition(&mStats.mPositionUs);
++        mStats.mOffloadSinkCreationError = mOffloadSinkCreationError;
++    }
++
++    Stats stats = mStats;
++    reset_l();
++
++    mOffloadSinkCreationError = stats.mOffloadSinkCreationError;
++    mOffloadTearDown = true;
++    /* Resume the IA decoding. */
++    if (stats.mFileSource != NULL) {
++        err = setDataSource_l(stats.mFileSource);
++        if (err == OK) {
++            mFileSource = stats.mFileSource;
++        }
++    } else {
++        err = setDataSource_l(stats.mURI, &stats.mUriHeaders);
++    }
++    mIsAsyncPrepare = true;
++    mFlags |= PREPARING;
++    /* Call parepare for the IA decoding */
++    onPrepareAsyncEvent();
++    /* Seek to the positionw where offload terminated */
++    seekTo(stats.mPositionUs);
++
++    if (stats.mFlags & PLAYING) {
++        play();
++    }
++    mOffloadTearDown = false;
++#endif
++}
++
++bool AwesomePlayer::isAudioEffectEnabled() {
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    ALOGV("isAudioEffectEnabled");
++    const sp<IAudioFlinger>& audioFlinger = AudioSystem::get_audio_flinger();
++
++    if (audioFlinger != 0) {
++        if (audioFlinger->isAudioEffectEnabled(0)) {
++            ALOGV("Effects enabled");
++            return true;
++        }
++        int sessionId = mAudioSink->getSessionId();
++        if (audioFlinger->isAudioEffectEnabled(sessionId)) {
++            ALOGV("S:Effects enabled");
++            return true;
++        }
++     }
++    ALOGV("Effects not enabled");
++    return false;
++#endif
++    return false;
++}
++
+ }  // namespace android
+diff --git a/media/libstagefright/ESDS.cpp b/media/libstagefright/ESDS.cpp
+index 560c5bd..14cf62d 100644
+--- a/media/libstagefright/ESDS.cpp
++++ b/media/libstagefright/ESDS.cpp
+@@ -223,5 +223,31 @@ status_t ESDS::parseDecoderConfigDescriptor(size_t offset, size_t size) {
+     return OK;
+ }
+ 
++status_t ESDS::getCodecSpecificOffset(size_t *offset, size_t *size) const {
++    if (mInitCheck != OK) {
++        return mInitCheck;
++    }
++    *offset = mDecoderSpecificOffset;
++    *size = mDecoderSpecificLength;
++    return OK;
++}
++
++status_t ESDS::getBitRate(uint32_t *brateMax, uint32_t *brateAvg) const {
++    if (mInitCheck != OK) {
++        return mInitCheck;
++    }
++    *brateMax = mBitRateMax;
++    *brateAvg = mBitRateAvg;
++    return OK;
++}
++
++status_t ESDS::getStreamType(uint8_t *streamType) const {
++    if (mInitCheck != OK) {
++        return mInitCheck;
++    }
++    *streamType = mStreamType;
++    return OK;
++}
++
+ }  // namespace android
+ 
+diff --git a/media/libstagefright/include/AwesomePlayer.h b/media/libstagefright/include/AwesomePlayer.h
+index 750f99a..30ef64a 100644
+--- a/media/libstagefright/include/AwesomePlayer.h
++++ b/media/libstagefright/include/AwesomePlayer.h
+@@ -32,8 +32,12 @@
+ #include <utils/threads.h>
+ #include <drm/DrmManagerClient.h>
+ 
+-namespace android {
++#include <media/stagefright/MetaData.h> // for AAC aparams
++extern "C" void timerCallback(union sigval);
++extern "C" void timerCallbackEOS(union sigval);
+ 
++namespace android {
++#define OFFLOAD_PAUSED_TIMEOUT_DURATION  10000000  //in micro seconds
+ struct AudioPlayer;
+ struct DataSource;
+ struct MediaBuffer;
+@@ -106,7 +110,13 @@ struct AwesomePlayer {
+     void postAudioSeekComplete();
+ 
+     status_t dump(int fd, const Vector<String16> &args) const;
+-
++    
++    void offloadPauseStartTimer(int64_t time);
++    status_t offloadSuspend();
++    status_t offloadResume();
++    bool mOffloadCalAudioEOS;
++    bool mOffloadPostAudioEOS;
++    void postAudioOffloadTearDown();
+ #ifdef BGM_ENABLED
+     status_t remoteBGMSuspend();
+     status_t remoteBGMResume();
+@@ -320,6 +330,10 @@ private:
+         String8 mURI;
+         int64_t mBitrate;
+ 
++        KeyedVector<String8, String8> mUriHeaders;
++        sp<DataSource> mFileSource;
++        int64_t mPositionUs;
++
+         // FIXME:
+         // These two indices are just 0 or 1 for now
+         // They are not representing the actual track
+@@ -333,6 +347,7 @@ private:
+         int32_t mVideoHeight;
+         uint32_t mFlags;
+         Vector<TrackStat> mTracks;
++        bool mOffloadSinkCreationError;
+     } mStats;
+ 
+     status_t setVideoScalingMode(int32_t mode);
+@@ -349,6 +364,27 @@ private:
+ 
+     AwesomePlayer(const AwesomePlayer &);
+     AwesomePlayer &operator=(const AwesomePlayer &);
++
++    void postAudioOffloadTearDownEvent_l();
++    void onAudioOffloadTearDownEvent();
++    bool isAudioEffectEnabled();
++    status_t createAudioPlayer(audio_format_t audioFormat,
++                               int sampleRate,
++                               int channelsCount,
++                               int bitRate);
++    status_t mapMimeToAudioFormat(audio_format_t *audioFormat, const char *mime);
++    status_t setAACParameters(sp<MetaData> meta, audio_format_t *aFormat,
++                              uint32_t *avgBitRate);
++
++    audio_format_t mAudioFormat;
++    bool mOffload;
++    timer_t mPausedTimerId;
++    bool mOffloadTearDown;
++    bool mOffloadTearDownForPause;
++    int64_t mOffloadPauseUs;
++    sp<TimedEventQueue::Event> mAudioOffloadTearDownEvent;
++    bool mAudioOffloadTearDownEventPending;
++    bool mOffloadSinkCreationError;
+ #ifdef BGM_ENABLED
+     bool mRemoteBGMsuspend;
+     bool mBGMEnabled;
+@@ -357,7 +393,6 @@ private:
+ #ifdef LVSE
+     sp<LVAudioSource> mLVAudioSource;
+ #endif
+-
+ };
+ 
+ }  // namespace android
+diff --git a/media/libstagefright/include/ESDS.h b/media/libstagefright/include/ESDS.h
+index 3a79951..1f337d0 100644
+--- a/media/libstagefright/include/ESDS.h
++++ b/media/libstagefright/include/ESDS.h
+@@ -33,6 +33,9 @@ public:
+ 
+     status_t getObjectTypeIndication(uint8_t *objectTypeIndication) const;
+     status_t getCodecSpecificInfo(const void **data, size_t *size) const;
++    status_t getCodecSpecificOffset(size_t *offset, size_t *size) const;
++    status_t getBitRate(uint32_t *brateMax, uint32_t *brateAvg) const;
++    status_t getStreamType(uint8_t *streamType) const;
+ 
+ private:
+     enum {
+@@ -49,7 +52,9 @@ private:
+     size_t mDecoderSpecificOffset;
+     size_t mDecoderSpecificLength;
+     uint8_t mObjectTypeIndication;
+-
++    uint8_t mStreamType;
++    uint32_t mBitRateMax;
++    uint32_t mBitRateAvg;
+     status_t skipDescriptorHeader(
+             size_t offset, size_t size,
+             uint8_t *tag, size_t *data_offset, size_t *data_size) const;
+diff --git a/services/audioflinger/Android.mk b/services/audioflinger/Android.mk
+index 99722b1..34970a3 100644
+--- a/services/audioflinger/Android.mk
++++ b/services/audioflinger/Android.mk
+@@ -2,6 +2,10 @@ LOCAL_PATH:= $(call my-dir)
+ 
+ include $(CLEAR_VARS)
+ 
++ifeq ($(strip $(INTEL_MUSIC_OFFLOAD_FEATURE)),true)
++  LOCAL_CFLAGS += -DINTEL_MUSIC_OFFLOAD_FEATURE
++endif
++
+ LOCAL_SRC_FILES := \
+     ISchedulingPolicyService.cpp \
+     SchedulingPolicyService.cpp
+@@ -13,6 +17,40 @@ include $(BUILD_STATIC_LIBRARY)
+ 
+ include $(CLEAR_VARS)
+ 
++ifeq ($(strip $(INTEL_MUSIC_OFFLOAD_FEATURE)),true)
++  LOCAL_CFLAGS += -DINTEL_MUSIC_OFFLOAD_FEATURE
++endif
++
++LOCAL_SRC_FILES := \
++    AudioBufferProviderSource.cpp   \
++    AudioStreamOutSink.cpp          \
++    AudioStreamInSource.cpp         \
++    NBAIO.cpp                       \
++    MonoPipe.cpp                    \
++    MonoPipeReader.cpp              \
++    Pipe.cpp                        \
++    PipeReader.cpp                  \
++    roundup.c                       \
++    SourceAudioBufferProvider.cpp
++
++# libsndfile license is incompatible; uncomment to use for local debug only
++#LOCAL_SRC_FILES += LibsndfileSink.cpp LibsndfileSource.cpp
++#LOCAL_C_INCLUDES += path/to/libsndfile/src
++#LOCAL_STATIC_LIBRARIES += libsndfile
++
++# uncomment for systrace
++# LOCAL_CFLAGS += -DATRACE_TAG=ATRACE_TAG_AUDIO
++
++LOCAL_MODULE := libnbaio
++
++include $(BUILD_STATIC_LIBRARY)
++
++include $(CLEAR_VARS)
++
++ifeq ($(strip $(INTEL_MUSIC_OFFLOAD_FEATURE)),true)
++  LOCAL_CFLAGS += -DINTEL_MUSIC_OFFLOAD_FEATURE
++endif
++
+ LOCAL_SRC_FILES:=               \
+     AudioFlinger.cpp            \
+     Threads.cpp                 \
+@@ -54,6 +92,10 @@ LOCAL_STATIC_LIBRARIES := \
+     libcpustats \
+     libmedia_helper
+ 
++ifeq ($(strip $(INTEL_MUSIC_OFFLOAD_FEATURE)),true)
++  LOCAL_CFLAGS += -DINTEL_MUSIC_OFFLOAD_FEATURE
++endif
++
+ LOCAL_MODULE:= libaudioflinger
+ 
+ LOCAL_SRC_FILES += FastMixer.cpp FastMixerState.cpp
+diff --git a/services/audioflinger/AudioFlinger.cpp b/services/audioflinger/AudioFlinger.cpp
+index 02e3e4a..5e7d171 100644
+--- a/services/audioflinger/AudioFlinger.cpp
++++ b/services/audioflinger/AudioFlinger.cpp
+@@ -84,6 +84,10 @@
+ #define ALOGVV(a...) do { } while(0)
+ #endif
+ 
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++#define CODEC_OFFLOAD_MODULE_NAME "codec_offload"
++#endif
++
+ namespace android {
+ 
+ static const char kDeadlockedString[] = "AudioFlinger may be deadlocked\n";
+@@ -146,6 +150,9 @@ AudioFlinger::AudioFlinger()
+       mNextUniqueId(1),
+       mMode(AUDIO_MODE_INVALID),
+       mBtNrecIsOff(false)
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++      ,mOffloadDev(NULL)
++#endif
+ {
+     getpid_cached = getpid();
+     char value[PROPERTY_VALUE_MAX];
+@@ -214,7 +221,10 @@ AudioFlinger::~AudioFlinger()
+ static const char * const audio_interfaces[] = {
+     AUDIO_HARDWARE_MODULE_ID_PRIMARY,
+     AUDIO_HARDWARE_MODULE_ID_A2DP,
+-    AUDIO_HARDWARE_MODULE_ID_USB,
++    AUDIO_HARDWARE_MODULE_ID_USB
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    ,AUDIO_HARDWARE_MODULE_ID_CODEC_OFFLOAD
++#endif
+ };
+ #define ARRAY_SIZE(x) (sizeof((x))/sizeof(((x)[0])))
+ 
+@@ -862,7 +872,31 @@ status_t AudioFlinger::setParameters(audio_io_handle_t ioHandle, const String8&
+     if (!settingsAllowed()) {
+         return PERMISSION_DENIED;
+     }
+-
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    // Check if Music offload specific information to be routed to the direct thread
++    AudioParameter param = AudioParameter(keyValuePairs);
++    int value = 0;
++    if (param.getInt(String8(AUDIO_OFFLOAD_CODEC_ID), value) == NO_ERROR) {
++        ALOGV("setParameters: AUDIO_OFFLOAD_CODEC_ID and other AAC params");
++        Mutex::Autolock _l(mLock);
++        if (mOffloadDev == NULL) {
++            for (size_t i = 0; i < mAudioHwDevs.size(); i++) {
++                if (strncmp(mAudioHwDevs.valueAt(i)->moduleName(),
++                    CODEC_OFFLOAD_MODULE_NAME,
++                    strlen(CODEC_OFFLOAD_MODULE_NAME)) == 0) {
++                    ALOGW("getOffloadBufferSize: offload module %s matches",
++                           CODEC_OFFLOAD_MODULE_NAME);
++                    mOffloadDev = mAudioHwDevs.valueAt(i)->hwDevice();
++               }
++            }
++            if (mOffloadDev == NULL) {
++                ALOGE("setParameters: No offload device");
++                return INVALID_OPERATION;
++            }
++        }
++        return mOffloadDev->set_parameters(mOffloadDev, keyValuePairs.string());
++    }
++#endif
+     // ioHandle == 0 means the parameters are global to the audio hardware interface
+     if (ioHandle == 0) {
+         Mutex::Autolock _l(mLock);
+@@ -1116,6 +1150,41 @@ void AudioFlinger::removeClient_l(pid_t pid)
+             IPCThreadState::self()->getCallingPid());
+     mClients.removeItem(pid);
+ }
++// Function to get the offload buffer size for a offload device using
++// sample rate, bit rate and channel
++size_t AudioFlinger::getOffloadBufferSize(
++        uint32_t bitRate,
++        uint32_t sampleRate,
++        uint32_t channel,
++        int output)
++{
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    ALOGV("getOffloadBufferSize");
++    Mutex::Autolock _l(mLock);
++    if (mOffloadDev == NULL) {
++        for (size_t i = 0; i < mAudioHwDevs.size(); i++) {
++                ALOGW("getOffloadBufferSize: mAudioHwDevs.valueAt(%d)->moduleName() %s ",
++                       i, mAudioHwDevs.valueAt(i)->moduleName());
++            if (strncmp(mAudioHwDevs.valueAt(i)->moduleName(),
++                         CODEC_OFFLOAD_MODULE_NAME,
++                         strlen(CODEC_OFFLOAD_MODULE_NAME)) == 0) {
++                ALOGW("getOffloadBufferSize: offload module %s matches",
++                          CODEC_OFFLOAD_MODULE_NAME);
++                mOffloadDev = mAudioHwDevs.valueAt(i)->hwDevice();
++            }
++        }
++        if (mOffloadDev == NULL)
++            return 0;
++    }
++
++    ALOGV("Calling Hardware Offload Buffer Size");
++    return mOffloadDev->get_offload_buffer_size(mOffloadDev,
++               bitRate, sampleRate, channel);
++#endif
++    return 0;
++}
++
++
+ 
+ // getEffectThread_l() must be called with AudioFlinger::mLock held
+ sp<AudioFlinger::PlaybackThread> AudioFlinger::getEffectThread_l(int sessionId, int EffectId)
+@@ -1475,6 +1544,11 @@ audio_io_handle_t AudioFlinger::openOutput(audio_module_handle_t module,
+             hwDevHal->set_mode(hwDevHal, mMode);
+             mHardwareStatus = AUDIO_HW_IDLE;
+         }
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++        if (flags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD) {
++           mOffloadDev = outHwDev;
++        }
++#endif
+         return id;
+     }
+ 
+@@ -1531,6 +1605,29 @@ status_t AudioFlinger::closeOutput_nonvirtual(audio_io_handle_t output)
+                 }
+             }
+         }
++//To be checked as close is called in nonvirtual
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++        if (thread->type() == ThreadBase::DIRECT) {
++            Vector<int> sessionIds;
++
++            thread->getEffectSessionIds(sessionIds);
++            ALOGV("closeOutput: EffectSessionIds vector size: %d", sessionIds.size());
++            // save all audio effects created in the offload thread to the default thread
++            for (size_t i=0; i < sessionIds.size(); i++) {
++                int output=0;
++                if (mPlaybackThreads.size()) {
++                    output = mPlaybackThreads.keyAt(0);
++                    ALOGV("closeOutput: Target new output=%d", output);
++                    PlaybackThread *dstThread = checkPlaybackThread_l(output);
++                    PlaybackThread *srcThread = (PlaybackThread *) thread.get();
++
++                    Mutex::Autolock _dl(dstThread->mLock);
++                    Mutex::Autolock _sl(srcThread->mLock);
++                    moveEffectChain_l(sessionIds[i], srcThread, dstThread, true);
++                }
++            }
++        }
++#endif
+         audioConfigChanged_l(AudioSystem::OUTPUT_CLOSED, output, NULL);
+         mPlaybackThreads.removeItem(output);
+     }
+@@ -1760,6 +1857,13 @@ status_t AudioFlinger::setStreamOutput(audio_stream_type_t stream, audio_io_hand
+         PlaybackThread *thread = mPlaybackThreads.valueAt(i).get();
+         thread->invalidateTracks(stream);
+     }
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++        if(thread->type() == ThreadBase::DIRECT){
++            ALOGV("setStreamOutput: invalidating tracks");
++            DirectOutputThread *srcThread = (DirectOutputThread *)thread;
++            srcThread->invalidateTracks(stream);
++        }
++#endif
+ 
+     return NO_ERROR;
+ }
+@@ -2182,7 +2286,26 @@ status_t AudioFlinger::moveEffects(int sessionId, audio_io_handle_t srcOutput,
+ 
+     return NO_ERROR;
+ }
+-
++bool AudioFlinger::isAudioEffectEnabled(int sessionId) const
++{
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    Mutex::Autolock _l(mLock);
++    sp<EffectChain> chain = NULL;
++    ALOGV("isAudioEffectEnabled(sessionId=%d)", sessionId);
++    size_t size = mPlaybackThreads.size();
++    for (size_t i = 0; i < size; i++) {
++        chain = mPlaybackThreads.valueAt(i)->getEffectChain_l(sessionId);
++        if (chain != 0) {
++            break;
++        }
++    }
++    if (chain != 0 && chain->isAudioEffectEnabled()) {
++        return true;
++    }
++    return false;
++#endif
++    return false;
++}
+ // moveEffectChain_l must be called with both srcThread and dstThread mLocks held
+ status_t AudioFlinger::moveEffectChain_l(int sessionId,
+                                    AudioFlinger::PlaybackThread *srcThread,
+diff --git a/services/audioflinger/AudioFlinger.h b/services/audioflinger/AudioFlinger.h
+index b0efef6..17a02eb 100644
+--- a/services/audioflinger/AudioFlinger.h
++++ b/services/audioflinger/AudioFlinger.h
+@@ -221,7 +221,14 @@ public:
+                                 const Parcel& data,
+                                 Parcel* reply,
+                                 uint32_t flags);
+-
++    //Get Offload buffer size
++    size_t getOffloadBufferSize(
++            uint32_t bitRate,
++            uint32_t sampleRate,
++            uint32_t channel,
++            int output);
++
++    virtual bool isAudioEffectEnabled(int sessionId) const;
+     // end of IAudioFlinger interface
+ 
+     sp<NBLog::Writer>   newWriter_l(size_t size, const char *name);
+@@ -394,6 +401,7 @@ private:
+         virtual void        stop();
+         virtual void        flush();
+         virtual void        pause();
++        virtual void        setVolume(float left, float right);
+         virtual status_t    attachAuxEffect(int effectId);
+         virtual status_t    allocateTimedBuffer(size_t size,
+                                                 sp<IMemory>* buffer);
+@@ -526,6 +534,7 @@ private:
+ 
+                 // These two fields are immutable after onFirstRef(), so no lock needed to access
+                 AudioHwDevice*                      mPrimaryHardwareDev; // mAudioHwDevs[0] or NULL
++                AudioHwDevice*                      mOffloadDev;
+                 DefaultKeyedVector<audio_module_handle_t, AudioHwDevice*>  mAudioHwDevs;
+ 
+     // for dump, indicates which hardware operation is currently in progress (but not stream ops)
+diff --git a/services/audioflinger/AudioPolicyService.cpp b/services/audioflinger/AudioPolicyService.cpp
+index d276959..d6b415d 100644
+--- a/services/audioflinger/AudioPolicyService.cpp
++++ b/services/audioflinger/AudioPolicyService.cpp
+@@ -1058,6 +1058,31 @@ int AudioPolicyService::setVoiceVolume(float volume, int delayMs)
+     return (int)mAudioCommandThread->voiceVolumeCommand(volume, delayMs);
+ }
+ 
++bool AudioPolicyService::isOffloadSupported(uint32_t format,
++                                    audio_stream_type_t stream,
++                                    uint32_t samplingRate,
++                                    uint32_t bitRate,
++                                    int64_t duration,
++                                    bool isVideo,
++                                    bool isStreaming) const
++{
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    if (mpAudioPolicy == NULL) {
++        return false;
++    }
++
++    return mpAudioPolicy->is_offload_supported(mpAudioPolicy,
++                                               format,
++                                               stream,
++                                               samplingRate,
++                                               bitRate,
++                                               duration,
++                                               isVideo,
++                                               isStreaming);
++#endif
++    return false;
++}
++
+ // ----------------------------------------------------------------------------
+ // Audio pre-processing configuration
+ // ----------------------------------------------------------------------------
+diff --git a/services/audioflinger/AudioPolicyService.h b/services/audioflinger/AudioPolicyService.h
+index 35cf368..be3f326 100644
+--- a/services/audioflinger/AudioPolicyService.h
++++ b/services/audioflinger/AudioPolicyService.h
+@@ -135,6 +135,13 @@ public:
+     virtual status_t startTone(audio_policy_tone_t tone, audio_stream_type_t stream);
+     virtual status_t stopTone();
+     virtual status_t setVoiceVolume(float volume, int delayMs = 0);
++    virtual bool isOffloadSupported(uint32_t format,
++                                    audio_stream_type_t stream,
++                                    uint32_t samplingRate,
++                                    uint32_t bitRate,
++                                    int64_t duration,
++                                    bool isVideo = false,
++                                    bool isStreaming = false) const;
+ 
+ private:
+                         AudioPolicyService();
+diff --git a/services/audioflinger/Effects.cpp b/services/audioflinger/Effects.cpp
+index c566d7a..7300025 100644
+--- a/services/audioflinger/Effects.cpp
++++ b/services/audioflinger/Effects.cpp
+@@ -43,6 +43,10 @@
+ #define ALOGVV(a...) do { } while(0)
+ #endif
+ 
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++#define CODEC_OFFLOAD_MODULE_NAME "codec_offload"
++#endif
++
+ namespace android {
+ 
+ // ----------------------------------------------------------------------------
+@@ -602,6 +606,21 @@ status_t AudioFlinger::EffectModule::setEnabled_l(bool enabled)
+                 h->setEnabled(enabled);
+             }
+         }
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++        sp<ThreadBase> thread = mThread.promote();
++        if (thread == 0) {
++            return NO_ERROR;
++        }
++        PlaybackThread *p = (PlaybackThread *)thread.get();
++
++        if (enabled) {
++            if (p->type() == ThreadBase::DIRECT ) {
++                ALOGV("setEnabled: Offload, invalidate tracks");
++                DirectOutputThread *srcThread = (DirectOutputThread *)p;
++                srcThread->invalidateTracks(AUDIO_STREAM_MUSIC);
++            }
++        }
++#endif
+     }
+     return NO_ERROR;
+ }
+diff --git a/services/audioflinger/Effects.h b/services/audioflinger/Effects.h
+index 1c17392..68460af 100644
+--- a/services/audioflinger/Effects.h
++++ b/services/audioflinger/Effects.h
+@@ -261,6 +261,7 @@ public:
+     sp<EffectModule> getEffectFromDesc_l(effect_descriptor_t *descriptor);
+     sp<EffectModule> getEffectFromId_l(int id);
+     sp<EffectModule> getEffectFromType_l(const effect_uuid_t *type);
++    bool isAudioEffectEnabled() const;
+     bool setVolume_l(uint32_t *left, uint32_t *right);
+     void setDevice_l(audio_devices_t device);
+     void setMode_l(audio_mode_t mode);
+diff --git a/services/audioflinger/PlaybackTracks.h b/services/audioflinger/PlaybackTracks.h
+index a749d7a..cd8984b 100644
+--- a/services/audioflinger/PlaybackTracks.h
++++ b/services/audioflinger/PlaybackTracks.h
+@@ -76,7 +76,8 @@ protected:
+     // releaseBuffer() not overridden
+ 
+     virtual size_t framesReady() const;
+-
++//offload
++    bool isActive() { return (mState == ACTIVE || mState == RESUMING); }
+     bool isPausing() const { return mState == PAUSING; }
+     bool isPaused() const { return mState == PAUSED; }
+     bool isResuming() const { return mState == RESUMING; }
+diff --git a/services/audioflinger/Threads.cpp b/services/audioflinger/Threads.cpp
+index 474d216..452cf5c 100644
+--- a/services/audioflinger/Threads.cpp
++++ b/services/audioflinger/Threads.cpp
+@@ -85,6 +85,10 @@
+ #define ALOGVV(a...) do { } while(0)
+ #endif
+ 
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++#define CODEC_OFFLOAD_MODULE_NAME "codec_offload"
++#endif
++
+ namespace android {
+ 
+ // retry counts for buffer fill timeout
+@@ -93,9 +97,13 @@ static const int8_t kMaxTrackRetries = 50;
+ static const int8_t kMaxTrackStartupRetries = 50;
+ // allow less retry attempts on direct output thread.
+ // direct outputs can be a scarce resource in audio hardware and should
+-// be released as quickly as possible.
++// be released as quickly as possible. However if the stream is deep buffered
++// we need to make sure that AudioTrack client has enough time to send large buffers
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++static const int8_t kMaxTrackRetriesDirect = 20;
++#else.
+ static const int8_t kMaxTrackRetriesDirect = 2;
+-
++#endif
+ // don't warn about blocked writes or record buffer overflows more often than this
+ static const nsecs_t kWarningThrottleNs = seconds(5);
+ 
+@@ -1308,6 +1316,15 @@ void AudioFlinger::PlaybackThread::setMasterMute(bool muted)
+ 
+ void AudioFlinger::PlaybackThread::setStreamVolume(audio_stream_type_t stream, float value)
+ {
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    // Check if MusicOffload Track is running, if so, instanly apply volume
++    // AudioTrack.
++    ALOGV("setStreamVolume of thread");
++    if (stream == AUDIO_STREAM_MUSIC && mType == DIRECT && getOutput_l()) {
++        ALOGV("DIRECT thread calling set_volume");
++        getOutput_l()->stream->set_volume(getOutput_l()->stream, value, value);
++    }
++#endif
+     Mutex::Autolock _l(mLock);
+     mStreamTypes[stream].volume = value;
+ }
+@@ -1544,6 +1561,16 @@ uint32_t AudioFlinger::PlaybackThread::hasAudioSession(int sessionId) const
+     return result;
+ }
+ 
++void AudioFlinger::PlaybackThread::getEffectSessionIds(Vector<int> &sessionIds)
++{
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    size_t size = mEffectChains.size();
++    for (size_t i=0; i < size; i++) {
++        sessionIds.add(mEffectChains[i]->sessionId());
++    }
++#endif
++}
++	
+ uint32_t AudioFlinger::PlaybackThread::getStrategyForSession_l(int sessionId)
+ {
+     // session AUDIO_SESSION_OUTPUT_MIX is placed in same strategy as MUSIC stream so that
+@@ -1567,6 +1594,15 @@ AudioFlinger::AudioStreamOut* AudioFlinger::PlaybackThread::getOutput() const
+     return mOutput;
+ }
+ 
++AudioFlinger::AudioStreamOut* AudioFlinger::PlaybackThread::getOutput_l() const
++{
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    ALOGV("returns mOutput");
++    return mOutput;
++#endif
++    return NULL;
++}
++
+ AudioFlinger::AudioStreamOut* AudioFlinger::PlaybackThread::clearOutput()
+ {
+     Mutex::Autolock _l(mLock);
+@@ -1634,6 +1670,26 @@ void AudioFlinger::PlaybackThread::threadLoop_removeTracks(
+ 
+ }
+ 
++status_t AudioFlinger::PlaybackThread::setParametersMusicOffload(const String8& keyValuePairs)
++{
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    ALOGV("setParametersMusicOffload: %s", keyValuePairs.string());
++    status_t status = NO_ERROR;
++
++    status = getOutput_l()->stream->common.set_parameters(
++                                           &getOutput_l()->stream->common,
++                                           keyValuePairs.string());
++
++    if (status != NO_ERROR) {
++        ALOGE("PBT: Error setting offload codec parameters");
++        return status;
++    }
++    return status;
++#endif
++    return NO_ERROR;
++}
++
++
+ void AudioFlinger::PlaybackThread::checkSilentMode_l()
+ {
+     if (!mMasterMute) {
+@@ -3173,9 +3229,19 @@ AudioFlinger::PlaybackThread::mixer_state AudioFlinger::DirectOutputThread::prep
+         } else {
+             minFrames = 1;
+         }
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++        if (track->isPausing()) {
++             track->setPaused();
++        }
++
++        if ((track->framesReady() >= minFrames) && track->isReady() &&  track->isActive())
++//                !track->isPaused() && !track->isTerminated())
++        {
++#else
+         if ((track->framesReady() >= minFrames) && track->isReady() &&
+                 !track->isPaused() && !track->isTerminated())
+         {
++#endif
+             ALOGVV("track %d u=%08x, s=%08x [OK]", track->name(), cblk->user, cblk->server);
+ 
+             if (track->mFillingUpStatus == Track::FS_FILLED) {
+@@ -3213,7 +3279,13 @@ AudioFlinger::PlaybackThread::mixer_state AudioFlinger::DirectOutputThread::prep
+             // As we only care about the transition phase between two tracks on a
+             // direct output, it is not a problem to ignore the underrun case.
+             if (i == (count - 1)) {
+-                if (left != mLeftVolFloat || right != mRightVolFloat) {
++//ToBeChecked - Prasanna offload
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++            if (left != mLeftVolFloat || right != mRightVolFloat) {	
++            if (left != mLeftVolFloat || right != mRightVolFloat || (left==0 && mLeftVolFloat==0)) {
++#else
++            if (left != mLeftVolFloat || right != mRightVolFloat) {
++#endif
+                     mLeftVolFloat = left;
+                     mRightVolFloat = right;
+ 
+@@ -3309,6 +3381,10 @@ void AudioFlinger::DirectOutputThread::threadLoop_mix()
+         memcpy(curBuf, buffer.raw, buffer.frameCount * mFrameSize);
+         frameCount -= buffer.frameCount;
+         curBuf += buffer.frameCount * mFrameSize;
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++        //Used in writing offload data to avoid sending padded bytes.
++        mixBufferSize = buffer.frameCount * mFrameSize;
++#endif
+         mActiveTrack->releaseBuffer(&buffer);
+     }
+     sleepTime = 0;
+@@ -3433,6 +3509,29 @@ void AudioFlinger::DirectOutputThread::cacheParameters_l()
+     standbyDelay = microseconds(activeSleepTime*2);
+ }
+ 
++void AudioFlinger::DirectOutputThread::invalidateTracks(audio_stream_type_t streamType)
++{
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    ALOGV ("DirectOutputThread::invalidateTracks mixer %p, streamType %d, mTracks.size %d",
++            this,  streamType, mTracks.size());
++    Mutex::Autolock _l(mLock);
++
++    size_t size = mTracks.size();
++    for (size_t i = 0; i < size; i++) {
++        sp<Track> t = mTracks[i];
++        if (t->streamType() == streamType) {
++            if(!t->isPaused() && (!(t->mCblk->flags & CBLK_OFFLOAD_TEAR_DOWN_ON))) {
++                t->mCblk->lock.lock();
++                t->mCblk->flags |= CBLK_INVALID_ON;
++                t->mCblk->flags |= CBLK_OFFLOAD_TEAR_DOWN_ON;
++                t->mCblk->cv.signal();
++                t->mCblk->lock.unlock();
++            }
++        }
++    }
++#endif
++}
++
+ // ----------------------------------------------------------------------------
+ 
+ AudioFlinger::DuplicatingThread::DuplicatingThread(const sp<AudioFlinger>& audioFlinger,
+diff --git a/services/audioflinger/Threads.h b/services/audioflinger/Threads.h
+index 7de6872..dbeb9ea 100644
+--- a/services/audioflinger/Threads.h
++++ b/services/audioflinger/Threads.h
+@@ -394,6 +394,7 @@ public:
+                                 status_t *status);
+ 
+                 AudioStreamOut* getOutput() const;
++                AudioStreamOut* getOutput_l() const;
+                 AudioStreamOut* clearOutput();
+                 virtual audio_stream_t* stream() const;
+ 
+@@ -424,12 +425,15 @@ public:
+                 virtual status_t addEffectChain_l(const sp<EffectChain>& chain);
+                 virtual size_t removeEffectChain_l(const sp<EffectChain>& chain);
+                 virtual uint32_t hasAudioSession(int sessionId) const;
++                void getEffectSessionIds(Vector<int> &sessionIds);
+                 virtual uint32_t getStrategyForSession_l(int sessionId);
+ 
+ 
+                 virtual status_t setSyncEvent(const sp<SyncEvent>& event);
+                 virtual bool     isValidSyncEvent(const sp<SyncEvent>& event) const;
+                         void     invalidateTracks(audio_stream_type_t streamType);
++                virtual status_t setParametersMusicOffload(
++                                 const String8& keyValuePairs);
+ 
+ 
+ protected:
+@@ -625,7 +629,7 @@ public:
+     virtual                 ~DirectOutputThread();
+ 
+     // Thread virtuals
+-
++                void        invalidateTracks(audio_stream_type_t streamType);
+     virtual     bool        checkForNewParameters_l();
+ 
+ protected:
+diff --git a/services/audioflinger/Tracks.cpp b/services/audioflinger/Tracks.cpp
+index bf99f66..a6dcf9f 100644
+--- a/services/audioflinger/Tracks.cpp
++++ b/services/audioflinger/Tracks.cpp
+@@ -50,6 +50,10 @@
+ #define ALOGVV(a...) do { } while(0)
+ #endif
+ 
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++#define CODEC_OFFLOAD_MODULE_NAME "codec_offload"
++#endif
++
+ namespace android {
+ 
+ // ----------------------------------------------------------------------------
+@@ -290,6 +294,12 @@ void AudioFlinger::TrackHandle::pause() {
+     mTrack->pause();
+ }
+ 
++void AudioFlinger::TrackHandle::setVolume(float left, float right) {
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    mTrack->setVolume(left, right);
++#endif
++}
++
+ status_t AudioFlinger::TrackHandle::attachAuxEffect(int EffectId)
+ {
+     return mTrack->attachAuxEffect(EffectId);
+@@ -634,6 +644,21 @@ status_t AudioFlinger::PlaybackThread::Track::start(AudioSystem::sync_event_t ev
+             mState = state;
+             triggerEvents(AudioSystem::SYNC_EVENT_PRESENTATION_COMPLETE);
+         }
++//To be checked - offload
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++        // In case of Music Offload write, it could be blocked on pause-event
++        // make sure we restart the output
++        PlaybackThread* playbackThread = static_cast<PlaybackThread*>(thread.get());
++        if (playbackThread->type() == DIRECT && (state==PAUSING || state==PAUSED)) {
++            ALOGV("calling resume directly");
++            status_t status = playbackThread->getOutput_l()->stream->resume(
++                                            playbackThread->getOutput_l()->stream);
++            if (NO_ERROR != status) {
++                ALOGE("AudioStreamOut::resume returns error = %d", status);
++            }
++            mState = TrackBase::RESUMING;
++        }
++#endif
+     } else if (thread == 0) {
+       /*in case of direct output thread, on disconnect; the thread exits hence
+        we need to make sure the tracks are restored */
+@@ -677,6 +702,20 @@ void AudioFlinger::PlaybackThread::Track::stop()
+             addBatteryData(IMediaPlayerService::kBatteryDataAudioFlingerStop);
+ #endif
+         }
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++        PlaybackThread* playbackThread = static_cast<PlaybackThread*>(thread.get());
++        if ((playbackThread->type() == DIRECT) ) {
++            if (state!=ACTIVE && state!=RESUMING) {
++                ALOGV("Track:stop: state!=ACTIVE && state!=RESUMING");
++                status_t status = playbackThread->getOutput_l()->stream->flush(
++                                           playbackThread->getOutput_l()->stream);
++                if (NO_ERROR != status) {
++                    ALOGE("stop returns error = %d", status);
++                }
++            }
++        }
++#endif
++
+     }
+ }
+ 
+@@ -690,6 +729,20 @@ void AudioFlinger::PlaybackThread::Track::pause()
+             mState = PAUSING;
+             ALOGV("ACTIVE/RESUMING => PAUSING (%d) on thread %p", mName, thread.get());
+             if (!isOutputTrack()) {
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++                // Call direct pause for offload mechanism
++                PlaybackThread* pPBThread = static_cast<PlaybackThread*>(thread.get());
++                if (pPBThread->type() == DIRECT) {
++                    status_t status = pPBThread->getOutput_l()->stream->pause(
++                                               pPBThread->getOutput_l()->stream);
++                    if (NO_ERROR != status) {
++                        ALOGE("AudioStreamOut::stop returns error = %d", status);
++                    }
++                    // No need to wait for the direct output thread to run to do state
++                    // transition
++                    setPaused();
++                }
++#endif
+                 thread->mLock.unlock();
+                 AudioSystem::stopOutput(thread->id(), mStreamType, mSessionId);
+                 thread->mLock.lock();
+@@ -709,6 +762,23 @@ void AudioFlinger::PlaybackThread::Track::flush()
+     sp<ThreadBase> thread = mThread.promote();
+     if (thread != 0) {
+         Mutex::Autolock _l(thread->mLock);
++    PlaybackThread *playbackThread = (PlaybackThread *)thread.get();
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++        if (playbackThread->type() == DIRECT) {
++            ALOGV("Calling flush directly");
++            mCblk->lock.lock();
++            reset();
++            mCblk->lock.unlock();
++            // If state needs to be set to STOPPED, do that here
++            if (mState == STOPPED || mState == PAUSED || mState == PAUSING) {
++                mState = STOPPED;
++            }
++
++            playbackThread->getOutput_l()->stream->flush(
++                                      playbackThread->getOutput_l()->stream);
++        }
++#endif
++
+         if (mState != STOPPING_1 && mState != STOPPING_2 && mState != STOPPED && mState != PAUSED &&
+                 mState != PAUSING && mState != IDLE && mState != FLUSHED) {
+             return;
+@@ -720,7 +790,7 @@ void AudioFlinger::PlaybackThread::Track::flush()
+         // this will be done by prepareTracks_l() when the track is stopped.
+         // prepareTracks_l() will see mState == FLUSHED, then
+         // remove from active track list, reset(), and trigger presentation complete
+-        PlaybackThread *playbackThread = (PlaybackThread *)thread.get();
++//        PlaybackThread *playbackThread = (PlaybackThread *)thread.get(); To be checked 
+         if (playbackThread->mActiveTracks.indexOf(this) < 0) {
+             reset();
+         }
+@@ -731,7 +801,26 @@ void AudioFlinger::PlaybackThread::Track::reset()
+ {
+     // Do not reset twice to avoid discarding data written just after a flush and before
+     // the audioflinger thread detects the track is stopped.
++    // For MusicOffload: Flush the data if requested anytime
++    // Check if Music Offload playback is running
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    bool offload = false;
++    sp<ThreadBase> baseThread = mThread.promote();
++    if (baseThread != 0) {
++        PlaybackThread *playbackThread = (PlaybackThread *)baseThread.get();
++
++        if (playbackThread->type() == DIRECT) {
++            offload = true;
++        }
++    }
++#endif
++
++#ifdef INTEL_MUSIC_OFFLOAD_FEATURE
++    if (!mResetDone || offload) {
++#else
+     if (!mResetDone) {
++#endif
++
+         TrackBase::reset();
+         // Force underrun condition to avoid false underrun callback until first data is
+         // written to buffer
+@@ -745,6 +834,13 @@ void AudioFlinger::PlaybackThread::Track::reset()
+     }
+ }
+ 
++void AudioFlinger::PlaybackThread::Track::setVolume(float left, float right)
++{
++   /* Call set volume of offload hal. This will be invoked by the
++    * volume control from application
++    */
++}
++	
+ status_t AudioFlinger::PlaybackThread::Track::attachAuxEffect(int EffectId)
+ {
+     status_t status = DEAD_OBJECT;
+-- 
+1.7.4.1
+

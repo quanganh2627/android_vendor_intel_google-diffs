@@ -1,0 +1,1759 @@
+From 026762b960f81309b28cfd9d989f6bbf15826324 Mon Sep 17 00:00:00 2001
+From: WeiTang <wei.a.tang@intel.com>
+Date: Wed, 10 Jul 2013 15:02:31 +0800
+Subject: Revert "Dalvik: Add dual double divide optimization"
+
+BZ: 120675
+
+This patch is to revert dual double divide optimization tracked by
+BZ 96223. To convert double divide to Newton-Raphson sequence will
+cause last bit of result is not exact for some inputs. It has chance
+to affect final rounding result. We have to revert the optimization
+for correctness.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I22afbff8aebdca4814a3f6920002fb8dd95cdcc2
+Orig-MCG-Change-Id: I2f243dee9c7650a5e5ccf157d35f090e96c22169
+Signed-off-by: WeiTang <wei.a.tang@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/Dvm.mk                                         |    1 -
+ vm/compiler/CompilerIR.h                          |   12 -
+ vm/compiler/Dataflow.cpp                          |   71 +---
+ vm/compiler/DualDoubleDivOpt.cpp                  |  679 ---------------------
+ vm/compiler/DualDoubleDivOpt.h                    |  203 ------
+ vm/compiler/IntermediateRep.cpp                   |   20 -
+ vm/compiler/LoopOpt.cpp                           |    3 -
+ vm/compiler/LoopOpt.h                             |    8 -
+ vm/compiler/codegen/x86/AnalysisO1.cpp            |    1 -
+ vm/compiler/codegen/x86/BytecodeVisitor.cpp       |   90 ---
+ vm/compiler/codegen/x86/CodegenInterface.cpp      |    6 -
+ vm/compiler/codegen/x86/InstructionGeneration.cpp |  171 ------
+ vm/compiler/codegen/x86/InstructionGeneration.h   |   16 -
+ vm/compiler/codegen/x86/Lower.h                   |   12 -
+ vm/compiler/codegen/x86/LowerHelper.cpp           |  110 ----
+ vm/compiler/codegen/x86/LowerJump.cpp             |    4 -
+ vm/compiler/codegen/x86/Scheduler.cpp             |    1 -
+ vm/compiler/codegen/x86/libenc/enc_defs.h         |    3 -
+ vm/compiler/codegen/x86/libenc/enc_defs_ext.h     |    2 -
+ vm/compiler/codegen/x86/libenc/enc_tabl.cpp       |    6 -
+ 20 files changed, 2 insertions(+), 1417 deletions(-)
+ delete mode 100755 vm/compiler/DualDoubleDivOpt.cpp
+ delete mode 100755 vm/compiler/DualDoubleDivOpt.h
+
+diff --git a/vm/Dvm.mk b/vm/Dvm.mk
+index 80aac3b..1be4a7a 100644
+--- a/vm/Dvm.mk
++++ b/vm/Dvm.mk
+@@ -250,7 +250,6 @@ ifeq ($(WITH_JIT),true)
+   LOCAL_SRC_FILES += \
+ 	compiler/Compiler.cpp \
+ 	compiler/JitProfiling.cpp \
+-	compiler/DualDoubleDivOpt.cpp \
+ 	compiler/Frontend.cpp \
+ 	compiler/Utility.cpp \
+ 	compiler/InlineTransformation.cpp \
+diff --git a/vm/compiler/CompilerIR.h b/vm/compiler/CompilerIR.h
+index dfe9d0a..6e6a8e2 100644
+--- a/vm/compiler/CompilerIR.h
++++ b/vm/compiler/CompilerIR.h
+@@ -102,16 +102,6 @@ enum ExtendedMIROpcode {
+     /** @brief PHI node
+       No arguments for the back-end */
+     kMirOpPhi = kMirOpFirst,
+-    /** @brief Dual Double Divide
+-        vA: Result of division 1
+-        vB: Numerator of division 1
+-        vC: Denominator (double) of division 1
+-        arg[0]: Denominator (int) of division 1
+-        arg[1]: Result of division 2
+-        arg[2]: Numerator of division 2
+-        arg[3]: Denominator (double) of division 2
+-        arg[4]: Denominator (int) of division 2  */
+-    kMirOpDualDoubleDivide,
+     /** @brief Null and Range Up for Up Loop
+       va: arrayReg, vB: idx Reg, vC: end condition,
+       arg[0]: maxC, arg[1]: minC, arg[2]:branch opcode */
+@@ -456,8 +446,6 @@ void dvmCompilerAppendMIR(BasicBlock *bb, MIR *mir);
+ 
+ void dvmCompilerPrependMIR(BasicBlock *bb, MIR *mir);
+ 
+-void dvmCompilerInsertMIRBefore(BasicBlock *bb, MIR *currentMIR, MIR *newMIR);
+-
+ void dvmCompilerInsertMIRAfter(BasicBlock *bb, MIR *currentMIR, MIR *newMIR);
+ 
+ void dvmCompilerAppendLIR(CompilationUnit *cUnit, LIR *lir);
+diff --git a/vm/compiler/Dataflow.cpp b/vm/compiler/Dataflow.cpp
+index d1719c9..ccd0661 100644
+--- a/vm/compiler/Dataflow.cpp
++++ b/vm/compiler/Dataflow.cpp
+@@ -815,7 +815,6 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_FORMAT_EXT_OP,
+     DF_FORMAT_EXT_OP,
+     DF_FORMAT_EXT_OP,
+-    DF_FORMAT_EXT_OP,
+ };
+ 
+ /* Return the Dalvik register/subscript pair of a given SSA register */
+@@ -1160,14 +1159,6 @@ void dvmCompilerExtendedDisassembler (const CompilationUnit *cUnit,
+             snprintf (buffer, len, "kMirOpRegisterize: v%d %s", insn->vA, regClass);
+             break;
+         }
+-        case kMirOpDualDoubleDivide:
+-            // kMirOpDualDoubleDivide: a, b, c, d, e, f
+-            snprintf (buffer, len, "kMirOpDualDoubleDivide: v%d, v%d, v%d, v%d, v%d, v%d "
+-                     "(int-to-double v%d, v%d, int-to-double v%d, v%d)",
+-                     insn->vA, insn->vB, insn->arg[0],
+-                     insn->arg[1], insn->arg[2], insn->arg[4],
+-                     insn->vC, insn->arg[0], insn->arg[3], insn->arg[4]);
+-            break;
+         default:
+             snprintf (buffer, len, "Unknown Extended Opcode");
+             break;
+@@ -1414,15 +1405,6 @@ void handleExtOpUses (BitVector *useV, BitVector *defV, DecodedInstruction* dIns
+                 handleUse (useV, defV, dInsn->vA + 1);
+             }
+             break;
+-        case kMirOpDualDoubleDivide:
+-            // Used: two each of numerator (double), denominator (integer)
+-            handleUse(useV, defV, dInsn->vB);
+-            handleUse(useV, defV, dInsn->vB + 1);
+-            handleUse(useV, defV, dInsn->arg[0]);
+-            handleUse(useV, defV, dInsn->arg[2]);
+-            handleUse(useV, defV, dInsn->arg[2] + 1);
+-            handleUse(useV, defV, dInsn->arg[4]);
+-            break;
+         default:
+             ALOGW("JIT_INFO: Unexpected Extended opcode %#x", dInsn->opcode);
+             break;
+@@ -1447,17 +1429,6 @@ void handleExtOpDefs (BitVector *defV, DecodedInstruction* dInsn)
+         case kMirOpPhi:
+             handleDef (defV, dInsn->vA);
+             break;
+-        case kMirOpDualDoubleDivide:
+-            // Defined: two each of result (double), denominator (double)
+-            handleDef(defV, dInsn->vA);
+-            handleDef(defV, dInsn->vA + 1);
+-            handleDef(defV, dInsn->vC);
+-            handleDef(defV, dInsn->vC + 1);
+-            handleDef(defV, dInsn->arg[1]);
+-            handleDef(defV, dInsn->arg[1] + 1);
+-            handleDef(defV, dInsn->arg[3]);
+-            handleDef(defV, dInsn->arg[3] + 1);
+-            break;
+         default:
+             ALOGW("JIT_INFO: Unexpected Extended opcode %#x", dInsn->opcode);
+             break;
+@@ -1779,8 +1750,8 @@ static void dataFlowSSAFormatExtendedOp(CompilationUnit *cUnit, MIR *mir)
+ {
+     //We need to keep track of uses and defs and just so we can put those arrays
+     //on the stack, we set up some maximums.
+-    const int maxUses = 6;
+-    const int maxDefs = 8;
++    const int maxUses = 2;
++    const int maxDefs = 1;
+ 
+     //Now declare the temporary arrays we will use
+     int uses[maxUses] = {}, defs[maxDefs] = {};
+@@ -1841,44 +1812,6 @@ static void dataFlowSSAFormatExtendedOp(CompilationUnit *cUnit, MIR *mir)
+                 numUses++;
+             }
+             break;
+-        case kMirOpDualDoubleDivide:
+-            // Used: two each of numerator (double), denominator (integer)
+-            numUses = 0;
+-            fpUse[numUses] = true;
+-            handleSSAUse(cUnit, uses, mir->dalvikInsn.vB, numUses);
+-            fpUse[numUses] = true;
+-            handleSSAUse(cUnit, uses, mir->dalvikInsn.vB+1, numUses + 1);
+-            numUses += 2;
+-            fpUse[numUses] = false;
+-            handleSSAUse(cUnit, uses, mir->dalvikInsn.arg[0], numUses);
+-            numUses++;
+-            fpUse[numUses] = true;
+-            handleSSAUse(cUnit, uses, mir->dalvikInsn.arg[2], numUses);
+-            fpUse[numUses] = true;
+-            handleSSAUse(cUnit, uses, mir->dalvikInsn.arg[2]+1, numUses + 1);
+-            numUses += 2;
+-            fpUse[numUses] = false;
+-            handleSSAUse(cUnit, uses, mir->dalvikInsn.arg[4], numUses);
+-            numUses++;
+-
+-            // Defined: two each of result (double), denominator (double)
+-            numDefs = 0;
+-            handleSSADef(cUnit, defs, mir->dalvikInsn.vA, numDefs);
+-            handleSSADef(cUnit, defs, mir->dalvikInsn.vA + 1, numDefs + 1);
+-            numDefs += 2;
+-            handleSSADef(cUnit, defs, mir->dalvikInsn.vC, numDefs);
+-            handleSSADef(cUnit, defs, mir->dalvikInsn.vC + 1, numDefs + 1);
+-            numDefs += 2;
+-            handleSSADef(cUnit, defs, mir->dalvikInsn.arg[1], numDefs);
+-            handleSSADef(cUnit, defs, mir->dalvikInsn.arg[1] + 1, numDefs + 1);
+-            numDefs += 2;
+-            handleSSADef(cUnit, defs, mir->dalvikInsn.arg[3], numDefs);
+-            handleSSADef(cUnit, defs, mir->dalvikInsn.arg[3] + 1, numDefs + 1);
+-            numDefs += 2;
+-            for( int i = 0; i < 8; i++ ) {
+-                fpDef[i] = true;
+-            }
+-            break;
+         default:
+             ALOGW("Unexpected extended opcode when figuring out SSA %#x", mir->dalvikInsn.opcode);
+             break;
+diff --git a/vm/compiler/DualDoubleDivOpt.cpp b/vm/compiler/DualDoubleDivOpt.cpp
+deleted file mode 100755
+index f2dc0e7..0000000
+--- a/vm/compiler/DualDoubleDivOpt.cpp
++++ /dev/null
+@@ -1,679 +0,0 @@
+-/*
+- * Copyright (C) 2013 Intel Corporation
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-/*
+- * Optimization to replace:
+- *   int-to-double A, B
+- *   int-to-double C, D
+- *   div-double E, F, A
+- *   div-double G, H, C
+- * where the second div-double's inputs do not depend on the result of the first div-double
+- * with:
+- *   dual-double-div (E, F, A, B), (G, H, C, D)
+- * which performs the same operation as the replaced instructions, but for which optimized code can
+- * be generated.
+- */
+-
+-#include "CompilerIR.h"
+-#include "DualDoubleDivOpt.h"
+-
+-bool dvmCompilerDDDOGate(const CompilationUnit *cUnit, const Pass *curPass)
+-{
+-#ifdef ARCH_IA32
+-    return true;
+-#else
+-    return false;
+-#endif
+-}
+-
+-
+-void dvmCompilerDDDOOptimize (CompilationUnit *cUnit, Pass *currentPass)
+-{
+-    DualDoubleDivOpt aDDDO(*cUnit);
+-    aDDDO.optimize(cUnit->printMe);
+-
+-    //Unused argument
+-    (void) currentPass;
+-}
+-
+-static inline bool isDivDouble(MIR* pMIR)
+-{
+-    return pMIR->dalvikInsn.opcode == OP_DIV_DOUBLE;
+-}
+-
+-static inline bool isIntToDouble(MIR* pMIR)
+-{
+-    return pMIR->dalvikInsn.opcode == OP_INT_TO_DOUBLE;
+-}
+-
+-static inline bool isFloatToDouble(MIR* pMIR)
+-{
+-    return pMIR->dalvikInsn.opcode == OP_FLOAT_TO_DOUBLE;
+-}
+-
+-/**
+- * @brief Check whether an instruction's result depends on a virtual register's value.
+- *
+- * @param pOutVRegIndex  index of the virtual machine register containing the result
+- * @param pDalvikInstr   instruction for which to check whether it depends on
+- *                       the virtual register's value
+- * @return dependency enumeration value describing whether a dependency exists, or if
+- *         this cannot be determined, what dependency information is available
+- * (see definition of enum Dependency).
+- */
+-Dependency DualDoubleDivOpt::determineDependency(unsigned int pOutVRegIndex,
+-        DecodedInstruction& pDalvikInstr)
+-{
+-    switch (pDalvikInstr.opcode)
+-    {
+-        case OP_NOP:
+-        case OP_RETURN_VOID:
+-        case OP_MONITOR_ENTER:
+-        case OP_MONITOR_EXIT:
+-        case OP_CHECK_CAST:
+-        case OP_GOTO:
+-        case OP_GOTO_16:
+-        case OP_GOTO_32:
+-        case OP_RETURN_VOID_BARRIER: //kFmt10x
+-            return None;
+-
+-        case OP_MOVE:
+-        case OP_MOVE_FROM16:
+-        case OP_MOVE_16:
+-        case OP_MOVE_WIDE:
+-        case OP_MOVE_WIDE_FROM16:
+-        case OP_MOVE_WIDE_16:
+-        case OP_MOVE_OBJECT:
+-        case OP_MOVE_OBJECT_FROM16:
+-        case OP_MOVE_OBJECT_16:
+-        case OP_INSTANCE_OF:
+-        case OP_ARRAY_LENGTH:
+-        case OP_NEW_ARRAY:
+-        case OP_AGET:
+-        case OP_AGET_WIDE:
+-        case OP_AGET_OBJECT:
+-        case OP_AGET_BOOLEAN:
+-        case OP_AGET_BYTE:
+-        case OP_AGET_CHAR:
+-        case OP_AGET_SHORT:
+-        case OP_IGET:
+-        case OP_IGET_WIDE:
+-        case OP_IGET_OBJECT:
+-        case OP_IGET_BOOLEAN:
+-        case OP_IGET_BYTE:
+-        case OP_IGET_CHAR:
+-        case OP_IGET_SHORT:
+-        case OP_NEG_INT:
+-        case OP_NOT_INT:
+-        case OP_NEG_LONG:
+-        case OP_NOT_LONG:
+-        case OP_NEG_FLOAT:
+-        case OP_NEG_DOUBLE:
+-        case OP_INT_TO_LONG:
+-        case OP_INT_TO_FLOAT:
+-        case OP_INT_TO_DOUBLE:
+-        case OP_LONG_TO_INT:
+-        case OP_LONG_TO_FLOAT:
+-        case OP_LONG_TO_DOUBLE:
+-        case OP_FLOAT_TO_INT:
+-        case OP_FLOAT_TO_LONG:
+-        case OP_FLOAT_TO_DOUBLE:
+-        case OP_DOUBLE_TO_INT:
+-        case OP_DOUBLE_TO_LONG:
+-        case OP_DOUBLE_TO_FLOAT:
+-        case OP_INT_TO_BYTE:
+-        case OP_INT_TO_CHAR:
+-        case OP_INT_TO_SHORT:
+-        case OP_ADD_INT_LIT16:
+-        case OP_RSUB_INT:
+-        case OP_MUL_INT_LIT16:
+-        case OP_DIV_INT_LIT16:
+-        case OP_REM_INT_LIT16:
+-        case OP_AND_INT_LIT16:
+-        case OP_OR_INT_LIT16:
+-        case OP_XOR_INT_LIT16:
+-        case OP_ADD_INT_LIT8:
+-        case OP_RSUB_INT_LIT8:
+-        case OP_MUL_INT_LIT8:
+-        case OP_DIV_INT_LIT8:
+-        case OP_REM_INT_LIT8:
+-        case OP_AND_INT_LIT8:
+-        case OP_OR_INT_LIT8:
+-        case OP_XOR_INT_LIT8:
+-        case OP_SHL_INT_LIT8:
+-        case OP_SHR_INT_LIT8:
+-        case OP_USHR_INT_LIT8:
+-        case OP_IGET_VOLATILE: //kFmt22c
+-        case OP_IGET_OBJECT_VOLATILE: //kFmt22c
+-        case OP_IGET_WIDE_VOLATILE: //kFmt22c
+-        case OP_IGET_QUICK: //kFmt22cs
+-        case OP_IGET_WIDE_QUICK: //kFmt22cs
+-        case OP_IGET_OBJECT_QUICK: //kFmt22cs
+-            if (pDalvikInstr.vB == pOutVRegIndex) {
+-                return Some;
+-            }
+-
+-            if (pDalvikInstr.vA == pOutVRegIndex) {
+-                return Dead;
+-            }
+-
+-            return None;
+-
+-        case OP_MOVE_RESULT:
+-        case OP_MOVE_RESULT_WIDE:
+-        case OP_MOVE_RESULT_OBJECT:
+-        case OP_MOVE_EXCEPTION:
+-        case OP_CONST_4:
+-        case OP_CONST_16:
+-        case OP_CONST:
+-        case OP_CONST_HIGH16:
+-        case OP_CONST_WIDE_16:
+-        case OP_CONST_WIDE_32:
+-        case OP_CONST_WIDE:
+-        case OP_CONST_WIDE_HIGH16:
+-        case OP_CONST_STRING:
+-        case OP_CONST_STRING_JUMBO:
+-        case OP_CONST_CLASS:
+-        case OP_NEW_INSTANCE:
+-        case OP_SGET:
+-        case OP_SGET_WIDE:
+-        case OP_SGET_OBJECT:
+-        case OP_SGET_BOOLEAN:
+-        case OP_SGET_BYTE:
+-        case OP_SGET_CHAR:
+-        case OP_SGET_SHORT:
+-        case OP_SGET_VOLATILE: //kFmt21c
+-        case OP_SGET_WIDE_VOLATILE: //kFmt21c
+-        case OP_SGET_OBJECT_VOLATILE: //kFmt21c
+-            if (pDalvikInstr.vA == pOutVRegIndex) {
+-                return Dead;
+-            }
+-
+-            return None;
+-
+-        case OP_RETURN:
+-        case OP_RETURN_WIDE:
+-        case OP_RETURN_OBJECT:
+-            if (pDalvikInstr.vA == pOutVRegIndex) {
+-                return Return;
+-            }
+-
+-            return None;
+-
+-        case OP_FILLED_NEW_ARRAY:
+-        case OP_FILLED_NEW_ARRAY_RANGE:
+-        case OP_THROW:
+-        case OP_PACKED_SWITCH:
+-        case OP_SPARSE_SWITCH:
+-        case OP_IF_EQ:
+-        case OP_IF_NE:
+-        case OP_IF_LT:
+-        case OP_IF_GE:
+-        case OP_IF_GT:
+-        case OP_IF_LE:
+-        case OP_IF_EQZ:
+-        case OP_IF_NEZ:
+-        case OP_IF_LTZ:
+-        case OP_IF_GEZ:
+-        case OP_IF_GTZ:
+-        case OP_IF_LEZ:
+-        case OP_INVOKE_VIRTUAL:
+-        case OP_INVOKE_SUPER:
+-        case OP_INVOKE_DIRECT:
+-        case OP_INVOKE_STATIC:
+-        case OP_INVOKE_INTERFACE:
+-        case OP_INVOKE_VIRTUAL_RANGE:
+-        case OP_INVOKE_SUPER_RANGE:
+-        case OP_INVOKE_DIRECT_RANGE:
+-        case OP_INVOKE_STATIC_RANGE:
+-        case OP_INVOKE_INTERFACE_RANGE:
+-        case OP_INVOKE_VIRTUAL_QUICK: //kFmt35ms
+-        case OP_INVOKE_VIRTUAL_QUICK_RANGE: //kFmt3rms
+-        case OP_INVOKE_SUPER_QUICK: //kFmt35ms
+-        case OP_INVOKE_SUPER_QUICK_RANGE: //kFmt3rms
+-        case OP_BREAKPOINT: //kFmt00x
+-        case OP_THROW_VERIFICATION_ERROR: //kFmt20bc
+-        case OP_EXECUTE_INLINE: //kFmt35mi
+-        case OP_EXECUTE_INLINE_RANGE: //kFmt3rmi
+-        case OP_INVOKE_OBJECT_INIT_RANGE: //kFmt35c
+-            // Don't know where we are going next, or too complicated to figure out dependency
+-            return Unknown;
+-
+-        case OP_FILL_ARRAY_DATA:
+-            if (pDalvikInstr.vA == pOutVRegIndex) {
+-                return Unknown;
+-            }
+-
+-            return None;
+-
+-        case OP_CMPL_FLOAT:
+-        case OP_CMPG_FLOAT:
+-        case OP_CMPL_DOUBLE:
+-        case OP_CMPG_DOUBLE:
+-        case OP_CMP_LONG:
+-        case OP_ADD_INT:
+-        case OP_SUB_INT:
+-        case OP_MUL_INT:
+-        case OP_DIV_INT:
+-        case OP_REM_INT:
+-        case OP_AND_INT:
+-        case OP_OR_INT:
+-        case OP_XOR_INT:
+-        case OP_SHL_INT:
+-        case OP_SHR_INT:
+-        case OP_USHR_INT:
+-        case OP_ADD_LONG:
+-        case OP_SUB_LONG:
+-        case OP_MUL_LONG:
+-        case OP_DIV_LONG:
+-        case OP_REM_LONG:
+-        case OP_AND_LONG:
+-        case OP_OR_LONG:
+-        case OP_XOR_LONG:
+-        case OP_SHL_LONG:
+-        case OP_SHR_LONG:
+-        case OP_USHR_LONG:
+-        case OP_ADD_FLOAT:
+-        case OP_SUB_FLOAT:
+-        case OP_MUL_FLOAT:
+-        case OP_DIV_FLOAT:
+-        case OP_REM_FLOAT:
+-        case OP_ADD_DOUBLE:
+-        case OP_SUB_DOUBLE:
+-        case OP_MUL_DOUBLE:
+-        case OP_DIV_DOUBLE:
+-        case OP_REM_DOUBLE:
+-            if (pDalvikInstr.vB == pOutVRegIndex || pDalvikInstr.vC == pOutVRegIndex) {
+-                return Some;
+-            }
+-
+-            if (pDalvikInstr.vA == pOutVRegIndex) {
+-                return Dead;
+-            }
+-
+-            return None;
+-
+-        case OP_APUT:
+-        case OP_APUT_WIDE:
+-        case OP_APUT_OBJECT:
+-        case OP_APUT_BOOLEAN:
+-        case OP_APUT_BYTE:
+-        case OP_APUT_CHAR:
+-        case OP_APUT_SHORT:
+-        case OP_SPUT:
+-        case OP_SPUT_WIDE:
+-        case OP_SPUT_OBJECT:
+-        case OP_SPUT_BOOLEAN:
+-        case OP_SPUT_BYTE:
+-        case OP_SPUT_CHAR:
+-        case OP_SPUT_SHORT:
+-        case OP_SPUT_VOLATILE: //kFmt21c
+-        case OP_SPUT_WIDE_VOLATILE: //kFmt21c
+-        case OP_SPUT_OBJECT_VOLATILE: //kFmt21c
+-            if (pDalvikInstr.vA == pOutVRegIndex) {
+-                return Memory;
+-            }
+-
+-            return None;
+-
+-        case OP_IPUT:
+-        case OP_IPUT_WIDE:
+-        case OP_IPUT_OBJECT:
+-        case OP_IPUT_BOOLEAN:
+-        case OP_IPUT_BYTE:
+-        case OP_IPUT_CHAR:
+-        case OP_IPUT_SHORT:
+-        case OP_IPUT_VOLATILE: //kFmt22c
+-        case OP_IPUT_WIDE_VOLATILE: //kFmt22c
+-        case OP_IPUT_QUICK: //kFmt22cs
+-        case OP_IPUT_WIDE_QUICK: //kFmt22cs
+-        case OP_IPUT_OBJECT_QUICK: //kFmt22cs
+-        case OP_IPUT_OBJECT_VOLATILE: //kFmt22c
+-            if (pDalvikInstr.vA == pOutVRegIndex || pDalvikInstr.vB == pOutVRegIndex) {
+-                return Memory;
+-            }
+-
+-            return None;
+-
+-        case OP_UNUSED_3E:
+-        case OP_UNUSED_3F:
+-        case OP_UNUSED_40:
+-        case OP_UNUSED_41:
+-        case OP_UNUSED_42:
+-        case OP_UNUSED_43:
+-        case OP_UNUSED_73:
+-        case OP_UNUSED_79:
+-        case OP_UNUSED_7A:
+-        case OP_UNUSED_FF: //kFmt00x
+-            ALOGE("DDDO: Invalid opcode %d", pDalvikInstr.opcode);
+-            dvmCompilerAbort(&mCompilationUnit);
+-            break;
+-        default:
+-            break;
+-    }
+-    return Unknown;
+-}
+-
+-/*
+- * See DualDoubleDivOpt.h
+- */
+-inline MIR* DualDoubleDivOpt::nextMIR(MIR* pMIR)
+-{
+-    BasicBlock* aBasicBlock;
+-
+-    if (pMIR != NULL) {
+-        aBasicBlock = pMIR->bb;
+-    }
+-    else {
+-        return NULL;
+-    }
+-
+-    if (aBasicBlock == NULL) {
+-        // No block
+-        return NULL;
+-    }
+-
+-    MIR* aMIR = pMIR->next;
+-    while (aMIR == NULL)
+-    {
+-        // Try the next block
+-        if ((static_cast<size_t>(aBasicBlock->id + 1)) >= mCompilationUnit.blockList.numUsed) {
+-            // No next block
+-            break;
+-        }
+-
+-        aBasicBlock = (BasicBlock *) dvmGrowableListGetElement(&mCompilationUnit.blockList,
+-                    aBasicBlock->id + 1);
+-        assert(aBasicBlock != 0);
+-        aMIR = aBasicBlock->firstMIRInsn;
+-    }
+-    return aMIR;
+-}
+-
+-/*
+- * @brief Determine whether two MIR instructions have a dependency, i.e. if the second instruction's
+- * inputs depend on the first instruction's output.
+- *
+- * @details Iterates over the MIR instructions from the first (exclusive) to the second (inclusive) and
+- * determines whether a dependency exists to the first instruction.
+- * - If a dependency is found:
+- *   -- If we have reached the second instruction then there is a dependency
+- *   -- If the current instruction stores a result to memory or is a return, we are (currently)
+- *      unable to determine a dependency and err on the side of caution, i.e. assume there is
+- *      one
+- *   -- Determine whether there is a dependency between the current instruction and the second
+- *      instruction, and if so, then there is a dependency
+- *   -- Otherwise try the next instruction
+- * - If no dependency is found:
+- *   -- If we have reached the second instruction then there is no dependency
+- *   -- If the instruction overwrites the result of the first instruction then there can be no
+- *      dependency because the result is dead.
+- *   -- Otherwise try the next instruction
+- * - If it is unknown whether there is a dependency because we have encountered conditional
+- *   control flow or a throw, we are (currently) unable to determine a dependency and err on the
+- *   side of caution, i.e. assume there is one
+- *
+- * @param pMIR1  first instruction
+- * @param pMIR2  second instruction
+- * @return   false if it could be proven that there is no dependency between the first and the second
+- *          instruction, true otherwise
+- */
+-bool DualDoubleDivOpt::haveDependency(MIR* pMIR1, MIR* pMIR2)
+-{
+-    MIR* aMIR = pMIR1;
+-    while (true)
+-    {
+-        aMIR = nextMIR(aMIR);
+-        if (aMIR == NULL) {
+-            // No next MIR
+-            break;
+-        }
+-
+-        Dependency aDependency = determineDependency(pMIR1->dalvikInsn.vA,
+-                aMIR->dalvikInsn);
+-        switch (aDependency)
+-        {
+-            case Some:
+-                if (aMIR == pMIR2) {
+-                    return true;
+-                }
+-
+-                if (haveDependency(aMIR, pMIR2)) {
+-                    return true;
+-                }
+-
+-                break;
+-            case None:
+-                if (aMIR == pMIR2) {
+-                    return false;
+-                }
+-
+-                break;
+-            case Dead:
+-                return false;
+-
+-            case Memory:
+-            case Return:
+-            case Unknown:
+-                return true;
+-        }
+-    }
+-    return false;
+-}
+-
+-/*
+- * See DualDoubleDivOpt.h
+- */
+-bool DualDoubleDivOpt::undoableMoveBefore(MIR* pItem, MIR* pItemAfter)
+-{
+-    assert(pItem);
+-    assert(pItemAfter);
+-    MIR* aMIR = nextMIR(pItem);
+-    while (aMIR != NULL && aMIR != pItemAfter)
+-    {
+-        Dependency aDependency = determineDependency(pItem->dalvikInsn.vA,
+-                aMIR->dalvikInsn);
+-        if (aDependency != None) {
+-            return false;
+-        }
+-
+-        aMIR = nextMIR(aMIR);
+-    }
+-
+-    // aMIR shouldn't equal NULL. If this happens,
+-    // we only return false to cancel the optimization.
+-    if(aMIR == NULL) {
+-        return false;
+-    }
+-
+-    addUndo(pItem->next, pItemAfter);
+-    dvmCompilerRemoveMIR(pItem);
+-    dvmCompilerInsertMIRBefore(pItemAfter->bb, pItemAfter, pItem);
+-    return true;
+-}
+-
+-/*
+- * See DualDoubleDivOpt.h
+- */
+-void DualDoubleDivOpt::undoMoves(void)
+-{
+-    for (int i = mUndoInfos.size() - 1; i >= 0; i -= 1)
+-    {
+-        dvmCompilerRemoveMIR(mUndoInfos[i].mDest);
+-        dvmCompilerInsertMIRBefore(mUndoInfos[i].mOrig->bb,
+-            mUndoInfos[i].mOrig, mUndoInfos[i].mDest);
+-    }
+-    mUndoInfos.clear();
+-}
+-
+-/*
+- * See DualDoubleDivOpt.h
+- */
+-void DualDoubleDivOpt::addUndo(MIR* pOrigMIR, MIR* pDestMIR)
+-{
+-    mUndoInfos.push_back(UndoInfo(pOrigMIR, pDestMIR));
+-}
+-
+-/*
+- * See DualDoubleDivOpt.h
+- */
+-void DualDoubleDivOpt::clearUndo()
+-{
+-    mUndoInfos.clear();
+-}
+-
+-/*
+- * Constructor
+- */
+-DualDoubleDivOpt::DualDoubleDivOpt(CompilationUnit& pCompilationUnit)
+-: mCompilationUnit(pCompilationUnit)
+-{
+-}
+-
+-/*
+- * Destructor
+- */
+-DualDoubleDivOpt::~DualDoubleDivOpt()
+-{
+-}
+-
+-/**
+- * @brief find definition MIR of one register used in consumer MIR
+- * @param cUnit  compilation unit
+- * @param consumer the consumer MIR
+- * @param reg a dalvik register number
+- */
+-MIR* findDefinition (CompilationUnit *cUnit, MIR* consumer, int dalvikReg) {
+-    int i;
+-    SSARepresentation *ssa = consumer->ssaRep;
+-    assert(ssa != 0);
+-    for( i = 0; i < consumer->ssaRep->numUses; i++) {
+-        if( dalvikReg == dvmExtractSSARegister(cUnit, ssa->uses[i]) ) {
+-             break;
+-        }
+-    }
+-    assert(i < consumer->ssaRep->numUses);
+-    MIR **defWhere = ssa->defWhere;
+-    assert (defWhere != NULL);
+-    return defWhere[i];
+-}
+-
+-/**
+- * @brief Perform the optimisation if it is enabled and there are two independent double divides available.
+- * @param doLogging to enable logging of when optimization is performed
+- */
+-void DualDoubleDivOpt::optimize(bool doLogging)
+-{
+-    GrowableListIterator iterator;
+-
+-    if (mCompilationUnit.blockList.numUsed == 0) {
+-        // Compilation unit has no basic blocks
+-        return;
+-    }
+-
+-    dvmGrowableListIteratorInit(&mCompilationUnit.blockList, &iterator);
+-    BasicBlock * aBB;
+-    for (aBB = (BasicBlock *) (dvmGrowableListIteratorNext(&iterator));
+-         aBB != NULL;
+-         aBB = (BasicBlock *) (dvmGrowableListIteratorNext(&iterator))) {
+-
+-        MIR* aMIR = NULL;
+-
+-        for (aMIR = aBB->firstMIRInsn; aMIR != NULL; aMIR = aMIR->next)
+-        {
+-            if (isDivDouble(aMIR) == true)
+-            {
+-                // Find out if the DIV is eligible
+-                // Check that the denominator originated from an integer
+-                MIR *aDenominator = findDefinition (&mCompilationUnit, aMIR, aMIR->dalvikInsn.vC);
+-                if (aDenominator != NULL && isIntToDouble(aDenominator) == true)
+-                {
+-                    mToDoubles.push_back(aDenominator);
+-                    mDoubleDivs.push_back(aMIR);
+-                }
+-            }
+-            if (mDoubleDivs.size() == 2)
+-            {
+-                // Check that the two divs are independent
+-                if (haveDependency(mDoubleDivs[0], mDoubleDivs[1]) == true)
+-                {
+-                    // Discard first div found in the hope that there may be another to pair the
+-                    // second one up with
+-                    mToDoubles.pop_front();
+-                    mDoubleDivs.pop_front();
+-                }
+-                else
+-                {
+-                    // Note:
+-                    //  The current patch can only optimize one pair 2)/3)
+-                    //  since it handles the pairs sequentially. We can enhance
+-                    //  the DDDO patch to be able to identify two separate pairs
+-                    //  of DDDOs in an interleaving way like below for 1)/3) and 2)/4).
+-                    //  1) DIV A, B, C
+-                    //  2) DIV D, A, B
+-                    //  3) DIV F, G, H
+-                    //  4) DIV I, J, K
+-                    if (doLogging == true) {
+-                        ALOGE("DDDO: optimizing code\n");
+-                    }
+-                    clearUndo();
+-                    bool ok = true;
+-                    ok = ok && undoableMoveBefore(mDoubleDivs[0], mDoubleDivs[1]);
+-                    ok = ok && undoableMoveBefore(mToDoubles[1], mDoubleDivs[0]);
+-                    ok = ok && undoableMoveBefore(mToDoubles[0], mToDoubles[1]);
+-                    if (ok == false)
+-                    {
+-                        undoMoves();
+-                        if (doLogging == true) {
+-                            ALOGD("DDDO: optimization aborted, reverted to original code\n");
+-                            dvmCompilerDumpCompilationUnit(&mCompilationUnit);
+-                        }
+-                    }
+-                    else
+-                    {
+-                        // Replace the instructions with a new dual double divide operation
+-                        MIR* aDualDoubleDiv = (MIR*) dvmCompilerNew(sizeof(MIR), true);
+-                        aDualDoubleDiv->dalvikInsn.opcode = (Opcode) kMirOpDualDoubleDivide;
+-                        aDualDoubleDiv->offset = mDoubleDivs[1]->offset;
+-                        aDualDoubleDiv->width = mDoubleDivs[1]->width;
+-                        aDualDoubleDiv->dalvikInsn.vA = mDoubleDivs[0]->dalvikInsn.vA;
+-                        aDualDoubleDiv->dalvikInsn.vB = mDoubleDivs[0]->dalvikInsn.vB;
+-                        aDualDoubleDiv->dalvikInsn.vC = mDoubleDivs[0]->dalvikInsn.vC;
+-                        aDualDoubleDiv->dalvikInsn.arg[0] = mToDoubles[0]->dalvikInsn.vB;
+-                        aDualDoubleDiv->dalvikInsn.arg[1] = mDoubleDivs[1]->dalvikInsn.vA;
+-                        aDualDoubleDiv->dalvikInsn.arg[2] = mDoubleDivs[1]->dalvikInsn.vB;
+-                        aDualDoubleDiv->dalvikInsn.arg[3] = mDoubleDivs[1]->dalvikInsn.vC;
+-                        aDualDoubleDiv->dalvikInsn.arg[4] = mToDoubles[1]->dalvikInsn.vB;
+-                        aDualDoubleDiv->dalvikInsn.vB_wide = 0;
+-
+-                        // insert new dual double division right after second division instruction
+-                        dvmCompilerInsertMIRAfter(mDoubleDivs[1]->bb, mDoubleDivs[1], aDualDoubleDiv);
+-                        // remove original instructions
+-                        dvmCompilerRemoveMIR(mDoubleDivs[1]);
+-                        dvmCompilerRemoveMIR(mDoubleDivs[0]);
+-                        dvmCompilerRemoveMIR(mToDoubles[1]);
+-                        dvmCompilerRemoveMIR(mToDoubles[0]);
+-                        mToDoubles.clear();
+-                        mDoubleDivs.clear();
+-                        if (doLogging == true) {
+-                            ALOGE("DDDO: optimization completed\n");
+-                            dvmCompilerDumpCompilationUnit(&mCompilationUnit);
+-                        }
+-                    }
+-                }
+-            }
+-        }
+-    }
+-}
+diff --git a/vm/compiler/DualDoubleDivOpt.h b/vm/compiler/DualDoubleDivOpt.h
+deleted file mode 100755
+index 9749e12..0000000
+--- a/vm/compiler/DualDoubleDivOpt.h
++++ /dev/null
+@@ -1,203 +0,0 @@
+-/*
+- * Copyright (C) 2013 Intel Corporation
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-/*
+- * Optimization to replace:
+- *   int-to-double A, B
+- *   int-to-double C, D
+- *   div-double E, F, A
+- *   div-double G, H, C
+- * where the second div-double's inputs do not depend on the result of the first div-double
+- * with:
+- *   dual-double-div (E, F, A, B), (G, H, C, D)
+- * which performs the same operation as the replaced instructions, but for which optimized code can
+- * be generated.
+- */
+-
+-#ifndef _DUAL_DOUBLE_DIV_OPT_H_
+-#define _DUAL_DOUBLE_DIV_OPT_H_
+-
+-
+-#include <deque>
+-#include "CompilerIR.h"
+-#include "Dataflow.h"
+-#include "DualDoubleDivOpt.h"
+-
+-
+-// Forward declarations
+-struct MIR;
+-struct CompilationUnit;
+-
+-/**
+- * @class UndoInfo
+- * @brief Information about the move of a MIR instruction from one position in a basic block to another
+- * position (and basic block). Used to undo a move operation if it was not valid.
+- */
+-struct UndoInfo
+-{
+-    /** @brief original position */
+-    MIR* mOrig;
+-
+-    /** @brief destination move position */
+-    MIR* mDest;
+-
+-    /** @brief Empty constructor. */
+-    UndoInfo()
+-    : mOrig(), mDest()
+-    {}
+-
+-    /**
+-     * @brief Constructor with parameters
+-     */
+-    UndoInfo(MIR* pOrigMIR, MIR* pDestMIR) {
+-        mOrig = pOrigMIR;
+-        mDest = pDestMIR;
+-    }
+-};
+-
+-/**
+- * @enum Dependency
+- * @brief Reflects dependency type between MIRs
+- */
+-enum Dependency
+-{
+-    None = false,
+-    Some = true,
+-    Memory,   // A dependency exists and the value is written to memory (and escapes analysis)
+-    Return,   // A dependency exists and the value is a return value (and escapes analysis)
+-    Dead,     // No dependency exists and furthermore the original value is overwritten, i.e. dead
+-    Unknown,  // Unknown whether a dependency exists (due to conditional control flow, complexity)
+-};
+-
+-/**
+- * @class DualDoubleDivOpt
+- * @brief Determine whether a dual-double-divide optimisation is permitted, and if so,
+- * perform the optimisation by replacing two int-to-double and div-double instructions
+- * with a dual-double-divide instruction (for which optimised code can then be generated).
+- */
+-class DualDoubleDivOpt
+-{
+-protected:
+-    /** @brief The compilation unit to scan for optimizable instruction sequences */
+-    CompilationUnit& mCompilationUnit;
+-
+-    /** @brief Two double-div MIR instructions that are suitable for optimization */
+-    std::deque<MIR*> mDoubleDivs;
+-
+-    /** @brief Two int-to-double MIR instructions that are suitable for optimization */
+-    std::deque<MIR*> mToDoubles;
+-
+-    /** @brief Undo information for MIR instruction moves performed */
+-    std::deque<UndoInfo> mUndoInfos;
+-
+-    /**
+-     * @brief Check whether an instruction's result depends on a virtual register's value.
+-     *
+-     * @param pOutVRegIndex  index of the virtual machine register containing the result
+-     * @param pDalvikInstr   instruction for which to check whether it depends on the virtual register's value
+-     * @return         dependency enumeration value describing whether a dependency exists, or if this
+-     *                cannot be determined, what dependency information is available
+-     *                (see definition of enum Dependency).
+-     */
+-    Dependency determineDependency(unsigned int pOutVRegIndex, DecodedInstruction& pDalvikInstr);
+-    /**
+-     * @brief Get the next MIR after the given MIR. WARNING: Progresses to the next block in
+-     *         block list order, i.e. only finds the correct next block for traces, not methods.
+-     * @param pMIR pointer to current MIR
+-     */
+-    inline MIR* nextMIR(MIR* pMIR);
+-
+-    /**
+-     * @brief Determine whether two MIR instructions have a dependency.
+-     * @details Determine if the second instruction's inputs depend on the first instruction's output.
+-     * WARNING: Processes basic blocks in block list order, i.e. only processes blocks in the correct
+-     * order for traces, not methods.
+-     *
+-     * Iterates over the MIR instructions from the first (exclusive) to the second (inclusive) and
+-     * determines whether a dependency exists to the first instruction.
+-     * - If a dependency is found:
+-     *   -- If we have reached the second instruction then there is a dependency
+-     *   -- If the current instruction stores a result to memory or is a return, we are (currently)
+-     *      unable to determine a dependency and err on the side of caution, i.e. assume there is
+-     *      one
+-     *   -- Determine whether there is a dependency between the current instruction and the second
+-     *      instruction, and if so, then there is a dependency
+-     *   -- Otherwise try the next instruction
+-     * - If no dependency is found:
+-     *   -- If we have reached the second instruction then there is no dependency
+-     *   -- If the instruction overwrites the result of the first instruction then there can be no
+-     *      dependency because the result is dead.
+-     *   -- Otherwise try the next instruction
+-     * - If it is unknown whether there is a dependency because we have encountered conditional
+-     *   control flow or a throw, we are (currently) unable to determine a dependency and err on the
+-     *   side of caution, i.e. assume there is one
+-     *
+-     * @param pMIR1   first instruction
+-     * @param pMIR2   second instruction
+-     * @return Returns false if it could be proven that there is no dependency between the first and
+-     *         the second instruction, true otherwise
+-     */
+-    bool haveDependency(MIR* pMIR1, MIR* pMIR2);
+-
+-    /**
+-     * @brief Remove a MIR instruction from its current position in a basic block and insert it just before
+-     * another. Remember information about the move so it can be reverted if necessary.
+-     *
+-     * @param pItem       MIR instruction to move
+-     * @param pItemAfter  MIR instruction before which to insert the moved MIR instruction
+-     */
+-    bool undoableMoveBefore(MIR* pItem, MIR* pItemAfter);
+-
+-    /** @brief Undo all moves of MIR instructions performed */
+-    void undoMoves(void);
+-
+-    /**
+-     * @brief Add undo information for a move of a MIR instruction
+-     * @param pOrigMIR pointer to MIR in original basic block record position
+-     * @param pDestMIR pointer to MIR in target basic block to record position
+-     */
+-    void addUndo(MIR* pOrigMIR, MIR* pDestMIR);
+-
+-    /**
+-     * @brief Clear all undo information for MIR instruction moves
+-     */
+-    void clearUndo(void);
+-
+-public:
+-    /** @brief constructor. */
+-    DualDoubleDivOpt(CompilationUnit& pCompilationUnit);
+-
+-    /** @brief Deconstructor */
+-    virtual ~DualDoubleDivOpt(void);
+-
+-    /**
+-     * @brief Perform the optimisation if it is enabled and there are two independent double divides available.
+-     * @param doLogging To enable logging of when optimization is performed
+-     */
+-    void optimize(bool doLogging);
+-
+-};
+-
+-
+-/**
+- * @brief Perform accumulation sinkingDDDDO optimization
+- * @param cUnit the CompilationUnit
+- * @param pass the current Pass
+- */
+-
+-void dvmCompilerDDDOOptimize (CompilationUnit *cUnit, Pass *currentPass);
+-
+-
+-#endif /* _DUAL_DOUBLE_DIV_OPT_H_ */
+diff --git a/vm/compiler/IntermediateRep.cpp b/vm/compiler/IntermediateRep.cpp
+index 7e1a203..d5b1749 100644
+--- a/vm/compiler/IntermediateRep.cpp
++++ b/vm/compiler/IntermediateRep.cpp
+@@ -99,26 +99,6 @@ void dvmCompilerPrependMIR(BasicBlock *bb, MIR *mir)
+     mir->bb = bb;
+ }
+ 
+-/*
+- * @brief Insert an MIR instruction before the specified MIR
+- * @param bb the BasicBlock
+- * @param currentMIR the specified mir to insert before
+- * @param newMIR the mir to insert
+- */
+-void dvmCompilerInsertMIRBefore(BasicBlock *bb, MIR *currentMIR, MIR *newMIR)
+-{
+-    assert(currentMIR->prev != NULL);
+-    MIR *prevMIR = currentMIR->prev;
+-
+-    prevMIR->next = newMIR;
+-    newMIR->prev = prevMIR;
+-    newMIR->next = currentMIR;
+-    currentMIR->prev = newMIR;
+-
+-    //Set BB for mir
+-    newMIR->bb = bb;
+-}
+-
+ /* Insert an MIR instruction after the specified MIR */
+ void dvmCompilerInsertMIRAfter(BasicBlock *bb, MIR *currentMIR, MIR *newMIR)
+ {
+diff --git a/vm/compiler/LoopOpt.cpp b/vm/compiler/LoopOpt.cpp
+index 4b190ed..53ed591 100644
+--- a/vm/compiler/LoopOpt.cpp
++++ b/vm/compiler/LoopOpt.cpp
+@@ -17,7 +17,6 @@
+ #include <dlfcn.h>
+ 
+ #include "AccumulationSinking.h"
+-#include "DualDoubleDivOpt.h"
+ #include "BBOptimization.h"
+ #include "Checks.h"
+ #include "Dalvik.h"
+@@ -82,8 +81,6 @@ START_PASSES
+               dvmCompilerIgetIputRemoval, 0, 0, 0, kOptimizationBasicBlockChange),
+     NEW_PASS ("Accumulation_Sinking", kAllNodes, 0, dvmCompilerSinkAccumulationsGate,
+             0, dvmCompilerAccumulationSinking, 0, 0, kOptimizationBasicBlockChange),
+-    NEW_PASS ("DDDO_Optimization", kAllNodes, 0, dvmCompilerDDDOGate,
+-            0, dvmCompilerDDDOOptimize, 0, 0, kOptimizationBasicBlockChange),
+     //This should be after the last optimization that changes instruction sequence or BB logic
+     //Note: reorder is safe and should be after
+     //We do registerization for all traces to provide spill information to the BE
+diff --git a/vm/compiler/LoopOpt.h b/vm/compiler/LoopOpt.h
+index 4e2d5ad..7b9646c 100644
+--- a/vm/compiler/LoopOpt.h
++++ b/vm/compiler/LoopOpt.h
+@@ -89,14 +89,6 @@ void dvmCompilerPrintIgnorePasses (void);
+ bool dvmCompilerSinkAccumulationsGate (const CompilationUnit *cUnit, const Pass *curPass);
+ 
+ /**
+- * @brief Verify that DDDO optimization is on
+- * @param cUnit the CompilationUnit
+- * @param curPass the Pass
+- * @return check whether the DDDO optimization is applicable
+- */
+-bool dvmCompilerDDDOGate (const CompilationUnit *cUnit, const Pass *curPass);
+-
+-/**
+  * @brief Check if the loops are formed the way we want (nested / branches on / off)
+  * @param cUnit the CompilationUnit
+  * @param curPass the Pass
+diff --git a/vm/compiler/codegen/x86/AnalysisO1.cpp b/vm/compiler/codegen/x86/AnalysisO1.cpp
+index a0d862b..e2ff0251 100644
+--- a/vm/compiler/codegen/x86/AnalysisO1.cpp
++++ b/vm/compiler/codegen/x86/AnalysisO1.cpp
+@@ -1249,7 +1249,6 @@ bool skipExtendedMir(Opcode opc) {
+ 
+     switch (extendedOpCode) {
+         case kMirOpRegisterize:
+-        case kMirOpDualDoubleDivide:
+             return false;
+         default:
+             return true;
+diff --git a/vm/compiler/codegen/x86/BytecodeVisitor.cpp b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+index 068c806..2e5537d 100644
+--- a/vm/compiler/codegen/x86/BytecodeVisitor.cpp
++++ b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+@@ -622,16 +622,6 @@ int getConstInfo(BasicBlock_O1* bb, const MIR * currentMIR) {
+     if (currentMIR->dalvikInsn.opcode >= static_cast<Opcode> (kMirOpFirst)) {
+         //Currently no extended MIR generates constants
+         switch (static_cast<ExtendedMIROpcode>(currentMIR->dalvikInsn.opcode)) {
+-            case kMirOpDualDoubleDivide:
+-                addConstKill(currentMIR->dalvikInsn.vA);
+-                addConstKill(currentMIR->dalvikInsn.vA + 1);
+-                addConstKill(currentMIR->dalvikInsn.vC);
+-                addConstKill(currentMIR->dalvikInsn.vC + 1);
+-                addConstKill(currentMIR->dalvikInsn.arg[1]);
+-                addConstKill(currentMIR->dalvikInsn.arg[1] + 1);
+-                addConstKill(currentMIR->dalvikInsn.arg[3]);
+-                addConstKill(currentMIR->dalvikInsn.arg[3] + 1);
+-                return 0;
+             default:
+                 // No constant is generated
+                 return 0;
+@@ -1538,51 +1528,6 @@ int getVirtualRegInfo (VirtualRegInfo* infoArray, const MIR * currentMIR, bool u
+                 }
+                 num_regs_per_bytecode = 1;
+                 break;
+-            case kMirOpDualDoubleDivide:
+-                // (int-to-double arg[0], vC), (int-to-double arg[4], arg[3])
+-                // (div-double vA, vB, vC), (div-double arg[1], arg[2], arg[3])
+-                infoArray[7].regNum = currentMIR->dalvikInsn.vA;
+-                infoArray[7].refCount = 1;
+-                infoArray[7].accessType = REGACCESS_D;
+-                infoArray[7].physicalType = LowOpndRegType_xmm;
+-
+-                infoArray[6].regNum = currentMIR->dalvikInsn.vB;
+-                infoArray[6].refCount = 2;
+-                infoArray[6].accessType = REGACCESS_U;
+-                infoArray[6].physicalType = LowOpndRegType_xmm;
+-
+-                infoArray[5].regNum = currentMIR->dalvikInsn.vC;
+-                infoArray[5].refCount = 2;
+-                infoArray[5].accessType = REGACCESS_UD;
+-                infoArray[5].physicalType = LowOpndRegType_xmm;
+-
+-                infoArray[4].regNum = currentMIR->dalvikInsn.arg[0];
+-                infoArray[4].refCount = 2;
+-                infoArray[4].accessType = REGACCESS_U;
+-                infoArray[4].physicalType = LowOpndRegType_gp;
+-
+-                infoArray[3].regNum = currentMIR->dalvikInsn.arg[1];
+-                infoArray[3].refCount = 1;
+-                infoArray[3].accessType = REGACCESS_D;
+-                infoArray[3].physicalType = LowOpndRegType_xmm;
+-
+-                infoArray[2].regNum = currentMIR->dalvikInsn.arg[2];
+-                infoArray[2].refCount = 2;
+-                infoArray[2].accessType = REGACCESS_U;
+-                infoArray[2].physicalType = LowOpndRegType_xmm;
+-
+-                infoArray[1].regNum = currentMIR->dalvikInsn.arg[3];
+-                infoArray[1].refCount = 2;
+-                infoArray[1].accessType = REGACCESS_UD;
+-                infoArray[1].physicalType = LowOpndRegType_xmm;
+-
+-                infoArray[0].regNum = currentMIR->dalvikInsn.arg[4];
+-                infoArray[0].refCount = 2;
+-                infoArray[0].accessType = REGACCESS_U;
+-                infoArray[0].physicalType = LowOpndRegType_gp;
+-
+-                num_regs_per_bytecode = 8;
+-                break;
+             default:
+                 ALOGI("JIT_INFO: Extended MIR not supported in getVirtualRegInfo");
+                 SET_JIT_ERROR(kJitErrorUnsupportedBytecode);
+@@ -3692,41 +3637,6 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+                         break;
+                 }
+                 return 1;
+-            case kMirOpDualDoubleDivide:
+-            {
+-                unsigned int aRegCount = 0;
+-                infoArray[aRegCount].regNum = 8;
+-                infoArray[aRegCount].refCount = 2;
+-                infoArray[aRegCount++].physicalType = LowOpndRegType_gp;
+-                infoArray[aRegCount].regNum = 9;
+-                infoArray[aRegCount].refCount = 2;
+-                infoArray[aRegCount++].physicalType = LowOpndRegType_gp;
+-                infoArray[aRegCount].regNum = 10;
+-                infoArray[aRegCount].refCount = 20;
+-                infoArray[aRegCount++].physicalType = LowOpndRegType_xmm;
+-                infoArray[aRegCount].regNum = 11;
+-                infoArray[aRegCount].refCount = 12;
+-                infoArray[aRegCount++].physicalType = LowOpndRegType_xmm;
+-                infoArray[aRegCount].regNum = 12;
+-                infoArray[aRegCount].refCount = 13;
+-                infoArray[aRegCount++].physicalType = LowOpndRegType_xmm;
+-                infoArray[aRegCount].regNum = 13;
+-                infoArray[aRegCount].refCount = 9;
+-                infoArray[aRegCount++].physicalType = LowOpndRegType_xmm;
+-                infoArray[aRegCount].regNum = 14;
+-                infoArray[aRegCount].refCount = 20;
+-                infoArray[aRegCount++].physicalType = LowOpndRegType_xmm;
+-                infoArray[aRegCount].regNum = 15;
+-                infoArray[aRegCount].refCount = 12;
+-                infoArray[aRegCount++].physicalType = LowOpndRegType_xmm;
+-                infoArray[aRegCount].regNum = 16;
+-                infoArray[aRegCount].refCount = 13;
+-                infoArray[aRegCount++].physicalType = LowOpndRegType_xmm;
+-                infoArray[aRegCount].regNum = 17;
+-                infoArray[aRegCount].refCount = 9;
+-                infoArray[aRegCount++].physicalType = LowOpndRegType_xmm;
+-                return aRegCount;
+-            }
+             default:
+                 ALOGI("JIT_INFO: Extended MIR not supported in getTempRegInfo");
+                 SET_JIT_ERROR(kJitErrorUnsupportedBytecode);
+diff --git a/vm/compiler/codegen/x86/CodegenInterface.cpp b/vm/compiler/codegen/x86/CodegenInterface.cpp
+index f1114bf..347a05b 100644
+--- a/vm/compiler/codegen/x86/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/CodegenInterface.cpp
+@@ -1374,12 +1374,6 @@ bool handleExtendedMIR (CompilationUnit *cUnit, BasicBlock_O1 *bb, MIR *mir)
+             break;
+         }
+ #endif
+-        case kMirOpDualDoubleDivide:
+-        {
+-            gDvm.executionMode = kExecutionModeNcgO1;
+-            genDualDoubleDivide(cUnit, mir);
+-            break;
+-        }
+         default:
+         {
+             char * decodedString = dvmCompilerGetDalvikDisassembly(&mir->dalvikInsn, NULL);
+diff --git a/vm/compiler/codegen/x86/InstructionGeneration.cpp b/vm/compiler/codegen/x86/InstructionGeneration.cpp
+index c8e4c89..c6edaad 100644
+--- a/vm/compiler/codegen/x86/InstructionGeneration.cpp
++++ b/vm/compiler/codegen/x86/InstructionGeneration.cpp
+@@ -342,174 +342,3 @@ bool genRegisterize (CompilationUnit *cUnit, BasicBlock_O1 *bb, MIR *mir)
+     //If we get here, everything was handled
+     return true;
+ }
+-
+-/**
+- * @brief Generate code for MirOpDualDoubleDivide.
+- * @details An interleaved Newton-Raphson algorithm is used that provides the accuracy
+- * of normal double calculations. Due to the long latency and blocking nature of
+- * floating point divides on Atom this is actually much faster. Moreover, it allows
+- * interleaving of operations between hyperthreads which is not possible with the fully
+- * blocking divide instruction.
+- *
+- * vA = Result of division 1
+- * vB = Numerator of division 1
+- * vC = Denominator (double) of division 1
+- * arg[0] = Denominator (int) of division 1
+- * arg[1] = Result of division 2
+- * arg[2] = Numerator of division 2
+- * arg[3] = Denominator (double) of division 2
+- * arg[4] = Denominator (int) of division 2
+- * vB_wide = type (currently fixed to double numerator, integer denominator)
+- *
+- * @param cUnit pointer to compilation unit
+- * @param mir pointer to a dual double division MIR
+- */
+-void genDualDoubleDivide(CompilationUnit *cUnit, MIR *mir)
+-{
+-    //     cvtsi2sd arg[0], vC      // convert integer denominator a to double (da) (for original
+-    //                              // int-to-double)
+-    get_virtual_reg(mir->dalvikInsn.arg[0], OpndSize_32, 9, false);
+-    alu_cvt_si2sd(9, false, 13, false);
+-    set_VR_sd(mir->dalvikInsn.vC, 13, false);
+-    //     cmp arg[0], #0           // compare denominator A (as integer)
+-    compare_imm_VR(OpndSize_32, 0, mir->dalvikInsn.arg[0]);
+-    //     cvtsi2sd arg[4], arg[3]  // convert integer denominator B to double (db) (for original
+-    //                              // int-to-double)
+-    get_virtual_reg(mir->dalvikInsn.arg[4], OpndSize_32, 8, false);
+-    alu_cvt_si2sd(8, false, 17, false);
+-    set_VR_sd(mir->dalvikInsn.arg[3], 17, false);
+-    //     jle OriginalDiv          // if denominator A is not positive, go to original division
+-    conditional_jump(Condition_LE, ".OriginalDiv", true);
+-    rememberState(1);
+-    //     cmp arg[4], #0           // compare denominator B (as integer)
+-    compare_imm_VR(OpndSize_32, 0, mir->dalvikInsn.arg[4]);
+-    //     jgt NewtonRaphson        // if denominator B is positive, go to Newton-Raphson algorithm
+-    transferToState(1);
+-    conditional_jump(Condition_G, ".NewtonRaphson", true);
+-
+-    // OriginalDiv:
+-    insertLabel(".OriginalDiv", true);
+-    //     divss vA, vB, vC
+-    get_VR_sd(mir->dalvikInsn.vB, 12, false);
+-    // alu_sd_binary_reg_reg(div_opc, denominator, isPhysical, numerator/result, isPhysical);
+-    alu_sd_binary_reg_reg(div_opc, 12, false, 13, false);
+-    set_VR_sd(mir->dalvikInsn.vA, 13, false);
+-    //     divss arg[1], arg[2], arg[3]
+-    get_VR_sd(mir->dalvikInsn.arg[2], 16, false);
+-    // alu_sd_binary_reg_reg(div_opc, denominator, isPhysical, numerator/result, isPhysical);
+-    alu_sd_binary_reg_reg(div_opc, 16, false, 17, false);
+-    set_VR_sd(mir->dalvikInsn.arg[1], 17, false);
+-    //     jmp End
+-    rememberState(2);
+-    unconditional_jump(".End", false);
+-
+-    // NewtonRaphson:
+-    insertLabel(".NewtonRaphson", true);
+-    goToState(1);
+-    // // Setup (xmm3=vC, xmm7=arg[3]
+-    //     cvtsd2ss xmm3    xmm0    // Convert da to float
+-    alu_cvt_sd2ss(13, false, 10, false);
+-    //     cvtsd2ss xmm7    xmm4    // Convert db to float
+-    alu_cvt_sd2ss(17, false, 14, false);
+-    //     rcpss    xmm0    xmm0    // Calculate 1/da as a float
+-    alu_rcpss(10, false, 10, false);
+-    //     cvtss2sd xmm0    xmm0    // Convert 1/da to a double
+-    alu_cvt_ss2sd(10, false, 10, false);
+-    //     rcpss    xmm4    xmm4    // Calculate 1/db as a float
+-    alu_rcpss(14, false, 14, false);
+-    //     cvtss2sd xmm4    xmm4    // Convert 1/db to a double
+-    alu_cvt_ss2sd(14, false, 14, false);
+-
+-    // // Iteration 1
+-    //     movsd    xmm0    xmm1    // Copy 1/da
+-    move_sd_reg_to_sd_reg(10, false, 11, false);
+-    //     movsd    xmm0    xmm2    // Copy 1/da
+-    move_sd_reg_to_sd_reg(10, false, 12, false);
+-    //     movsd    xmm4    xmm5    // Copy 1/db
+-    move_sd_reg_to_sd_reg(14, false, 15, false);
+-    //     movsd    xmm4    xmm6    // Copy 1/db
+-    move_sd_reg_to_sd_reg(14, false, 16, false);
+-    //     mulsd    xmm3    xmm1    // Calculate da*1/da
+-    alu_sd_binary_reg_reg(mul_opc, 13, false, 11, false);
+-    //     addsd    xmm2    xmm0    // Calculate 2*1/da
+-    alu_sd_binary_reg_reg(add_opc, 12, false, 10, false);
+-    //     mulsd    xmm7    xmm5    // Calculate db*1/db
+-    alu_sd_binary_reg_reg(mul_opc, 17, false, 15, false);
+-    //     addsd    xmm6    xmm4    // Calculate 2*1/db
+-    alu_sd_binary_reg_reg(add_opc, 16, false, 14, false);
+-    //     mulsd    xmm2    xmm1    // Calculate da*1/da*1/da
+-    alu_sd_binary_reg_reg(mul_opc, 12, false, 11, false);
+-    //     mulsd    xmm6    xmm5    // Calculate db*1/db*1/db
+-    alu_sd_binary_reg_reg(mul_opc, 16, false, 15, false);
+-    //     subsd    xmm1    xmm0    // 1/da=(2*1/da)-(da*1/da*1/da)
+-    alu_sd_binary_reg_reg(sub_opc, 11, false, 10, false);
+-    //     subsd    xmm5    xmm4    // 1/db=(2*1/db)-(db*1/db*1/db)
+-    alu_sd_binary_reg_reg(sub_opc, 15, false, 14, false);
+-
+-    // // Iteration 2
+-    //     movsd    xmm0    xmm1    // Copy 1/da
+-    move_sd_reg_to_sd_reg(10, false, 11, false);
+-    //     movsd    xmm0    xmm2    // Copy 1/da
+-    move_sd_reg_to_sd_reg(10, false, 12, false);
+-    //     movsd    xmm4    xmm5    // Copy 1/db
+-    move_sd_reg_to_sd_reg(14, false, 15, false);
+-    //     movsd    xmm4    xmm6    // Copy 1/db
+-    move_sd_reg_to_sd_reg(14, false, 16, false);
+-    //     mulsd    xmm3    xmm1    // Calculate da*1/da
+-    alu_sd_binary_reg_reg(mul_opc, 13, false, 11, false);
+-    //     addsd    xmm2    xmm0    // Calculate 2*1/da
+-    alu_sd_binary_reg_reg(add_opc, 12, false, 10, false);
+-    //     mulsd    xmm7    xmm5    // Calculate db*1/db
+-    alu_sd_binary_reg_reg(mul_opc, 17, false, 15, false);
+-    //     addsd    xmm6    xmm4    // Calculate 2*1/db
+-    alu_sd_binary_reg_reg(add_opc, 16, false, 14, false);
+-    //     mulsd    xmm2    xmm1    // Calculate da*1/da*1/da
+-    alu_sd_binary_reg_reg(mul_opc, 12, false, 11, false);
+-    //     mulsd    xmm6    xmm5    // Calculate db*1/db*1/db
+-    alu_sd_binary_reg_reg(mul_opc, 16, false, 15, false);
+-    //     subsd    xmm1    xmm0    // 1/da=(2*1/da)-(da*1/da*1/da)
+-    alu_sd_binary_reg_reg(sub_opc, 11, false, 10, false);
+-    //     subsd    xmm5    xmm4    // 1/db=(2*1/db)-(db*1/db*1/db)
+-    alu_sd_binary_reg_reg(sub_opc, 15, false, 14, false);
+-
+-    // // Iteration 3
+-    //     movsd    xmm0    xmm1    // Copy 1/da
+-    move_sd_reg_to_sd_reg(10, false, 11, false);
+-    //     movsd    xmm0    xmm2    // Copy 1/da
+-    move_sd_reg_to_sd_reg(10, false, 12, false);
+-    //     movsd    xmm4    xmm5    // Copy 1/db
+-    move_sd_reg_to_sd_reg(14, false, 15, false);
+-    //     movsd    xmm4    xmm6    // Copy 1/db
+-    move_sd_reg_to_sd_reg(14, false, 16, false);
+-    //     mulsd    xmm3    xmm1    // Calculate da*1/da
+-    alu_sd_binary_reg_reg(mul_opc, 13, false, 11, false);
+-    //     addsd    xmm2    xmm0    // Calculate 2*1/da
+-    alu_sd_binary_reg_reg(add_opc, 12, false, 10, false);
+-    //     mulsd    xmm7    xmm5    // Calculate db*1/db
+-    alu_sd_binary_reg_reg(mul_opc, 17, false, 15, false);
+-    //     addsd    xmm6    xmm4    // Calculate 2*1/db
+-    alu_sd_binary_reg_reg(add_opc, 16, false, 14, false);
+-    //     mulsd    xmm2    xmm1    // Calculate da*1/da*1/da
+-    alu_sd_binary_reg_reg(mul_opc, 12, false, 11, false);
+-    //     mulsd    xmm6    xmm5    // Calculate db*1/db*1/db
+-    alu_sd_binary_reg_reg(mul_opc, 16, false, 15, false);
+-    //     subsd    xmm1    xmm0    // 1/da=(2*1/da)-(da*1/da*1/da)
+-    alu_sd_binary_reg_reg(sub_opc, 11, false, 10, false);
+-    //     subsd    xmm5    xmm4    // 1/db=(2*1/db)-(db*1/db*1/db)
+-    alu_sd_binary_reg_reg(sub_opc, 15, false, 14, false);
+-    // // Computation of reciprocals complete
+-
+-    // // Multiply with numerators TODO: Skip if possible (i.e. numerator == 1.0)
+-    get_VR_sd(mir->dalvikInsn.vB, 12, false);
+-    get_VR_sd(mir->dalvikInsn.arg[2], 16, false);
+-    //    mulsd     vA, vB, (1/vC)(xmm0)
+-    alu_sd_binary_reg_reg(mul_opc, 12, false, 10, false);
+-    //    mulsd     arg[1], arg[2], (1/arg[3])(xmm4)
+-    alu_sd_binary_reg_reg(mul_opc, 16, false, 14, false);
+-    set_VR_sd(mir->dalvikInsn.vA, 10, false);
+-    set_VR_sd(mir->dalvikInsn.arg[1], 14, false);
+-
+-    // End:
+-    transferToState(2);
+-    insertLabel(".End", true);
+-}
+diff --git a/vm/compiler/codegen/x86/InstructionGeneration.h b/vm/compiler/codegen/x86/InstructionGeneration.h
+index a795d81..da71a61 100644
+--- a/vm/compiler/codegen/x86/InstructionGeneration.h
++++ b/vm/compiler/codegen/x86/InstructionGeneration.h
+@@ -94,20 +94,4 @@ void genValidationForPredictedInline(CompilationUnit *cUnit, MIR *mir);
+  * @return Returns whether or not it successfully handled the request
+  */
+ bool genRegisterize (CompilationUnit *cUnit, BasicBlock_O1 *bb, MIR *mir);
+-
+-/**
+- * @brief Generate code for MirOpDualDoubleDivide
+- *   vA = Result of division 1
+- *   vB = Numerator of division 1
+- *   vC = Denominator (double) of division 1
+- *   arg[0] = Denominator (int) of division 1
+- *   arg[1] = Result of division 2
+- *   arg[2] = Numerator of division 2
+- *   arg[3] = Denominator (double) of division 2
+- *   arg[4] = Denominator (int) of division 2
+- * @param cUnit the CompilationUnit
+- * @param mir the MIR instruction
+- */
+-void genDualDoubleDivide(CompilationUnit *cUnit, MIR *mir);
+-
+ #endif
+diff --git a/vm/compiler/codegen/x86/Lower.h b/vm/compiler/codegen/x86/Lower.h
+index fb666ee..a28e187 100644
+--- a/vm/compiler/codegen/x86/Lower.h
++++ b/vm/compiler/codegen/x86/Lower.h
+@@ -751,9 +751,6 @@ void move_sd_mem_to_reg(int disp, int base_reg, bool isBasePhysical,
+                          int reg, bool isPhysical);
+ void move_sd_reg_to_mem(LowOp* op, int reg, bool isPhysical,
+                          int disp, int base_reg, bool isBasePhysical);
+-/** @brief move between sd registers */
+-void move_sd_reg_to_sd_reg(int srcReg, bool isSrcPhysical, int destReg,
+-                            bool isDestPhysical);
+ 
+ void conditional_jump(ConditionCode cc, const char* target, bool isShortTerm);
+ void unconditional_jump(const char* target, bool isShortTerm);
+@@ -796,15 +793,6 @@ void alu_ss_binary_reg_reg(ALU_Opcode opc, int reg, bool isPhysical,
+ void alu_sd_binary_reg_reg(ALU_Opcode opc, int reg, bool isPhysical,
+                             int reg2, bool isPhysical2);
+ 
+- /** @brief Convert 32-bit integer to double SSE 64-bit ALU */
+-void alu_cvt_si2sd(int reg, bool isPhysical, int reg2, bool isPhysical2);
+- /** @brief Convert float to double SSE 64-bit ALU */
+-void alu_cvt_ss2sd(int reg, bool isPhysical, int reg2, bool isPhysical2);
+- /** @brief Convert double to float SSE 64-bit ALU */
+-void alu_cvt_sd2ss(int reg, bool isPhysical, int reg2, bool isPhysical2);
+- /** @brief Compute float reciprocal from float SSE 32-bit ALU */
+-void alu_rcpss(int reg, bool isPhysical, int reg2, bool isPhysical2);
+-
+ void push_mem_to_stack(OpndSize size, int disp, int base_reg, bool isBasePhysical);
+ void push_reg_to_stack(OpndSize size, int reg, bool isPhysical);
+ 
+diff --git a/vm/compiler/codegen/x86/LowerHelper.cpp b/vm/compiler/codegen/x86/LowerHelper.cpp
+index bd0b365..6daf878 100644
+--- a/vm/compiler/codegen/x86/LowerHelper.cpp
++++ b/vm/compiler/codegen/x86/LowerHelper.cpp
+@@ -2234,61 +2234,6 @@ void alu_sd_binary_reg_reg(ALU_Opcode opc, int reg, bool isPhysical,
+     Mnemonic m = map_of_sse_opcode_2_mnemonic[opc];
+     dump_reg_reg(m, ATOM_NORMAL_ALU, OpndSize_64, reg, isPhysical, reg2, isPhysical2, LowOpndRegType_xmm);
+ }
+-
+-/**
+- * @brief Convert 32-bit integer to double SSE 64-bit ALU
+- * @param srcReg  The source register itself
+- * @param isPhysical Whether source is physical
+- * @param destReg The destination register itself
+- * @param isDestPhysical Whether destination is physical
+- */
+-void alu_cvt_si2sd(int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical) {
+-    dump_reg_reg_diff_types(Mnemonic_CVTSI2SD, ATOM_NORMAL,
+-            OpndSize_32, srcReg, isSrcPhysical, LowOpndRegType_gp,
+-            OpndSize_64, destReg, isDestPhysical, LowOpndRegType_xmm);
+-}
+-
+-/**
+- * @brief Convert float to double SSE 64-bit ALU
+- * @param srcReg  The source register itself
+- * @param isPhysical Whether source is physical
+- * @param destReg The destination register itself
+- * @param isDestPhysical Whether destination is physical
+- */
+-void alu_cvt_ss2sd(int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical) {
+-    dump_reg_reg_diff_types(Mnemonic_CVTSS2SD, ATOM_NORMAL,
+-            OpndSize_32, srcReg, isSrcPhysical, LowOpndRegType_xmm,
+-            OpndSize_64, destReg, isDestPhysical, LowOpndRegType_xmm);
+-}
+-
+-/**
+- * @brief Convert double to float SSE 64-bit ALU
+- * @param srcReg  The source register itself
+- * @param isPhysical Whether source is physical
+- * @param destReg The destination register itself
+- * @param isDestPhysical Whether destination is physical
+- */
+-void alu_cvt_sd2ss(int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical) {
+-    dump_reg_reg(Mnemonic_CVTSD2SS, ATOM_NORMAL, OpndSize_64, srcReg, isSrcPhysical, destReg,
+-            isDestPhysical, LowOpndRegType_xmm);
+-    dump_reg_reg_diff_types(Mnemonic_CVTSD2SS, ATOM_NORMAL,
+-            OpndSize_64, srcReg, isSrcPhysical, LowOpndRegType_xmm,
+-            OpndSize_32, destReg, isDestPhysical, LowOpndRegType_xmm);
+-}
+-
+-/**
+- * @brief Compute float reciprocal from float SSE 32-bit ALU
+- * @param srcReg  The source register itself
+- * @param isPhysical Whether source is physical
+- * @param destReg The destination register itself
+- * @param isDestPhysical Whether destination is physical
+- */
+-void alu_rcpss(int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical) {
+-    dump_reg_reg_diff_types(Mnemonic_RCPSS, ATOM_NORMAL,
+-            OpndSize_32, srcReg, isSrcPhysical, LowOpndRegType_xmm,
+-            OpndSize_32, destReg, isDestPhysical, LowOpndRegType_xmm);
+-}
+-
+ //!push reg to native stack
+ 
+ //!
+@@ -2408,48 +2353,6 @@ void move_reg_to_reg(OpndSize size,
+     Mnemonic m = (size == OpndSize_64) ? Mnemonic_MOVQ : Mnemonic_MOV;
+     dump_reg_reg(m, ATOM_NORMAL, size, reg, isPhysical, reg2, isPhysical2, getTypeFromIntSize(size));
+ }
+-
+-/**
+- * @brief  mov from one reg to another reg
+- * the register type can be defined independently for source and destination
+- * @param size The size of operand
+- * @param srcReg  The source register itself
+- * @param isSrcPhysical Whether source is physical
+- * @param srcType The type of source register
+- * @param destReg The destination register itself
+- * @param isDestPhysical Whether destination is physical
+- * @param destType destType The type of destination register
+- */
+-void move_reg_to_reg_diff_type(OpndSize size, int srcReg, bool isSrcPhysical, LowOpndRegType srcType,
+-        int destReg, bool isDestPhysical, LowOpndRegType destType) {
+-    Mnemonic aMnemonic = Mnemonic_NULL;
+-    if (srcType == LowOpndRegType_xmm && destType == LowOpndRegType_xmm) {
+-        if (size == OpndSize_64) {
+-            aMnemonic = Mnemonic_MOVSD;
+-        }
+-        else if (size == OpndSize_32) {
+-            aMnemonic = Mnemonic_MOVSS;
+-        }
+-        else {
+-            LOGW("Invalid operand size in move from XMM to XMM");
+-            SET_JIT_ERROR(kJitErrorInvalidOperandSize);
+-            return;
+-        }
+-    }
+-    else if(srcType == LowOpndRegType_xmm && destType == LowOpndRegType_gp) {
+-        aMnemonic = Mnemonic_MOVD;
+-    }
+-    else {
+-        if (size == OpndSize_64) {
+-            aMnemonic = Mnemonic_MOVQ;
+-        }
+-        else {
+-            aMnemonic = Mnemonic_MOV;
+-        }
+-    }
+-    dump_reg_reg_diff_types(aMnemonic, ATOM_NORMAL, size, srcReg, isSrcPhysical, srcType,
+-            size, destReg, isDestPhysical, destType);
+-}
+ //!mov from one reg to another reg
+ 
+ //!Sign extends the value. Only 32-bit support.
+@@ -2643,19 +2546,6 @@ void move_sd_reg_to_mem(LowOp* op, int reg, bool isPhysical,
+                         disp, base_reg, isBasePhysical,
+                         MemoryAccess_Unknown, -1, LowOpndRegType_xmm);
+ }
+-
+-/**
+- * @brief move between sd registers
+- * @param srcReg  The source register itself
+- * @param isPhysical Whether source is physical
+- * @param destReg The destination register itself
+- * @param isDestPhysical Whether destination is physical
+- */
+-void move_sd_reg_to_sd_reg(int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical) {
+-    move_reg_to_reg_diff_type(OpndSize_64, srcReg, isSrcPhysical, LowOpndRegType_xmm, destReg,
+-            isDestPhysical, LowOpndRegType_xmm);
+-}
+-
+ //!load from VR to a temporary
+ 
+ //!
+diff --git a/vm/compiler/codegen/x86/LowerJump.cpp b/vm/compiler/codegen/x86/LowerJump.cpp
+index 709056a..6f655cc 100644
+--- a/vm/compiler/codegen/x86/LowerJump.cpp
++++ b/vm/compiler/codegen/x86/LowerJump.cpp
+@@ -677,10 +677,6 @@ void conditional_jump(ConditionCode cc, const char* target, bool isShortTerm) {
+     dump_label(m, size, imm, target, isShortTerm);
+ }
+ 
+-void goto_invokeArgsDone(void) {
+-    unconditional_jump_global_API(".invokeArgsDone", false);
+-}
+-
+ /*!
+ \brief generate a single native instruction "jmp imm" to jump to a label
+ 
+diff --git a/vm/compiler/codegen/x86/Scheduler.cpp b/vm/compiler/codegen/x86/Scheduler.cpp
+index ca3742b..ed496bd 100644
+--- a/vm/compiler/codegen/x86/Scheduler.cpp
++++ b/vm/compiler/codegen/x86/Scheduler.cpp
+@@ -198,7 +198,6 @@ MachineModelEntry atomMachineModel[Mnemonic_Count*6] = {
+     {INVP,INVN},{EITHER_PORT,1},{PORT0,1},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //DEC
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,62},{BOTH_PORTS,62},{INVP,INVN}, //DIVSD
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,34},{BOTH_PORTS,34},{INVP,INVN}, //DIVSS
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{PORT0,4},{PORT0,4},{INVP,INVN}, // RCPSS
+ 
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN},{INVP,INVN}, //ENTER
+     {INVP,INVN},{INVP,INVN},{BOTH_PORTS,5},{INVP,INVN},{BOTH_PORTS,5},{INVP,INVN}, //FLDCW
+diff --git a/vm/compiler/codegen/x86/libenc/enc_defs.h b/vm/compiler/codegen/x86/libenc/enc_defs.h
+index 41a080c..10409d2 100644
+--- a/vm/compiler/codegen/x86/libenc/enc_defs.h
++++ b/vm/compiler/codegen/x86/libenc/enc_defs.h
+@@ -458,9 +458,6 @@ Mnemonic_DEC,                           // Decrement by 1
+ Mnemonic_DIVSD,                         // Divide Scalar Double-Precision Floating-Point Values
+ Mnemonic_DIVSS,                         // Divide Scalar Single-Precision Floating-Point Values
+ 
+-
+-Mnemonic_RCPSS,                         // Compute Reciprocal of Scalar Single-Precision Floating-Point Value
+-
+ #ifdef _HAVE_MMX_
+ Mnemonic_EMMS,                          // Empty MMX Technology State
+ #endif
+diff --git a/vm/compiler/codegen/x86/libenc/enc_defs_ext.h b/vm/compiler/codegen/x86/libenc/enc_defs_ext.h
+index b809f66..acc61d9 100644
+--- a/vm/compiler/codegen/x86/libenc/enc_defs_ext.h
++++ b/vm/compiler/codegen/x86/libenc/enc_defs_ext.h
+@@ -169,8 +169,6 @@ Mnemonic_DEC,                           // Decrement by 1
+ Mnemonic_DIVSD,                         // Divide Scalar Double-Precision Floating-Point Values
+ Mnemonic_DIVSS,                         // Divide Scalar Single-Precision Floating-Point Values
+ 
+-Mnemonic_RCPSS,                         // Compute Reciprocal of Scalar Single-Precision Floating-Point Value
+-
+ #ifdef _HAVE_MMX_
+ Mnemonic_EMMS,                          // Empty MMX Technology State
+ #endif
+diff --git a/vm/compiler/codegen/x86/libenc/enc_tabl.cpp b/vm/compiler/codegen/x86/libenc/enc_tabl.cpp
+index 441790e..af20bd8 100644
+--- a/vm/compiler/codegen/x86/libenc/enc_tabl.cpp
++++ b/vm/compiler/codegen/x86/libenc/enc_tabl.cpp
+@@ -613,12 +613,6 @@ BEGIN_OPCODES()
+ END_OPCODES()
+ END_MNEMONIC()
+ 
+-BEGIN_MNEMONIC(RCPSS, MF_NONE, D_U)
+-BEGIN_OPCODES()
+-    {OpcodeInfo::all, {0xF3, 0x0F, 0x53, _r},   {xmm32, xmm_m32},   D_U },
+-END_OPCODES()
+-END_MNEMONIC()
+-
+ /****************************************************************************
+                  ***** FPU operations *****
+ ****************************************************************************/
+-- 
+1.7.4.1
+

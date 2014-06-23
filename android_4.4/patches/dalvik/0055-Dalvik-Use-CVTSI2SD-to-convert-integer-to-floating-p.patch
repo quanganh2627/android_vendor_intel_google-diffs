@@ -1,0 +1,400 @@
+From 123cb21d0f6d74902aa828dcd554732c131a4cd3 Mon Sep 17 00:00:00 2001
+From: Udayan Banerji <udayan.banerji@intel.com>
+Date: Thu, 24 Jan 2013 16:18:55 -0800
+Subject: Dalvik: Use CVTSI2SD to convert integer to floating point
+
+BZ: 82107
+
+Add support to instruction scheduling for SSE conversion routines, and use
+CVTSI2SD for int-to-double bytecode
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I8480a329dd8615b4c742cc5d42baea8fd35e5929
+Orig-MCG-Change-Id: Id0f886ed2a6434398f166f4f435104fc36f9d0ca
+Signed-off-by: Udayan Banerji <udayan.banerji@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/codegen/x86/BytecodeVisitor.cpp |   17 +++-
+ vm/compiler/codegen/x86/Lower.h             |    5 +
+ vm/compiler/codegen/x86/LowerAlu.cpp        |    5 +-
+ vm/compiler/codegen/x86/LowerHelper.cpp     |  116 +++++++++++++++++++++------
+ vm/compiler/codegen/x86/Schedule.cpp        |   41 ++++++---
+ 5 files changed, 139 insertions(+), 45 deletions(-)
+
+diff --git a/vm/compiler/codegen/x86/BytecodeVisitor.cpp b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+index f921b05..4c4888d 100644
+--- a/vm/compiler/codegen/x86/BytecodeVisitor.cpp
++++ b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+@@ -2230,15 +2230,19 @@ int getVirtualRegInfo(VirtualRegInfo* infoArray, const MIR * currentMIR) {
+         infoArray[1].regNum = vA;
+         infoArray[1].refCount = 1;
+         infoArray[1].accessType = REGACCESS_D;
+-        if(inst_op == OP_INT_TO_DOUBLE || inst_op == OP_LONG_TO_DOUBLE || inst_op == OP_FLOAT_TO_DOUBLE)
++        if(inst_op == OP_LONG_TO_DOUBLE || inst_op == OP_FLOAT_TO_DOUBLE)
+             infoArray[1].physicalType = LowOpndRegType_fs;
++        else if (inst_op == OP_INT_TO_DOUBLE)
++            infoArray[1].physicalType = LowOpndRegType_xmm;
+         else
+             infoArray[1].physicalType = LowOpndRegType_fs_s;
+         infoArray[0].regNum = vB;
+         infoArray[0].refCount = 1;
+         infoArray[0].accessType = REGACCESS_U;
+-        if(inst_op == OP_INT_TO_FLOAT || inst_op == OP_INT_TO_DOUBLE || inst_op == OP_FLOAT_TO_DOUBLE)
++        if(inst_op == OP_INT_TO_FLOAT || inst_op == OP_FLOAT_TO_DOUBLE)
+             infoArray[0].physicalType = LowOpndRegType_fs_s; //float
++        else if (inst_op == OP_INT_TO_DOUBLE)
++            infoArray[0].physicalType = LowOpndRegType_gp;
+         else
+             infoArray[0].physicalType = LowOpndRegType_fs;
+         num_regs_per_bytecode = 2;
+@@ -4605,8 +4609,15 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+         infoArray[1].refCount = 1+1; //cdq accesses edx & eax
+         infoArray[1].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
+         return 2;
+-    case OP_INT_TO_FLOAT:
+     case OP_INT_TO_DOUBLE:
++        infoArray[0].regNum = 1;
++        infoArray[0].refCount = 2;
++        infoArray[0].physicalType = LowOpndRegType_gp;
++        infoArray[1].regNum = 2;
++        infoArray[1].refCount = 2;
++        infoArray[1].physicalType = LowOpndRegType_xmm;
++        return 2;
++    case OP_INT_TO_FLOAT:
+     case OP_LONG_TO_FLOAT:
+     case OP_LONG_TO_DOUBLE:
+     case OP_FLOAT_TO_DOUBLE:
+diff --git a/vm/compiler/codegen/x86/Lower.h b/vm/compiler/codegen/x86/Lower.h
+index 51a0b03..f851900 100644
+--- a/vm/compiler/codegen/x86/Lower.h
++++ b/vm/compiler/codegen/x86/Lower.h
+@@ -752,6 +752,7 @@ void load_effective_addr_scale(int base_reg, bool isBasePhysical,
+ void load_fpu_cw(int disp, int base_reg, bool isBasePhysical);
+ void store_fpu_cw(bool checkException, int disp, int base_reg, bool isBasePhysical);
+ void convert_integer(OpndSize srcSize, OpndSize dstSize);
++void convert_int_to_fp(int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical, bool isDouble);
+ void load_fp_stack(LowOp* op, OpndSize size, int disp, int base_reg, bool isBasePhysical);
+ void load_int_fp_stack(OpndSize size, int disp, int base_reg, bool isBasePhysical);
+ void load_int_fp_stack_imm(OpndSize size, int imm);
+@@ -1312,6 +1313,10 @@ LowOpImmMem* dump_imm_mem_noalloc(Mnemonic m, OpndSize size,
+ LowOpRegReg* dump_reg_reg(Mnemonic m, AtomOpCode m2, OpndSize size,
+                    int reg, bool isPhysical,
+                    int reg2, bool isPhysical2, LowOpndRegType type);
++LowOpRegReg* dump_reg_reg_diff_types(Mnemonic m, AtomOpCode m2, OpndSize srcSize,
++                   int srcReg, int isSrcPhysical, LowOpndRegType srcType,
++                   OpndSize destSize, int destReg, int isDestPhysical,
++                   LowOpndRegType destType);
+ LowOpRegReg* dump_movez_reg_reg(Mnemonic m, OpndSize size,
+                         int reg, bool isPhysical,
+                         int reg2, bool isPhysical2);
+diff --git a/vm/compiler/codegen/x86/LowerAlu.cpp b/vm/compiler/codegen/x86/LowerAlu.cpp
+index 2dbf89c..f7fd3b7 100644
+--- a/vm/compiler/codegen/x86/LowerAlu.cpp
++++ b/vm/compiler/codegen/x86/LowerAlu.cpp
+@@ -169,8 +169,9 @@ int op_int_to_double(const MIR * mir) {
+     assert(mir->dalvikInsn.opcode == OP_INT_TO_DOUBLE);
+     u2 vA = mir->dalvikInsn.vA; //destination
+     u2 vB = mir->dalvikInsn.vB;
+-    load_int_fp_stack_VR(OpndSize_32, vB); //fildl
+-    store_fp_stack_VR(true, OpndSize_64, vA); //fstpl
++    get_virtual_reg(vB, OpndSize_32, 1, false);
++    convert_int_to_fp(1, false, 2, false, true /* isDouble */);
++    set_virtual_reg(vA, OpndSize_64, 2, false);
+     return 0;
+ }
+ 
+diff --git a/vm/compiler/codegen/x86/LowerHelper.cpp b/vm/compiler/codegen/x86/LowerHelper.cpp
+index 0fd0d28..9d71b78 100644
+--- a/vm/compiler/codegen/x86/LowerHelper.cpp
++++ b/vm/compiler/codegen/x86/LowerHelper.cpp
+@@ -357,21 +357,34 @@ LowOpReg* dump_reg_noalloc(Mnemonic m, OpndSize size, int reg, bool isPhysical,
+ //! \return a LowOp corresponding to the reg-reg operation
+ LowOpRegReg* lower_reg_to_reg(Mnemonic m, AtomOpCode m2, OpndSize size, int regSrc,
+         bool isPhysical, int regDest, bool isPhysical2, LowOpndRegType type) {
+-    bool isMovzs = (m == Mnemonic_MOVZX || m == Mnemonic_MOVSX);
+ 
+-    //If we are sign extending / zero extending, the destination becomes a fixed size
+-    //container of 32-bits. The size and type apply to the source. Note that this is
+-    //a rigid requirement, and for now won't allow, for example, MOVSX Sz8, Sz16
+-    OpndSize overridden_size = isMovzs ? OpndSize_32 : size;
+-    LowOpndRegType overridden_type = isMovzs ? LowOpndRegType_gp : type;
++    OpndSize srcSize = size;
++    OpndSize destSize = size;
++    LowOpndRegType srcType = type;
++    LowOpndRegType destType = type;
++
++    //We may need to override the default size and type if src and dest can be
++    //of different size / type, as follows:
++
++    //For MOVSX and MOVZX, fix the destination size and type to 32-bit and GP
++    //respectively. Note that this is a rigid requirement, and for now won't
++    //allow, for example, MOVSX Sz8, Sz16
++    if (m == Mnemonic_MOVZX || m == Mnemonic_MOVSX) {
++        destSize = OpndSize_32;
++    }
++    //For CVTSI2SD or CVTSI2SS, the source needs to be fixed at 32-bit GP
++    else if (m == Mnemonic_CVTSI2SD || m == Mnemonic_CVTSI2SS) {
++        srcSize = OpndSize_32;
++        srcType = LowOpndRegType_gp;
++    }
+ 
+     if (!gDvmJit.scheduling) {
+         if (m == Mnemonic_FUCOMP || m == Mnemonic_FUCOM) {
+             stream = encoder_compare_fp_stack(m == Mnemonic_FUCOMP, regSrc - regDest,
+                     size == OpndSize_64, stream);
+         } else {
+-            stream = encoder_reg_reg_diff_sizes(m, size, regSrc, isPhysical, overridden_size,
+-                    regDest, isPhysical2, overridden_type, stream);
++            stream = encoder_reg_reg_diff_sizes(m, srcSize, regSrc, isPhysical, destSize,
++                    regDest, isPhysical2, destType, stream);
+         }
+         return NULL;
+     }
+@@ -386,13 +399,13 @@ LowOpRegReg* lower_reg_to_reg(Mnemonic m, AtomOpCode m2, OpndSize size, int regS
+ 
+     op->opCode = m;
+     op->opCode2 = m2;
+-    op->opndDest.size = overridden_size;
++    op->opndDest.size = destSize;
+     op->opndDest.type = LowOpndType_Reg;
+-    op->opndSrc.size = size;
++    op->opndSrc.size = srcSize;
+     op->opndSrc.type = LowOpndType_Reg;
+     op->numOperands = 2;
+-    set_reg_opnd(&(op->regDest), regDest, isPhysical2, overridden_type);
+-    set_reg_opnd(&(op->regSrc), regSrc, isPhysical, type);
++    set_reg_opnd(&(op->regDest), regDest, isPhysical2, destType);
++    set_reg_opnd(&(op->regSrc), regSrc, isPhysical, srcType);
+     singletonPtr<Scheduler>()->updateUseDefInformation_reg_to_reg(op);
+ 
+     return op;
+@@ -461,42 +474,77 @@ LowOpRegReg* dump_reg_reg_noalloc_src(Mnemonic m, AtomOpCode m2, OpndSize size,
+     return NULL;
+ }
+ 
+-//!update fields of LowOp and generate a x86 instruction that takes two reg operands
+-
+-//!
+-LowOpRegReg* dump_reg_reg(Mnemonic m, AtomOpCode m2, OpndSize size, int reg,
+-        bool isPhysical, int reg2, bool isPhysical2, LowOpndRegType type) {
++//! \brief Wrapper around lower_reg_to_reg with reg allocation
++//! \details Allocates both registers, checks for optimizations etc,
++//! and calls lower_reg_to_reg
++//! \param m The mnemonic
++//! \param m2 The ATOM mnemonic type
++//! \param srcSize Size of the source operand
++//! \param srcReg The source register itself
++//! \param isSrcPhysical Whether source is physical
++//! \param srcType The type of source register
++//! \param destSize Size of the destination operand
++//! \param destReg The destination register itself
++//! \param isDestPhysical Whether destination is physical
++//! \param destType The type of destination register
++//! \return The generated LowOp
++LowOpRegReg* dump_reg_reg_diff_types(Mnemonic m, AtomOpCode m2, OpndSize srcSize,
++        int srcReg, int isSrcPhysical, LowOpndRegType srcType, OpndSize destSize,
++        int destReg, int isDestPhysical, LowOpndRegType destType) {
+     if (gDvm.executionMode == kExecutionModeNcgO1) {
+         startNativeCode(-1, -1);
+         //reg is source if m is MOV
+         freeReg(true);
+-        int regAll = registerAlloc(type, reg, isPhysical, true);
++        int regAll = registerAlloc(srcType, srcReg, isSrcPhysical, true);
+         int regAll2;
+         LowOpRegReg* op = NULL;
+ #ifdef MOVE_OPT2
+         if(isMoveOptimizable(m) &&
+-                ((reg != PhysicalReg_EDI && reg != PhysicalReg_ESP && reg != PhysicalReg_EBP) || (!isPhysical)) &&
+-                isPhysical2 == false) { //dst reg is logical
++                ((reg != PhysicalReg_EDI && srcReg != PhysicalReg_ESP && srcReg != PhysicalReg_EBP) || (!isSrcPhysical)) &&
++                isDestPhysical == false) { //dst reg is logical
+             //called from move_reg_to_reg
+-            regAll2 = registerAllocMove(reg2, type, isPhysical2, regAll);
++            regAll2 = registerAllocMove(regDest, destType, isDestPhysical, regAll);
+         } else {
+ #endif
+         donotSpillReg(regAll);
+-        regAll2 = registerAlloc(type, reg2, isPhysical2, true);
+-        op = lower_reg_to_reg(m, m2, size, regAll, true /*isPhysical*/, regAll2,
+-                true /*isPhysical2*/, type);
++        regAll2 = registerAlloc(destType, destReg, isDestPhysical, true);
++
++        // NOTE: The use of (destSize, destType) as THE (size, type) can be confusing. In most
++        // cases, we are using this function through dump_reg_reg, so the (size, type) doesn't
++        // matter. For MOVSX and MOVZX, the size passed to dump_reg_reg is the srcSize (8 or 16),
++        // so destSize is technically the srcSize, (type is gpr) and we override destSize inside
++        // lower_reg_to_reg to 32. For CVTSI2SS and CVTSI2SD, the destSize is 64-bit, and we
++        // override the srcSize inside lower_reg_to_reg.
++        op = lower_reg_to_reg(m, m2, destSize, regAll, true /*isPhysical*/, regAll2,
++                true /*isPhysical2*/, destType);
+ #ifdef MOVE_OPT2
+     }
+ #endif
+         endNativeCode();
+         return op;
+     } else {
+-        return lower_reg_to_reg(m, m2, size, reg, isPhysical, reg2, isPhysical2,
+-                type);
++        return lower_reg_to_reg(m, m2, destSize, srcReg, isSrcPhysical, destReg, isDestPhysical,
++                destType);
+     }
+     return NULL;
+ }
+ 
++//! \brief Wrapper around dump_reg_reg_diff_types assuming sizes and types are same
++//! \param m The mnemonic
++//! \param m2 The ATOM mnemonic type
++//! \param size Size of the source and destination operands
++//! \param reg The source register
++//! \param isPhysical Whether source is physical
++//! \param reg2 The destination register
++//! \param isPhysical2 Whether destination is physical
++//! \param type The type of operation
++//! \return The generated LowOp
++LowOpRegReg* dump_reg_reg(Mnemonic m, AtomOpCode m2, OpndSize size, int reg,
++        bool isPhysical, int reg2, bool isPhysical2, LowOpndRegType type) {
++    return dump_reg_reg_diff_types(m, m2, size, reg, isPhysical, type, size,
++            reg2, isPhysical2, type);
++}
++
+ LowOpMemReg* lower_mem_to_reg(Mnemonic m, AtomOpCode m2, OpndSize size, int disp,
+         int base_reg, bool isBasePhysical, MemoryAccessType mType, int mIndex,
+         int reg, bool isPhysical, LowOpndRegType type) {
+@@ -1144,6 +1192,22 @@ void convert_integer(OpndSize srcSize, OpndSize dstSize) { //cbw, cwd, cdq
+     Mnemonic m = Mnemonic_CDQ;
+     dump_reg_reg(m, ATOM_NORMAL, OpndSize_32, PhysicalReg_EAX, true, PhysicalReg_EDX, true, LowOpndRegType_gp);
+ }
++
++//! \brief Generates the CVTSI2SD and CVTSI2SS opcodes
++//! \details performs cvtsi2** destReg, srcReg
++//! NOTE: Even for cvtsi2ss, the destination is still XMM
++//! and needs to be moved to a GPR.
++//! \param srcReg the src register
++//! \param isSrcPhysical if the srcReg is a physical register
++//! \param destReg the destination register
++//! \param isDestPhysical if destReg is a physical register
++//! \param isDouble if the destination needs to be a double value (float otherwise)
++void convert_int_to_fp(int srcReg, bool isSrcPhysical, int destReg, bool isDestPhysical, bool isDouble) {
++    Mnemonic m = isDouble ? Mnemonic_CVTSI2SD : Mnemonic_CVTSI2SS;
++    dump_reg_reg_diff_types(m, ATOM_NORMAL, OpndSize_32, srcReg, isSrcPhysical, LowOpndRegType_gp,
++            OpndSize_64, destReg, isDestPhysical, LowOpndRegType_xmm);
++}
++
+ //!fld: load from memory (float or double) to stack
+ 
+ //!
+diff --git a/vm/compiler/codegen/x86/Schedule.cpp b/vm/compiler/codegen/x86/Schedule.cpp
+index fa86f5d..0f150e6 100644
+--- a/vm/compiler/codegen/x86/Schedule.cpp
++++ b/vm/compiler/codegen/x86/Schedule.cpp
+@@ -167,8 +167,8 @@ MachineModelEntry atomMachineModel[Mnemonic_Count*6] = {
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,7},{BOTH_PORTS,8},{INVP,INVN}, //CVTSS2SD
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,9},{BOTH_PORTS,10},{INVP,INVN}, //CVTSS2SI
+     {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,9},{BOTH_PORTS,10},{INVP,INVN}, //CVTTSS2SI
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,7},{INVP,INVN},{INVP,INVN}, //CVTSI2SD
+-    {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,6},{INVP,INVN},{INVP,INVN}, //CVTSI2SS
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,7},{BOTH_PORTS,8},{INVP,INVN}, //CVTSI2SD
++    {INVP,INVN},{INVP,INVN},{INVP,INVN},{BOTH_PORTS,6},{BOTH_PORTS,7},{INVP,INVN}, //CVTSI2SS
+ 
+     {INVP,INVN},{BOTH_PORTS,9},{INVP,INVN},{BOTH_PORTS,9},{BOTH_PORTS,10},{INVP,INVN}, //COMISD
+     {INVP,INVN},{BOTH_PORTS,9},{INVP,INVN},{BOTH_PORTS,9},{BOTH_PORTS,10},{INVP,INVN}, //COMISS
+@@ -486,6 +486,14 @@ inline bool isCompareMnemonic(Mnemonic m) {
+             || m == Mnemonic_TEST;
+ }
+ 
++//! \brief Returns true if mnemonic is SSE conversion routine
++inline bool isConvertMnemonic(Mnemonic m) {
++    return m == Mnemonic_CVTSD2SS || m == Mnemonic_CVTSD2SI
++            || m == Mnemonic_CVTTSD2SI || m == Mnemonic_CVTSS2SD
++            || m == Mnemonic_CVTSS2SI || m == Mnemonic_CVTTSS2SI
++            || m == Mnemonic_CVTSI2SD || m == Mnemonic_CVTSI2SS;
++}
++
+ //! \brief Returns true if mnemonic uses and then defines the FLAGS register
+ inline bool usesAndDefinesFlags(Mnemonic m) {
+     return m == Mnemonic_ADC || m == Mnemonic_SBB;
+@@ -1033,14 +1041,16 @@ void Scheduler::updateUseDefInformation_imm_to_mem(LowOpImmMem * op) {
+ //! \brief Updates dependency information for LowOps with two operands:
+ //! register to register.
+ //! \param op must be a MOV variant, a comparison (CMP, TEST, COMISS, COMISD),
+-//! an ALU instruction including SSE variants SD and SS, or must have mnemonic
+-//! FUCOM, FUCOMP, CMOVcc, or CDQ.
++//! an ALU instruction including SSE variants SD and SS, SSE conversion,
++//! or must have mnemonic FUCOM, FUCOMP, CMOVcc, or CDQ.
+ void Scheduler::updateUseDefInformation_reg_to_reg(LowOpRegReg * op) {
+     assert(isMoveMnemonic(op->opCode) || isCompareMnemonic(op->opCode)
+-            || op->opCode2 == ATOM_NORMAL_ALU || op->opCode == Mnemonic_FUCOM
+-            || op->opCode == Mnemonic_FUCOMP || op->opCode == Mnemonic_CDQ
+-            || (op->opCode >= Mnemonic_CMOVcc && op->opCode < Mnemonic_CMP));
++            || isConvertMnemonic(op->opCode) ||op->opCode2 == ATOM_NORMAL_ALU
++            || op->opCode == Mnemonic_FUCOM || op->opCode == Mnemonic_FUCOMP
++            || op->opCode == Mnemonic_CDQ ||
++            (op->opCode >= Mnemonic_CMOVcc && op->opCode < Mnemonic_CMP));
+     bool isMove = isMoveMnemonic(op->opCode);
++    bool isConvert = isConvertMnemonic(op->opCode);
+     op->instructionLatency = getAtomMnemonicLatency_reg_to_reg(op->opCode);
+     op->portType = getAtomMnemonicPort_reg_to_reg(op->opCode);
+     assert(op->instructionLatency != INVN);
+@@ -1050,7 +1060,7 @@ void Scheduler::updateUseDefInformation_reg_to_reg(LowOpRegReg * op) {
+             || usesAndDefinesFlags(op->opCode))
+         updateDependencyGraph(UseDefType_Ctrl, REG_NOT_USED, LowOpndDefUse_Use,
+                 Latency_None, op);
+-    else if (!isMove && op->opCode != Mnemonic_FUCOM
++    else if (!isMove && !isConvert && op->opCode != Mnemonic_FUCOM
+             && op->opCode != Mnemonic_FUCOMP && op->opCode != Mnemonic_CDQ)
+         updateDependencyGraph(UseDefType_Ctrl, REG_NOT_USED, LowOpndDefUse_Def,
+                 Latency_None, op);
+@@ -1069,7 +1079,8 @@ void Scheduler::updateUseDefInformation_reg_to_reg(LowOpRegReg * op) {
+     updateDependencyGraph(UseDefType_Reg, op->regSrc.regNum, op->opndSrc.defuse,
+             Latency_None, op);
+ 
+-    if (isMove || (op->opCode >= Mnemonic_CMOVcc && op->opCode < Mnemonic_CMP))
++    if (isMove || isConvert
++            || (op->opCode >= Mnemonic_CMOVcc && op->opCode < Mnemonic_CMP))
+         op->opndDest.defuse = LowOpndDefUse_Def;
+     else if (isCompareMnemonic(op->opCode))
+         op->opndDest.defuse = LowOpndDefUse_Use;
+@@ -1085,12 +1096,14 @@ void Scheduler::updateUseDefInformation_reg_to_reg(LowOpRegReg * op) {
+ //! \brief Updates dependency information for LowOps with two operands:
+ //! memory to register.
+ //! \param op must be a MOV variant, a comparison (CMP, COMISS, COMISD),
+-//! an ALU instruction including SSE variants SD and SS, or must have
+-//! mnemonic LEA
++//! an ALU instruction including SSE variants SD and SS, SSE conversion,
++//! or must have mnemonic LEA
+ void Scheduler::updateUseDefInformation_mem_to_reg(LowOpMemReg * op) {
+     assert(isMoveMnemonic(op->opCode) || isCompareMnemonic(op->opCode)
+-            || op->opCode2 == ATOM_NORMAL_ALU || op->opCode == Mnemonic_LEA);
++            || isConvertMnemonic(op->opCode) || op->opCode2 == ATOM_NORMAL_ALU
++            || op->opCode == Mnemonic_LEA);
+     bool isMove = isMoveMnemonic(op->opCode);
++    bool isConvert = isConvertMnemonic(op->opCode);
+     op->instructionLatency = getAtomMnemonicLatency_mem_to_reg(op->opCode);
+     op->portType = getAtomMnemonicPort_mem_to_reg(op->opCode);
+     assert(op->instructionLatency != INVN);
+@@ -1099,7 +1112,7 @@ void Scheduler::updateUseDefInformation_mem_to_reg(LowOpMemReg * op) {
+     if (usesAndDefinesFlags(op->opCode))
+         updateDependencyGraph(UseDefType_Ctrl, REG_NOT_USED, LowOpndDefUse_Use,
+                 Latency_None, op);
+-    if (!isMove && op->opCode != Mnemonic_LEA)
++    if (!isMove && !isConvert && op->opCode != Mnemonic_LEA)
+         updateDependencyGraph(UseDefType_Ctrl, REG_NOT_USED, LowOpndDefUse_Def,
+                 Latency_None, op);
+ 
+@@ -1116,7 +1129,7 @@ void Scheduler::updateUseDefInformation_mem_to_reg(LowOpMemReg * op) {
+                     op->opndSrc.defuse, Latency_Agen_stall, op);
+     }
+ 
+-    if (isMove || op->opCode == Mnemonic_LEA)
++    if (isMove || isConvert || op->opCode == Mnemonic_LEA)
+         op->opndDest.defuse = LowOpndDefUse_Def;
+     else if (isCompareMnemonic(op->opCode))
+         op->opndDest.defuse = LowOpndDefUse_Use;
+-- 
+1.7.4.1
+

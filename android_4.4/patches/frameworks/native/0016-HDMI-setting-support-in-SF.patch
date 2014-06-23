@@ -1,0 +1,266 @@
+From a3a83e9b09edd1c45b24504811af8cd04eb0e503 Mon Sep 17 00:00:00 2001
+From: binchen1 <bin.chen@intel.com>
+Date: Tue, 15 Oct 2013 11:26:36 +0800
+Subject: HDMI setting support in SF
+
+BZ: 70713
+
+This is to support HDMI setting feature and it is a squash and
+refact of two patches you could find in the following 2 Orig-Change-Id
+
+could verify using command line:
+adb shell service call SurfaceFlinger 2001 scale
+
+Category: Feature differentiation
+Domain:   <Graphics.HDMI>-HDMISetting
+Origin:   Internal
+Upstream-Candiate: No
+
+Orig-Change-Id:Iff68229b3043e22e4390342d412cb5023d4f8835
+Orig-Change-Id:I28735a8ac82ba2c97690e580e33db9b381f67447
+
+Change-Id: I08736bceacd13ea0ae17e2ee8edd69fd138de205
+Signed-off-by: binchen1 <bin.chen@intel.com>
+---
+ services/surfaceflinger/SurfaceFlinger.cpp |  151 +++++++++++++++++++++++++++-
+ services/surfaceflinger/SurfaceFlinger.h   |   19 ++++
+ 2 files changed, 166 insertions(+), 4 deletions(-)
+
+diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinger/SurfaceFlinger.cpp
+index 9d94c87..0ab0b1b 100644
+--- a/services/surfaceflinger/SurfaceFlinger.cpp
++++ b/services/surfaceflinger/SurfaceFlinger.cpp
+@@ -152,7 +152,8 @@ SurfaceFlinger::SurfaceFlinger()
+         mBootFinished(false),
+         mPrimaryHWVsyncEnabled(false),
+         mHWVsyncAvailable(false),
+-        mDaltonize(false)
++        mDaltonize(false),
++        mDisplayScaleState(0)
+ {
+     ALOGI("SurfaceFlinger is starting");
+ 
+@@ -1291,10 +1292,15 @@ void SurfaceFlinger::handleTransactionLocked(uint32_t transactionFlags)
+                         }
+                         if ((state.orientation != draw[i].orientation)
+                                 || (state.viewport != draw[i].viewport)
+-                                || (state.frame != draw[i].frame))
++                                || (state.frame != draw[i].frame)
++                                || (state.scale != draw[i].scale))
+                         {
++                            Rect frame = state.frame;
++                            Rect viewport = state.viewport;
++                            // this will modify viewport and frame parameters
++                            handleDisplayScaling(state, viewport, frame);
+                             disp->setProjection(state.orientation,
+-                                    state.viewport, state.frame);
++                                    viewport, frame);
+                         }
+                     }
+                 }
+@@ -2740,6 +2746,20 @@ status_t SurfaceFlinger::onTransact(
+                 repaintEverything();
+             }
+             return NO_ERROR;
++            /***************************************
++             *  intel customization start below
++             **************************************/
++
++            enum {eIntelHDMISetting = 2001};
++            case eIntelHDMISetting: {
++                n = data.readInt32();
++                ALOGD("setting HDMI scaling %d ", n); 
++                int32_t result = setDisplayScaling((uint32_t)n);
++                n = data.readInt32();
++                reply->writeInt32(result);
++                return NO_ERROR;
++            }
++
+         }
+     }
+     return err;
+@@ -3136,13 +3156,136 @@ SurfaceFlinger::DisplayDeviceState::DisplayDeviceState()
+ }
+ 
+ SurfaceFlinger::DisplayDeviceState::DisplayDeviceState(DisplayDevice::DisplayType type)
+-    : type(type), layerStack(DisplayDevice::NO_LAYER_STACK), orientation(0) {
++    : type(type), layerStack(DisplayDevice::NO_LAYER_STACK), orientation(0),scale(0) {
+     viewport.makeInvalid();
+     frame.makeInvalid();
+ }
+ 
+ // ---------------------------------------------------------------------------
+ 
++// ----------------------------------------------
++// Put Intel Customize stuff here
++
++int SurfaceFlinger::setDisplayScaling(uint32_t scale)
++{
++    Mutex::Autolock _l(mStateLock);
++    int32_t result = NO_ERROR;
++    sp<IBinder> token =
++        getBuiltInDisplay(DisplayDevice::DISPLAY_EXTERNAL);
++    ssize_t dpyIdx = mCurrentState.displays.indexOfKey(token);
++    if (dpyIdx < 0)
++        return BAD_VALUE;
++
++    DisplayDeviceState& disp(mCurrentState.displays.editValueAt(dpyIdx));
++    if (disp.isValid()) {
++         if (disp.scale != scale) {
++             mDisplayScaleState = scale;
++             disp.scale = mDisplayScaleState;
++             setTransactionFlags(eDisplayTransactionNeeded);
++         }
++    } else {
++        result = INVALID_OPERATION;
++    }
++    return result;
++}
++
++
++enum {
++    eDisplayScaleNone            = 0,
++    eDisplayScaleFullscreen      = 1,
++    eDisplayScaleCenter          = 2,
++    eDisplayScaleAspect          = 3
++};
++
++
++void SurfaceFlinger::handleDisplayScaling(const DisplayDeviceState& state,
++        Rect& viewport, Rect& frame)
++{
++
++    ALOGD("handleDisplayScaling");
++    if (state.type == DisplayDevice::DISPLAY_EXTERNAL) {
++        uint32_t width;
++        uint32_t height;
++        HWComposer& hwc(getHwComposer());
++
++        if (!hwc.isConnected(state.type))
++            return;
++
++        width = hwc.getWidth(state.type);
++        height = hwc.getHeight(state.type);
++
++        switch (state.scaleMode) {
++        case eDisplayScaleFullscreen:
++            frame.left = frame.top = 0;
++            frame.right = width;
++            frame.bottom = height;
++            break;
++        case eDisplayScaleCenter:
++        {
++            uint32_t viewWidth;
++            uint32_t viewHeight;
++            bool isRot90_270;
++
++            isRot90_270 = (state.orientation == DisplayState::eOrientation90 ||
++                 state.orientation == DisplayState::eOrientation270);
++            if (isRot90_270) {
++                viewWidth = viewport.bottom - viewport.top;
++                viewHeight = viewport.right - viewport.left;
++            } else {
++                viewWidth = viewport.right - viewport.left;
++                viewHeight = viewport.bottom - viewport.top;
++            }
++
++            if (width < viewWidth) {
++                frame.left = 0;
++                frame.right = width;
++                if (isRot90_270) {
++                    viewport.top = 0;
++                    viewport.bottom = width;
++                } else {
++                    viewport.left = 0;
++                    viewport.right = width;
++                }
++            } else {
++                frame.left = (width - viewWidth) / 2;
++                frame.right = (width + viewWidth) / 2;
++            }
++
++            if (height < viewHeight) {
++                frame.top = 0;
++                frame.bottom = height;
++                if (isRot90_270) {
++                    viewport.left = 0;
++                    viewport.right = height;
++                } else {
++                    viewport.top = 0;
++                    viewport.bottom = height;
++                }
++            } else {
++                frame.top = (height - viewHeight) / 2;
++                frame.bottom = (height + viewHeight) / 2;
++            }
++            break;
++        }
++        case eDisplayScaleAspect:
++        case eDisplayScaleNone:
++        default:
++            break;
++        }
++
++        if (state.scaleStepX) {
++            int frameWidth = frame.right - frame.left;
++            frame.left += state.scaleStepX * frameWidth / 100;
++            frame.right -= state.scaleStepX * frameWidth / 100;
++        }
++        if (state.scaleStepY) {
++            int frameHeight = frame.bottom - frame.left;
++            frame.top += state.scaleStepY * frameHeight / 100;
++            frame.bottom -= state.scaleStepY * frameHeight / 100;
++        }
++    }
++}
++
+ }; // namespace android
+ 
+ 
+diff --git a/services/surfaceflinger/SurfaceFlinger.h b/services/surfaceflinger/SurfaceFlinger.h
+index f08e66a..2af4a0a 100644
+--- a/services/surfaceflinger/SurfaceFlinger.h
++++ b/services/surfaceflinger/SurfaceFlinger.h
+@@ -171,6 +171,15 @@ private:
+         uint8_t orientation;
+         String8 displayName;
+         bool isSecure;
++        // customization for HDMI scaling setting
++        union {
++            uint32_t scale;
++            struct {
++                uint16_t scaleMode;
++                uint8_t  scaleStepX;
++                uint8_t  scaleStepY;
++            };
++        };
+     };
+ 
+     struct State {
+@@ -387,6 +396,13 @@ private:
+      void disableHardwareVsync(bool makeUnavailable);
+      void resyncToHardwareVsync(bool makeAvailable);
+ 
++    // Intel feature : HDMI setting
++
++    int setDisplayScaling(uint32_t scale);
++    // handleDisplayScaling: calculate and modify the scaled frame rect.
++    void handleDisplayScaling(const DisplayDeviceState& state,
++        Rect& viewport, Rect& frame);
++
+     /* ------------------------------------------------------------------------
+      * Debugging & dumpsys
+      */
+@@ -478,6 +494,9 @@ private:
+ 
+     Daltonizer mDaltonizer;
+     bool mDaltonize;
++
++    /* Intel HDMI setting feature*/
++    uint32_t mDisplayScaleState;
+ };
+ 
+ }; // namespace android
+-- 
+1.7.4.1
+

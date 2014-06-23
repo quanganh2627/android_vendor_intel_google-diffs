@@ -1,0 +1,1294 @@
+From 7e140714d2294c744f2cab8f5c605f6d8cfc315b Mon Sep 17 00:00:00 2001
+From: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Date: Mon, 13 May 2013 22:17:48 +0000
+Subject: Dalvik: JIT Compiler Plugin System
+
+BZ: 103736
+
+This patch enables a plugin system, wherein developers can quickly
+alter the runtime behavior of the JIT by changing the ME and BE
+compilation function pointers and altering the JIT ME optimization
+passes. It is intended to simplify the development of new infrastructure
+and optimizations by enabling a rapid development cycle.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I93e5f4d3efa2398619d0c68bffe2b65109627bd1
+Orig-MCG-Change-Id: Ic20140de0d20cb57fedc396052af302fee804d37
+Signed-off-by: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Signed-off-by: Tim Hartley <timothy.d.hartley@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/Dvm.mk                                    |    4 +-
+ vm/Globals.h                                 |   47 ++++
+ vm/Init.cpp                                  |   35 +++
+ vm/compiler/Frontend.cpp                     |   68 ++++++-
+ vm/compiler/LoopOpt.cpp                      |  302 ++++++++++++++++++++++++--
+ vm/compiler/LoopOpt.h                        |   53 +++++-
+ vm/compiler/Pass.cpp                         |    2 +
+ vm/compiler/Pass.h                           |   50 ++++-
+ vm/compiler/codegen/x86/AnalysisO1.cpp       |   34 ---
+ vm/compiler/codegen/x86/CodegenInterface.cpp |  109 +++++++--
+ vm/compiler/codegen/x86/Lower.h              |   24 ++-
+ vm/compiler/codegen/x86/LowerHelper.cpp      |   11 +
+ vm/compiler/codegen/x86/LowerInvoke.cpp      |   45 +++-
+ vm/compiler/codegen/x86/LowerJump.cpp        |   19 ++
+ vm/compiler/codegen/x86/x86Specific.cpp      |   51 +++++
+ vm/compiler/codegen/x86/x86Specific.h        |   41 ++++
+ 16 files changed, 796 insertions(+), 99 deletions(-)
+ create mode 100644 vm/compiler/codegen/x86/x86Specific.cpp
+ create mode 100644 vm/compiler/codegen/x86/x86Specific.h
+
+diff --git a/vm/Dvm.mk b/vm/Dvm.mk
+index d95ae16..5b96d74 100644
+--- a/vm/Dvm.mk
++++ b/vm/Dvm.mk
+@@ -358,6 +358,7 @@ ifeq ($(dvm_arch),x86)
+               compiler/codegen/$(dvm_arch_variant)/CodegenErrors.cpp \
+               compiler/codegen/$(dvm_arch_variant)/RegisterizationBE.cpp \
+               compiler/codegen/$(dvm_arch_variant)/StackExtensionX86.cpp \
++              compiler/codegen/$(dvm_arch_variant)/x86Specific.cpp \
+               compiler/LoopOpt.cpp \
+               compiler/Checks.cpp \
+               compiler/LoopRegisterUsage.cpp \
+@@ -371,7 +372,8 @@ ifeq ($(dvm_arch),x86)
+               compiler/AccumulationSinking.cpp
+        # need apache harmony x86 encoder/decoder
+        LOCAL_C_INCLUDES += \
+-              dalvik/vm/compiler/codegen/x86/libenc
++              dalvik/vm/compiler/codegen/x86/libenc \
++              dalvik/vm/compiler
+ 
+        LOCAL_SRC_FILES += \
+               compiler/codegen/x86/libenc/enc_base.cpp \
+diff --git a/vm/Globals.h b/vm/Globals.h
+index 54e7c84..890091a 100644
+--- a/vm/Globals.h
++++ b/vm/Globals.h
+@@ -76,6 +76,14 @@ enum ProfilerClockSource {
+     kProfilerClockSourceDual,
+ };
+ 
++
++//Forward declarations
++struct CompilationUnit;
++struct JitTranslationInfo;
++struct JitTranslationDescription;
++class Pass;
++
++
+ /*
+  * All fields are initialized to zero.
+  *
+@@ -785,6 +793,42 @@ enum VTuneInfo {
+ #define VTUNE_VERSION_DEFAULT 279866
+ #endif
+ 
++/**
++ * @class sPassFramework The Pass framework's entry point
++ */
++typedef struct sJitFramework
++{
++    /** @brief the First Pass of the framework */
++    Pass *firstPass;
++
++    /** @brief The general pass gate if there is one, called before each Pass */
++    bool (*generalGate) (const CompilationUnit *, const Pass*);
++
++    /** @brief Back-end function pointer */
++    void (*backEndFunction) (CompilationUnit *, JitTranslationInfo *);
++
++    /** @brief Back-end BasicBlock allocater pointer */
++    BasicBlock * (*backEndBasicBlockAllocation) (void);
++
++    /** @brief Back-end Dumping a BasicBlock */
++    void (*backEndDumpSpecificBB) (CompilationUnit *, BasicBlock *, FILE *, bool);
++
++    /** @brief Back-end gate, do we want to process the trace? */
++    bool (*backEndGate) (CompilationUnit *);
++
++    /** @brief Invoke handler */
++    const char* (*backEndInvokeArgsDone) (int);
++
++    /** @brief Back-end callback to add a symbol at a specific location in the JIT code cache */
++    void (*backEndSymbolCreationCallback) (const std::string &, void *);
++
++    /** @brief Middle-end function pointer */
++    bool (*middleEndFunction) (JitTraceDescription *, int, JitTranslationInfo *, jmp_buf *, int );
++
++    /** @brief Middle-end gate, do we want to process the trace? */
++    bool (*middleEndGate) (JitTraceDescription *, int, JitTranslationInfo *, jmp_buf *, int );
++}SJitFramework;
++
+ /*
+  * JIT-specific global state
+  */
+@@ -956,6 +1000,9 @@ struct DvmJitGlobals {
+     /* Flag to control backend registerization */
+     bool backEndRegisterization;
+ 
++    /* Structure to handle the Jit framework */
++    SJitFramework jitFramework;
++
+     /*
+      * Flag to control maximum number of registerization requests when
+      * backend registerization is enabled.
+diff --git a/vm/Init.cpp b/vm/Init.cpp
+index 77a7215..4e8342f 100644
+--- a/vm/Init.cpp
++++ b/vm/Init.cpp
+@@ -40,6 +40,8 @@
+ #include "JniConstants.h"
+ 
+ #ifdef ARCH_IA32
++#include "compiler/codegen/x86/Lower.h"
++#include "compiler/codegen/x86/x86Specific.h"
+ #include "compiler/CompilerUtility.h"
+ #include "compiler/LoopOpt.h"
+ #endif
+@@ -159,6 +161,7 @@ static void usage(const char* progName)
+     dvmFprintf(stderr, "  -Xjitbackendoption:key=value[,key=value,...] (Provide option passing to the backend\n");
+     dvmFprintf(stderr, "  -Xjitbackendstring:value (Provide a string to the backend for post-processing\n");
+     dvmFprintf(stderr, "  -Xjit[no]scheduling (Turn on/off Atom Instruction Scheduling)\n");
++    dvmFprintf(stderr, "  -Xjituserplugin:<file.so> (Handle a user plugin file)\n");
+     dvmFprintf(stderr, "  -Xjitarenatrimstyle:<none|onlyOne|average|user> (Select arena triming style)\n");
+     dvmFprintf(stderr, "  -Xjitarenatrimvalue:<value> (The value for the user based arena trim style)\n");
+     dvmFprintf(stderr, "  -Xjitnestedloops (Allows nested loops to be compiled or not)\n");
+@@ -1313,6 +1316,10 @@ static int processOptions(int argc, const char* const argv[],
+         } else if (strncmp(argv[i], "-Xjitlooppasses", 15) == 0) {
+             //Simply call the loop pass printer
+             dvmCompilerPrintPassNames ();
++        } else if (strncmp (argv[i], "-Xjituserplugin:", 16) == 0) {
++            const char *file = argv[i] + 16;
++            //Send off to handle user pass
++            dvmCompilerHandleUserPlugin (file);
+         } else if (strncmp (argv[i], "-Xjitarenatrimstyle:", 20) == 0) {
+             const char *style = argv[i] + 20;
+             const char *acceptedStyles[] = {"none", "onlyOne", "average", "user"};
+@@ -1467,6 +1474,31 @@ static int processOptions(int argc, const char* const argv[],
+     return 0;
+ }
+ 
++
++#if defined(WITH_JIT) && defined(ARCH_IA32)
++
++//Need the include for dvmCompilerMIR2LIR's definition
++#include "compiler/codegen/CompilerCodegen.h"
++
++/**
++ * @brief Set the default Jit Framework
++ */
++static void setJitFramework ()
++{
++    //Set the pass list
++    dvmCompilerBuildPassList ();
++
++    //Now set the default function pointers
++    SJitFramework &jitFramework = gDvmJit.jitFramework;
++
++    jitFramework.backEndFunction = dvmCompilerMIR2LIR;
++    jitFramework.middleEndFunction = dvmCompileTrace;
++    jitFramework.backEndDumpSpecificBB = x86StandAloneArchSpecificDumpBB;
++    jitFramework.backEndBasicBlockAllocation = x86StandAloneArchSpecificNewBB;
++    jitFramework.backEndInvokeArgsDone = dvmCompilerHandleInvokeArgsHeader;
++}
++#endif
++
+ /*
+  * Set defaults for fields altered or modified by arguments.
+  *
+@@ -1541,6 +1573,9 @@ static void setCommandLineDefaults()
+ 
+     gDvmJit.ignorePasses = 0;
+ #if defined(ARCH_IA32)
++    //Set the jit framework in place
++    setJitFramework ();
++
+     gDvmJit.num_entries_pcTable = 0;
+     gDvmJit.scheduling = true;
+     gDvmJit.includeSelectedMethod = false; //uninitialized variable may not be zero
+diff --git a/vm/compiler/Frontend.cpp b/vm/compiler/Frontend.cpp
+index ab5ba9d..fdc3b37 100644
+--- a/vm/compiler/Frontend.cpp
++++ b/vm/compiler/Frontend.cpp
+@@ -1873,8 +1873,37 @@ static bool compileLoop(CompilationUnit *cUnit, unsigned int startOffset,
+         }
+     }
+ 
+-    /* Convert MIR to LIR, etc. */
+-    dvmCompilerMIR2LIR(cUnit, info);
++    {
++        //Get backend gate function
++        bool (*backEndGate) (CompilationUnit *) = gDvmJit.jitFramework.backEndGate;
++
++        //Suppose we are going to call the back-end
++        bool callBackend = true;
++
++        //If it exists
++        if (backEndGate != 0)
++        {
++            callBackend = backEndGate (cUnit);
++        }
++
++        //Call if need be
++        if (callBackend == true)
++        {
++            //Get backend function call
++            void (*mir2lir) (CompilationUnit *, JitTranslationInfo *) = gDvmJit.jitFramework.backEndFunction;
++
++            //If defined, call it
++            if (mir2lir != 0)
++            {
++                /* Convert MIR to LIR, etc. */
++                mir2lir (cUnit, info);
++            }
++        }
++        else
++        {
++            goto bail;
++        }
++    }
+ #else
+     dvmCompilerInitializeRegAlloc(cUnit);
+ 
+@@ -2037,7 +2066,7 @@ bool dvmCompileTrace(JitTraceDescription *desc, int numMaxInsts,
+ #endif
+ 
+     /* Set the recover buffer pointer */
+-    cUnit.bailPtr = bailPtr;
++    cUnit.bailPtr = static_cast<jmp_buf *> (bailPtr);
+ 
+     /* Initialize the printMe flag */
+     cUnit.printMe = gDvmJit.printMe;
+@@ -2533,8 +2562,37 @@ bool dvmCompileTrace(JitTraceDescription *desc, int numMaxInsts,
+     //The loop optimization framework can work for traces as well
+     dvmCompilerLoopOpt(&cUnit);
+ 
+-    /* Convert MIR to LIR, etc. */
+-    dvmCompilerMIR2LIR(&cUnit, info);
++    {
++        //Get backend gate function
++        bool (*backEndGate) (CompilationUnit *) = gDvmJit.jitFramework.backEndGate;
++
++        //Suppose we are going to call the back-end
++        bool callBackend = true;
++
++        //If it exists
++        if (backEndGate != 0)
++        {
++            callBackend = backEndGate (&cUnit);
++        }
++
++        //Call if need be
++        if (callBackend == true)
++        {
++            //Get backend function call
++            void (*mir2lir) (CompilationUnit *, JitTranslationInfo *) = gDvmJit.jitFramework.backEndFunction;
++
++            //If defined, call it
++            if (mir2lir != 0)
++            {
++                /* Convert MIR to LIR, etc. */
++                mir2lir (&cUnit, info);
++            }
++        }
++        else
++        {
++            return false;
++        }
++    }
+ #endif
+ 
+     /* Convert LIR into machine code. Loop for recoverable retries */
+diff --git a/vm/compiler/LoopOpt.cpp b/vm/compiler/LoopOpt.cpp
+index faff712..487e776 100644
+--- a/vm/compiler/LoopOpt.cpp
++++ b/vm/compiler/LoopOpt.cpp
+@@ -14,6 +14,8 @@
+ * limitations under the License.
+ */
+ 
++#include <dlfcn.h>
++
+ #include "AccumulationSinking.h"
+ #include "DualDoubleDivOpt.h"
+ #include "BBOptimization.h"
+@@ -36,7 +38,6 @@ static void clearPHIInformation (CompilationUnit *cUnit);
+ /**
+  * @brief Three macros to help pass definitions
+  */
+-
+ #define START_PASSES \
+     static Pass gPasses[] = {
+ 
+@@ -108,6 +109,39 @@ START_PASSES
+          ),
+ END_PASSES
+ 
++void dvmCompilerBuildPassList (void)
++{
++    //Our pass system above is a table and is easy to create as it is, but our plugin system might want to reorder things,
++    //So let's make it a pass list
++    unsigned int max = sizeof (gPasses) / sizeof (gPasses[0]);
++
++    //If at least one, we have work to do
++    if (max > 0)
++    {
++        //Attach first
++        gDvmJit.jitFramework.firstPass = gPasses;
++
++        //Set last
++        Pass *last = gPasses;
++
++        for (unsigned int i = 1; i < max; i++)
++        {
++            //Get local version
++            Pass *ptr = gPasses + i;
++
++            //Paranoid
++            assert (ptr != 0);
++
++            //Attach it to last
++            last->setNext (ptr);
++            ptr->setPrevious (last);
++
++            //Update last
++            last = ptr;
++        }
++    }
++}
++
+ bool dvmCompilerCalculateBasicBlockInformation (CompilationUnit *cUnit, bool filter)
+ {
+     //Clear SSA information
+@@ -194,7 +228,7 @@ void handlePassFlag (CompilationUnit *cUnit, Pass *pass)
+ void dvmCompilerLoopOptimizationDriver (CompilationUnit *cUnit)
+ {
+     //Go through the different elements
+-    Pass *curPass = gPasses;
++    Pass *curPass = gDvmJit.jitFramework.firstPass;
+ 
+     //As long as we have a pass and we haven't decided to quit the loop mode
+     while (curPass->getName () != "" && cUnit->quitLoopMode == false)
+@@ -204,37 +238,53 @@ void dvmCompilerLoopOptimizationDriver (CompilationUnit *cUnit)
+         //So if strstr returns something, someone wanted to ignore that pass
+         if (gDvmJit.ignorePasses != 0 && strstr (gDvmJit.ignorePasses, curPass->getName ().c_str ()) != 0)
+         {
+-            curPass++;
++            curPass = curPass->getNext ();
+             continue;
+         }
+ 
+-        //We have a pass: do we apply it? By default yes
+-        bool applyPass = curPass->gate (cUnit, curPass);
++        //Do we have a general gate defined?
++        bool (*generalGate) (const CompilationUnit *, const Pass *) = gDvmJit.jitFramework.generalGate;
+ 
+-        if (applyPass == true)
++        //We suppose we can apply the pass
++        bool applyPass = true;
++
++        //Apply the general gate
++        if (generalGate != 0)
+         {
+-            //Applying the pass: first start, doWork, and end calls
+-            curPass->start (cUnit, curPass);
++            applyPass = generalGate (cUnit, curPass);
++        }
+ 
+-            //Get work function
+-            bool (*doWork) (CompilationUnit *, BasicBlock *) = curPass->getWork ();
++        //If the general gate did not invalidate the pass, continue
++        if (applyPass == true)
++        {
++            applyPass = curPass->gate (cUnit, curPass);
+ 
+-            if (doWork != 0)
++            //If the specific gate said ok
++            if (applyPass == true)
+             {
+-                //Set the data in cUnit
+-                cUnit->passData = curPass->getData ();
+-                dvmCompilerDataFlowAnalysisDispatcher (cUnit, doWork, curPass->getTraversal (), false /* isIterative */);
+-                cUnit->passData = 0;
+-            }
++                //Applying the pass: first start, doWork, and end calls
++                curPass->start (cUnit, curPass);
+ 
+-            curPass->end (cUnit, curPass);
++                //Get work function
++                bool (*doWork) (CompilationUnit *, BasicBlock *) = curPass->getWork ();
+ 
+-            //Do we need any clean up?
+-            handlePassFlag (cUnit, curPass);
++                if (doWork != 0)
++                {
++                    //Set the data in cUnit
++                    cUnit->passData = curPass->getData ();
++                    dvmCompilerDataFlowAnalysisDispatcher (cUnit, doWork, curPass->getTraversal (), false /* isIterative */);
++                    cUnit->passData = 0;
++                }
++
++                curPass->end (cUnit, curPass);
++
++                //Do we need any clean up?
++                handlePassFlag (cUnit, curPass);
++            }
+         }
+ 
+         //Go to next pass
+-        curPass++;
++        curPass = curPass->getNext ();
+     }
+ }
+ 
+@@ -333,7 +383,7 @@ void dvmCompilerPrintPassNames (void)
+     while (curPass->getName () != "")
+     {
+         ALOGI ("\t-%s", curPass->getName ().c_str ());
+-        curPass++;
++        curPass = curPass->getNext ();
+     }
+ }
+ 
+@@ -354,7 +404,7 @@ void dvmCompilerPrintIgnorePasses (void)
+             //Set flag to true, we are going to ignore something
+             ignoredSomething = true;
+         }
+-        curPass++;
++        curPass = curPass->getNext ();
+     }
+ 
+     //If nothing got ignored, print out information about it
+@@ -465,3 +515,211 @@ bool dvmCompilerCheckLoops (const CompilationUnit *cUnit, const Pass *curPass)
+ 
+     return true;
+ }
++
++//Get a given pass
++Pass *dvmCompilerGetPass (const char *name)
++{
++    //Go through the different elements
++    Pass *curPass = gDvmJit.jitFramework.firstPass;
++
++    //Find the pass we care about
++    while (curPass->getName () != "" && curPass->getName () != name)
++    {
++        //Next pass
++        curPass = curPass->getNext ();
++    }
++
++    //If not found
++    if (curPass->getName () == "")
++    {
++        return 0;
++    }
++
++    //Otherwise return the pass
++    return curPass;
++}
++
++//Remove a given pass
++bool dvmCompilerRemovePass (const char *name)
++{
++    //Find the pass
++    Pass *curPass = dvmCompilerGetPass (name);
++
++    //Paranoid: didn't find the name
++    if (curPass == 0)
++    {
++        ALOGI ("\tRemoving a pass could not find the reference pass name, here is what you provided %s", name);
++        ALOGI ("\t- Here are the loop passes for reference:");
++        dvmCompilerPrintPassNames ();
++        return false;
++    }
++
++    Pass *previous = curPass->getPrevious ();
++    Pass *next = curPass->getNext ();
++
++    //Update previous
++    if (previous != 0)
++    {
++        previous->setNext (next);
++    }
++    else
++    {
++        //Update global list otherwise
++        gDvmJit.jitFramework.firstPass = next;
++    }
++
++    //Update next
++    if (next != 0)
++    {
++        next->setPrevious (previous);
++    }
++
++    //Report success
++    return true;
++}
++
++//Insert a user pass
++bool dvmCompilerInsertUserPass (Pass *newPass, const char *name, enum PassInstrumentation mode)
++{
++    //Find the pass
++    Pass *curPass = dvmCompilerGetPass (name);
++
++    //Paranoid: didn't find the name
++    if (curPass == 0)
++    {
++        ALOGI ("Pass Modification could not find the reference pass name, here is what you provided %s", name);
++        ALOGI ("\t- Here are the loop passes for reference:");
++        dvmCompilerPrintPassNames ();
++        return false;
++    }
++
++    //We have the pass reference, what we do now depends on the mode
++    switch (mode)
++    {
++        case kPassInstrumentationReplace:
++            {
++                Pass *previous = curPass->getPrevious ();
++                Pass *next = curPass->getNext ();
++
++                //Update links
++                if (previous != 0)
++                {
++                    previous->setNext (newPass);
++                }
++                else
++                {
++                    gDvmJit.jitFramework.firstPass = curPass;
++                }
++
++                if (next != 0)
++                {
++                    next->setPrevious (newPass);
++                }
++
++                newPass->setNext (next);
++                newPass->setPrevious (previous);
++            }
++            break;
++        case kPassInstrumentationInsertBefore:
++            {
++                Pass *previous = curPass->getPrevious ();
++
++                //Update links
++                newPass->setPrevious (previous);
++                newPass->setNext (curPass);
++
++                //If curPass was the first pass
++                if (previous == 0)
++                {
++                    //Update it now
++                    gDvmJit.jitFramework.firstPass = newPass;
++                }
++                else
++                {
++                    previous->setNext (curPass);
++                }
++
++                curPass->setPrevious (newPass);
++            }
++            break;
++        case kPassInstrumentationInsertAfter:
++            {
++                Pass *next = curPass->getNext ();
++
++                //Update links
++                newPass->setNext (next);
++                newPass->setPrevious (curPass);
++                curPass->setNext (newPass);
++
++                //Handle next
++                if (next != 0)
++                {
++                    next->setPrevious (newPass);
++                }
++            }
++            break;
++        default:
++            break;
++    }
++
++    //Report success
++    return true;
++}
++
++void dvmCompilerSetGeneralGate (bool (*general) (const CompilationUnit *, const Pass*))
++{
++    gDvmJit.jitFramework.generalGate = general;
++}
++
++//Replace a given pass gate
++bool dvmCompilerReplaceGate (const char *name, bool (*gate) (const CompilationUnit *, const Pass*))
++{
++    //Find the pass
++    Pass *curPass = dvmCompilerGetPass (name);
++
++    //Paranoid: didn't find the name
++    if (curPass == 0)
++    {
++        ALOGI ("Pass Modification could not find the reference pass name, here is what you provided %s", name);
++        ALOGI ("\t- Here are the loop passes for reference:");
++        dvmCompilerPrintPassNames ();
++        return false;
++    }
++
++    //Set the gate
++    curPass->setGate (gate);
++
++    //Report success
++    return true;
++}
++
++//Handle a user plugin
++void dvmCompilerHandleUserPlugin (const char *fileName)
++{
++    //Open the file
++    void *userHandle = dlopen (fileName, RTLD_NOW);
++
++    if (userHandle != 0)
++    {
++        //Open now the init function
++        void *tmp = dlsym (userHandle, "dalvikPluginInit");
++
++        if (tmp == 0)
++        {
++            fprintf (stderr, "Problem with %s, cannot find dalvikPluginInit function\n", fileName);
++        }
++        else
++        {
++            //Transform it into a function pointer
++            void (*ptr) (void) = (void (*) (void)) (tmp);
++
++            //Call it
++            ptr ();
++        }
++    }
++    else
++    {
++        ALOGE("Problem opening user plugin file %s", fileName);
++        ALOGE("dlerror() reports %s", dlerror());
++    }
++}
+diff --git a/vm/compiler/LoopOpt.h b/vm/compiler/LoopOpt.h
+index 75b7b4b..045b747 100644
+--- a/vm/compiler/LoopOpt.h
++++ b/vm/compiler/LoopOpt.h
+@@ -17,7 +17,15 @@
+ #ifndef DALVIK_VM_LOOPOPT_H_
+ #define DALVIK_VM_LOOPOPT_H_
+ 
+-#include "CompilerInternals.h"
++/**
++ * @brief PassInstrumentation allows the user to modify existing passes and add new ones
++ */
++enum PassInstrumentation
++{
++    kPassInstrumentationInsertBefore,   /**< @brief Insert before the Pass */
++    kPassInstrumentationInsertAfter,    /**< @brief Insert after the Pass */
++    kPassInstrumentationReplace,        /**< @brief Replace a Pass */
++};
+ 
+ //Forward Declaration
+ struct CompilationUnit;
+@@ -94,4 +102,47 @@ bool dvmCompilerDDDOGate (const CompilationUnit *cUnit, const Pass *curPass);
+  * @return Whether to continue as a loop or bail
+  */
+ bool dvmCompilerCheckLoops ( const CompilationUnit *cUnit, const Pass *curPass);
++
++/**
++ * @brief Remove an optimization Pass
++ * @param name the name of the Pass
++ * @return whether removal was successful
++ */
++bool dvmCompilerRemovePass (const char *name);
++
++/**
++ * @brief Get an optimization pass
++ * @param name the name of the Pass
++ * @return pointer to the Pass, 0 if not found
++ */
++Pass *dvmCompilerGetPass (const char *name);
++
++/**
++ * @brief Get an optimization pass
++ * @param name the name of the Pass
++ * @param gate the new gate
++ * @return whether the gate replacement was successful
++ */
++bool dvmCompilerReplaceGate (const char *name, bool (*gate) (const CompilationUnit *, const Pass*));
++
++/**
++ * @brief Insert the user pass
++ * @param newPass the Pass information we want to add/modify
++ * @param name the name of the current pass we want to be adding/modifying
++ * @param mode what we want to do/change
++ * @return whether we succeeded or not
++ */
++bool dvmCompilerInsertUserPass (Pass *newPass, const char *name, enum PassInstrumentation mode);
++
++/**
++ * @brief Handle User Plugin Library
++ * @param name the name of the library
++ */
++void dvmCompilerHandleUserPlugin (const char *fileName);
++
++/**
++ * @brief Create the Pass list
++ */
++void dvmCompilerBuildPassList (void);
++
+ #endif
+diff --git a/vm/compiler/Pass.cpp b/vm/compiler/Pass.cpp
+index 63dac27..c27f9f7 100644
+--- a/vm/compiler/Pass.cpp
++++ b/vm/compiler/Pass.cpp
+@@ -37,6 +37,8 @@ Pass::Pass (const std::string &name,
+     this->doWorkPtr = doWorkPtr;
+     this->freeDataPtr = freeDataPtr;
+     this->flags = flags;
++    this->next = 0;
++    this->previous = 0;
+ }
+ 
+ 
+diff --git a/vm/compiler/Pass.h b/vm/compiler/Pass.h
+index cc2ccdc..85c8c79 100644
+--- a/vm/compiler/Pass.h
++++ b/vm/compiler/Pass.h
+@@ -20,11 +20,14 @@
+ #include <string>
+ 
+ //Forward declarations
+-struct CompilationUnit;
+ struct BasicBlock;
++struct CompilationUnit;
++class Pass;
+ 
+-//We need a typedef for returning a pointer function
++//We need a typedef for returning a work function pointer
+ typedef bool (*fctWorkPtr) (CompilationUnit *, BasicBlock *);
++//We need a typedef for returning a gate function pointer
++typedef bool (*fctGatePtr) (const CompilationUnit *, const Pass *);
+ 
+ /**
+  * @brief OptimizationFlag is an enumeration to perform certain tasks after a given pass using the flags field of Pass, each enum should be a power of 2 to be correctly used
+@@ -77,6 +80,12 @@ class Pass
+         /** @brief Flags for clean-up */
+         unsigned int flags;
+ 
++        /** @brief Next Pass */
++        Pass *next;
++
++        /** @brief Previous Pass */
++        Pass *previous;
++
+     public:
+         /**
+          * @brief Constructor
+@@ -169,6 +178,41 @@ class Pass
+          * @return returns the work function pointer (can be NULL)
+          */
+         fctWorkPtr getWork (void) const;
+-};
+ 
++        /**
++         * @brief Set next Pass
++         * @param pass the Pass to be set as next
++         */
++        void setNext (Pass *pass) {next = pass;}
++
++        /**
++         * @brief Get the next Pass
++         * @return the next Pass
++         */
++        Pass *getNext (void) const {return next;}
++
++        /**
++         * @brief Set previous Pass
++         * @param pass the Pass to be set as previous
++         */
++        void setPrevious (Pass *pass) {previous = pass;}
++
++        /**
++         * @brief Get the previous Pass
++         * @return the previous Pass
++         */
++        Pass *getPrevious (void) const {return previous;}
++
++        /**
++         * @brief Set gate
++         * @param newGate the new gate pointer
++         */
++        void setGate (bool (*newGate) (const CompilationUnit *cUnit, const Pass *curPass)) {gatePtr = newGate;}
++
++        /**
++         * @brief Get the gate
++         * @return the gate pointer
++         */
++        fctGatePtr getGate (void) const {return gatePtr;}
++};
+ #endif
+diff --git a/vm/compiler/codegen/x86/AnalysisO1.cpp b/vm/compiler/codegen/x86/AnalysisO1.cpp
+index df5f57b..7ca48d6 100644
+--- a/vm/compiler/codegen/x86/AnalysisO1.cpp
++++ b/vm/compiler/codegen/x86/AnalysisO1.cpp
+@@ -836,40 +836,6 @@ void BasicBlock_O1::freeIt (void) {
+ }
+ 
+ /**
+- * @brief Architecture specific BasicBlock creator
+- * @details Initializes x86 specific BasicBlock fields
+- * @return newly created BasicBlock
+- */
+-BasicBlock * dvmCompilerArchSpecificNewBB() {
+-    // Make space on arena for this BB
+-    void * space = dvmCompilerNew(sizeof(BasicBlock_O1), true);
+-    // Ensure that constructor is called
+-    BasicBlock_O1 * newBB = new (space) BasicBlock_O1;
+-
+-    // Paranoid because dvmCompilerNew should never return NULL
+-    assert(newBB != NULL);
+-
+-    return newBB;
+-}
+-
+-/**
+- * @brief Architecture specific BasicBlock printing
+- * @param cUnit the CompilationUnit
+- * @param bb the BasicBlock
+- * @param file the File in which to dump the BasicBlock
+- * @param beforeMIRs whether this is being called before the MIRs or not
+- */
+-void dvmCompilerDumpArchSpecificBB(CompilationUnit *cUnit, BasicBlock *bb,
+-        FILE *file, bool beforeMIRs) {
+-    // We have already created the x86 specific BB so cast is okay
+-    BasicBlock_O1 * curBB = reinterpret_cast<BasicBlock_O1 *>(bb);
+-
+-    if (beforeMIRs == true) {
+-        curBB->associationTable.printToDot(file);
+-    }
+-}
+-
+-/**
+  * @brief Do we have enough of a given class of registers to registerize
+  * @param cUnit the BasicBlock
+  * @param reg the RegisterClass to consider
+diff --git a/vm/compiler/codegen/x86/CodegenInterface.cpp b/vm/compiler/codegen/x86/CodegenInterface.cpp
+index 52f6915..4581ae6 100644
+--- a/vm/compiler/codegen/x86/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/CodegenInterface.cpp
+@@ -2482,51 +2482,87 @@ void* dvmJitChain_staticAddr(void* tgtAddr, u4* branchAddr)
+     return tgtAddr;
+ }
+ 
++/**
++ * @brief Send off the work
++ * @param work the CompilerWorkOrder
++ * @return if the compilation succeeded
++ */
++static bool sendOffWork (CompilerWorkOrder *work)
++{
++    //Get trace description
++    JitTraceDescription *desc = static_cast<JitTraceDescription *> (work->info);
++    bool success = true;
++
++    //Will we compile it?
++    bool (*middleEndGate) (JitTraceDescription *, int, JitTranslationInfo *, jmp_buf *, int ) = gDvmJit.jitFramework.middleEndGate;
++
++    //Compilation function
++    bool (*middleEndFunction) (JitTraceDescription *, int, JitTranslationInfo *, jmp_buf *, int ) = gDvmJit.jitFramework.middleEndFunction;
++
++    //If we have a middle-end function, we have work
++    if (middleEndFunction != 0)
++    {
++        //Suppose we will compile it
++        bool willCompile = true;
++
++        //If we have a gate
++        if (middleEndGate != 0)
++        {
++            willCompile = middleEndGate (desc, JIT_MAX_TRACE_LEN, &work->result, work->bailPtr, 0);
++        }
++
++        if (willCompile == true)
++        {
++            //Get middle end function
++
++            success = middleEndFunction (desc, JIT_MAX_TRACE_LEN, &work->result, work->bailPtr, 0 /* no hints */);
++        }
++    }
++
++    return success;
++}
++
+ /*
+  * Accept the work and start compiling.  Returns true if compilation
+  * is attempted.
+  */
+ bool dvmCompilerDoWork(CompilerWorkOrder *work)
+ {
+-    JitTraceDescription *desc;
+-    bool isCompile;
++    bool isCompile = true;
+     bool success = true;
+ 
+-    if (gDvmJit.codeCacheFull) {
++    if (gDvmJit.codeCacheFull == true) {
+         return false;
+     }
+ 
+     switch (work->kind) {
+         case kWorkOrderTrace:
+-            isCompile = true;
+-            /* Start compilation with maximally allowed trace length */
+-            desc = (JitTraceDescription *)work->info;
+-            success = dvmCompileTrace(desc, JIT_MAX_TRACE_LEN, &work->result,
+-                                        work->bailPtr, 0 /* no hints */);
+-            break;
+-        case kWorkOrderTraceDebug: {
+-            bool oldPrintMe = gDvmJit.printMe;
+-            gDvmJit.printMe = true;
+-            isCompile = true;
+-            /* Start compilation with maximally allowed trace length */
+-            desc = (JitTraceDescription *)work->info;
+-            success = dvmCompileTrace(desc, JIT_MAX_TRACE_LEN, &work->result,
+-                                        work->bailPtr, 0 /* no hints */);
+-            gDvmJit.printMe = oldPrintMe;
++            sendOffWork (work);
+             break;
+-        }
++        case kWorkOrderTraceDebug:
++            {
++                bool oldPrintMe = gDvmJit.printMe;
++                gDvmJit.printMe = true;
++                sendOffWork (work);
++                gDvmJit.printMe = oldPrintMe;
++                break;
++            }
+         case kWorkOrderProfileMode:
+-            dvmJitChangeProfileMode((TraceProfilingModes)(int)work->info);
++            dvmJitChangeProfileMode ( (TraceProfilingModes) (int) work->info);
+             isCompile = false;
+             break;
+         default:
+             isCompile = false;
+-            ALOGI("JIT_INFO: Unknown work order type");
+-            assert(0);  // Bail if debug build, discard otherwise
+-            ALOGI("\tError ignored");
++            ALOGI ("JIT_INFO: Unknown work order type");
++            assert (0);  // Bail if debug build, discard otherwise
++            ALOGI ("\tError ignored");
++            break;
+     }
+-    if (!success)
++
++    if (success == false) {
+         work->result.codeAddress = NULL;
++    }
++
+     return isCompile;
+ }
+ 
+@@ -2581,3 +2617,28 @@ bool dvmCompilerFindRegClass (MIR *mir, int vR, RegisterClass &regClass)
+     //Success, signal it
+     return true;
+ }
++
++BasicBlock *x86StandAloneArchSpecificNewBB (void)
++{
++    // Make space on arena for this BB
++    void * space = dvmCompilerNew(sizeof(BasicBlock_O1), true);
++
++    // Ensure that constructor is called
++    BasicBlock_O1 * newBB = new (space) BasicBlock_O1;
++
++    // Paranoid because dvmCompilerNew should never return NULL
++    assert(newBB != 0);
++
++    return newBB;
++}
++
++void x86StandAloneArchSpecificDumpBB (CompilationUnit *cUnit, BasicBlock *bb, FILE *file, bool beforeMIRs)
++{
++    // We have already created the x86 specific BB so cast is okay
++    BasicBlock_O1 * curBB = reinterpret_cast<BasicBlock_O1 *>(bb);
++
++    if (beforeMIRs == true)
++    {
++        curBB->associationTable.printToDot(file);
++    }
++}
+diff --git a/vm/compiler/codegen/x86/Lower.h b/vm/compiler/codegen/x86/Lower.h
+index 3a145c4..2a77442 100644
+--- a/vm/compiler/codegen/x86/Lower.h
++++ b/vm/compiler/codegen/x86/Lower.h
+@@ -1397,8 +1397,30 @@ int preprocessingTrace();
+ /** @brief align the relative offset of jmp/jcc and movl within 16B */
+ void alignOffset(int cond);
+ bool doesJumpToBBNeedAlignment(BasicBlock * bb);
+-#endif
++
++/**
++ * @brief Architecture specific BasicBlock creator
++ * @details Initializes x86 specific BasicBlock fields
++ * @return newly created BasicBlock
++ */
++BasicBlock *x86StandAloneArchSpecificNewBB (void);
++
++/**
++ * @brief Architecture specific BasicBlock printing
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock
++ * @param file the File in which to dump the BasicBlock
++ */
++void x86StandAloneArchSpecificDumpBB (CompilationUnit *cUnit, BasicBlock *bb, FILE *file, bool beforeMIRs);
++
++/**
++ * @brief Handle the invoke label
++ * @param value the form of the arguments
++ * @return the section label's name
++ */
++const char *dvmCompilerHandleInvokeArgsHeader (int value);
+ 
+ void pushCallerSavedRegs(void);
+ void popCallerSavedRegs(void);
+ 
++#endif
+diff --git a/vm/compiler/codegen/x86/LowerHelper.cpp b/vm/compiler/codegen/x86/LowerHelper.cpp
+index 83448cb..8086b7c 100644
+--- a/vm/compiler/codegen/x86/LowerHelper.cpp
++++ b/vm/compiler/codegen/x86/LowerHelper.cpp
+@@ -3927,6 +3927,17 @@ int resolve_class2(
+            bool indexPhysical, int thirdArg) {
+     if (insertLabel(".class_resolve", false) == -1)
+         return -1;
++
++    //Get call back
++    void (*backEndSymbolCreationCallback) (const std::string &, void *) =
++        gDvmJit.jitFramework.backEndSymbolCreationCallback;
++
++    //Call it if we have one
++    if (backEndSymbolCreationCallback != 0)
++    {
++        backEndSymbolCreationCallback (".class_resolve", (void*) stream);
++    }
++
+     scratchRegs[0] = PhysicalReg_ESI; scratchRegs[1] = PhysicalReg_EDX;
+     scratchRegs[2] = PhysicalReg_Null; scratchRegs[3] = PhysicalReg_Null;
+ 
+diff --git a/vm/compiler/codegen/x86/LowerInvoke.cpp b/vm/compiler/codegen/x86/LowerInvoke.cpp
+index b51d34a..52e1e0e 100644
+--- a/vm/compiler/codegen/x86/LowerInvoke.cpp
++++ b/vm/compiler/codegen/x86/LowerInvoke.cpp
+@@ -912,6 +912,29 @@ int unspill_reg(int reg, bool isPhysical) {
+ int generate_invokeNative(void); //forward declaration
+ int generate_stackOverflow(void); //forward declaration
+ 
++const char *dvmCompilerHandleInvokeArgsHeader (int value)
++{
++    ArgsDoneType form = static_cast<ArgsDoneType> (value);
++
++    // Insert different labels for the various forms
++    const char * sectionLabel = 0;
++
++    //Look at the form
++    switch (form)
++    {
++        case ArgsDone_Full:
++            sectionLabel = ".invokeArgsDone_jit";
++            break;
++        case ArgsDone_Normal:
++            sectionLabel = ".invokeArgsDone_normal";
++            break;
++        default:
++            sectionLabel = ".invokeArgsDone_native";
++            break;
++    }
++
++    return sectionLabel;
++}
+ /**
+  * @brief Common code to invoke a method after all of the arguments
+  * are handled.
+@@ -937,16 +960,22 @@ int common_invokeArgsDone(ArgsDoneType form) {
+     scratchRegs[2] = PhysicalReg_EDX;
+     scratchRegs[3] = PhysicalReg_Null;
+ 
+-    // Insert different labels for the various forms
+-    const char * sectionLabel;
+-    if (form == ArgsDone_Full) {
+-        sectionLabel = ".invokeArgsDone_jit";
+-    } else if (form == ArgsDone_Normal) {
+-        sectionLabel = ".invokeArgsDone_normal";
+-    } else { // form == ArgsDone_Native
+-        sectionLabel = ".invokeArgsDone_native";
++    //Get the callback
++    const char* (*backEndInvokeArgsDone) (int) = gDvmJit.jitFramework.backEndInvokeArgsDone;
++
++    //We actually need this call back for this backend
++    assert (backEndInvokeArgsDone != 0);
++
++    const char *sectionLabel = 0;
++
++    if (backEndInvokeArgsDone != 0)
++    {
++        sectionLabel = backEndInvokeArgsDone (form);
+     }
+ 
++    //Paranoid
++    assert (sectionLabel != 0);
++
+     if (insertLabel(sectionLabel, false) == -1)
+         return -1;
+ 
+diff --git a/vm/compiler/codegen/x86/LowerJump.cpp b/vm/compiler/codegen/x86/LowerJump.cpp
+index b0a56a9..39ed407 100644
+--- a/vm/compiler/codegen/x86/LowerJump.cpp
++++ b/vm/compiler/codegen/x86/LowerJump.cpp
+@@ -1380,6 +1380,16 @@ int common_errStringIndexOutOfBounds() {
+ int common_errArrayIndex() {
+     if (insertLabel("common_errArrayIndex", false) == -1)
+         return -1;
++
++    //Get call back
++    void (*backEndSymbolCreationCallback) (const std::string &, void *) =
++        gDvmJit.jitFramework.backEndSymbolCreationCallback;
++
++    if (backEndSymbolCreationCallback != 0)
++    {
++        backEndSymbolCreationCallback ("common_errArrayIndex", (void*) stream);
++    }
++
+ #if defined VTUNE_DALVIK
+     int startStreamPtr = (int)stream;
+ #endif
+@@ -2123,6 +2133,15 @@ int common_gotoBail_0(void) {
+     if (insertLabel("common_gotoBail_0", false) == -1)
+         return -1;
+ 
++    //Get call back
++    void (*backEndSymbolCreationCallback) (const std::string &, void *) =
++        gDvmJit.jitFramework.backEndSymbolCreationCallback;
++
++    if (backEndSymbolCreationCallback != 0)
++    {
++        backEndSymbolCreationCallback ("common_gotoBail_0", (void*) stream);
++    }
++
+ #if defined VTUNE_DALVIK
+     int startStreamPtr = (int)stream;
+ #endif
+diff --git a/vm/compiler/codegen/x86/x86Specific.cpp b/vm/compiler/codegen/x86/x86Specific.cpp
+new file mode 100644
+index 0000000..3b3f640
+--- /dev/null
++++ b/vm/compiler/codegen/x86/x86Specific.cpp
+@@ -0,0 +1,51 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#include "CompilerIR.h"
++#include "x86Specific.h"
++
++/**
++ * @brief Architecture specific BasicBlock creator
++ * @details Initializes x86 specific BasicBlock fields
++ * @return newly created BasicBlock
++ */
++BasicBlock *dvmCompilerArchSpecificNewBB(void)
++{
++    BasicBlock * (*fctPtr) (void) = gDvmJit.jitFramework.backEndBasicBlockAllocation;
++
++    //If we have a function pointer, call it
++    if (fctPtr != 0)
++    {
++        return fctPtr ();
++    }
++
++    return 0;
++}
++
++/**
++ * @brief Architecture specific BasicBlock printing
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock
++ * @param file the File in which to dump the BasicBlock
++ */
++void dvmCompilerDumpArchSpecificBB(CompilationUnit *cUnit, BasicBlock *bb, FILE *file, bool beforeMIRs)
++{
++    void (*fctPtr) (CompilationUnit *, BasicBlock *, FILE *, bool) = gDvmJit.jitFramework.backEndDumpSpecificBB;
++
++    if (fctPtr != 0)
++    {
++        fctPtr (cUnit, bb, file, beforeMIRs);
++    }
++}
+diff --git a/vm/compiler/codegen/x86/x86Specific.h b/vm/compiler/codegen/x86/x86Specific.h
+new file mode 100644
+index 0000000..7f60199
+--- /dev/null
++++ b/vm/compiler/codegen/x86/x86Specific.h
+@@ -0,0 +1,41 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef H_X86SPECIFIC
++#define H_X86SPECIFIC
++
++#include <stdlib.h>
++
++//Forward Declarations
++struct BasicBlock;
++struct CompilationUnit;
++
++/**
++ * @brief Architecture specific BasicBlock creator
++ * @details Initializes x86 specific BasicBlock fields
++ * @return newly created BasicBlock
++ */
++BasicBlock *dvmCompilerArchSpecificNewBB(void);
++
++/**
++ * @brief Architecture specific BasicBlock printing
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock
++ * @param file the File in which to dump the BasicBlock
++ */
++void dvmCompilerDumpArchSpecificBB(CompilationUnit *cUnit, BasicBlock *bb, FILE *file, bool beforeMIRs);
++
++#endif
+-- 
+1.7.4.1
+

@@ -1,0 +1,387 @@
+From a5a5d61d46f69a98a07f284b99af1d27fb696c51 Mon Sep 17 00:00:00 2001
+From: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Date: Fri, 1 Feb 2013 14:33:44 -0800
+Subject: Dalvik: Addressing issues identified by Klocwork
+
+BZ: 84707
+
+This patch addresses several issues which were identified by Klocwork:
+-Possible dereference of null MIR pointer
+-No null check after call to calloc
+-Possible use of uninitialized operand size
+-Possible use of uninitialized array value (readyOps)
+-Use of sizeof as parameter to memcpy could lead to out of bounds accesses
+-Disassembly of operand size can return null
+-Possible use of null result from localtime
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Ie4973e57b9837aaa484644efbcfb7c2e317a3cef
+Orig-MCG-Change-Id: Ib7c0efa12b317112c8d547f8688f34ab54d8cb2e
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/SignalCatcher.cpp                           |   13 ++++++--
+ vm/compiler/Dataflow.cpp                       |    2 +-
+ vm/compiler/JitProfiling.cpp                   |   12 ++++++-
+ vm/compiler/codegen/x86/LowerJump.cpp          |    8 ++--
+ vm/compiler/codegen/x86/Schedule.cpp           |   37 +++++++++++++----------
+ vm/compiler/codegen/x86/Scheduler.h            |    4 ++-
+ vm/compiler/codegen/x86/libenc/enc_base.h      |   13 ++++++--
+ vm/compiler/codegen/x86/libenc/enc_prvt.h      |    2 +-
+ vm/compiler/codegen/x86/libenc/enc_tabl.cpp    |    4 ++-
+ vm/compiler/codegen/x86/libenc/enc_wrapper.cpp |   31 +++++++++++++++++--
+ 10 files changed, 88 insertions(+), 38 deletions(-)
+
+diff --git a/vm/SignalCatcher.cpp b/vm/SignalCatcher.cpp
+index d4302aa..0404c4b 100644
+--- a/vm/SignalCatcher.cpp
++++ b/vm/SignalCatcher.cpp
+@@ -114,10 +114,15 @@ static void logThreadStacks(FILE* fp)
+ #else
+     ptm = localtime(&now);
+ #endif
+-    dvmPrintDebugMessage(&target,
+-        "\n\n----- pid %d at %04d-%02d-%02d %02d:%02d:%02d -----\n",
+-        pid, ptm->tm_year + 1900, ptm->tm_mon+1, ptm->tm_mday,
+-        ptm->tm_hour, ptm->tm_min, ptm->tm_sec);
++    if (ptm != NULL) {
++        dvmPrintDebugMessage(&target,
++                "\n\n----- pid %d at %04d-%02d-%02d %02d:%02d:%02d -----\n",
++                pid, ptm->tm_year + 1900, ptm->tm_mon+1, ptm->tm_mday,
++                ptm->tm_hour, ptm->tm_min, ptm->tm_sec);
++    } else {
++        dvmPrintDebugMessage(&target,
++                "\n\n----- pid %d at unknown time -----\n", pid);
++    }
+     printProcessName(&target);
+     dvmPrintDebugMessage(&target, "\n");
+     dvmDumpJniStats(&target);
+diff --git a/vm/compiler/Dataflow.cpp b/vm/compiler/Dataflow.cpp
+index 234799e..dc550cf 100644
+--- a/vm/compiler/Dataflow.cpp
++++ b/vm/compiler/Dataflow.cpp
+@@ -1082,7 +1082,7 @@ void dvmCompilerExtendedDisassembler (const CompilationUnit *cUnit,
+             {
+                 snprintf (buffer, len, "kMirOpCheckInlinePrediction: v%d, Class %s",
+                         insn->vC,
+-                        mir->meta.callsiteInfo->classDescriptor);
++                        mir != NULL ? mir->meta.callsiteInfo->classDescriptor : "Unknown");
+             }
+             break;
+         default:
+diff --git a/vm/compiler/JitProfiling.cpp b/vm/compiler/JitProfiling.cpp
+index c9bf884..27145b6 100644
+--- a/vm/compiler/JitProfiling.cpp
++++ b/vm/compiler/JitProfiling.cpp
+@@ -172,8 +172,16 @@ ITT_EXTERN_C int JITAPI iJIT_NotifyEvent(iJIT_JVM_EVENT event_type, void *EventS
+         {
+             // initialize the stack.
+             threadStack = (pThreadStack) calloc (sizeof(ThreadStack), 1);
+-            threadStack->TopStack = INIT_TOP_Stack;
+-            threadStack->CurrentStack = INIT_TOP_Stack;
++
++            // That's not good if we failed to allocate threadStack.
++            // However, it doesn't affect us now and it only affects the readers of
++            // threadLocalStorageHandle. Thus we can allow it to be set to NULL
++            // and users of it must check that it has been initialized.
++            if (threadStack != NULL) {
++                threadStack->TopStack = INIT_TOP_Stack;
++                threadStack->CurrentStack = INIT_TOP_Stack;
++            }
++
+ #if ITT_PLATFORM==ITT_PLATFORM_WIN
+             TlsSetValue(threadLocalStorageHandle,(void*)threadStack);
+ #else  /* ITT_PLATFORM==ITT_PLATFORM_WIN */
+diff --git a/vm/compiler/codegen/x86/LowerJump.cpp b/vm/compiler/codegen/x86/LowerJump.cpp
+index 80a2b35..bc5949b 100644
+--- a/vm/compiler/codegen/x86/LowerJump.cpp
++++ b/vm/compiler/codegen/x86/LowerJump.cpp
+@@ -594,7 +594,7 @@ void conditional_jump(ConditionCode cc, const char* target, bool isShortTerm) {
+     }
+     Mnemonic m = (Mnemonic)(Mnemonic_Jcc + cc);
+     bool unknown;
+-    OpndSize size;
++    OpndSize size = OpndSize_Null;
+     int imm = 0;
+     if(!gDvmJit.scheduling)
+         imm = getRelativeOffset(target, isShortTerm, JmpCall_cond, &unknown, &size);
+@@ -613,7 +613,7 @@ void unconditional_jump(const char* target, bool isShortTerm) {
+     }
+     Mnemonic m = Mnemonic_JMP;
+     bool unknown;
+-    OpndSize size;
++    OpndSize size = OpndSize_Null;
+     if(gDvm.executionMode == kExecutionModeNcgO1) {
+         //for other three labels used by JIT: invokeArgsDone_formal, _native, _jit
+         if(!strncmp(target, ".invokeArgsDone", 15)) {
+@@ -690,7 +690,7 @@ void call(const char* target) {
+     }
+     Mnemonic m = Mnemonic_CALL;
+     bool dummy;
+-    OpndSize size;
++    OpndSize size = OpndSize_Null;
+     int relOffset = 0;
+     if(!gDvmJit.scheduling)
+         relOffset = getRelativeOffset(target, false, JmpCall_call, &dummy, &size);
+@@ -1091,7 +1091,7 @@ int common_goto(s4 targetBlockId) {
+ 
+ int common_if(s4 tmp, ConditionCode cc_next, ConditionCode cc) {
+     bool unknown;
+-    OpndSize size;
++    OpndSize size = OpndSize_Null;
+     int relativeNCG;
+ 
+     if (traceMode == kJitLoop && !branchInLoop && hasVRStoreExitOfLoop()) {
+diff --git a/vm/compiler/codegen/x86/Schedule.cpp b/vm/compiler/codegen/x86/Schedule.cpp
+index 0f150e6..408edea 100644
+--- a/vm/compiler/codegen/x86/Schedule.cpp
++++ b/vm/compiler/codegen/x86/Schedule.cpp
+@@ -1387,8 +1387,8 @@ void Scheduler::generateAssembly(LowOp * op) {
+ //! \param chosenIdx is the index of the chosen instruction for scheduling
+ //! \param scheduledOps is an input list of scheduled LowOps
+ //! \param readyOps is an output list of LowOps that are ready
+-void Scheduler::updateReadyOps(int chosenIdx, bool* scheduledOps,
+-        bool* readyOps) {
++void Scheduler::updateReadyOps(int chosenIdx, BitVector * scheduledOps,
++        BitVector * readyOps) {
+     // Go through each successor LIR that depends on selected LIR
+     for (unsigned int k = 0; k < dependencyAssociation[queuedLIREntries[chosenIdx]].successorDependencies.size(); ++k) {
+         int dst = dependencyAssociation[queuedLIREntries[chosenIdx]].successorDependencies[k].lowopSlotId;
+@@ -1397,7 +1397,7 @@ void Scheduler::updateReadyOps(int chosenIdx, bool* scheduledOps,
+         // If all predecessors are scheduled, insert into ready queue
+         for (unsigned int k2 = 0; k2 < dependencyAssociation[queuedLIREntries[dst]].predecessorDependencies.size(); ++k2) {
+             int src = dependencyAssociation[queuedLIREntries[dst]].predecessorDependencies[k2].lowopSlotId;
+-            if (!scheduledOps[src]) {
++            if (dvmIsBitSet(scheduledOps, src) == false) {
+                 // If one of parents hasn't been scheduled, then current instruction is not ready
+                 isReady = false;
+                 break;
+@@ -1414,7 +1414,7 @@ void Scheduler::updateReadyOps(int chosenIdx, bool* scheduledOps,
+                 readyTime = candidateReadyTime;
+         }
+         if (isReady) {
+-            readyOps[dst] = true; // Update entry in ready queue
++            dvmSetBit(readyOps, dst);
+             queuedLIREntries[dst]->readyTime = readyTime;
+ #ifndef DISABLE_DEBUG_ATOM_SCHEDULER
+             ALOGD("update readyTime of slot %d: %d\n", dst, readyTime);
+@@ -1515,12 +1515,17 @@ void Scheduler::findLongestPath() {
+ //! also be the last LIR in Scheduler::scheduledLIREntries
+ void Scheduler::schedule() {
+     // Declare data structures for scheduling
+-    bool readyOps[queuedLIREntries.size()]; // ready for scheduling
+-    bool scheduledOps[queuedLIREntries.size()]; // scheduled
+     unsigned int candidateArray[queuedLIREntries.size()]; // ready candidates for scheduling
+     unsigned int num_candidates = 0 /*index for candidateArray*/, numScheduled = 0, lirID;
+     int currentTime = 0;
+ 
++    // LIRs ready for scheduling
++    BitVector * readyOps = dvmCompilerAllocBitVector(queuedLIREntries.size(), false);
++    dvmClearAllBits(readyOps);
++    // LIRs that have been scheduled
++    BitVector * scheduledOps = dvmCompilerAllocBitVector(queuedLIREntries.size(), false);
++    dvmClearAllBits(scheduledOps);
++
+     // Predecessor dependencies have already been initialized in the dependency graph building.
+     // Now, initialize successor dependencies to complete dependency graph.
+     for (lirID = 0; lirID < queuedLIREntries.size(); ++lirID) {
+@@ -1545,10 +1550,8 @@ void Scheduler::schedule() {
+         ALOGD("-- slot %d: latency %d port type %d\n", lirID, queuedLIREntries[lirID]->instructionLatency,
+                 queuedLIREntries[lirID]->portType);
+ #endif
+-        scheduledOps[lirID] = false;
+-        readyOps[lirID] = false;
+         if (dependencyAssociation[queuedLIREntries[lirID]].predecessorDependencies.size() == 0) {
+-            readyOps[lirID] = true;
++            dvmSetBit(readyOps, lirID);
+ #ifndef DISABLE_DEBUG_ATOM_SCHEDULER
+             ALOGD("slot %d is ready\n", lirID);
+ #endif
+@@ -1568,7 +1571,8 @@ void Scheduler::schedule() {
+ 
+         // Select candidates that are ready (readyTime <= currentTime)
+         for (lirID = 0; lirID < queuedLIREntries.size(); lirID++) {
+-            if (readyOps[lirID] && queuedLIREntries[lirID]->readyTime <= currentTime
++            if (dvmIsBitSet(readyOps, lirID)
++                    && queuedLIREntries[lirID]->readyTime <= currentTime
+                     && (!isBasicBlockDelimiter(queuedLIREntries[lirID]->opCode)))
+                 candidateArray[num_candidates++] = lirID;
+         }
+@@ -1580,7 +1584,7 @@ void Scheduler::schedule() {
+             // First, find the smallest ready time out of instructions that are
+             // ready.
+             for (lirID = 0; lirID < queuedLIREntries.size(); lirID++) {
+-                if (readyOps[lirID]
++                if (dvmIsBitSet(readyOps, lirID)
+                         && (!isBasicBlockDelimiter(queuedLIREntries[lirID]->opCode))) {
+                     if (chosenIdx1 == queuedLIREntries.size()
+                             || queuedLIREntries[lirID]->readyTime
+@@ -1594,7 +1598,8 @@ void Scheduler::schedule() {
+ 
+             // Select any other candidates that also are ready at the same time.
+             for (lirID = 0; lirID < queuedLIREntries.size(); lirID++) {
+-                if (readyOps[lirID] && (!isBasicBlockDelimiter(queuedLIREntries[lirID]->opCode))
++                if (dvmIsBitSet(readyOps, lirID)
++                        && (!isBasicBlockDelimiter(queuedLIREntries[lirID]->opCode))
+                         && queuedLIREntries[lirID]->readyTime <= currentTime) {
+                     candidateArray[num_candidates++] = lirID;
+                 }
+@@ -1663,15 +1668,15 @@ void Scheduler::schedule() {
+ #endif
+ 
+         scheduledLIREntries.push_back(queuedLIREntries[chosenIdx1]);
+-        scheduledOps[chosenIdx1] = true;
+-        readyOps[chosenIdx1] = false;
++        dvmSetBit(scheduledOps, chosenIdx1);
++        dvmClearBit(readyOps, chosenIdx1);
+         queuedLIREntries[chosenIdx1]->scheduledTime = currentTime;
+         numScheduled++;
+ 
+         if (chosenIdx2 < queuedLIREntries.size()) {
+             scheduledLIREntries.push_back(queuedLIREntries[chosenIdx2]);
+-            scheduledOps[chosenIdx2] = true;
+-            readyOps[chosenIdx2] = false;
++            dvmSetBit(scheduledOps, chosenIdx2);
++            dvmClearBit(readyOps, chosenIdx2);
+             queuedLIREntries[chosenIdx2]->scheduledTime = currentTime;
+             numScheduled++;
+         }
+diff --git a/vm/compiler/codegen/x86/Scheduler.h b/vm/compiler/codegen/x86/Scheduler.h
+index 804d9a0..3571f99 100644
+--- a/vm/compiler/codegen/x86/Scheduler.h
++++ b/vm/compiler/codegen/x86/Scheduler.h
+@@ -24,6 +24,7 @@
+ #include "Lower.h"
+ #include <map>
+ #include <vector>
++#include "BitVector.h"
+ 
+ /**
+  * @class Dependencies
+@@ -111,7 +112,8 @@ private:
+     void visitNodeTopologicalSort(unsigned int nodeId, int * visitedList,
+             NativeBasicBlock & inverseTopologicalOrder);
+     void findLongestPath();
+-    void updateReadyOps(int chosenIdx, bool* scheduledOps, bool* readyOps);
++    void updateReadyOps(int chosenIdx, BitVector * scheduledOps,
++            BitVector * readyOps);
+     void schedule();
+ 
+     double basicBlockEditDistance(const NativeBasicBlock & block1,
+diff --git a/vm/compiler/codegen/x86/libenc/enc_base.h b/vm/compiler/codegen/x86/libenc/enc_base.h
+index e90ad2b..14cdb4c 100644
+--- a/vm/compiler/codegen/x86/libenc/enc_base.h
++++ b/vm/compiler/codegen/x86/libenc/enc_base.h
+@@ -214,6 +214,14 @@ public:
+     }
+ 
+     /**
++     * @brief Defines the maximum number of operands for an opcode.
++     *
++     * The 3 mostly comes from IDIV/IMUL which both may have up to
++     * 3 operands.
++     */
++    static const unsigned int MAX_NUM_OPCODE_OPERANDS = 3;
++
++    /**
+      * @brief Info about single opcode - its opcode bytes, operands,
+      *        operands' roles.
+      */
+@@ -234,11 +242,8 @@ public:
+            unsigned    aux1;
+            /**
+            * @brief Info about opcode's operands.
+-           *
+-           * The [3] mostly comes from IDIV/IMUL which both may have up to 3
+-           * operands.
+            */
+-           OpndDesc        opnds[3];
++           OpndDesc        opnds[MAX_NUM_OPCODE_OPERANDS];
+            unsigned        first_opnd;
+            /**
+            * @brief Info about operands - total number, number of uses/defs,
+diff --git a/vm/compiler/codegen/x86/libenc/enc_prvt.h b/vm/compiler/codegen/x86/libenc/enc_prvt.h
+index 4300574..343b161 100644
+--- a/vm/compiler/codegen/x86/libenc/enc_prvt.h
++++ b/vm/compiler/codegen/x86/libenc/enc_prvt.h
+@@ -304,7 +304,7 @@ struct OpcodeInfo {
+     };
+     platform                        platf;
+     unsigned                        opcode[4+1+1];
+-    EncoderBase::OpndDesc           opnds[3];
++    EncoderBase::OpndDesc           opnds[EncoderBase::MAX_NUM_OPCODE_OPERANDS];
+     EncoderBase::OpndRolesDesc      roles;
+ };
+ 
+diff --git a/vm/compiler/codegen/x86/libenc/enc_tabl.cpp b/vm/compiler/codegen/x86/libenc/enc_tabl.cpp
+index e18f214..9dab951 100644
+--- a/vm/compiler/codegen/x86/libenc/enc_tabl.cpp
++++ b/vm/compiler/codegen/x86/libenc/enc_tabl.cpp
+@@ -1906,7 +1906,9 @@ void EncoderBase::buildMnemonicDesc(const MnemonicInfo * minfo)
+         }
+ 
+         assert(sizeof(odesc.opnds) == sizeof(oinfo.opnds));
+-        memcpy(odesc.opnds, oinfo.opnds, sizeof(odesc.opnds));
++        memcpy(odesc.opnds, oinfo.opnds,
++                sizeof(EncoderBase::OpndDesc)
++                        * EncoderBase::MAX_NUM_OPCODE_OPERANDS);
+         odesc.roles = oinfo.roles;
+         odesc.first_opnd = 0;
+         if (odesc.opnds[0].reg != RegName_Null) {
+diff --git a/vm/compiler/codegen/x86/libenc/enc_wrapper.cpp b/vm/compiler/codegen/x86/libenc/enc_wrapper.cpp
+index 8ba9c5d..b6d7c12 100644
+--- a/vm/compiler/codegen/x86/libenc/enc_wrapper.cpp
++++ b/vm/compiler/codegen/x86/libenc/enc_wrapper.cpp
+@@ -87,8 +87,20 @@ void printOperand(const EncoderBase::Operand & opnd) {
+     if(!dump_x86_inst) return;
+     sz = strlen(tmpBuffer);
+     if(opnd.size() != OpndSize_32) {
+-        sz += snprintf(&tmpBuffer[sz], MAX_DECODED_STRING_LEN-sz, "%s ",
+-                       getOpndSizeString(opnd.size()));
++        const char * opndSizeString = getOpndSizeString(opnd.size());
++
++        if (opndSizeString == NULL) {
++            // If the string that represents operand size is null it means that
++            // the operand size is an invalid value. Although this could be a
++            // problem if instruction is corrupted, technically failing to
++            // disassemble is not fatal. Thus, let's warn but proceed with using
++            // an empty string.
++            ALOGW("JIT-WARNING: Cannot decode instruction operand size.");
++            opndSizeString = "";
++        }
++
++        sz += snprintf(&tmpBuffer[sz], MAX_DECODED_STRING_LEN - sz, "%s ",
++                opndSizeString);
+     }
+     if(opnd.is_mem()) {
+         if(opnd.scale() != 0) {
+@@ -526,8 +538,19 @@ unsigned int DisassembleOperandToBuf(const EncoderBase::Operand& opnd, char* str
+ {
+     unsigned int sz = 0;
+     if(opnd.size() != OpndSize_32) {
+-        sz += snprintf(&strbuf[sz], len-sz, "%s ",
+-                       getOpndSizeString(opnd.size()));
++        const char * opndSizeString = getOpndSizeString(opnd.size());
++
++        if (opndSizeString == NULL) {
++            // If the string that represents operand size is null it means that
++            // the operand size is an invalid value. Although this could be a
++            // problem if instruction is corrupted, technically failing to
++            // disassemble is not fatal. Thus, let's warn but proceed with using
++            // an empty string.
++            ALOGW("JIT-WARNING: Cannot decode instruction operand size.");
++            opndSizeString = "";
++        }
++
++        sz += snprintf(&strbuf[sz], len-sz, "%s ", opndSizeString);
+     }
+     if(opnd.is_mem()) {
+         if(opnd.scale() != 0) {
+-- 
+1.7.4.1
+

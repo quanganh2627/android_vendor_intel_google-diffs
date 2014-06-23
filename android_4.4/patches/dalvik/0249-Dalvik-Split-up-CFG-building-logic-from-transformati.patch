@@ -1,0 +1,1281 @@
+From 823b987453806ba10183ebfa9a07c900ebdac290 Mon Sep 17 00:00:00 2001
+From: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Date: Thu, 13 Jun 2013 14:31:23 -0700
+Subject: Dalvik: Split up CFG building logic from transformation
+
+BZ: 116029
+
+The CFG for a method can now be built using the new exposed API.
+This allows for building a CFG without actually making it part of
+cUnit and applying transformation passes and code generation on it.
+A function has also been added to check for resolved fields, methods,
+and classes in case trying to build a cold method.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I134a7292579c8083d38ab92eba2ff58f14868350
+Orig-MCG-Change-Id: Iebaace21d0152d50d090e47c673d7e988526ab0b
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/Compiler.h               |   39 ++-
+ vm/compiler/Frontend.cpp             |  741 +++++++++++++++++++++-------------
+ vm/compiler/InlineTransformation.cpp |    8 +-
+ 3 files changed, 498 insertions(+), 290 deletions(-)
+
+diff --git a/vm/compiler/Compiler.h b/vm/compiler/Compiler.h
+index fee96bd..e6be4c7 100644
+--- a/vm/compiler/Compiler.h
++++ b/vm/compiler/Compiler.h
+@@ -210,8 +210,43 @@ bool dvmCompilerWorkEnqueue(const u2* pc, WorkOrderKind kind, void* info);
+ void *dvmCheckCodeCache(void *method);
+ CompilerMethodStats *dvmCompilerAnalyzeMethodBody(const Method *method,
+                                                   bool isCallee);
+-bool dvmCompilerCanIncludeThisInstruction(const Method *method,
+-                                          const DecodedInstruction *insn);
++
++/**
++ * @brief Checks if bytecodes in method reference fully resolved classes, methods, and fields.
++ * @details Since we are including instructions from possibly a cold method into the current trace,
++ * we need to make sure that all the associated information with the callee is properly initialized.
++ * @param method The method that contains the bytecode
++ * @param insn The decoded instruction that we are examining
++ * @param tryToResolve In case it hasn't been resolved, try to resolve it now.
++ * @return Returns whether class/method/field is fully resolved.
++ */
++bool dvmCompilerCheckResolvedReferences (const Method *method, const DecodedInstruction *insn, bool tryToResolve = false);
++
++/**
++ * @brief Used to split a basic block into two, thus creating a new BB in the cUnit.
++ * @param blockList The list of basic blocks to update
++ * @param mirToSplitAt The mir at which the split should happen. This MIR becomes part of newly
++ * created bottom block. This should not be null but if it is, the block returned is null.
++ * @param origBlock The original block which to split.
++ * @param immedPredBlockP Updated to contain the newly added block (may be null).
++ * @return Returns the newly added block that was split from original (may return null).
++ */
++BasicBlock *dvmCompilerSplitBlock (GrowableList *blockList, MIR *mirToSplitAt, BasicBlock *origBlock,
++        BasicBlock **immedPredBlockP = 0);
++
++/**
++ * @brief Decodes methods and creates control flow graph for it with single entry and single exit.
++ * @param method The method to decode
++ * @param blockList Updated by function to contain the newly added blocks
++ * @param entry Updated by function to point to entry block
++ * @param exit Updated by function to point to exit block
++ * @param tryBlockAddr Bit vector of method offsets in try block (may be null)
++ * @param bytecodeGate A function that looks at decoded instruction and make a decision about CFG building
++ * @return Returns whether we successfully built CFG
++ */
++bool dvmCompilerBuildCFG (const Method *method, GrowableList *blockList, BasicBlock **entry = 0, BasicBlock **exit = 0,
++        BitVector *tryBlockAddr = 0, bool (*bytecodeGate) (const Method *, const DecodedInstruction *, const char **) = 0);
++
+ bool dvmCompileMethod(const Method *method, JitTranslationInfo *info);
+ bool dvmCompileTrace(JitTraceDescription *trace, int numMaxInsts,
+                      JitTranslationInfo *info, jmp_buf *bailPtr, int optHints);
+diff --git a/vm/compiler/Frontend.cpp b/vm/compiler/Frontend.cpp
+index 294dcec..1e35537 100644
+--- a/vm/compiler/Frontend.cpp
++++ b/vm/compiler/Frontend.cpp
+@@ -438,28 +438,30 @@ static bool filterMethodByCallGraph(Thread *thread, const char *curMethodName)
+     return false;
+ }
+ 
+-/*
+- * Since we are including instructions from possibly a cold method into the
+- * current trace, we need to make sure that all the associated information
+- * with the callee is properly initialized. If not, we punt on this inline
+- * target.
+- *
+- * TODO: volatile instructions will be handled later.
++/**
++ * Checks if bytecodes in method reference fully resolved classes, methods, and fields
++ * @see Compiler.h
+  */
+-bool dvmCompilerCanIncludeThisInstruction(const Method *method,
+-                                          const DecodedInstruction *insn)
++bool dvmCompilerCheckResolvedReferences (const Method *method, const DecodedInstruction *insn, bool tryToResolve)
+ {
+-    switch (insn->opcode) {
++    switch (insn->opcode)
++    {
+         case OP_NEW_INSTANCE:
+-        case OP_CHECK_CAST: {
+-            ClassObject *classPtr = (ClassObject *)(void*)
+-              (method->clazz->pDvmDex->pResClasses[insn->vB]);
++        case OP_CHECK_CAST:
++        {
++            ClassObject *classPtr = dvmDexGetResolvedClass (method->clazz->pDvmDex, insn->vB);
+ 
+-            /* Class hasn't been initialized yet */
+-            if (classPtr == NULL) {
++            if (tryToResolve == true && classPtr == 0)
++            {
++                classPtr = dvmResolveClass (method->clazz, insn->vB, false);
++            }
++
++            if (classPtr == 0)
++            {
+                 return false;
+             }
+-            return true;
++
++            break;
+         }
+         case OP_SGET:
+         case OP_SGET_WIDE:
+@@ -474,111 +476,247 @@ bool dvmCompilerCanIncludeThisInstruction(const Method *method,
+         case OP_SPUT_BOOLEAN:
+         case OP_SPUT_BYTE:
+         case OP_SPUT_CHAR:
+-        case OP_SPUT_SHORT: {
+-            void *fieldPtr = (void*)
+-              (method->clazz->pDvmDex->pResFields[insn->vB]);
++        case OP_SPUT_SHORT:
++        {
++            u4 ref = insn->vB;
++            StaticField *sField =
++                    reinterpret_cast<StaticField*> (dvmDexGetResolvedField (method->clazz->pDvmDex, ref));
++
++            if (tryToResolve == true && sField == 0)
++            {
++                sField = dvmResolveStaticField (method->clazz, ref);
++            }
+ 
+-            if (fieldPtr == NULL) {
++            if (sField == 0)
++            {
+                 return false;
+             }
+-            return true;
++
++            break;
+         }
+         case OP_INVOKE_SUPER:
+-        case OP_INVOKE_SUPER_RANGE: {
+-            int mIndex = method->clazz->pDvmDex->
+-                pResMethods[insn->vB]->methodIndex;
+-            const Method *calleeMethod = method->clazz->super->vtable[mIndex];
+-            if (calleeMethod == NULL) {
++        case OP_INVOKE_SUPER_RANGE:
++        {
++            //We need to determine the method to call
++            const Method *methodToCall = 0;
++
++            //Reference is in vB
++            u4 ref = insn->vB;
++
++            //Get the base method
++            Method *baseMethod = dvmDexGetResolvedMethod (method->clazz->pDvmDex, ref);
++
++            //Try to resolve the base method if needed
++            if (tryToResolve == true && baseMethod == 0)
++            {
++                baseMethod = dvmResolveMethod (method->clazz, ref, METHOD_VIRTUAL);
++            }
++
++            //If we resolve the base method and we can find the index in the super vtable, then we try it
++            if (baseMethod != 0 && baseMethod->methodIndex < method->clazz->super->vtableCount)
++            {
++                //Get the method to call from the super vtable
++                methodToCall = method->clazz->super->vtable[baseMethod->methodIndex];
++            }
++
++            if (methodToCall == 0)
++            {
+                 return false;
+             }
+-            return true;
++
++            break;
+         }
+         case OP_INVOKE_SUPER_QUICK:
+-        case OP_INVOKE_SUPER_QUICK_RANGE: {
++        case OP_INVOKE_SUPER_QUICK_RANGE:
++        {
+             const Method *calleeMethod = method->clazz->super->vtable[insn->vB];
+-            if (calleeMethod == NULL) {
++
++            if (calleeMethod == 0)
++            {
+                 return false;
+             }
+-            return true;
++
++            break;
+         }
+         case OP_INVOKE_STATIC:
+         case OP_INVOKE_STATIC_RANGE:
++        {
++            const Method *calleeMethod = dvmDexGetResolvedMethod (method->clazz->pDvmDex, insn->vB);
++
++            if (tryToResolve == true && calleeMethod == 0)
++            {
++                calleeMethod = dvmResolveMethod (method->clazz, insn->vB, METHOD_STATIC);
++            }
++
++            if (calleeMethod == 0)
++            {
++                return false;
++            }
++
++            break;
++        }
+         case OP_INVOKE_DIRECT:
+-        case OP_INVOKE_DIRECT_RANGE: {
+-            const Method *calleeMethod =
+-                method->clazz->pDvmDex->pResMethods[insn->vB];
+-            if (calleeMethod == NULL) {
++        case OP_INVOKE_DIRECT_RANGE:
++        {
++            const Method *calleeMethod = dvmDexGetResolvedMethod (method->clazz->pDvmDex, insn->vB);
++
++            if (tryToResolve == true && calleeMethod == 0)
++            {
++                calleeMethod = dvmResolveMethod (method->clazz, insn->vB, METHOD_DIRECT);
++            }
++
++            if (calleeMethod == 0)
++            {
+                 return false;
+             }
+-            return true;
++
++            break;
+         }
+-        case OP_CONST_CLASS: {
+-            void *classPtr = (void*)
+-                (method->clazz->pDvmDex->pResClasses[insn->vB]);
++        case OP_CONST_CLASS:
++        {
++            ClassObject *classPtr = dvmDexGetResolvedClass (method->clazz->pDvmDex, insn->vB);
+ 
+-            if (classPtr == NULL) {
++            if (tryToResolve == true && classPtr == 0)
++            {
++                classPtr = dvmResolveClass(method->clazz, insn->vB, true);
++            }
++
++            if (classPtr == 0)
++            {
+                 return false;
+             }
+-            return true;
++
++            break;
+         }
+         case OP_CONST_STRING_JUMBO:
+-        case OP_CONST_STRING: {
+-            void *strPtr = (void*)
+-                (method->clazz->pDvmDex->pResStrings[insn->vB]);
++        case OP_CONST_STRING:
++        {
++            StringObject *strPtr = dvmDexGetResolvedString (method->clazz->pDvmDex, insn->vB);
+ 
+-            if (strPtr == NULL) {
++            if (tryToResolve == true && strPtr == 0)
++            {
++                strPtr = dvmResolveString (method->clazz, insn->vB);
++            }
++
++            if (strPtr == 0)
++            {
+                 return false;
+             }
+-            return true;
++
++            break;
++        }
++        case OP_IGET:
++        case OP_IGET_WIDE:
++        case OP_IGET_OBJECT:
++        case OP_IGET_BOOLEAN:
++        case OP_IGET_BYTE:
++        case OP_IGET_CHAR:
++        case OP_IGET_SHORT:
++        case OP_IPUT:
++        case OP_IPUT_WIDE:
++        case OP_IPUT_OBJECT:
++        case OP_IPUT_BOOLEAN:
++        case OP_IPUT_BYTE:
++        case OP_IPUT_CHAR:
++        case OP_IPUT_SHORT:
++        {
++            u4 ref = insn->vC;
++            InstField *iField = reinterpret_cast <InstField*> (dvmDexGetResolvedField(method->clazz->pDvmDex, ref));
++
++            if (tryToResolve == true && iField == 0)
++            {
++                iField = dvmResolveInstField(method->clazz, ref);
++            }
++
++            if (iField == 0)
++            {
++                return false;
++            }
++
++            break;
+         }
++        case OP_NEW_ARRAY:
++        case OP_FILLED_NEW_ARRAY:
++        case OP_FILLED_NEW_ARRAY_RANGE:
++        case OP_INSTANCE_OF:
++            //TODO Add support for these to resolve fields
++            return false;
+         default:
+-            return true;
++            break;
+     }
++
++    //If we get here, everything went okay
++    return true;
+ }
+ 
+-/* Split an existing block from the specified code offset into two */
+-static BasicBlock *splitBlock(CompilationUnit *cUnit,
+-                              unsigned int codeOffset,
+-                              BasicBlock *origBlock,
+-                              BasicBlock **immedPredBlockP)
++/**
++ * @brief Checks if bytecode in method reference fully resolved classes, methods, and fields.
++ * @details If not resolved, tries to resolve it.
++ * @param method The method that contains the bytecode
++ * @param insn The decoded instruction that we are examining
++ * @param failureMessage In case of false return, it may be updated to point to a failure message.
++ * @return Returns whether class/method/field is fully resolved.
++ */
++bool resolveReferences (const Method *method, const DecodedInstruction *insn, const char **failureMessage)
+ {
+-    MIR *insn = origBlock->firstMIRInsn;
+-    while (insn) {
+-        if (insn->offset == codeOffset) break;
+-        insn = insn->next;
+-    }
+-    if (insn == NULL) {
+-        ALOGE("Break split failed");
+-        dvmAbort();
++    //Check if resolved and resolve if not
++    bool resolved = dvmCompilerCheckResolvedReferences (method, insn, true);
++
++    if (resolved == false && failureMessage != 0)
++    {
++        *failureMessage = "references could not be resolved";
+     }
+-    BasicBlock *bottomBlock = dvmCompilerNewBB(kDalvikByteCode,
+-                                               cUnit->numBlocks++);
+-    dvmInsertGrowableList(&cUnit->blockList, (intptr_t) bottomBlock);
+ 
+-    bottomBlock->startOffset = codeOffset;
+-    bottomBlock->firstMIRInsn = insn;
+-    bottomBlock->lastMIRInsn = origBlock->lastMIRInsn;
++    return resolved;
++}
+ 
+-    /* Handle the taken path */
+-    bottomBlock->taken = origBlock->taken;
+-    if (bottomBlock->taken) {
+-        origBlock->taken = NULL;
+-        dvmCompilerClearBit(bottomBlock->taken->predecessors, origBlock->id);
+-        dvmCompilerSetBit(bottomBlock->taken->predecessors, bottomBlock->id);
++/**
++ * Used to split a basic block into two, thus creating a new BB in the cUnit
++ * @see Compiler.h
++ */
++BasicBlock *dvmCompilerSplitBlock (GrowableList *blockList,
++                                   MIR *mirToSplitAt,
++                                   BasicBlock *origBlock,
++                                   BasicBlock **immedPredBlockP)
++{
++    /* The first instruction of the new block is the mirToSplitAt */
++    MIR *insn = mirToSplitAt;
++
++    if (insn == 0)
++    {
++        //We weren't able to determine a split point so we have no immediate block
++        if (immedPredBlockP != 0)
++        {
++            *immedPredBlockP = 0;
++        }
++
++        //If we have no MIR to split at, then we have no work to do
++        return 0;
+     }
+ 
+-    /* Handle the fallthrough path */
++    /* Create a new block for bottom */
++    BasicBlock *bottomBlock = dvmCompilerNewBBinList (*blockList, kDalvikByteCode);
++
++    bottomBlock->startOffset = insn->offset;
++
++    /* Move all required mirs to the new block */
++    dvmCompilerMoveLinkedMIRsAfter (bottomBlock, 0, insn);
++
++    /* Take origBlock's taken and make it taken of bottomBlock */
++    dvmCompilerReplaceChildBasicBlock (origBlock->taken, bottomBlock, kChildTypeTaken);
++
++    /* Make the taken for origBlock be null */
++    dvmCompilerReplaceChildBasicBlock (0, origBlock, kChildTypeTaken);
++
++    /* Take origBlock's fallthrough and make it fallthrough of bottomBlock */
++    dvmCompilerReplaceChildBasicBlock (origBlock->fallThrough, bottomBlock, kChildTypeFallthrough);
++
++    /* Make origBlock's fallthrough be the newly created bottomBlock */
++    dvmCompilerReplaceChildBasicBlock (bottomBlock, origBlock, kChildTypeFallthrough);
++
++    /* The original block needs a fallthrough branch now and new bottom block must respect previous decision */
+     bottomBlock->needFallThroughBranch = origBlock->needFallThroughBranch;
+-    bottomBlock->fallThrough = origBlock->fallThrough;
+-    origBlock->fallThrough = bottomBlock;
+     origBlock->needFallThroughBranch = true;
+-    dvmCompilerSetBit(bottomBlock->predecessors, origBlock->id);
+-    if (bottomBlock->fallThrough) {
+-        dvmCompilerClearBit(bottomBlock->fallThrough->predecessors,
+-                            origBlock->id);
+-        dvmCompilerSetBit(bottomBlock->fallThrough->predecessors,
+-                          bottomBlock->id);
+-    }
+ 
+     /* Handle the successor list */
+     if (origBlock->successorBlockList.blockListType != kNotUsed) {
+@@ -598,11 +736,6 @@ static BasicBlock *splitBlock(CompilationUnit *cUnit,
+         }
+     }
+ 
+-    origBlock->lastMIRInsn = insn->prev;
+-
+-    insn->prev->next = NULL;
+-    insn->prev = NULL;
+-
+     /*
+      * Update the immediate predecessor block pointer so that outgoing edges
+      * can be applied to the proper block.
+@@ -614,6 +747,37 @@ static BasicBlock *splitBlock(CompilationUnit *cUnit,
+     return bottomBlock;
+ }
+ 
++/**
++ * @brief Splits an existing block from the specified code offset into two.
++ * @param blockList The list of blocks in CFG
++ * @param codeOffset The code offset to include in the new block
++ * @param origBlock The original block which to split
++ * @param immedPredBlockP If non-null, updated to point to newly created block after split
++ * @return Returns the newly created block after the split.
++ */
++static BasicBlock *splitBlock(GrowableList *blockList,
++                              unsigned int codeOffset,
++                              BasicBlock *origBlock,
++                              BasicBlock **immedPredBlockP)
++{
++    //Get the block's first instruction
++    MIR *insn = origBlock->firstMIRInsn;
++
++    //Iterate through instruction until we find the one with the desired offset
++    while (insn != 0)
++    {
++        if (insn->offset == codeOffset)
++        {
++            break;
++        }
++
++        insn = insn->next;
++    }
++
++    //Now do the actual split
++    return dvmCompilerSplitBlock (blockList, insn, origBlock, immedPredBlockP);
++}
++
+ /*
+  * Given a code offset, find out the block that starts with it. If the offset
+  * is in the middle of an existing block, split it into two. If immedPredBlockP
+@@ -621,12 +785,11 @@ static BasicBlock *splitBlock(CompilationUnit *cUnit,
+  * to the bottom block so that outgoing edges can be setup properly (by the
+  * caller).
+  */
+-static BasicBlock *findBlock(CompilationUnit *cUnit,
++static BasicBlock *findBlock(GrowableList *blockList,
+                              unsigned int codeOffset,
+                              bool split, bool create,
+                              BasicBlock **immedPredBlockP)
+ {
+-    GrowableList *blockList = &cUnit->blockList;
+     BasicBlock *bb;
+     unsigned int i;
+ 
+@@ -638,17 +801,17 @@ static BasicBlock *findBlock(CompilationUnit *cUnit,
+         if ((split == true) && (codeOffset > bb->startOffset) &&
+             (bb->lastMIRInsn != NULL) &&
+             (codeOffset <= bb->lastMIRInsn->offset)) {
+-            BasicBlock *newBB = splitBlock(cUnit, codeOffset, bb,
++            BasicBlock *newBB = splitBlock(blockList, codeOffset, bb,
+                                            bb == *immedPredBlockP ?
+                                                immedPredBlockP : NULL);
+             return newBB;
+         }
+     }
+-    if (create) {
+-          bb = dvmCompilerNewBB(kDalvikByteCode, cUnit->numBlocks++);
+-          dvmInsertGrowableList(&cUnit->blockList, (intptr_t) bb);
+-          bb->startOffset = codeOffset;
+-          return bb;
++    if (create == true)
++    {
++        bb = dvmCompilerNewBBinList (*blockList, kDalvikByteCode);
++        bb->startOffset = codeOffset;
++        return bb;
+     }
+     return NULL;
+ }
+@@ -1064,9 +1227,8 @@ static bool verifyPredInfo(CompilationUnit *cUnit, BasicBlock *bb)
+ }
+ 
+ /* Identify code range in try blocks and set up the empty catch blocks */
+-static void processTryCatchBlocks(CompilationUnit *cUnit)
++static void processTryCatchBlocks (const Method *meth, GrowableList *blockList, BitVector *tryBlockAddr)
+ {
+-    const Method *meth = cUnit->method;
+     const DexCode *pCode = dvmGetMethodCode(meth);
+     int triesSize = pCode->triesSize;
+     int i;
+@@ -1077,7 +1239,6 @@ static void processTryCatchBlocks(CompilationUnit *cUnit)
+     }
+ 
+     const DexTry *pTries = dexGetTries(pCode);
+-    BitVector *tryBlockAddr = cUnit->tryBlockAddr;
+ 
+     /* Mark all the insn offsets in Try blocks */
+     for (i = 0; i < triesSize; i++) {
+@@ -1110,7 +1271,7 @@ static void processTryCatchBlocks(CompilationUnit *cUnit)
+              * Create dummy catch blocks first. Since these are created before
+              * other blocks are processed, "split" is specified as false.
+              */
+-            findBlock(cUnit, handler->address,
++            findBlock(blockList, handler->address,
+                       /* split */
+                       false,
+                       /* create */
+@@ -1124,7 +1285,7 @@ static void processTryCatchBlocks(CompilationUnit *cUnit)
+ }
+ 
+ /* Process instructions with the kInstrCanBranch flag */
+-static void processCanBranch(CompilationUnit *cUnit, BasicBlock *curBlock,
++static void processCanBranch(GrowableList *blockList, BasicBlock *curBlock,
+                              MIR *insn, int curOffset, int width, int flags,
+                              const u2* codePtr, const u2* codeEnd)
+ {
+@@ -1156,7 +1317,7 @@ static void processCanBranch(CompilationUnit *cUnit, BasicBlock *curBlock,
+                  insn->dalvikInsn.opcode);
+             dvmAbort();
+     }
+-    BasicBlock *takenBlock = findBlock(cUnit, target,
++    BasicBlock *takenBlock = findBlock(blockList, target,
+                                        /* split */
+                                        true,
+                                        /* create */
+@@ -1168,7 +1329,7 @@ static void processCanBranch(CompilationUnit *cUnit, BasicBlock *curBlock,
+ 
+     /* Always terminate the current block for conditional branches */
+     if (flags & kInstrCanContinue) {
+-        BasicBlock *fallthroughBlock = findBlock(cUnit,
++        BasicBlock *fallthroughBlock = findBlock(blockList,
+                                                  curOffset +  width,
+                                                  /*
+                                                   * If the method is processed
+@@ -1191,8 +1352,8 @@ static void processCanBranch(CompilationUnit *cUnit, BasicBlock *curBlock,
+         dvmCompilerSetBit(fallthroughBlock->predecessors, curBlock->id);
+     } else if (codePtr < codeEnd) {
+         /* Create a fallthrough block for real instructions (incl. OP_NOP) */
+-        if (contentIsInsn(codePtr)) {
+-            findBlock(cUnit, curOffset + width,
++        if (contentIsInsn (codePtr) == true) {
++            findBlock(blockList, curOffset + width,
+                       /* split */
+                       false,
+                       /* create */
+@@ -1204,10 +1365,11 @@ static void processCanBranch(CompilationUnit *cUnit, BasicBlock *curBlock,
+ }
+ 
+ /* Process instructions with the kInstrCanSwitch flag */
+-static void processCanSwitch(CompilationUnit *cUnit, BasicBlock *curBlock,
+-                             MIR *insn, int curOffset, int width, int flags)
++static void processCanSwitch(GrowableList *blockList, BasicBlock *curBlock,
++                             MIR *insn, const u2 *baseInsnsAddr, int curOffset,
++                             int width, int flags)
+ {
+-    u2 *switchData= (u2 *) (cUnit->method->insns + curOffset +
++    u2 *switchData= (u2 *) (baseInsnsAddr + curOffset +
+                             insn->dalvikInsn.vB);
+     int size;
+     int *keyTable;
+@@ -1258,7 +1420,7 @@ static void processCanSwitch(CompilationUnit *cUnit, BasicBlock *curBlock,
+     dvmInitGrowableList(&curBlock->successorBlockList.blocks, size);
+ 
+     for (i = 0; i < size; i++) {
+-        BasicBlock *caseBlock = findBlock(cUnit, curOffset + targetTable[i],
++        BasicBlock *caseBlock = findBlock(blockList, curOffset + targetTable[i],
+                                           /* split */
+                                           true,
+                                           /* create */
+@@ -1277,7 +1439,7 @@ static void processCanSwitch(CompilationUnit *cUnit, BasicBlock *curBlock,
+     }
+ 
+     /* Fall-through case */
+-    BasicBlock *fallthroughBlock = findBlock(cUnit,
++    BasicBlock *fallthroughBlock = findBlock(blockList,
+                                              curOffset +  width,
+                                              /* split */
+                                              false,
+@@ -1290,12 +1452,12 @@ static void processCanSwitch(CompilationUnit *cUnit, BasicBlock *curBlock,
+ }
+ 
+ /* Process instructions with the kInstrCanThrow flag */
+-static void processCanThrow(CompilationUnit *cUnit, BasicBlock *curBlock,
++static void processCanThrow(const Method *method, GrowableList *blockList,
++                            BasicBlock *curBlock,
+                             MIR *insn, int curOffset, int width, int flags,
+                             BitVector *tryBlockAddr, const u2 *codePtr,
+                             const u2* codeEnd)
+ {
+-    const Method *method = cUnit->method;
+     const DexCode *dexCode = dvmGetMethodCode(method);
+ 
+     /* In try block */
+@@ -1323,7 +1485,7 @@ static void processCanThrow(CompilationUnit *cUnit, BasicBlock *curBlock,
+                 break;
+             }
+ 
+-            BasicBlock *catchBlock = findBlock(cUnit, handler->address,
++            BasicBlock *catchBlock = findBlock(blockList, handler->address,
+                                                /* split */
+                                                false,
+                                                /* create */
+@@ -1341,10 +1503,9 @@ static void processCanThrow(CompilationUnit *cUnit, BasicBlock *curBlock,
+             dvmCompilerSetBit(catchBlock->predecessors, curBlock->id);
+         }
+     } else {
+-        BasicBlock *ehBlock = dvmCompilerNewBB(kExceptionHandling,
+-                                               cUnit->numBlocks++);
++        BasicBlock *ehBlock = dvmCompilerNewBBinList (*blockList, kExceptionHandling);
+         curBlock->taken = ehBlock;
+-        dvmInsertGrowableList(&cUnit->blockList, (intptr_t) ehBlock);
++        dvmInsertGrowableList (blockList, (intptr_t) ehBlock);
+         ehBlock->startOffset = curOffset;
+         dvmCompilerSetBit(ehBlock->predecessors, curBlock->id);
+     }
+@@ -1357,8 +1518,8 @@ static void processCanThrow(CompilationUnit *cUnit, BasicBlock *curBlock,
+      */
+     if (codePtr < codeEnd) {
+         /* Create a fallthrough block for real instructions (incl. OP_NOP) */
+-        if (contentIsInsn(codePtr)) {
+-            BasicBlock *fallthroughBlock = findBlock(cUnit,
++        if (contentIsInsn (codePtr) == true) {
++            BasicBlock *fallthroughBlock = findBlock(blockList,
+                                                      curOffset + width,
+                                                      /* split */
+                                                      false,
+@@ -1379,100 +1540,69 @@ static void processCanThrow(CompilationUnit *cUnit, BasicBlock *curBlock,
+     }
+ }
+ 
+-/*
+- * Similar to dvmCompileTrace, but the entity processed here is the whole
+- * method.
+- *
+- * TODO: implementation will be revisited when the trace builder can provide
+- * whole-method traces.
++/**
++ * Decodes methods and creates control flow graph for it with single entry and single exit.
++ * @see Compiler.h
+  */
+-bool dvmCompileMethod(const Method *method, JitTranslationInfo *info)
++bool dvmCompilerBuildCFG (const Method *method, GrowableList *blockList, BasicBlock **entry, BasicBlock **exit,
++        BitVector *tryBlockAddr, bool (*bytecodeGate) (const Method *, const DecodedInstruction *, const char **))
+ {
+-    CompilationUnit cUnit;
+-    const DexCode *dexCode = dvmGetMethodCode(method);
++    /* Initialize variables */
++    const DexCode *dexCode = dvmGetMethodCode (method);
+     const u2 *codePtr = dexCode->insns;
+     const u2 *codeEnd = dexCode->insns + dexCode->insnsSize;
+-    int numBlocks = 0;
+     unsigned int curOffset = 0;
+ 
+-    /* Method already compiled */
+-    if (dvmJitGetMethodAddr(codePtr)) {
+-        info->codeAddress = NULL;
+-        return false;
+-    }
+-
+-    memset(&cUnit, 0, sizeof(cUnit));
+-    cUnit.method = method;
+-
+-    cUnit.jitMode = kJitMethod;
+-
+-    //Set the constant values
+-    std::map<int, int> constantValues;
+-    cUnit.constantValues = &constantValues;
+-
+-    /* Initialize the block list */
+-    dvmInitGrowableList(&cUnit.blockList, 4);
+-
+-    /*
+-     * FIXME - PC reconstruction list won't be needed after the codegen routines
+-     * are enhanced to true method mode.
+-     */
+-    /* Initialize the PC reconstruction list */
+-    dvmInitGrowableList(&cUnit.pcReconstructionList, 8);
+-
+-    /* Allocate the bit-vector to track the beginning of basic blocks */
+-    BitVector *tryBlockAddr = dvmCompilerAllocBitVector(dexCode->insnsSize,
+-                                                        true /* expandable */);
+-    cUnit.tryBlockAddr = tryBlockAddr;
+-
+     /* Create the default entry and exit blocks and enter them to the list */
+-    BasicBlock *entryBlock = dvmCompilerNewBB(kEntryBlock, numBlocks++);
+-    BasicBlock *exitBlock = dvmCompilerNewBB(kExitBlock, numBlocks++);
+-
+-    cUnit.entryBlock = entryBlock;
+-    cUnit.exitBlock = exitBlock;
+-
+-    dvmInsertGrowableList(&cUnit.blockList, (intptr_t) entryBlock);
+-    dvmInsertGrowableList(&cUnit.blockList, (intptr_t) exitBlock);
+-
+-    /* Current block to record parsed instructions */
+-    BasicBlock *curBlock = dvmCompilerNewBB(kDalvikByteCode, numBlocks++);
+-    curBlock->startOffset = 0;
+-    dvmInsertGrowableList(&cUnit.blockList, (intptr_t) curBlock);
+-    entryBlock->fallThrough = curBlock;
+-    dvmCompilerSetBit(curBlock->predecessors, entryBlock->id);
++    BasicBlock *entryBlock = dvmCompilerNewBBinList (*blockList, kEntryBlock);
++    if (entry != 0)
++    {
++        *entry = entryBlock;
++    }
+ 
+-    /*
+-     * Store back the number of blocks since new blocks may be created of
+-     * accessing cUnit.
+-     */
+-    cUnit.numBlocks = numBlocks;
++    BasicBlock *exitBlock = dvmCompilerNewBBinList (*blockList, kExitBlock);
++    if (exit != 0)
++    {
++        *exit = exitBlock;
++    }
+ 
+-    /* Identify code range in try blocks and set up the empty catch blocks */
+-    processTryCatchBlocks(&cUnit);
++    /* Create initial block to record parsed instructions */
++    BasicBlock *curBlock = dvmCompilerNewBBinList (*blockList, kDalvikByteCode);
++    dvmCompilerReplaceChildBasicBlock (curBlock, entryBlock, kChildTypeFallthrough);
+ 
+     /* Parse all instructions and put them into containing basic blocks */
+     while (codePtr < codeEnd) {
+-        MIR *insn = (MIR *) dvmCompilerNew(sizeof(MIR), true);
++        MIR *insn = dvmCompilerNewMIR ();
+         insn->offset = curOffset;
+-        int width = parseInsn(codePtr, &insn->dalvikInsn, false);
++        int width = parseInsn (codePtr, &insn->dalvikInsn, false);
+         insn->width = width;
+ 
+         /* Terminate when the data section is seen */
+         if (width == 0)
+             break;
+ 
+-        dvmCompilerAppendMIR(curBlock, insn);
++        if (bytecodeGate != 0)
++        {
++            bool accept = bytecodeGate (method, &insn->dalvikInsn, 0);
++
++            /* If the bytecode gate supplied does not accept this bytecode, then we reject */
++            if (accept == false)
++            {
++                return false;
++            }
++        }
++
++        dvmCompilerAppendMIR (curBlock, insn);
+ 
+         codePtr += width;
+         int flags = dexGetFlagsFromOpcode(insn->dalvikInsn.opcode);
+ 
+         if (flags & kInstrCanBranch) {
+-            processCanBranch(&cUnit, curBlock, insn, curOffset, width, flags,
++            processCanBranch (blockList, curBlock, insn, curOffset, width, flags,
+                              codePtr, codeEnd);
+         } else if (flags & kInstrCanReturn) {
+-            curBlock->fallThrough = exitBlock;
+-            dvmCompilerSetBit(exitBlock->predecessors, curBlock->id);
++            dvmCompilerReplaceChildBasicBlock (exitBlock, curBlock, kChildTypeFallthrough);
++
+             /*
+              * Terminate the current block if there are instructions
+              * afterwards.
+@@ -1482,30 +1612,30 @@ bool dvmCompileMethod(const Method *method, JitTranslationInfo *info)
+                  * Create a fallthrough block for real instructions
+                  * (incl. OP_NOP).
+                  */
+-                if (contentIsInsn(codePtr)) {
+-                    findBlock(&cUnit, curOffset + width,
+-                              /* split */
+-                              false,
+-                              /* create */
+-                              true,
+-                              /* immedPredBlockP */
+-                              NULL);
++                if (contentIsInsn (codePtr) == true) {
++                    findBlock (blockList, curOffset + width,
++                               /* split */
++                               false,
++                               /* create */
++                               true,
++                               /* immedPredBlockP */
++                               NULL);
+                 }
+             }
+-        } else if (flags & kInstrCanThrow) {
+-            processCanThrow(&cUnit, curBlock, insn, curOffset, width, flags,
+-                            tryBlockAddr, codePtr, codeEnd);
++        } else if ((flags & kInstrCanThrow) != 0 && tryBlockAddr != 0) {
++            processCanThrow (method, blockList, curBlock, insn, curOffset, width, flags,
++                             tryBlockAddr, codePtr, codeEnd);
+         } else if (flags & kInstrCanSwitch) {
+-            processCanSwitch(&cUnit, curBlock, insn, curOffset, width, flags);
++            processCanSwitch (blockList, curBlock, insn, method->insns, curOffset, width, flags);
+         }
+         curOffset += width;
+-        BasicBlock *nextBlock = findBlock(&cUnit, curOffset,
+-                                          /* split */
+-                                          false,
+-                                          /* create */
+-                                          false,
+-                                          /* immedPredBlockP */
+-                                          NULL);
++        BasicBlock *nextBlock = findBlock (blockList, curOffset,
++                                           /* split */
++                                           false,
++                                           /* create */
++                                           false,
++                                           /* immedPredBlockP */
++                                           NULL);
+         if (nextBlock) {
+             /*
+              * The next instruction could be the target of a previously parsed
+@@ -1517,19 +1647,77 @@ bool dvmCompileMethod(const Method *method, JitTranslationInfo *info)
+                    curBlock->fallThrough == nextBlock ||
+                    curBlock->fallThrough == exitBlock);
+ 
+-            if ((curBlock->fallThrough == NULL) &&
+-                (flags & kInstrCanContinue)) {
+-                curBlock->fallThrough = nextBlock;
+-                dvmCompilerSetBit(nextBlock->predecessors, curBlock->id);
++            if ((curBlock->fallThrough == NULL) && (flags & kInstrCanContinue))
++            {
++                dvmCompilerReplaceChildBasicBlock (nextBlock, curBlock, kChildTypeFallthrough);
+             }
++
+             curBlock = nextBlock;
+         }
+     }
+ 
+-    if (cUnit.printMe) {
+-        dvmCompilerDumpCompilationUnit(&cUnit);
++    /* Building CFG succeeded */
++    return true;
++}
++
++/*
++ * Similar to dvmCompileTrace, but the entity processed here is the whole
++ * method.
++ *
++ * TODO: implementation will be revisited when the trace builder can provide
++ * whole-method traces.
++ */
++bool dvmCompileMethod(const Method *method, JitTranslationInfo *info)
++{
++    CompilationUnit cUnit;
++    const DexCode *dexCode = dvmGetMethodCode(method);
++    const u2 *codePtr = dexCode->insns;
++
++    /* Method already compiled */
++    if (dvmJitGetMethodAddr(codePtr)) {
++        info->codeAddress = NULL;
++        return false;
+     }
+ 
++    memset(&cUnit, 0, sizeof(cUnit));
++    cUnit.method = method;
++
++    cUnit.jitMode = kJitMethod;
++
++    //Set the constant values
++    std::map<int, int> constantValues;
++    cUnit.constantValues = &constantValues;
++
++    /* Initialize the block list */
++    dvmInitGrowableList(&cUnit.blockList, 4);
++
++    /*
++     * FIXME - PC reconstruction list won't be needed after the codegen routines
++     * are enhanced to true method mode.
++     */
++    /* Initialize the PC reconstruction list */
++    dvmInitGrowableList(&cUnit.pcReconstructionList, 8);
++
++    /* Allocate the bit-vector to track the beginning of basic blocks */
++    BitVector *tryBlockAddr = dvmCompilerAllocBitVector(dexCode->insnsSize,
++                                                        true /* expandable */);
++    cUnit.tryBlockAddr = tryBlockAddr;
++
++    /* Identify code range in try blocks and set up the empty catch blocks */
++    processTryCatchBlocks (cUnit.method, &cUnit.blockList, cUnit.tryBlockAddr);
++
++    /* Build CGF for the method */
++    bool createdCFG = dvmCompilerBuildCFG (cUnit.method, &cUnit.blockList,
++            &cUnit.entryBlock, &cUnit.exitBlock, cUnit.tryBlockAddr, resolveReferences);
++
++    if (createdCFG == false)
++    {
++        return false;
++    }
++
++    /* Now that we finished inserting blocks, let's update the number of blocks in cUnit */
++    cUnit.numBlocks = dvmGrowableListSize (&cUnit.blockList);
++
+     /* Adjust this value accordingly once inlining is performed */
+     cUnit.numDalvikRegisters = cUnit.method->registersSize
+             + dvmArchSpecGetNumberOfScratch();
+@@ -1551,6 +1739,11 @@ bool dvmCompileMethod(const Method *method, JitTranslationInfo *info)
+     dvmCompilerLocalRegAlloc(&cUnit);
+ #endif
+ 
++    /* Before lowering, print out the compilation unit */
++    if (cUnit.printMe == true) {
++        dvmCompilerDumpCompilationUnit(&cUnit);
++    }
++
+     /* Convert MIR to LIR, etc. */
+     dvmCompilerMethodMIR2LIR(&cUnit);
+ 
+@@ -1648,7 +1841,7 @@ static bool exhaustTrace(CompilationUnit *cUnit, BasicBlock *curBlock)
+             dvmCompilerSetBit(cUnit->exitBlock->predecessors, curBlock->id);
+             break;
+         } else if (flags & kInstrCanBranch) {
+-            processCanBranch(cUnit, curBlock, insn, curOffset, width, flags,
++            processCanBranch(&cUnit->blockList, curBlock, insn, curOffset, width, flags,
+                              codePtr, NULL);
+             if (curBlock->taken) {
+                 exhaustTrace(cUnit, curBlock->taken);
+@@ -1659,7 +1852,7 @@ static bool exhaustTrace(CompilationUnit *cUnit, BasicBlock *curBlock)
+             break;
+         }
+         curOffset += width;
+-        BasicBlock *nextBlock = findBlock(cUnit, curOffset,
++        BasicBlock *nextBlock = findBlock(&cUnit->blockList, curOffset,
+                                           /* split */
+                                           false,
+                                           /* create */
+@@ -1725,10 +1918,8 @@ static bool compileLoop(CompilationUnit *cUnit, unsigned int startOffset,
+                         JitTranslationInfo *info, jmp_buf *bailPtr,
+                         int optHints)
+ {
+-    int numBlocks = 0;
+     unsigned int curOffset = startOffset;
+     bool changed;
+-    BasicBlock *bb;
+ #if defined(WITH_JIT_TUNING)
+     CompilerMethodStats *methodStats;
+ #endif
+@@ -1752,29 +1943,19 @@ static bool compileLoop(CompilationUnit *cUnit, unsigned int startOffset,
+     dvmInitGrowableList(&cUnit->pcReconstructionList, 8);
+ 
+     /* Create the default entry and exit blocks and enter them to the list */
+-    BasicBlock *entryBlock = dvmCompilerNewBB(kEntryBlock, numBlocks++);
++    BasicBlock *entryBlock = dvmCompilerNewBBinList (cUnit->blockList, kEntryBlock);
+     entryBlock->startOffset = curOffset;
+-    BasicBlock *exitBlock = dvmCompilerNewBB(kExitBlock, numBlocks++);
+-
+     cUnit->entryBlock = entryBlock;
+-    cUnit->exitBlock = exitBlock;
+ 
+-    dvmInsertGrowableList(&cUnit->blockList, (intptr_t) entryBlock);
+-    dvmInsertGrowableList(&cUnit->blockList, (intptr_t) exitBlock);
++    BasicBlock *exitBlock = dvmCompilerNewBBinList (cUnit->blockList, kExitBlock);
++    cUnit->exitBlock = exitBlock;
+ 
+     /* Current block to record parsed instructions */
+-    BasicBlock *curBlock = dvmCompilerNewBB(kDalvikByteCode, numBlocks++);
++    BasicBlock *curBlock = dvmCompilerNewBBinList (cUnit->blockList, kDalvikByteCode);
+     curBlock->startOffset = curOffset;
+ 
+-    dvmInsertGrowableList(&cUnit->blockList, (intptr_t) curBlock);
+-    entryBlock->fallThrough = curBlock;
+-    dvmCompilerSetBit(curBlock->predecessors, entryBlock->id);
+-
+-    /*
+-     * Store back the number of blocks since new blocks may be created of
+-     * accessing cUnit.
+-     */
+-    cUnit->numBlocks = numBlocks;
++    /* Set entry's fallthrough be the bytecode block */
++    dvmCompilerReplaceChildBasicBlock (curBlock, entryBlock, kChildTypeFallthrough);
+ 
+     do {
+         dvmCompilerDataFlowAnalysisDispatcher(cUnit,
+@@ -1784,6 +1965,17 @@ static bool compileLoop(CompilationUnit *cUnit, unsigned int startOffset,
+         changed = exhaustTrace(cUnit, curBlock);
+     } while (changed);
+ 
++#ifndef ARCH_IA32
++    /* A special block to host PC reconstruction code */
++    dvmCompilerNewBBinList (cUnit->blockList, kPCReconstruction);
++#endif
++
++    /* And one final block that publishes the PC and raises the exception */
++    cUnit->puntBlock = dvmCompilerNewBBinList (cUnit->blockList, kExceptionHandling);
++
++    /* Now that we finished inserting blocks, let's update the number of blocks in cUnit */
++    cUnit->numBlocks = dvmGrowableListSize (&cUnit->blockList);
++
+ #ifdef BYTECODE_FILTER
+     GrowableListIterator iterator;
+     MIR *insn;
+@@ -1799,17 +1991,6 @@ static bool compileLoop(CompilationUnit *cUnit, unsigned int startOffset,
+     }
+ #endif
+ 
+-#ifndef ARCH_IA32
+-    /* A special block to host PC reconstruction code */
+-    bb = dvmCompilerNewBB(kPCReconstruction, cUnit->numBlocks++);
+-    dvmInsertGrowableList(&cUnit->blockList, (intptr_t) bb);
+-#endif
+-
+-    /* And one final block that publishes the PC and raises the exception */
+-    bb = dvmCompilerNewBB(kExceptionHandling, cUnit->numBlocks++);
+-    dvmInsertGrowableList(&cUnit->blockList, (intptr_t) bb);
+-    cUnit->puntBlock = bb;
+-
+     cUnit->numDalvikRegisters = cUnit->method->registersSize
+             + dvmArchSpecGetNumberOfScratch();
+ 
+@@ -2027,7 +2208,6 @@ bool dvmCompileTrace(JitTraceDescription *desc, int numMaxInsts,
+     int traceSize = 0;  // # of half-words
+     const u2 *startCodePtr = codePtr;
+     BasicBlock *curBB, *entryCodeBB;
+-    int numBlocks = 0;
+     static int compilationId;
+ #ifndef ARCH_IA32
+     CompilationUnit cUnit;
+@@ -2193,13 +2373,11 @@ bool dvmCompileTrace(JitTraceDescription *desc, int numMaxInsts,
+     }
+ 
+     /* Allocate the entry block */
+-    curBB = dvmCompilerNewBB(kEntryBlock, numBlocks++);
+-    dvmInsertGrowableList(blockList, (intptr_t) curBB);
++    curBB = dvmCompilerNewBBinList (*blockList, kEntryBlock);
+     curBB->startOffset = curOffset;
+     cUnit.entryBlock = curBB;
+ 
+-    entryCodeBB = dvmCompilerNewBB(kDalvikByteCode, numBlocks++);
+-    dvmInsertGrowableList(blockList, (intptr_t) entryCodeBB);
++    entryCodeBB = dvmCompilerNewBBinList (*blockList, kDalvikByteCode);
+     entryCodeBB->startOffset = curOffset;
+     curBB->fallThrough = entryCodeBB;
+     curBB = entryCodeBB;
+@@ -2300,8 +2478,7 @@ bool dvmCompileTrace(JitTraceDescription *desc, int numMaxInsts,
+                     break;
+                 }
+ 
+-                curBB = dvmCompilerNewBB(kDalvikByteCode, numBlocks++);
+-                dvmInsertGrowableList(blockList, (intptr_t) curBB);
++                curBB = dvmCompilerNewBBinList (*blockList, kDalvikByteCode);
+                 curOffset = currRun->info.frag.startOffset;
+                 numInsts = currRun->info.frag.numInsts;
+                 curBB->startOffset = curOffset;
+@@ -2418,16 +2595,12 @@ bool dvmCompileTrace(JitTraceDescription *desc, int numMaxInsts,
+ 
+             /* One chaining cell for the first MAX_CHAINED_SWITCH_CASES cases */
+             for (i = 0; i < maxChains; i++) {
+-                BasicBlock *caseChain = dvmCompilerNewBB(kChainingCellNormal,
+-                                                         numBlocks++);
+-                dvmInsertGrowableList(blockList, (intptr_t) caseChain);
++                BasicBlock *caseChain = dvmCompilerNewBBinList (*blockList, kChainingCellNormal);
+                 caseChain->startOffset = lastInsn->offset + targets[i];
+             }
+ 
+             /* One more chaining cell for the default case */
+-            BasicBlock *caseChain = dvmCompilerNewBB(kChainingCellNormal,
+-                                                     numBlocks++);
+-            dvmInsertGrowableList(blockList, (intptr_t) caseChain);
++            BasicBlock *caseChain = dvmCompilerNewBBinList (*blockList, kChainingCellNormal);
+             caseChain->startOffset = lastInsn->offset + lastInsn->width;
+         /* Fallthrough block not included in the trace */
+         } else if (!isUnconditionalBranch(lastInsn) &&
+@@ -2439,12 +2612,10 @@ bool dvmCompileTrace(JitTraceDescription *desc, int numMaxInsts,
+              * chaining cell.
+              */
+             if (isInvoke || curBB->needFallThroughBranch) {
+-                fallThroughBB = dvmCompilerNewBB(kChainingCellHot, numBlocks++);
++                fallThroughBB = dvmCompilerNewBBinList (*blockList, kChainingCellHot);
+             } else {
+-                fallThroughBB = dvmCompilerNewBB(kChainingCellNormal,
+-                                                 numBlocks++);
++                fallThroughBB = dvmCompilerNewBBinList (*blockList, kChainingCellNormal);
+             }
+-            dvmInsertGrowableList(blockList, (intptr_t) fallThroughBB);
+             fallThroughBB->startOffset = fallThroughOffset;
+             curBB->fallThrough = fallThroughBB;
+             dvmCompilerSetBit(fallThroughBB->predecessors, curBB->id);
+@@ -2459,57 +2630,49 @@ bool dvmCompileTrace(JitTraceDescription *desc, int numMaxInsts,
+                 if (callee) {
+                     /* JNI call doesn't need a chaining cell */
+                     if (!dvmIsNativeMethod(callee)) {
+-                        newBB = dvmCompilerNewBB(kChainingCellInvokeSingleton,
+-                                                 numBlocks++);
++                        newBB = dvmCompilerNewBBinList (*blockList, kChainingCellInvokeSingleton);
+                         newBB->startOffset = 0;
+                         newBB->containingMethod = callee;
+                     }
+                 /* Will resolve at runtime */
+                 } else {
+-                    newBB = dvmCompilerNewBB(kChainingCellInvokePredicted,
+-                                             numBlocks++);
++                    newBB = dvmCompilerNewBBinList (*blockList, kChainingCellInvokePredicted);
+                     newBB->startOffset = 0;
+                 }
+             /* For unconditional branches, request a hot chaining cell */
+             } else {
+ #if !defined(WITH_SELF_VERIFICATION)
+-                newBB = dvmCompilerNewBB(dexIsGoto(flags) ?
+-                                                  kChainingCellHot :
+-                                                  kChainingCellNormal,
+-                                         numBlocks++);
++                newBB = dvmCompilerNewBBinList (*blockList, dexIsGoto (flags) ? kChainingCellHot : kChainingCellNormal);
+                 newBB->startOffset = targetOffset;
+ #else
+                 /* Handle branches that branch back into the block */
+                 if (targetOffset >= curBB->firstMIRInsn->offset &&
+                     targetOffset <= curBB->lastMIRInsn->offset) {
+-                    newBB = dvmCompilerNewBB(kChainingCellBackwardBranch,
+-                                             numBlocks++);
++                    newBB = dvmCompilerNewBBinList (*blockList, kChainingCellBackwardBranch);
+                 } else {
+-                    newBB = dvmCompilerNewBB(dexIsGoto(flags) ?
+-                                                      kChainingCellHot :
+-                                                      kChainingCellNormal,
+-                                             numBlocks++);
++                    newBB = dvmCompilerNewBBinList (*blockList,
++                            dexIsGoto (flags) ? kChainingCellHot : kChainingCellNormal);
+                 }
+                 newBB->startOffset = targetOffset;
+ #endif
+             }
+-            if (newBB) {
+-                curBB->taken = newBB;
+-                dvmCompilerSetBit(newBB->predecessors, curBB->id);
+-                dvmInsertGrowableList(blockList, (intptr_t) newBB);
++            if (newBB != 0) {
++                dvmCompilerReplaceChildBasicBlock (newBB, curBB, kChildTypeTaken);
+             }
+         }
+     }
+ 
++#ifndef ARCH_IA32
+     /* Now create a special block to host PC reconstruction code */
+-    curBB = dvmCompilerNewBB(kPCReconstruction, numBlocks++);
+-    dvmInsertGrowableList(blockList, (intptr_t) curBB);
++    curBB = dvmCompilerNewBBinList (*blockList, kPCReconstruction);
++#endif
+ 
+     /* And one final block that publishes the PC and raise the exception */
+-    curBB = dvmCompilerNewBB(kExceptionHandling, numBlocks++);
+-    dvmInsertGrowableList(blockList, (intptr_t) curBB);
++    curBB = dvmCompilerNewBBinList (*blockList, kExceptionHandling);
+     cUnit.puntBlock = curBB;
+ 
++    cUnit.numBlocks = dvmGrowableListSize (blockList);
++
+     if (cUnit.printMe) {
+         char* signature =
+             dexProtoCopyMethodDescriptor(&desc->method->prototype);
+@@ -2522,12 +2685,10 @@ bool dvmCompileTrace(JitTraceDescription *desc, int numMaxInsts,
+             desc->trace[0].info.frag.startOffset,
+             traceSize,
+             dexCode->insnsSize,
+-            numBlocks);
++            cUnit.numBlocks);
+         free(signature);
+     }
+ 
+-    cUnit.numBlocks = numBlocks;
+-
+     /* Set the instruction set to use (NOTE: later components may change it) */
+     cUnit.instructionSet = dvmCompilerInstructionSet();
+ 
+@@ -2553,13 +2714,15 @@ bool dvmCompileTrace(JitTraceDescription *desc, int numMaxInsts,
+     dvmCompilerCalculateBasicBlockInformation (&cUnit, false, false);
+ #endif
+ 
+-    if (cUnit.printMe) {
+-        dvmCompilerDumpCompilationUnit(&cUnit);
+-    }
+-
+ #ifndef ARCH_IA32
+     /* Allocate Registers using simple local allocation scheme */
+     dvmCompilerLocalRegAlloc(&cUnit);
++
++    /* Before lowering, print out the compilation unit */
++    if (cUnit.printMe == true) {
++        dvmCompilerDumpCompilationUnit(&cUnit);
++    }
++
+     /* Convert MIR to LIR, etc. */
+     dvmCompilerMIR2LIR(&cUnit);
+ #else /* ARCH_IA32 */
+@@ -2573,6 +2736,12 @@ bool dvmCompileTrace(JitTraceDescription *desc, int numMaxInsts,
+         return false;
+     }
+ 
++    //Before lowering, print out the compilation unit
++    if (cUnit.printMe == true)
++    {
++        dvmCompilerDumpCompilationUnit (&cUnit);
++    }
++
+     {
+         //Get backend gate function
+         bool (*backEndGate) (CompilationUnit *) = gDvmJit.jitFramework.backEndGate;
+diff --git a/vm/compiler/InlineTransformation.cpp b/vm/compiler/InlineTransformation.cpp
+index bcf730b..ed2036c 100755
+--- a/vm/compiler/InlineTransformation.cpp
++++ b/vm/compiler/InlineTransformation.cpp
+@@ -71,8 +71,10 @@ static bool inlineGetter(CompilationUnit *cUnit,
+ 
+     dexDecodeInstruction(calleeMethod->insns, &getterInsn);
+ 
+-    if (!dvmCompilerCanIncludeThisInstruction(calleeMethod, &getterInsn))
++    if (dvmCompilerCheckResolvedReferences (calleeMethod, &getterInsn) == false)
++    {
+         return false;
++    }
+ 
+     /*
+      * Some getters (especially invoked through interface) are not followed
+@@ -219,8 +221,10 @@ static bool inlineSetter(CompilationUnit *cUnit,
+ 
+     dexDecodeInstruction(calleeMethod->insns, &setterInsn);
+ 
+-    if (!dvmCompilerCanIncludeThisInstruction(calleeMethod, &setterInsn))
++    if (dvmCompilerCheckResolvedReferences (calleeMethod, &setterInsn) == false)
++    {
+         return false;
++    }
+ 
+     int dfFlags = dvmCompilerDataFlowAttributes[setterInsn.opcode];
+ 
+-- 
+1.7.4.1
+

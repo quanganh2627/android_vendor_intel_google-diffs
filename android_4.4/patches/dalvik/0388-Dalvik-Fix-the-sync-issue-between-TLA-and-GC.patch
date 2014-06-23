@@ -1,0 +1,168 @@
+From 4d62aede155636231e383502083f33747930b986 Mon Sep 17 00:00:00 2001
+From: wangzuo <zuo.wang@intel.com>
+Date: Wed, 23 Oct 2013 22:46:08 -0400
+Subject: Dalvik: Fix the sync issue between TLA and GC.
+
+BZ: 146615
+
+The sync design between TLA and GC has a fault: in some cases GC will
+recycle the table entry used by an un-finished alloc request to TLA.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-GC; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I81e75f0725a3c63d85d843117786c63a068e9e0e
+Orig-MCG-Change-Id: I99eb1fde74f4e8d3cf1337941f19ea58a81877eb
+Signed-off-by: Wang Zuo <zuo.wang@intel.com>
+Signed-off-by: Yang Chang <yang.chang@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/Thread.cpp                     |    5 +++
+ vm/alloc/MarkSweep.cpp            |    2 +-
+ vm/alloc/ThreadLocalAllocator.cpp |   54 ++++++++++++++++++++++++++-----------
+ vm/alloc/ThreadLocalAllocator.h   |   13 ++++++---
+ 4 files changed, 53 insertions(+), 21 deletions(-)
+
+diff --git a/vm/Thread.cpp b/vm/Thread.cpp
+index 8a31618..9fb553e 100644
+--- a/vm/Thread.cpp
++++ b/vm/Thread.cpp
+@@ -2176,6 +2176,11 @@ void dvmDetachCurrentThread()
+         }
+     }
+ 
++#ifdef WITH_TLA
++    // recycle table entry before thread exit
++    dvmTLARecycleThreadTableEntry(self->handle, self->tlaTableIndex);
++#endif
++
+     ALOGV("threadid=%d: bye!", self->threadId);
+     releaseThreadId(self);
+     dvmUnlockThreadList();
+diff --git a/vm/alloc/MarkSweep.cpp b/vm/alloc/MarkSweep.cpp
+index 4c4dd45..e9bdf58 100644
+--- a/vm/alloc/MarkSweep.cpp
++++ b/vm/alloc/MarkSweep.cpp
+@@ -1029,7 +1029,7 @@ void dvmHeapSweepUnmarkedObjects(bool isPartial, bool isConcurrent,
+     if (gDvm.withTLA == true)
+     {
+         /* Recycle available entries */
+-        dvmTLARecycleThreadTableEntry ();
++        dvmTLARedistributeThreadTableEntry ();
+ 
+         /* Enable TLAMalloc depending on the disable's return */
+         if(resultIntercept == true)
+diff --git a/vm/alloc/ThreadLocalAllocator.cpp b/vm/alloc/ThreadLocalAllocator.cpp
+index 33167bc..fd585e5 100644
+--- a/vm/alloc/ThreadLocalAllocator.cpp
++++ b/vm/alloc/ThreadLocalAllocator.cpp
+@@ -943,6 +943,8 @@ static void* allocSlot (mspace msp, unsigned int tableIndex, unsigned int size)
+ 
+             if (result != 0)
+             {
++                //TODO: do something for the blocked mspaceCalloc by GC
++
+                 //Request a new block and create slot list
+                 block->startDataPos = static_cast<unsigned char *> (result);
+ 
+@@ -1236,9 +1238,40 @@ unsigned int dvmTLAGetSlotSize (const void* ptr, bool isPureSize)
+ }
+ 
+ /**
+- * @details this function will be called after GC to recycle available table entries, and force the allocations after GC to start at the first private
++ * @details this function will be called before thread exit to recycle allocThreadTable entry
++ */
++void dvmTLARecycleThreadTableEntry (unsigned int tid, unsigned int tableIndex)
++{
++    //Paranoid
++    if (gDvm.tlaInformation.allocThreadTable == 0)
++    {
++        return;
++    }
++
++    //check whether tlaTableIndex is valid
++    if (tableIndex < TLA_MAX_ALLOC_THREAD_NUM)
++    {
++        //Is the table entry owned by current thread?
++        if (getTidFromThreadTable (tableIndex) == tid)
++        {
++            //Log it
++            TLA_LOG (2, "TLA INFO: TLARecycleThreadTableEntry () : recycle a thread entry, tableIndex %u tid %x", tableIndex, gDvm.tlaInformation.accTidArray[tableIndex]);
++
++            //Only clear the entry
++            gDvm.tlaInformation.accTidArray[tableIndex] = 0;
++
++            //Reset full tag
++            gDvm.tlaInformation.isAllocThreadTableFullTag = 0;
++
++            //Note: some objects may not be collected by GC after thread exit, so we should not touch blockTraversalArray and blockAllocNumArray
++        }
++    }
++}
++
++/**
++ * @details this function will be called after GC to force the allocations after GC to start at the first private, and redistribute table entries for threads
+  */
+-void dvmTLARecycleThreadTableEntry (void)
++void dvmTLARedistributeThreadTableEntry (void)
+ {
+     //Paranoid
+     if (gDvm.tlaInformation.allocThreadTable == 0)
+@@ -1262,24 +1295,13 @@ void dvmTLARecycleThreadTableEntry (void)
+                     gDvm.tlaInformation.allocThreadTable[tableIndex].allocHistoryHint[sizeOffset] = 0;
+                 }
+             }
+-
+-            //Recycle thread table entry
+-            if (gDvm.tlaInformation.allocThreadTable[tableIndex].totalAllocNum == 0)
+-            {
+-                //Only clear the entry
+-                gDvm.tlaInformation.accTidArray[tableIndex] = 0;
+-
+-                //Reset full tag
+-                gDvm.tlaInformation.isAllocThreadTableFullTag = 0;
+-
+-                //Log it
+-                TLA_LOG (2, "TLA INFO: TLARecycleThreadTableEntry () : recycle a thread entry, tableIndex %u tid %x", tableIndex, gDvm.tlaInformation.accTidArray[tableIndex]);
+-            }
+         }
+     }
+ 
++    //TODO: competition between threads to win allocThreadTable, winner will take away the allocThreadTable from loser
++
+     //Log it
+-    TLA_LOG (2, "TLARecycleThreadTableEntry () : finished");
++    TLA_LOG (2, "dvmTLARedistributeThreadTableEntry () : finished");
+ }
+ 
+ void dvmTLARecyclePrivateBuffer (unsigned int tableIndex, unsigned int sizeOffset, unsigned int blockIndex, void** smallObjectBuffer,
+diff --git a/vm/alloc/ThreadLocalAllocator.h b/vm/alloc/ThreadLocalAllocator.h
+index bd5fa23..3bad1a0 100644
+--- a/vm/alloc/ThreadLocalAllocator.h
++++ b/vm/alloc/ThreadLocalAllocator.h
+@@ -83,11 +83,16 @@ void dvmTLARecyclePrivateBuffer (unsigned int tableIndex, unsigned int sizeOffse
+                                  unsigned int numPtrs, bool isConcurrent, void *callbackArg, mspace msp);
+ 
+ /**
+- * @brief Recydle the thread table entry
+- * @param msp Current Mspace
+- * @param isConcurrent Whether there is a conCurrent GC or not
++ * @brief Recycle allocThreadTable entry before thread exit
++ * @param tid The pthread id
++ * @param tableIndex The index of target entry in allocThreadTable
++ */
++void dvmTLARecycleThreadTableEntry (unsigned int tid, unsigned int tableIndex);
++
++/**
++ * @brief Redistribute allocThreadTable entry
+  */
+-void dvmTLARecycleThreadTableEntry (void);
++void dvmTLARedistributeThreadTableEntry (void);
+ 
+ /**
+  * @brief return the end pos for current private buffer as well as valid tableIndex, sizeOffset and blockIndex
+-- 
+1.7.4.1
+

@@ -1,0 +1,1035 @@
+From c67789d977ef65d632302f7ab36f4fb2f4fd1952 Mon Sep 17 00:00:00 2001
+From: Udayan Banerji <udayan.banerji@intel.com>
+Date: Thu, 30 May 2013 11:59:15 -0700
+Subject: Dalvik: Make loop peeling available on demand
+
+BZ: 102273
+
+This patch turns the loop peeling into an API call.
+
+1. Enables loop peeling to be done on the whole loop. However, this will
+make the LoopInformation structure for the outermost loop wrong. Currently,
+no pass uses loop peeling on the outer loop.
+
+2. Loop peeling is not a separate pass and is done on demand, and only once
+per loop. If already peeled, the call to peel does nothing.
+
+3. Moved peeling code from BBOptimizations.cpp to LoopInformation.cpp
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I626d758e0bcb6803749a808414fc69e7b157262e
+Orig-MCG-Change-Id: I423c26acc5c57a2deb39a8d892b5c1a2f9b49993
+Signed-off-by: Udayan Banerji <udayan.banerji@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/BBOptimization.cpp   |  381 ++------------------------------------
+ vm/compiler/BBOptimization.h     |   16 +-
+ vm/compiler/InvariantRemoval.cpp |  123 ++++++++++++-
+ vm/compiler/LoopInformation.cpp  |  288 ++++++++++++++++++++++++++++
+ vm/compiler/LoopInformation.h    |   50 +++++
+ vm/compiler/LoopOpt.cpp          |    2 -
+ 6 files changed, 484 insertions(+), 376 deletions(-)
+
+diff --git a/vm/compiler/BBOptimization.cpp b/vm/compiler/BBOptimization.cpp
+index 09f2342..957e763 100644
+--- a/vm/compiler/BBOptimization.cpp
++++ b/vm/compiler/BBOptimization.cpp
+@@ -1137,6 +1137,15 @@ void dvmCompilerReorder (CompilationUnit *cUnit, Pass *pass)
+         bb->id = id;
+         id++;
+     }
++
++    //Since the blocks have been reordered, the peeling information is
++    //no longer valid. Invalidate it
++    LoopInformation *info = cUnit->loopInformation;
++
++    if (info != 0)
++    {
++        info->invalidatePeeling ();
++    }
+ }
+ 
+ /**
+@@ -1379,377 +1388,25 @@ bool dvmCompilerFixChainingCellPredecessors (CompilationUnit *cUnit, BasicBlock
+     return false;
+ }
+ 
+-/**
+- * Peeling pass: we want to peel an iteration of the loop
+- */
+-
+-/**
+- * @brief Parse the instructions, do we support them?
+- * @param mir the instruction
+- * @return whether we support the instruction
+- */
+-bool notPeelSupported (MIR *mir)
++//Peel the loop if needed
++bool dvmCompilerPeel (CompilationUnit *cUnit, LoopInformation *info)
+ {
+-    //Get the instruction
+-    DecodedInstruction &insn = mir->dalvikInsn;
+-
+-    //Get the opcode
+-    int opcode = insn.opcode;
+-
+-    switch (opcode)
+-    {
+-        case OP_SGET:
+-        case OP_SGET_WIDE:
+-        case OP_SGET_OBJECT:
+-        case OP_SGET_BOOLEAN:
+-        case OP_SGET_BYTE:
+-        case OP_SGET_CHAR:
+-        case OP_SGET_SHORT:
+-        case OP_SPUT:
+-        case OP_SPUT_WIDE:
+-        case OP_SPUT_OBJECT:
+-        case OP_SPUT_BOOLEAN:
+-        case OP_SPUT_BYTE:
+-        case OP_SPUT_CHAR:
+-        case OP_SPUT_SHORT:
+-        //Rejecting agets/aputs because they always have instance associated with them
+-        //so when coloring we need to take care of this case.
+-        case OP_AGET:
+-        case OP_AGET_WIDE:
+-        case OP_AGET_OBJECT:
+-        case OP_AGET_BOOLEAN:
+-        case OP_AGET_BYTE:
+-        case OP_AGET_CHAR:
+-        case OP_AGET_SHORT:
+-        case OP_APUT:
+-        case OP_APUT_WIDE:
+-        case OP_APUT_OBJECT:
+-        case OP_APUT_BOOLEAN:
+-        case OP_APUT_BYTE:
+-        case OP_APUT_CHAR:
+-        case OP_APUT_SHORT:
+-            return false;
+-        default:
+-            break;
+-    }
+-
+-    return true;
+-}
+-
+-//The gate function:
+-//  For the moment just do a simple loop
+-bool dvmCompilerPeelGate (const CompilationUnit *cUnit, const Pass *curPass)
+-{
+-    //We peel if we have an invariant in the inner loop
+-    //For the moment, just be like the Memory Aliasing: only a very simple loop
+-    if (dvmCompilerVerySimpleLoopGate (cUnit, curPass) == true)
+-    {
+-        //Ok, one more thing, does the loop contain invariant instructions?
+-        LoopInformation *info = cUnit->loopInformation;
+-
+-        bool res = (info->getContainsInvariantInstructions () == true);
+-
+-        if (res == true)
+-        {
+-            //Ok last decision, we want to check if there aren't too many instructions and if at least
+-            //one instruction throws
+-            BasicBlock *bb = info->getEntryBlock ();
+-
+-            if (bb != 0)
+-            {
+-                int cnt = 0;
+-                const int maxForPeeling = JIT_MAX_TRACE_LEN;
+-                bool haveGetter = false;
+-                bool haveSetter = false;
+-
+-                for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
+-                {
+-                    //Count
+-                    cnt++;
+-
+-                    if (cnt > maxForPeeling)
+-                    {
+-                        return false;
+-                    }
+-
+-                    //Get flags
+-                    int flags = dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
+-
+-                    if ( (flags & DF_IS_SETTER) != 0)
+-                    {
+-                        haveSetter = true;
+-                    }
+-
+-                    if ( (flags & DF_IS_GETTER) != 0)
+-                    {
+-                        haveGetter = true;
+-                    }
+-
+-                    if (notPeelSupported (mir) == false)
+-                    {
+-                        return false;
+-                    }
+-                }
+-
+-                return (haveGetter == true && haveSetter == true);
+-            }
+-        }
+-    }
+-
+-    //Otherwise, we bail
+-    return false;
+-}
+-
+-/**
+- * @brief Handle the new copies: link any block to preheader to the entry's copy
+- * @param cUnit the CompilationUnit
+- * @param info the LoopInformation
+- * @param associations the associations between original and copy BasicBlock
+- */
+-static void handlePredecessor (CompilationUnit *cUnit, LoopInformation *info, std::map<BasicBlock*, BasicBlock *> &associations)
+-{
+-    //Get the entry block
+-    BasicBlock *entry = info->getEntryBlock ();
+-
+-    //Get the preheader
+-    BasicBlock *preheader = info->getPreHeader ();
+-
+     //Paranoid
+-    assert (entry != 0 && preheader != 0);
+-
+-    //Get entry's copy
+-    BasicBlock *copyEntry = associations[entry];
+-
+-    //Paranoid
+-    assert (copyEntry != 0);
+-
+-    //Now go through all the predecessors
+-    BitVectorIterator bvIterator;
+-
+-    dvmBitVectorIteratorInit (preheader->predecessors, &bvIterator);
+-    while (true)
+-    {
+-        BasicBlock *bb = getNextBasicBlockViaBitVector (bvIterator, cUnit);
+-
+-        //Check if done
+-        if (bb == 0)
+-        {
+-            break;
+-        }
+-
+-        //Fix the links
+-        if (bb->taken == preheader)
+-        {
+-            bb->taken = copyEntry;
+-        }
+-
+-        if (bb->fallThrough == preheader)
+-        {
+-            bb->fallThrough = copyEntry;
+-        }
+-    }
+-
+-}
+-
+-/**
+- * @brief Handle the new copies: link any copy going to a BWCC to the preheader
+- * @param info the LoopInformation
+- * @param associations the associations between original and copy BasicBlock
+- */
+-static void handleBWCC (LoopInformation *info, std::map<BasicBlock*, BasicBlock *> &associations)
+-{
+-    //Get the preheader
+-    BasicBlock *preheader = info->getPreHeader ();
+-
+-    //Walk the BasicBlocks
+-    for (std::map<BasicBlock *, BasicBlock *>::iterator it = associations.begin (); it != associations.end (); it++)
+-    {
+-        BasicBlock *orig = it->first;
+-        BasicBlock *copy = it->second;
+-
+-        //Because we might have 0, 0 in the map, check here but we should never have (!0), 0 in the map
+-        assert (it->first == 0 || (it->first != 0 && copy != 0));
+-
+-        if (copy == 0)
+-        {
+-            continue;
+-        }
+-
+-        //Is taken a BackWard Chaining Cell?
+-        bool isTakenBWCC = (orig->taken != 0 && orig->taken->blockType == kChainingCellBackwardBranch);
+-
+-        //Does it go to a BWCC
+-        if (isTakenBWCC == true)
+-        {
+-            //Link it to predecessor then
+-            copy->taken = preheader;
+-        }
+-
+-        //Same for fallthrough
+-        bool isFallThroughBWCC = (orig->fallThrough != 0 && orig->fallThrough->blockType == kChainingCellBackwardBranch);
+-
+-        //Does it go to a BWCC
+-        if (isFallThroughBWCC == true)
+-        {
+-            //Link it to predecessor then
+-            copy->fallThrough = preheader;
+-        }
+-    }
+-}
+-
+-/**
+- * @brief Peel a loop
+- * @param cUnit the CompilationUnit
+- * @param info the LoopInformation
+- */
+-void peelLoop (CompilationUnit *cUnit, LoopInformation *info)
+-{
+-    //Get the BasicBlocks
+-    const BitVector *blocks = info->getBasicBlocks ();
+-
+-    //Go through each block
+-    BitVectorIterator bvIterator;
+-
+-    //The easiest way to do this is to simply copy them all
+-    //  - Copy all BasicBlock and mark in the maps
+-    std::map<BasicBlock *, BasicBlock *> associations;
+-
+-    dvmBitVectorIteratorInit ( (BitVector *) blocks, &bvIterator);
+-    while (true)
+-    {
+-        BasicBlock *bb = getNextBasicBlockViaBitVector (bvIterator, cUnit);
+-
+-        //Check if done
+-        if (bb == 0)
+-        {
+-            break;
+-        }
+-
+-        //Copy the BasicBlock
+-        BasicBlock *copy = dvmCompilerCopyBasicBlock (cUnit, bb);
+-
+-        //Mark it as peeled
+-        copy->peeled = true;
+-
+-        //Mark it in the association
+-        associations[bb] = copy;
+-    }
+-
+-    //Ok we copied everything , now through them again and link them together
+-    for (std::map<BasicBlock *, BasicBlock *>::iterator it = associations.begin (); it != associations.end (); it++)
+-    {
+-        BasicBlock *copy = it->second;
+-
+-        //Because we might have 0, 0 in the map, check here but we should never have (!0), 0 in the map
+-        assert (it->first == 0 || (it->first != 0 && copy != 0));
+-
+-        if (copy == 0)
+-        {
+-            continue;
+-        }
+-
+-        //Get copy's taken and fallthrough
+-        BasicBlock *taken = copy->taken;
+-        BasicBlock *fallThrough = copy->fallThrough;
+-
+-        //Transform the taken and fallthrough using the associations
+-        if (taken != 0)
+-        {
+-            //Update the association if we have one
+-            if (associations.count(taken) > 0)
+-            {
+-                //Now update the link
+-                copy->taken = associations[taken];
+-            }
+-            else
+-            {
+-                //It should be a loop exit block then. Copy and replace
+-                if (dvmIsBitSet (info->getExitLoops (), taken->id) == true)
+-                {
+-                    BasicBlock *loopExitCopy = dvmCompilerNewBBinCunit(cUnit, taken->blockType);
+-                    loopExitCopy->taken = taken->taken;
+-                    loopExitCopy->fallThrough = taken->fallThrough;
+-                    copy->taken = loopExitCopy;
+-                }
+-            }
+-
+-        }
+-
+-        if (fallThrough != 0)
+-        {
+-            //Update the association if we have one
+-            if (associations.count(fallThrough) > 0)
+-            {
+-                //Now update the link
+-                copy->fallThrough = associations[fallThrough];
+-            }
+-            else
+-            {
+-                //It should be a loop exit block then. Copy and replace
+-                if (dvmIsBitSet (info->getExitLoops (), fallThrough->id) == true)
+-                {
+-                    BasicBlock *loopExitCopy = dvmCompilerNewBBinCunit(cUnit, fallThrough->blockType);
+-                    loopExitCopy->taken = fallThrough->taken;
+-                    loopExitCopy->fallThrough = fallThrough->fallThrough;
+-                    copy->fallThrough = loopExitCopy;
+-                }
+-            }
+-        }
+-    }
+-
+-    //All copies are linked together, now we need to link the copies correctly
+-
+-    //First attach the entry block on top of the preheader of the loop
+-    handlePredecessor (cUnit, info, associations);
+-
+-    //Second attach all BBs that go to a BWCC to the current preheader
+-    handleBWCC (info, associations);
+-}
+-
+-/**
+- * @brief Helper to peel the inner loop
+- * @param cUnit the CompilationUnit
+- * @param info the LoopInformation
+- */
+-void peelLoopRecursive (CompilationUnit *cUnit, LoopInformation *info)
+-{
+-    //Search in the children if anybody includes them
+-    unsigned int nbr = info->getNestedNbr ();
+-
+-    //Is it the inner loop ?
+-    if (nbr == 0)
+-    {
+-        //Actually registerize the loop
+-        peelLoop (cUnit, info);
+-    }
+-    else
++    if (info == 0)
+     {
+-        for (unsigned int i = 0; i < nbr; i++)
+-        {
+-            LoopInformation *inner = info->getNested (i);
+-
+-            //Paranoid
+-            assert (inner != 0);
+-
+-            peelLoopRecursive (cUnit, inner);
+-        }
++        return false;
+     }
+-}
+ 
+-//The actual entry function to the peeling pass
+-void dvmCompilerPeel (CompilationUnit *cUnit, Pass *pass)
+-{
+-    //Now let's go through the loop information
+-    LoopInformation *info = cUnit->loopInformation;
++    //Peel the loop
++    bool result = info->peelLoop (cUnit);
+ 
+-    //If info is 0, there is nothing to do
+-    if (info == 0)
++    if (result == false)
+     {
+-        return;
++        return result;
+     }
+ 
+-    //Call the recursive function to peel the inner loop
+-    peelLoopRecursive (cUnit, info);
++    //We have changed the cUnit. Update information
++    return dvmCompilerCalculateBasicBlockInformation (cUnit, false);
+ }
+ 
+ /**
+diff --git a/vm/compiler/BBOptimization.h b/vm/compiler/BBOptimization.h
+index e090c8e..60954ae 100644
+--- a/vm/compiler/BBOptimization.h
++++ b/vm/compiler/BBOptimization.h
+@@ -21,6 +21,7 @@
+ struct BasicBlock;
+ struct CompilationUnit;
+ class Pass;
++class LoopInformation;
+ 
+ /**
+  * @brief Merge BasicBlocks together to reduce unnecessary jumps
+@@ -76,21 +77,14 @@ bool dvmCompilerConvert2addr (CompilationUnit *cUnit, BasicBlock *bb);
+ bool dvmCompilerFixChainingCellPredecessors (CompilationUnit *cUnit, BasicBlock *bb);
+ 
+ /**
+- * @brief Gate for the peel pass
++ * @brief Peel the loop if needed
+  * @param cUnit the CompilationUnit
+- * @param curPass the Pass structure
+- * @return whether to execute the pass or not
++ * @param info the loop information
++ * @return whether peel was successful
+  */
+-bool dvmCompilerPeelGate (const CompilationUnit *cUnit, const Pass *curPass);
++bool dvmCompilerPeel (CompilationUnit *cUnit, LoopInformation *info);
+ 
+ /**
+- * @brief Peeling pass: peel the loop
+- * @param cUnit the CompilationUnit
+- * @param curPass the current Pass
+- */
+-void dvmCompilerPeel (CompilationUnit *cUnit, Pass *curPass);
+-
+-/*
+  * @brief Perform local value numbering
+  * @param cUnit the CompilationUnit
+  * @param bb the BasicBlock
+diff --git a/vm/compiler/InvariantRemoval.cpp b/vm/compiler/InvariantRemoval.cpp
+index 899154a..d6b993a 100644
+--- a/vm/compiler/InvariantRemoval.cpp
++++ b/vm/compiler/InvariantRemoval.cpp
+@@ -617,6 +617,16 @@ void dvmCompilerIgetIputRemoval (CompilationUnit *cUnit, Pass *curPass)
+     //Paranoid
+     assert (info != 0);
+ 
++    //Peel the loop
++    bool res = dvmCompilerPeel (cUnit, info);
++
++    //See if we succeeded
++    if (res == false)
++    {
++        //Cannot continue without peeling
++        return;
++    }
++
+     //First job is to find if we have a color with only a get/put in it?
+     std::vector<std::pair<MIR *, MIR*> > candidates;
+ 
+@@ -663,6 +673,16 @@ void dvmCompilerInvariantRemoval (CompilationUnit *cUnit, Pass *curPass)
+ 
+     assert (loopInfo != 0);
+ 
++    //Peel the loop
++    bool res = dvmCompilerPeel (cUnit, loopInfo);
++
++    //See if we succeeded
++    if (res == false)
++    {
++        //Cannot continue without peeling
++        return;
++    }
++
+     //Needed to hold the selection of MIRs to consider
+     std::vector<MIR *> selection;
+ 
+@@ -815,10 +835,63 @@ static bool guaranteedToThrowFirstIteration (const CompilationUnit *cUnit, const
+     return true;
+ }
+ 
++/**
++ * @brief Parse the instructions, do we support them?
++ * @param mir the instruction
++ * @return whether we support the instruction
++ */
++static bool notInvariantRemovalSupported (MIR *mir)
++{
++    //Get the instruction
++    DecodedInstruction &insn = mir->dalvikInsn;
++
++    //Get the opcode
++    int opcode = insn.opcode;
++
++    switch (opcode)
++    {
++        case OP_SGET:
++        case OP_SGET_WIDE:
++        case OP_SGET_OBJECT:
++        case OP_SGET_BOOLEAN:
++        case OP_SGET_BYTE:
++        case OP_SGET_CHAR:
++        case OP_SGET_SHORT:
++        case OP_SPUT:
++        case OP_SPUT_WIDE:
++        case OP_SPUT_OBJECT:
++        case OP_SPUT_BOOLEAN:
++        case OP_SPUT_BYTE:
++        case OP_SPUT_CHAR:
++        case OP_SPUT_SHORT:
++        //Rejecting agets/aputs because they always have instance associated with them
++        //so when coloring we need to take care of this case.
++        case OP_AGET:
++        case OP_AGET_WIDE:
++        case OP_AGET_OBJECT:
++        case OP_AGET_BOOLEAN:
++        case OP_AGET_BYTE:
++        case OP_AGET_CHAR:
++        case OP_AGET_SHORT:
++        case OP_APUT:
++        case OP_APUT_WIDE:
++        case OP_APUT_OBJECT:
++        case OP_APUT_BOOLEAN:
++        case OP_APUT_BYTE:
++        case OP_APUT_CHAR:
++        case OP_APUT_SHORT:
++            return false;
++        default:
++            break;
++    }
++
++    return true;
++}
++
+ bool dvmCompilerInvariantRemovalGate (const CompilationUnit *cUnit, const Pass *curPass)
+ {
+     //We are only able to hoist/remove invariants if we can peel the loop
+-    if (dvmCompilerPeelGate (cUnit, curPass) == false)
++    if (dvmCompilerVerySimpleLoopGate (cUnit, curPass) == false)
+     {
+         return false;
+     }
+@@ -826,6 +899,54 @@ bool dvmCompilerInvariantRemovalGate (const CompilationUnit *cUnit, const Pass *
+     //Get the loop
+     LoopInformation *loopInfo = cUnit->loopInformation;
+ 
++    bool res = (loopInfo->getContainsInvariantInstructions () == true);
++
++    if (res == true)
++    {
++        //Ok last decision, we want to check if there aren't too many instructions and if at least
++        //one instruction throws
++        BasicBlock *bb = loopInfo->getEntryBlock ();
++
++        if (bb != 0)
++        {
++            int cnt = 0;
++            const int maxForPeeling = JIT_MAX_TRACE_LEN;
++            bool haveGetter = false;
++            bool haveSetter = false;
++
++            for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++            {
++                //Count
++                cnt++;
++
++                if (cnt > maxForPeeling)
++                {
++                    return false;
++                }
++
++                //Get flags
++                int flags = dvmCompilerDataFlowAttributes[mir->dalvikInsn.opcode];
++
++                if ( (flags & DF_IS_SETTER) != 0)
++                {
++                    haveSetter = true;
++                }
++
++                if ( (flags & DF_IS_GETTER) != 0)
++                {
++                    haveGetter = true;
++                }
++
++                if (notInvariantRemovalSupported (mir) == false)
++                {
++                    return false;
++                }
++            }
++
++            return (haveGetter == true && haveSetter == true);
++        }
++    }
++
+     //To make it here we are guaranteed to have just one block
+     const BitVector *bv = loopInfo->getBasicBlocks ();
+ 
+diff --git a/vm/compiler/LoopInformation.cpp b/vm/compiler/LoopInformation.cpp
+index 4c323b5..e951db3 100644
+--- a/vm/compiler/LoopInformation.cpp
++++ b/vm/compiler/LoopInformation.cpp
+@@ -43,6 +43,7 @@ void LoopInformation::init (void)
+     preHeader = 0;
+     postExitLoop = 0;
+     scratchRegisters = 0;
++    peeledBlocks = 0;
+ 
+     if (interIterationVariables == 0)
+     {
+@@ -1005,3 +1006,290 @@ void LoopInformation::sinkInstruction (CompilationUnit *cUnit, MIR *insn) const
+     //Call generic function
+     sinkInstructions (cUnit, insns);
+ }
++
++// Handle the new copies: link any block to preheader to the entry's copy
++void LoopInformation::handlePredecessor (CompilationUnit *cUnit, std::map<BasicBlock*, BasicBlock *> &associations)
++{
++    //Get the entry block
++    BasicBlock *entry = getEntryBlock ();
++
++    //Get the preheader
++    BasicBlock *preheader = getPreHeader ();
++
++    //Paranoid
++    assert (entry != 0 && preheader != 0);
++
++    //Get entry's copy
++    BasicBlock *copyEntry = associations[entry];
++
++    //Paranoid
++    assert (copyEntry != 0);
++
++    //Now go through all the predecessors
++    BitVectorIterator bvIterator;
++
++    dvmBitVectorIteratorInit (preheader->predecessors, &bvIterator);
++    while (true)
++    {
++        BasicBlock *bb = getNextBasicBlockViaBitVector (bvIterator, cUnit);
++
++        //Check if done
++        if (bb == 0)
++        {
++            break;
++        }
++
++        //Fix the links
++        if (bb->taken == preheader)
++        {
++            bb->taken = copyEntry;
++        }
++
++        if (bb->fallThrough == preheader)
++        {
++            bb->fallThrough = copyEntry;
++        }
++    }
++
++}
++
++// Handle the new copies: link any copy going to a BWCC to the preheader
++void LoopInformation::handleBWCC (std::map<BasicBlock*, BasicBlock *> &associations)
++{
++    //Get the preheader
++    BasicBlock *preheader = getPreHeader ();
++
++    //Walk the BasicBlocks
++    for (std::map<BasicBlock *, BasicBlock *>::iterator it = associations.begin (); it != associations.end (); it++)
++    {
++        BasicBlock *orig = it->first;
++        BasicBlock *copy = it->second;
++
++        //Because we might have 0, 0 in the map, check here but we should never have (!0), 0 in the map
++        assert (it->first == 0 || (it->first != 0 && copy != 0));
++
++        if (copy == 0)
++        {
++            continue;
++        }
++
++        //Is taken a BackWard Chaining Cell?
++        bool isTakenBWCC = (orig->taken != 0 && orig->taken->blockType == kChainingCellBackwardBranch);
++
++        //Does it go to a BWCC
++        if (isTakenBWCC == true)
++        {
++            //Link it to predecessor then
++            copy->taken = preheader;
++        }
++
++        //Same for fallthrough
++        bool isFallThroughBWCC = (orig->fallThrough != 0 && orig->fallThrough->blockType == kChainingCellBackwardBranch);
++
++        //Does it go to a BWCC
++        if (isFallThroughBWCC == true)
++        {
++            //Link it to predecessor then
++            copy->fallThrough = preheader;
++        }
++    }
++}
++
++/**
++ * @brief Peel a loop
++ */
++void LoopInformation::peelLoopHelper (CompilationUnit *cUnit)
++{
++    //Get the BasicBlocks
++    const BitVector *blocks = getBasicBlocks ();
++
++    //Go through each block
++    BitVectorIterator bvIterator;
++
++    //The easiest way to do this is to simply copy them all
++    //  - Copy all BasicBlock and mark in the maps
++    std::map<BasicBlock *, BasicBlock *> associations;
++
++    dvmBitVectorIteratorInit ( (BitVector *) blocks, &bvIterator);
++    while (true)
++    {
++        BasicBlock *bb = getNextBasicBlockViaBitVector (bvIterator, cUnit);
++
++        //Check if done
++        if (bb == 0)
++        {
++            break;
++        }
++
++        //Copy the BasicBlock
++        BasicBlock *copy = dvmCompilerCopyBasicBlock (cUnit, bb);
++
++        //Mark it as peeled
++        copy->peeled = true;
++
++        //Set it as a peeled block of the loop
++        dvmSetBit(peeledBlocks, copy->id);
++
++        //Mark it in the association
++        associations[bb] = copy;
++    }
++
++    //Ok we copied everything , now through them again and link them together
++    for (std::map<BasicBlock *, BasicBlock *>::iterator it = associations.begin (); it != associations.end (); it++)
++    {
++        BasicBlock *copy = it->second;
++
++        //Because we might have 0, 0 in the map, check here but we should never have (!0), 0 in the map
++        assert (it->first == 0 || (it->first != 0 && copy != 0));
++
++        if (copy == 0)
++        {
++            continue;
++        }
++
++        //Get copy's taken and fallthrough
++        BasicBlock *taken = copy->taken;
++        BasicBlock *fallThrough = copy->fallThrough;
++
++        //Transform the taken and fallthrough using the associations
++        if (taken != 0)
++        {
++            BasicBlock *newTaken = associations[taken];
++
++            //Update the association if we have one
++            if (newTaken != 0)
++            {
++                //Now update the link
++                copy->taken = newTaken;
++            }
++            else
++            {
++                //It should be a loop exit block then. Copy and replace
++                if (dvmIsBitSet (getExitLoops (), taken->id) == true)
++                {
++                    BasicBlock *loopExitCopy = dvmCompilerNewBBinCunit(cUnit, taken->blockType);
++                    loopExitCopy->taken = taken->taken;
++                    loopExitCopy->fallThrough = taken->fallThrough;
++                    copy->taken = loopExitCopy;
++                }
++            }
++
++        }
++
++        if (fallThrough != 0)
++        {
++            BasicBlock *newFallThrough = associations[fallThrough];
++
++            //Update the association if we have one
++            if (newFallThrough != 0)
++            {
++                //Now update the link
++                copy->fallThrough = newFallThrough;
++            }
++            else
++            {
++                //It should be a loop exit block then. Copy and replace
++                if (dvmIsBitSet (getExitLoops (), fallThrough->id) == true)
++                {
++                    BasicBlock *loopExitCopy = dvmCompilerNewBBinCunit(cUnit, fallThrough->blockType);
++                    loopExitCopy->taken = fallThrough->taken;
++                    loopExitCopy->fallThrough = fallThrough->fallThrough;
++                    copy->fallThrough = loopExitCopy;
++                }
++            }
++        }
++    }
++
++    //All copies are linked together, now we need to link the copies correctly
++
++    //First attach the entry block on top of the preheader of the loop
++    handlePredecessor (cUnit, associations);
++
++    //Second attach all BBs that go to a BWCC to the current preheader
++    handleBWCC (associations);
++}
++
++//Count the instructions
++unsigned int LoopInformation::countInstructions (CompilationUnit *cUnit)
++{
++    unsigned int res = 0;
++
++    //Get the BasicBlocks
++    const BitVector *blocks = getBasicBlocks ();
++
++    //Iterate through the basic blocks
++    BitVectorIterator bvIterator;
++    dvmBitVectorIteratorInit ( (BitVector *) blocks, &bvIterator);
++    while (true)
++    {
++        BasicBlock *bb = getNextBasicBlockViaBitVector (bvIterator, cUnit);
++
++        //Check if done
++        if (bb == 0)
++        {
++            break;
++        }
++
++        //Count the instructions in the BasicBlock
++        for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++        {
++            res++;
++        }
++    }
++
++    //Return accumulator
++    return res;
++}
++
++//Peel the loop
++bool LoopInformation::peelLoop (CompilationUnit *cUnit)
++{
++    if (peeledBlocks != 0)
++    {
++        //We have already peeled this loop
++        return true;
++    }
++
++    //Only peel if innermost
++    unsigned int nbr = getNestedNbr ();
++
++    if (nbr != 0)
++    {
++        return false;
++    }
++
++    //Also check the size
++    unsigned int count = countInstructions (cUnit);
++
++    if (count >= JIT_MAX_TRACE_LEN / 2)
++    {
++        return false;
++    }
++
++    //Initialize the peeled blocks bitvector
++    peeledBlocks = dvmCompilerAllocBitVector (1, true);
++
++    //Actually peel the loop
++    peelLoopHelper (cUnit);
++
++    return true;
++
++}
++
++//Invalidate all the peeling
++void LoopInformation::invalidatePeeling (void)
++{
++    if (peeledBlocks != 0)
++    {
++        dvmClearAllBits (peeledBlocks);
++    }
++
++    //Invalidate all the nested blocks also
++    unsigned int nbr = getNestedNbr ();
++
++    for (unsigned int i = 0 ; i < nbr ; i++)
++    {
++        LoopInformation *nested = getNested (i);
++        nested->invalidatePeeling ();
++    }
++}
+diff --git a/vm/compiler/LoopInformation.h b/vm/compiler/LoopInformation.h
+index bd3c1c1..0d10cbe 100644
+--- a/vm/compiler/LoopInformation.h
++++ b/vm/compiler/LoopInformation.h
+@@ -59,6 +59,9 @@ class LoopInformation
+         /** @brief Exit Block */
+         BasicBlock *postExitLoop;
+ 
++        /** @brief Peeled blocks */
++        BitVector *peeledBlocks;
++
+         /** @brief Registers available */
+         unsigned int scratchRegisters;
+ 
+@@ -80,6 +83,34 @@ class LoopInformation
+          */
+         void fillBasicBlockVector (BasicBlock *current);
+ 
++        /**
++         * @brief Peel a loop
++         * @param cUnit the CompilationUnit
++         */
++        void peelLoopHelper (CompilationUnit *cUnit);
++
++        /**
++         * @brief Handle the new copies: link any copy going to a BWCC to the preheader
++         * @param info the LoopInformation
++         * @param associations the associations between original and copy BasicBlock
++         */
++        void handleBWCC (std::map<BasicBlock*, BasicBlock *> &associations);
++
++        /**
++         * @brief Handle the new copies: link any block to preheader to the entry's copy
++         * @param cUnit the CompilationUnit
++         * @param info the LoopInformation
++         * @param associations the associations between original and copy BasicBlock
++         */
++        void handlePredecessor (CompilationUnit *cUnit, std::map<BasicBlock*, BasicBlock *> &associations);
++
++        /**
++         * @brief Count instructions in the loop
++         * @param cUnit the CompilationUnit
++         * @return the number of instructions in the loop
++         */
++        unsigned int countInstructions (CompilationUnit *cUnit);
++
+     public:
+         /** @brief Constructor */
+         LoopInformation (void);
+@@ -384,6 +415,25 @@ class LoopInformation
+           * @param insn the instruction to sink
+           */
+          void sinkInstruction (CompilationUnit *cUnit, MIR *insn) const;
++
++         /**
++          * @brief Helper to peel the inner loop
++          * @param cUnit the CompilationUnit
++          * @return whether the peeling succeeded
++          */
++         bool peelLoop (CompilationUnit *cUnit);
++
++         /**
++          * @brief Get the peeled blocks of the loop
++          * @return the BitVector that represents the peeled BasicBlocks of the loop
++          */
++         const BitVector *getPeeledBlocks (void) const {return peeledBlocks;}
++
++         /**
++          * @brief Invalidate the peeled blocks of this and nested loops
++          */
++         void invalidatePeeling (void);
++
+ };
+ 
+ /**
+diff --git a/vm/compiler/LoopOpt.cpp b/vm/compiler/LoopOpt.cpp
+index cde15de..4aa0138 100644
+--- a/vm/compiler/LoopOpt.cpp
++++ b/vm/compiler/LoopOpt.cpp
+@@ -73,8 +73,6 @@ START_PASSES
+               0, 0, dvmCompilerLocalValueNumbering, 0, 0),
+     NEW_PASS ("Variant", kAllNodes, 0, dvmCompilerVerySimpleLoopGate,
+               0, 0, dvmCompilerVariant, 0, 0),
+-    NEW_PASS ("Peel", kAllNodes, 0, dvmCompilerPeelGate,
+-              dvmCompilerPeel, 0, 0, 0, kOptimizationBasicBlockChange),
+     NEW_PASS ("Invariant_Removal", kAllNodes, 0, dvmCompilerInvariantRemovalGate,
+               dvmCompilerInvariantRemoval, 0, 0, 0, kOptimizationBasicBlockChange),
+     NEW_PASS ("Iget_Iput_Removal", kAllNodes, 0, dvmCompilerInvariantRemovalGate,
+-- 
+1.7.4.1
+

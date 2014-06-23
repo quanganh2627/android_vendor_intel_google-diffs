@@ -1,0 +1,485 @@
+From f22a1896721fe8f52c558d018cb0c8e5a2b50c6a Mon Sep 17 00:00:00 2001
+From: ywan171 <yi.a.wang@intel.com>
+Date: Sat, 4 May 2013 23:25:17 +0800
+Subject: [PORT FROM MAIN] Add retry mechanism in AwesomePlayer for http streaming
+
+BZ:73585 80722 86971
+
+Orig-patch-id: 82323 87055 92905
+
+Change-Id: Id5b87e956ec92932491d424bdec8e409937374a8
+Signed-off-by: ywan171 <yi.a.wang@intel.com>
+---
+ media/libstagefright/Android.mk                    |    1 +
+ media/libstagefright/AsyncOMXCodecWrapper.cpp      |  246 ++++++++++++++++++++
+ media/libstagefright/AwesomePlayer.cpp             |   49 +++--
+ .../libstagefright/include/AsyncOMXCodecWrapper.h  |  114 +++++++++
+ 4 files changed, 390 insertions(+), 20 deletions(-)
+ create mode 100644 media/libstagefright/AsyncOMXCodecWrapper.cpp
+ create mode 100644 media/libstagefright/include/AsyncOMXCodecWrapper.h
+
+diff --git a/media/libstagefright/Android.mk b/media/libstagefright/Android.mk
+index 8aa9fdc..d565660 100644
+--- a/media/libstagefright/Android.mk
++++ b/media/libstagefright/Android.mk
+@@ -35,6 +35,7 @@ LOCAL_SRC_FILES:=                         \
+         MediaExtractor.cpp                \
+         MediaMuxer.cpp                    \
+         MediaSource.cpp                   \
++        AsyncOMXCodecWrapper.cpp          \
+         MetaData.cpp                      \
+         NuCachedSource2.cpp               \
+         NuMediaExtractor.cpp              \
+diff --git a/media/libstagefright/AsyncOMXCodecWrapper.cpp b/media/libstagefright/AsyncOMXCodecWrapper.cpp
+new file mode 100644
+index 0000000..10ad271
+--- /dev/null
++++ b/media/libstagefright/AsyncOMXCodecWrapper.cpp
+@@ -0,0 +1,246 @@
++/*
++ * Copyright (C) 2009 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++//#define LOG_NDEBUG 0
++#define LOG_TAG "AsyncOMXCodecWrapper"
++#include "include/AsyncOMXCodecWrapper.h"
++#include <media/stagefright/MetaData.h>
++#include <media/stagefright/foundation/ADebug.h>
++#include <utils/Log.h>
++
++namespace android {
++
++// time limitaion is set to 200ms, so that the upper call can acquire its lock in time.
++const static int64_t kReadingBufferTimeOutNs = 200000000LL;
++
++sp<MediaSource> AsyncOMXCodecWrapper::Create(const sp < IOMX > & omx,
++        const sp < MetaData > & meta,
++        bool createEncoder,
++        const sp < MediaSource > & source,
++        const char * matchComponentName,
++        uint32_t flags,const sp < ANativeWindow > & nativeWindow) {
++    ALOGV("AsyncOMXCodecWrapper::Create");
++    sp<AsyncOMXCodecWrapper> asyncOMXCodecWrapper = new AsyncOMXCodecWrapper(omx, meta, createEncoder, source, matchComponentName, flags, nativeWindow);
++
++    if (asyncOMXCodecWrapper->getOMXCodec() != NULL) {
++       return asyncOMXCodecWrapper;
++    }
++    asyncOMXCodecWrapper.clear();
++    ALOGV("Create OMXCodec failure!");
++    return NULL;
++}
++
++AsyncOMXCodecWrapper::AsyncOMXCodecWrapper(const sp<IOMX> &omx,
++        const sp<MetaData> &meta, bool createEncoder,
++        const sp<MediaSource> &source,
++        const char *matchComponentName,
++        uint32_t flags,
++        const sp<ANativeWindow> &nativeWindow): mLooper(new ALooper),
++        mOMXCodec(OMXCodec::Create(omx, meta, createEncoder, source, matchComponentName, flags, nativeWindow)),
++        mReadPending(false) {
++
++    if (mOMXCodec != NULL) {
++        mLooper->setName("reading_thread");
++        mLooper->start();
++        mReflector = new AHandlerReflector<AsyncOMXCodecWrapper>(this);
++        mLooper->registerHandler(mReflector);
++    }
++}
++
++sp<MediaSource> AsyncOMXCodecWrapper::getOMXCodec() {
++    return mOMXCodec;
++}
++
++status_t AsyncOMXCodecWrapper::start(MetaData *meta) {
++    ALOGV("functin = %s line = %d, in ",__FUNCTION__, __LINE__);
++
++    sp<AMessage> msg = new AMessage(kWhatStart, mReflector->id());
++    sp<AMessage> response;
++    status_t err = msg->postAndAwaitResponse(&response);
++    if (err != OK) {
++        return err;
++    }
++    if (!response->findInt32("err", &err)) {
++        err = OK;
++    }
++    ALOGV("functin = %s line = %d, out!!! ",__FUNCTION__, __LINE__);
++    return err;
++}
++
++status_t AsyncOMXCodecWrapper::read(
++        MediaBuffer **buffer, const ReadOptions *options) {
++
++    bool seeking = false;
++    int64_t seekTimeUs = -1;
++    *buffer = NULL;
++    if (!mReadPending) {
++        mOptions = *options;
++        sp<AMessage> msg = new AMessage(kWhatRead, mReflector->id());
++        msg->setPointer("options", (void*)&mOptions);
++        msg->post();
++        mReadPending  = true;
++    } else {
++        // repeat reading, response the seeking first.
++        ReadOptions::SeekMode seekMode;
++        if (options && options->getSeekTo(&seekTimeUs, &seekMode)) {
++            seeking = true;
++        }
++    }
++    Mutex::Autolock autoLock(mLock);
++    while(mAsyncResult == NULL) {
++        status_t err = mCondition.waitRelative(mLock, kReadingBufferTimeOutNs);
++        if (err != OK) {
++            ALOGW("reading buffer timeout! reschedule the event");
++            return -EWOULDBLOCK;
++        }
++    }
++    CHECK(mAsyncResult != NULL);
++
++    status_t err;
++    CHECK(mAsyncResult->findInt32("result", &err));
++    MediaBuffer *mediaBuffer = NULL;
++    CHECK(mAsyncResult->findPointer("data", (void**)&mediaBuffer));
++
++    if (seeking && err == OK) {
++        int64_t currentSeekTime = -1;
++        if (!mAsyncResult->findInt64("seek", &currentSeekTime) || currentSeekTime != seekTimeUs) {
++            // another seek is comming, drop the current msg
++            ALOGV("drop obsolete seeking msg old seek time=%lld, comming is = %lld", currentSeekTime, seekTimeUs);
++            mAsyncResult.clear();
++            mReadPending = false;
++            mediaBuffer->release();
++            mOptions.clearSeekTo();
++            return -EWOULDBLOCK;
++        }
++        ALOGV("old seek time=%lld, comming is = %lld", currentSeekTime, seekTimeUs);
++    }
++    *buffer = mediaBuffer;
++    mAsyncResult.clear();
++    mOptions.clearSeekTo();
++    mReadPending = false;
++    return err;
++}
++
++status_t AsyncOMXCodecWrapper::stop() {
++    ALOGV("functin = %s line = %d, in ",__FUNCTION__, __LINE__);
++
++    sp<AMessage> msg = new AMessage(kWhatStop, mReflector->id());
++    sp<AMessage> response;
++    status_t err = msg->postAndAwaitResponse(&response);
++    if (err != OK) {
++        return err;
++    }
++    if (!response->findInt32("err", &err)) {
++        err = OK;
++    }
++    ALOGV("functin = %s line = %d, out ",__FUNCTION__, __LINE__);
++    return err;
++}
++
++sp<MetaData> AsyncOMXCodecWrapper::getFormat() {
++
++    return mOMXCodec->getFormat();
++
++}
++
++status_t AsyncOMXCodecWrapper::pause() {
++    ALOGV("functin = %s line = %d, in ",__FUNCTION__, __LINE__);
++
++    sp<AMessage> msg = new AMessage(kWhatPause, mReflector->id());
++    msg->post();
++    ALOGV("functin = %s line = %d, out ",__FUNCTION__, __LINE__);
++    // always OK
++    return OK;
++}
++
++AsyncOMXCodecWrapper::~AsyncOMXCodecWrapper() {
++    mLooper.clear();
++    mOMXCodec.clear();
++    mReflector.clear();
++}
++
++
++void AsyncOMXCodecWrapper::onMessageReceived(const sp < AMessage > & msg) {
++    switch (msg->what()) {
++        case kWhatRead:
++        {
++            ALOGV("reading in");
++            CHECK(mAsyncResult == NULL);
++            int64_t seekTimeUs = -1;
++            bool seeking = false;
++            ReadOptions *options = NULL;
++            CHECK(msg->findPointer("options", (void**)&options));
++            ReadOptions::SeekMode seekMode;
++            if (options && options->getSeekTo(&seekTimeUs, &seekMode)) {
++                seeking = true;
++            }
++            MediaBuffer *mediaBuffer = NULL;
++            status_t err = mOMXCodec->read(&mediaBuffer, options);
++            Mutex::Autolock autoLock(mLock);
++            mAsyncResult = new AMessage;
++            mAsyncResult->setInt32("result", err);
++            mAsyncResult->setPointer("data", (void*)mediaBuffer);
++            if (seeking) {
++                mAsyncResult->setInt64("seek", seekTimeUs);
++            }
++            ALOGV("reading out");
++            mCondition.signal();
++            break;
++        }
++        case kWhatStart:
++        {
++            status_t err = mOMXCodec->start();
++            uint32_t replyID;
++            CHECK(msg->senderAwaitsResponse(&replyID));
++
++            sp<AMessage> response = new AMessage;
++            response->setInt32("err", err);
++            response->postReply(replyID);
++            break;
++        }
++        case kWhatPause:
++        {
++            mOMXCodec->pause();
++            break;
++        }
++        case kWhatStop:
++        {
++            {
++                Mutex::Autolock autoLock(mLock);
++                if (mAsyncResult != NULL) {
++                    MediaBuffer *mediaBuffer = NULL;
++                    CHECK(mAsyncResult->findPointer("data", (void**)&mediaBuffer));
++                    if (mediaBuffer != NULL) {
++                        mediaBuffer->release();
++                    }
++                    mAsyncResult.clear();
++                }
++            }
++            status_t err = mOMXCodec->stop();
++            uint32_t replyID;
++            CHECK(msg->senderAwaitsResponse(&replyID));
++
++            sp<AMessage> response = new AMessage;
++            response->setInt32("err", err);
++            response->postReply(replyID);
++            break;
++        }
++        default:
++            TRESPASS();
++            break;
++    }
++}
++
++}  // namespace android
+diff --git a/media/libstagefright/AwesomePlayer.cpp b/media/libstagefright/AwesomePlayer.cpp
+index 0c0bc04..2788b2a 100644
+--- a/media/libstagefright/AwesomePlayer.cpp
++++ b/media/libstagefright/AwesomePlayer.cpp
+@@ -46,6 +46,7 @@
+ #include <media/stagefright/MediaDefs.h>
+ #include <media/stagefright/MediaExtractor.h>
+ #include <media/stagefright/MediaSource.h>
++#include "include/AsyncOMXCodecWrapper.h"
+ #include <media/stagefright/MetaData.h>
+ #include <media/stagefright/OMXCodec.h>
+ 
+@@ -1524,28 +1525,34 @@ status_t AwesomePlayer::initVideoDecoder(uint32_t flags) {
+         flags |= OMXCodec::kEnableGrallocUsageProtected;
+     }
+ #endif
+-
+-    sp<MetaData> meta = mExtractor->getMetaData();
+-    const char *mime;
+-    CHECK(meta->findCString(kKeyMIMEType, &mime));
+-    bool isPrefetchSupported = false;
+-    if (!strcasecmp(mime, MEDIA_MIMETYPE_CONTAINER_MPEG4)
+-        || !strcasecmp(mime, MEDIA_MIMETYPE_CONTAINER_MATROSKA)
+-        || !strcasecmp(mime, MEDIA_MIMETYPE_CONTAINER_AVI)
++    ALOGV("initVideoDecoder flags=0x%x", flags);
++    if (mCachedSource != NULL) {
++        mVideoSource = AsyncOMXCodecWrapper::Create(
++                mClient.interface(), mVideoTrack->getFormat(),
++                false, // createEncoder
++                mVideoTrack,
++                NULL, flags, USE_SURFACE_ALLOC ? mNativeWindow : NULL);
++    } else {
++        sp<MetaData> meta = mExtractor->getMetaData();
++        const char *mime;
++        CHECK(meta->findCString(kKeyMIMEType, &mime));
++        bool isPrefetchSupported = false;
++        if (!strcasecmp(mime, MEDIA_MIMETYPE_CONTAINER_MPEG4)
++            || !strcasecmp(mime, MEDIA_MIMETYPE_CONTAINER_MATROSKA)
++            || !strcasecmp(mime, MEDIA_MIMETYPE_CONTAINER_AVI)
+ #ifdef USE_INTEL_ASF_EXTRACTOR
+-        || !strcasecmp(mime, MEDIA_MIMETYPE_CONTAINER_ASF)
++            || !strcasecmp(mime, MEDIA_MIMETYPE_CONTAINER_ASF)
+ #endif
+-    ) {
+-        isPrefetchSupported = true;
++      ) {
++            isPrefetchSupported = true;
++        }
++        mVideoSource = OMXCodec::Create(
++                mClient.interface(), mVideoTrack->getFormat(),
++                false, // createEncoder
++                isPrefetchSupported ? new ThreadedSource(mVideoTrack, MediaSource::kMaxMediaBufferSize) : mVideoTrack,
++                NULL, flags, USE_SURFACE_ALLOC ? mNativeWindow : NULL);
+     }
+ 
+-    ALOGV("initVideoDecoder flags=0x%x", flags);
+-    mVideoSource = OMXCodec::Create(
+-            mClient.interface(), mVideoTrack->getFormat(),
+-            false, // createEncoder
+-            isPrefetchSupported ? new ThreadedSource(mVideoTrack, MediaSource::kMaxMediaBufferSize) : mVideoTrack,
+-            NULL, flags, USE_SURFACE_ALLOC ? mNativeWindow : NULL);
+-
+     if (mVideoSource != NULL) {
+         int64_t durationUs;
+         if (mVideoTrack->getFormat()->findInt64(kKeyDuration, &durationUs)) {
+@@ -1684,8 +1691,10 @@ void AwesomePlayer::onVideoEvent() {
+ 
+             if (err != OK) {
+                 CHECK(mVideoBuffer == NULL);
+-
+-                if (err == INFO_FORMAT_CHANGED) {
++                if (err == -EWOULDBLOCK) {
++                    postVideoEvent_l(10000);
++                    return;
++                } else if (err == INFO_FORMAT_CHANGED) {
+                     ALOGV("VideoSource signalled format change.");
+ 
+                     notifyVideoSize_l();
+diff --git a/media/libstagefright/include/AsyncOMXCodecWrapper.h b/media/libstagefright/include/AsyncOMXCodecWrapper.h
+new file mode 100644
+index 0000000..0fc014f
+--- /dev/null
++++ b/media/libstagefright/include/AsyncOMXCodecWrapper.h
+@@ -0,0 +1,114 @@
++/*
++ * Copyright (C) 2009 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef ASYNC_OMXCODEC_WRAPPER_H_
++
++#define ASYNC_OMXCODEC_WRAPPER_H_
++
++#include <sys/types.h>
++
++#include <media/stagefright/MediaErrors.h>
++#include <media/stagefright/MediaBuffer.h>
++#include <media/stagefright/MediaSource.h>
++#include <media/IOMX.h>
++#include <android/native_window.h>
++#include <media/stagefright/OMXCodec.h>
++#include <media/stagefright/foundation/ALooper.h>
++#include <media/stagefright/foundation/AMessage.h>
++#include <media/stagefright/foundation/AHandler.h>
++#include <media/stagefright/foundation/AHandlerReflector.h>
++
++namespace android {
++
++struct AsyncOMXCodecWrapper : public MediaSource {
++
++    static sp<MediaSource> Create(
++             const sp<IOMX> &omx,
++             const sp<MetaData> &meta, bool createEncoder,
++             const sp<MediaSource> &source,
++             const char *matchComponentName = NULL,
++             uint32_t flags = 0,
++             const sp<ANativeWindow> &nativeWindow = NULL);
++
++
++    // To be called before any other methods on this object, except
++    // getFormat().
++    virtual status_t start(MetaData *params = NULL);
++
++    // Any blocking read call returns immediately with a result of NO_INIT.
++    // It is an error to call any methods other than start after this call
++    // returns. Any buffers the object may be holding onto at the time of
++    // the stop() call are released.
++    // Also, it is imperative that any buffers output by this object and
++    // held onto by callers be released before a call to stop() !!!
++    virtual status_t stop();
++
++    // Returns the format of the data output by this media source.
++    virtual sp<MetaData> getFormat();
++
++    // Returns a new buffer of data. Call blocks until a
++    // buffer is available, an error is encountered of the end of the stream
++    // is reached.
++    // End of stream is signalled by a result of ERROR_END_OF_STREAM.
++    // A result of INFO_FORMAT_CHANGED indicates that the format of this
++    // MediaSource has changed mid-stream, the client can continue reading
++    // but should be prepared for buffers of the new configuration.
++    virtual status_t read(
++            MediaBuffer **buffer, const ReadOptions *options = NULL);
++
++
++    // Causes this source to suspend pulling data from its upstream source
++    // until a subsequent read-with-seek. Currently only supported by
++    // OMXCodec.
++    virtual status_t pause();
++
++    virtual void onMessageReceived(const sp<AMessage> &msg);
++
++    sp<MediaSource> getOMXCodec();
++
++protected:
++    virtual ~AsyncOMXCodecWrapper();
++
++private:
++    enum {
++         kWhatStart      = 'start',
++         kWhatRead       = 'read',
++         kWhatPause      = 'pause',
++         kWhatStop       = 'stop'
++    };
++    AsyncOMXCodecWrapper(const sp<IOMX> &omx,
++             const sp<MetaData> &meta, bool createEncoder,
++             const sp<MediaSource> &source,
++             const char *matchComponentName = NULL,
++             uint32_t flags = 0,
++             const sp<ANativeWindow> &nativeWindow = NULL);
++
++    AsyncOMXCodecWrapper(const AsyncOMXCodecWrapper &);
++    AsyncOMXCodecWrapper &operator=(const AsyncOMXCodecWrapper &);
++    sp<MediaSource> mOMXCodec;
++    sp<MetaData> mOutputFormat;
++    sp<ALooper> mLooper;
++    sp<AHandlerReflector<AsyncOMXCodecWrapper> > mReflector;
++    Mutex mLock;
++    Condition mCondition;
++    sp<AMessage> mAsyncResult;
++    MediaSource::ReadOptions mOptions;
++    bool mReadPending;
++};
++
++}  // namespace android
++
++#endif  // ASYNC_OMXCODEC_WRAPPER_H_
+-- 
+1.7.4.1
+

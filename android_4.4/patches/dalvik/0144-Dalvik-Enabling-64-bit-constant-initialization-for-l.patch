@@ -1,0 +1,326 @@
+From 2201f3daa771b31c4fcc059ab67adfdb1f65e242 Mon Sep 17 00:00:00 2001
+From: Bijoy Jose <bijoy.a.jose@intel.com>
+Date: Wed, 17 Apr 2013 16:02:17 -0700
+Subject: Dalvik: Enabling 64 bit constant initialization for logical and subtraction operations of long type
+
+BZ: 97821
+
+Enable loading constants from constant data section for all logical
+operations of long type. Also does similar optimization for subtraction.
+Provides 16-byte alignment for 64 bit alu and logical operations with
+memory accesses.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Ib682244bad44198671c0f43fd8ba62378de44ef5
+Orig-MCG-Change-Id: I6098c5abea3e19f906a7d985b546001e1863f0d9
+Signed-off-by: Bijoy Jose <bijoy.a.jose@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/codegen/x86/AnalysisO1.h         |    1 +
+ vm/compiler/codegen/x86/CodegenInterface.cpp |   56 ++++++++++++++++----------
+ vm/compiler/codegen/x86/Lower.h              |    2 +-
+ vm/compiler/codegen/x86/LowerAlu.cpp         |   14 +++++-
+ vm/compiler/codegen/x86/LowerHelper.cpp      |   51 +++++++++++++++++++-----
+ 5 files changed, 89 insertions(+), 35 deletions(-)
+
+diff --git a/vm/compiler/codegen/x86/AnalysisO1.h b/vm/compiler/codegen/x86/AnalysisO1.h
+index d76ab50..a9b2610 100644
+--- a/vm/compiler/codegen/x86/AnalysisO1.h
++++ b/vm/compiler/codegen/x86/AnalysisO1.h
+@@ -207,6 +207,7 @@ typedef struct ConstInfo {
+     int offsetAddr;         /**< @brief The offset from start of instruction */
+     char* streamAddr;       /**< @brief The address of instruction in stream */
+     char* constAddr;        /**< @brief The address of the constant at the end of trace */
++    bool constAlign;        /**< @brief Decide whether to Align constAddr to 16 bytes */
+     struct ConstInfo *next; /**< @brief The pointer to the next 64 bit constant */
+ } ConstInfo;
+ 
+diff --git a/vm/compiler/codegen/x86/CodegenInterface.cpp b/vm/compiler/codegen/x86/CodegenInterface.cpp
+index 58c5099..96f0349 100644
+--- a/vm/compiler/codegen/x86/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/CodegenInterface.cpp
+@@ -1440,8 +1440,9 @@ static void handleFallThroughBranch (CompilationUnit *cUnit, BasicBlock *bb, Bas
+  * @param constL the lower 32bits
+  * @param constH the higher 32bits
+  * @param reg Virtual Register number
++ * @param align Align to 16 bytes
+  */
+-void addNewToConstList(struct ConstInfo** listPtr, int constL, int constH, int reg) {
++void addNewToConstList(struct ConstInfo** listPtr, int constL, int constH, int reg, bool align) {
+     struct ConstInfo* tmpPtr =static_cast<ConstInfo *>(dvmCompilerNew(sizeof(ConstInfo), false));
+     tmpPtr->valueL = constL;
+     tmpPtr->valueH = constH;
+@@ -1449,6 +1450,7 @@ void addNewToConstList(struct ConstInfo** listPtr, int constL, int constH, int r
+     tmpPtr->offsetAddr = 0;
+     tmpPtr->streamAddr = NULL;
+     tmpPtr->constAddr = NULL;
++    tmpPtr->constAlign = align;
+     tmpPtr->next = *listPtr;
+     *listPtr = tmpPtr;
+     assert(*listPtr != NULL);
+@@ -1486,22 +1488,32 @@ bool saveAddrToConstList(struct ConstInfo** listPtr, int constL, int constH, int
+  * @brief insert 64bit constants in a Constant Data Section at end of a trace
+  * @details Populates stream information
+  * @param constListTemp pointer to list of 64 bit constants
+- * @param intaddr pointer to jit stream
++ * @param stream pointer to jit code
++ * @return the updated value of stream
+  */
+-void insertConstDataSection(struct ConstInfo *constListTemp, unsigned int *intaddr) {
++char* insertConstDataSection(struct ConstInfo *constListTemp,  char * stream) {
++    unsigned int *intaddr = reinterpret_cast<unsigned int *>(stream);
+     while(constListTemp != NULL){
+-        constListTemp->constAddr = reinterpret_cast<char *>(intaddr);
+-        *intaddr = constListTemp->valueL;// store lower 32 bit of a constant
++
++        /* Align trace to 16-bytes before Constant Data Section */
++        if (constListTemp->constAlign == true) {
++            stream = (char*)(((unsigned int)stream + 0xF) & ~0xF);
++        }
++        constListTemp->constAddr = stream;
++        intaddr = reinterpret_cast<unsigned int *>(stream);
++        *intaddr = constListTemp->valueL;    // store lower 32 bit of a constant
+ #ifdef DEBUG_CONST
+-        ALOGI("**Lower constants at  %p: %d(%x), VR# %d containing constant (%x):(%x) constAddr is (%d)%x",
++        ALOGI("**Lower constants at  %p: %d(%x), VR# %d containing constant (%x):(%x) constAddr is %p",
+                              intaddr, *intaddr, *intaddr, constListTemp->regNum, constListTemp->valueL, constListTemp->valueH,
+-                             *intaddr, constListTemp->constAddr, constListTemp->constAddr);
++                             *intaddr, constListTemp->constAddr);
+ #endif
+         intaddr++;
+-        *intaddr = constListTemp->valueH;// store higher 32 bits of a constant
++        *intaddr = constListTemp->valueH;    // store higher 32 bits of a constant
+         intaddr++;
+-        constListTemp = constListTemp->next; // move to next constant
++        stream = reinterpret_cast<char *>(intaddr);
++        constListTemp = constListTemp->next; // move to next constant in list
+     }
++    return stream;
+ }
+ 
+ /**
+@@ -1999,23 +2011,21 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+ 
+     /* Align trace to 16-bytes before Constant Data Section */
+     stream = reinterpret_cast<char*>((reinterpret_cast<unsigned int>(stream) + 0xF) & ~0xF);
+-    gDvmJit.codeCacheByteUsed += (stream - streamStart);
++    char * streamEnd = stream; // To store end of stream including constant data section
+ 
+     int patchCount = 0;       // Store number of constants initialized in a trace
+-    int constSize = 0;        // size of constant data section in bytes
+     ConstInfo *constListTemp; // Temp ptr for constant initialization
+-    unsigned int *intaddr = reinterpret_cast<unsigned int *>(stream);
+ 
+     if(((gDvmJit.disableOpt & (1 << kElimConstInitOpt)) == false) && cUnit->constListHead != NULL ) {
+ 
+         constListTemp = cUnit->constListHead;
+-        while(constListTemp != NULL){
+-            constSize = constSize + 8; // 4 bytes each for higher and lower 32 bits
++        while(constListTemp != NULL){ // Find projected end of trace
++            streamEnd = (char*)(((unsigned int)streamEnd + 0xF));
+             constListTemp = constListTemp->next;
+         }
+ 
+         //  Sum of bytes used in code cache, constant data section should be lower than code cache size
+-        if(gDvmJit.codeCacheByteUsed + constSize > gDvmJit.codeCacheSize) {
++        if((gDvmJit.codeCacheByteUsed + (streamEnd - streamStart)) > gDvmJit.codeCacheSize) {
+             ALOGE("JIT_ERROR: Code cache full after ChainingCellCounts and constant data section");
+             SET_JIT_ERROR(kJitErrorCodeCacheFull);
+             gDvmJit.codeCacheFull = true;
+@@ -2025,7 +2035,7 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+         }
+ 
+         /* Insert constant data section at the end of a trace */
+-        insertConstDataSection(cUnit->constListHead, intaddr);
++        streamEnd = insertConstDataSection(cUnit->constListHead, stream);
+ 
+         /* Patch address of constants into stream */
+         constListTemp = cUnit->constListHead;
+@@ -2040,6 +2050,9 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+         }
+     }
+ 
++    gDvmJit.codeCacheByteUsed += (stream - streamStart); // store code cache byte used to include the current trace
++    cUnit->totalSize = (stream - streamStart);           // store size of trace in cUnit->totalSize
++
+     if (cUnit->printMe == true) {
+         unsigned char* codeBaseAddr = static_cast<unsigned char *>(cUnit->baseAddr);
+         unsigned char* codeBaseAddrNext = static_cast<unsigned char *>(gDvmJit.codeCache) + gDvmJit.codeCacheByteUsed;
+@@ -2053,20 +2066,21 @@ static void compilerMIR2LIRJit(CompilationUnit *cUnit, JitTranslationInfo *info)
+           (char *) gDvmJit.codeCache + gDvmJit.codeCacheByteUsed, cUnit->totalSize, gDvmJit.codeCache);
+     }
+ 
++    gDvmJit.codeCacheByteUsed += (streamEnd - stream); // adjust code cache byte used to include constants in current trace
++    cUnit->totalSize = (streamEnd - streamStart);      // adjust size of trace in cUnit->totalSize to include constants
++
+     if((gDvmJit.disableOpt & (1 << kElimConstInitOpt)) == false) {
+         if ((cUnit->printMe && (patchCount > 0) ) == true) {
+             ALOGD("-------- Constant Data Section ------");
+-             unsigned long long *longaddr = reinterpret_cast<unsigned long long*>(static_cast<unsigned char *>(gDvmJit.codeCache) + gDvmJit.codeCacheByteUsed);
++            unsigned long long *longaddr;
+             constListTemp = cUnit->constListHead;
+             while(constListTemp != NULL){
+-                ALOGD("**  %p: %d (%x)", longaddr, *longaddr, *longaddr); // print each constant
++                longaddr = reinterpret_cast<unsigned long long*>(constListTemp->constAddr);
++                ALOGD("**  %p: %d (%x)",  constListTemp->constAddr,  *longaddr, *longaddr); //print each constant
+                 longaddr++;
+                 constListTemp = constListTemp->next;
+             }
+         }
+-        gDvmJit.codeCacheByteUsed += constSize; // adjust code cache byte used to include constants
+-        stream = stream + constSize;            // move stream pointer to end of constant section of trace
+-        cUnit->totalSize = (stream - streamStart);   // adjust cUnit->totalSize to include constants
+         cUnit->constListHead = NULL;
+ 
+         if (cUnit->printMe && (patchCount > 0) == true) {
+diff --git a/vm/compiler/codegen/x86/Lower.h b/vm/compiler/codegen/x86/Lower.h
+index 05e5044..5dc8df2 100644
+--- a/vm/compiler/codegen/x86/Lower.h
++++ b/vm/compiler/codegen/x86/Lower.h
+@@ -803,7 +803,7 @@ void push_mem_to_stack(OpndSize size, int disp, int base_reg, bool isBasePhysica
+ void push_reg_to_stack(OpndSize size, int reg, bool isPhysical);
+ 
+ // create a new record for a 64 bit constant
+-void addNewToConstList(struct ConstInfo** listPtr, int constL, int constH, int reg);
++void addNewToConstList(struct ConstInfo** listPtr, int constL, int constH, int reg, bool align);
+ // save address of memory location to be patched
+ bool saveAddrToConstList(struct ConstInfo** listPtr, int constL, int constH, int reg, char* patchAddr, int offset);
+ // access address of global constants
+diff --git a/vm/compiler/codegen/x86/LowerAlu.cpp b/vm/compiler/codegen/x86/LowerAlu.cpp
+index 326023c..fdffce7 100644
+--- a/vm/compiler/codegen/x86/LowerAlu.cpp
++++ b/vm/compiler/codegen/x86/LowerAlu.cpp
+@@ -1375,10 +1375,18 @@ int op_rem_int_lit8(const MIR * mir) {
+ //! common code to hanle long ALU ops
+ 
+ //! It uses XMM
+-int common_alu_long(ALU_Opcode opc, int vA, int v1, int v2) { //except div and rem
++//!all logical operations and sub operation of long type (no add mul div or rem)
++int common_alu_long(ALU_Opcode opc, int vA, int v1, int v2) {
++    int value[2];
++    int isConst = isVirtualRegConstant(v2, LowOpndRegType_xmm, value, false);
++
+     get_virtual_reg(v1, OpndSize_64, 1, false);
+-    get_virtual_reg(v2, OpndSize_64, 2, false);
+-    alu_binary_reg_reg(OpndSize_64, opc, 2, false, 1, false);
++    if (isConst == 3) {                                           //operate on constants stored in code stream
++        alu_binary_VR_reg(OpndSize_64, opc, v2, 1, false);        //opc const, XMM
++    } else {
++        get_virtual_reg(v2, OpndSize_64, 2, false);               //operate on XMM registers
++        alu_binary_reg_reg(OpndSize_64, opc, 2, false, 1, false); //opc XMM, XMM
++    }
+     set_virtual_reg(vA, OpndSize_64, 1, false);
+     return 0;
+ }
+diff --git a/vm/compiler/codegen/x86/LowerHelper.cpp b/vm/compiler/codegen/x86/LowerHelper.cpp
+index 4263ab1..a75d072 100644
+--- a/vm/compiler/codegen/x86/LowerHelper.cpp
++++ b/vm/compiler/codegen/x86/LowerHelper.cpp
+@@ -1346,7 +1346,7 @@ void compare_VR_reg_all(OpndSize size,
+                 if((gDvmJit.disableOpt & (1 << kElimConstInitOpt)) == false){
+                     tmpValue[1] = 0;// set higher 32 bits to zero
+                     // create a new record of a constant
+-                    addNewToConstList(&(gCompilationUnit->constListHead), tmpValue[0], tmpValue[1], vA);
++                    addNewToConstList(&(gCompilationUnit->constListHead), tmpValue[0], tmpValue[1], vA, false);
+ 
+                     // save mem access location in constList
+                     const int offset = 3; // offset is 3 for COMISS
+@@ -1392,7 +1392,7 @@ void compare_VR_reg_all(OpndSize size,
+ 
+                 if((gDvmJit.disableOpt & (1 << kElimConstInitOpt)) == false){
+                     // create a new record of a constant
+-                    addNewToConstList(&(gCompilationUnit->constListHead), tmpValue[0], tmpValue[1], vA);
++                    addNewToConstList(&(gCompilationUnit->constListHead), tmpValue[0], tmpValue[1], vA, false);
+                     const int offset = 4; // offset is 4 for COMISD
+ 
+                     // save mem access location in constList
+@@ -1980,7 +1980,7 @@ void alu_sd_binary_VR_reg(ALU_Opcode opc, int vA, int reg, bool isPhysical, bool
+             if((gDvmJit.disableOpt & (1 << kElimConstInitOpt)) == false){
+                 tmpValue[1] = 0;// set higher 32 bits to zero
+                 // create a new record of a constant
+-                addNewToConstList(&(gCompilationUnit->constListHead), tmpValue[0], tmpValue[1], vA);
++                addNewToConstList(&(gCompilationUnit->constListHead), tmpValue[0], tmpValue[1], vA, false);
+ 
+                 // save mem access location in constList
+                 const int offset = 4; // offset is 4 for OPC_(ADD,SUB,MUL,DIV) float operations
+@@ -2015,7 +2015,7 @@ void alu_sd_binary_VR_reg(ALU_Opcode opc, int vA, int reg, bool isPhysical, bool
+ 
+             if((gDvmJit.disableOpt & (1 << kElimConstInitOpt)) == false){
+                 // create a new record of a constant
+-                addNewToConstList(&(gCompilationUnit->constListHead), tmpValue[0], tmpValue[1], vA);
++                addNewToConstList(&(gCompilationUnit->constListHead), tmpValue[0], tmpValue[1], vA, false);
+ 
+                 const int offset = 4; // offset is 4 for OPC_(ADD,SUB,MUL,DIV) double operations
+                 // save mem access location in constList
+@@ -2090,10 +2090,41 @@ void alu_binary_VR_reg(OpndSize size, ALU_Opcode opc, int vA, int reg, bool isPh
+             return;
+         }
+         if(isConst == 3 && size == OpndSize_64) {
+-            writeBackConstVR(vA, tmpValue[0]);
+-            writeBackConstVR(vA+1, tmpValue[1]);
+-            dump_mem_reg(m, ATOM_NORMAL_ALU, size, 4*vA, PhysicalReg_FP, true,
+-                MemoryAccess_VR, vA, reg, isPhysical, getTypeFromIntSize(size), NULL);
++            bool storedAddr = false;
++            bool align = false;
++            if((gDvmJit.disableOpt & (1 << kElimConstInitOpt)) == false){
++
++                // create a new record of a constant
++                if (m == Mnemonic_PADDQ || Mnemonic_PSUBQ || Mnemonic_PAND || Mnemonic_POR || Mnemonic_PXOR) {
++                    align = true;
++                }
++                addNewToConstList(&(gCompilationUnit->constListHead), tmpValue[0], tmpValue[1], vA, align);
++                const int offset = 4; // offset is 4 for OPC_(ADD,SUB and logical) long operations
++                // save mem access location in constList
++                storedAddr = saveAddrToConstList(&(gCompilationUnit->constListHead), tmpValue[0], tmpValue[1], vA, stream, offset);
++
++                ConstInfo* tmpPtr = gCompilationUnit->constListHead;
++                if (storedAddr == true){ // creating constant record and saving address to constant list was successful
++#ifdef DEBUG_CONST
++                    ALOGD("constVRList regnum %d, valueL %d(%x) valueH %d(%x)",
++                            tmpPtr->regNum, tmpPtr->valueL, tmpPtr->valueL, tmpPtr->valueH, tmpPtr->valueH);
++#endif
++                } else {
++                    ALOGI("JIT_INFO: Error creating constant failed for VR %d, regnum %d, valueL %d(%x) valueH %d(%x)",
++                            tmpPtr->regNum, tmpPtr->valueL, tmpPtr->valueL, tmpPtr->valueH, tmpPtr->valueH);
++                }
++            }
++            // Lower mem_reg instruction with constant to be accessed from constant data section
++            if (storedAddr == true){
++                int dispAddr =  getGlobalDataAddr("64bits");
++                dump_mem_reg(m, ATOM_NORMAL_ALU, OpndSize_64, dispAddr, PhysicalReg_Null, true,
++                       MemoryAccess_Constants, vA, reg, isPhysical, LowOpndRegType_xmm, &(gCompilationUnit->constListHead));
++            } else {
++                writeBackConstVR(vA, tmpValue[0]);
++                writeBackConstVR(vA+1, tmpValue[1]);
++                dump_mem_reg(m, ATOM_NORMAL_ALU, OpndSize_64, 4*vA, PhysicalReg_FP, true,
++                       MemoryAccess_VR, vA, reg, isPhysical, LowOpndRegType_xmm, NULL);
++            }
+             return;
+         }
+         if(isConst == 1) writeBackConstVR(vA, tmpValue[0]);
+@@ -2506,7 +2537,7 @@ void get_virtual_reg_all(int vR, OpndSize size, int reg, bool isPhysical, Mnemon
+                 if((gDvmJit.disableOpt & (1 << kElimConstInitOpt)) == false){
+                     tmpValue[1] = 0;// set higher 32 bits to zero
+                     // create a new record of a constant
+-                    addNewToConstList(&(gCompilationUnit->constListHead), tmpValue[0], tmpValue[1], vR);
++                    addNewToConstList(&(gCompilationUnit->constListHead), tmpValue[0], tmpValue[1], vR, false);
+ 
+                     // save mem access location in constList
+                     const int offset = 4; // offset is 4 for MOVSS operations
+@@ -2543,7 +2574,7 @@ void get_virtual_reg_all(int vR, OpndSize size, int reg, bool isPhysical, Mnemon
+ 
+                 if((gDvmJit.disableOpt & (1 << kElimConstInitOpt)) == false){
+                     // create a new record of a constant
+-                    addNewToConstList(&(gCompilationUnit->constListHead), tmpValue[0], tmpValue[1], vR);
++                    addNewToConstList(&(gCompilationUnit->constListHead), tmpValue[0], tmpValue[1], vR, false);
+ 
+                     // save mem access location in constList
+                     const int offset = 4; // offset is 4 for MOVSD operations
+-- 
+1.7.4.1
+

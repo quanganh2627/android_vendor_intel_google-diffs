@@ -1,0 +1,478 @@
+From c39504ac3a73236fae68836483428afdab747a05 Mon Sep 17 00:00:00 2001
+From: Udayan Banerji <udayan.banerji@intel.com>
+Date: Mon, 14 Jan 2013 13:29:23 -0800
+Subject: Dalvik: Use 8-bit or 16-bit unsigned division when possible.
+
+BZ: 75820
+
+Perform 16-bit / 8-bit unsigned division instead of generic 32-bit signed
+divide when possible.
+Also squashed Dalvik: [x86 JIT PORT] Apache-Harmony: Improve support for DIV opcode in encoder.
+Also squashed Dalvik: [x86 JIT PORT] Use 8-bit or 16-bit unsigned division when possible.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Interpreter
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I0b6dafa43fffe708355a292bd35c6e36a8f525e1
+Orig-MCG-Change-Id: I9a0ebbdfc313968133bee6702f6f642c9cdb3a7e
+Signed-off-by: Udayan Banerji <udayan.banerji@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/codegen/x86/BytecodeVisitor.cpp    |   18 ++++--
+ vm/compiler/codegen/x86/LowerAlu.cpp           |   76 +++++++++++++++++----
+ vm/compiler/codegen/x86/libenc/enc_tabl.cpp    |    5 ++
+ vm/compiler/codegen/x86/libenc/enc_wrapper.cpp |    2 +-
+ vm/compiler/codegen/x86/libenc/encoder.h       |    1 +
+ vm/compiler/codegen/x86/libenc/encoder.inl     |   13 ++++
+ vm/mterp/out/InterpAsm-x86.S                   |   84 ++++++++++++++++-------
+ vm/mterp/x86/OP_DIV_INT.S                      |    2 +-
+ vm/mterp/x86/OP_REM_INT.S                      |    2 +-
+ vm/mterp/x86/bindiv.S                          |   43 ++++++++----
+ 10 files changed, 183 insertions(+), 63 deletions(-)
+
+diff --git a/vm/compiler/codegen/x86/BytecodeVisitor.cpp b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+index f06b8bc..7bbac8c 100644
+--- a/vm/compiler/codegen/x86/BytecodeVisitor.cpp
++++ b/vm/compiler/codegen/x86/BytecodeVisitor.cpp
+@@ -4711,7 +4711,7 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+     case OP_DIV_INT_2ADDR:
+     case OP_REM_INT_2ADDR: //hard-code %eax, %edx (dividend in edx:eax; quotient in eax; remainder in edx)
+         infoArray[0].regNum = 2;
+-        infoArray[0].refCount = 4; //define, update, use
++        infoArray[0].refCount = 7; //define, update, use
+         infoArray[0].physicalType = LowOpndRegType_gp;
+         infoArray[1].regNum = PhysicalReg_EAX; //dividend, quotient
+         infoArray[1].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
+@@ -4721,14 +4721,20 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR) { //returns a
+         infoArray[3].regNum = 1;
+         infoArray[3].refCount = 2; //define, use
+         infoArray[3].physicalType = LowOpndRegType_scratch;
++        infoArray[4].regNum = 3;
++        infoArray[4].refCount = 4; //define, use
++        infoArray[4].physicalType = LowOpndRegType_gp;
++        infoArray[5].regNum = PhysicalReg_EBX;
++        infoArray[5].refCount = 2; //define, use
++        infoArray[5].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
+         if(inst_op == OP_DIV_INT || inst_op == OP_DIV_INT_2ADDR) {
+-            infoArray[1].refCount = 5;
+-            infoArray[2].refCount = 4;
++            infoArray[1].refCount = 10;
++            infoArray[2].refCount = 8;
+         } else {
+-            infoArray[1].refCount = 4;
+-            infoArray[2].refCount = 5;
++            infoArray[1].refCount = 9;
++            infoArray[2].refCount = 11;
+         }
+-        return 4;
++        return 6;
+ 
+     case OP_ADD_INT_LIT16:
+     case OP_MUL_INT_LIT16:
+diff --git a/vm/compiler/codegen/x86/LowerAlu.cpp b/vm/compiler/codegen/x86/LowerAlu.cpp
+index deb8a73..697b78a 100644
+--- a/vm/compiler/codegen/x86/LowerAlu.cpp
++++ b/vm/compiler/codegen/x86/LowerAlu.cpp
+@@ -799,7 +799,7 @@ int op_ushr_int_2addr(const MIR * mir) {
+ //!common code to handle integer DIV & REM, it used GPR
+ 
+ //!The special case: when op0 == minint && op1 == -1, return 0 for isRem, return 0x80000000 for isDiv
+-//!There are two merge points in the control flow for this bytecode
++//!There are four merge points in the control flow for this bytecode
+ //!make sure the reg. alloc. state is the same at merge points by calling transferToState
+ int common_div_rem_int(bool isRem, u2 vA, u2 v1, u2 v2) {
+     get_virtual_reg(v1, OpndSize_32, PhysicalReg_EAX, true);
+@@ -808,37 +808,85 @@ int common_div_rem_int(bool isRem, u2 vA, u2 v1, u2 v2) {
+     handlePotentialException(
+                                        Condition_E, Condition_NE,
+                                        1, "common_errDivideByZero");
+-    /////////////////// handle special cases
+-    //conditional move 0 to $edx for rem for the two special cases
+-    //conditional move 0x80000000 to $eax for div
+-    //handle -1 special case divide error
+-    compare_imm_reg(OpndSize_32, -1, 2, false);
+-    conditional_jump(Condition_NE, ".common_div_rem_int_normal", true);
+-    //handle min int special case divide error
++
++    //Find out Numerator | Denominator
++    move_reg_to_reg(OpndSize_32, PhysicalReg_EAX, true, 3, false);
++    alu_binary_reg_reg(OpndSize_32, or_opc, 2, false, 3, false);
++
++    //If both arguments are less than 8-bits (and positive), do 8-bit divide
+     rememberState(1);
++    test_imm_reg(OpndSize_32, 0xFFFFFF00, 3, false);
++    conditional_jump(Condition_Z, ".common_div_rem_int_8", true);
++
++    //If both arguments are less than 16-bits (and positive), do 16-bit divide
++    test_imm_reg(OpndSize_32, 0xFFFF0000, 3, false);
++    conditional_jump(Condition_Z, ".common_div_rem_int_16", true);
++
++    //32-bit case:
++    goToState(1);
++
++    //Handle special cases:
++    //0x80000000 / -1 should result in a quotient of 0x80000000
++    //and a remainder of 0.
++    //Check for -1:
++    compare_imm_reg(OpndSize_32, -1, 2, false);
++    rememberState(2);
++    conditional_jump(Condition_NE, ".common_div_rem_int_32", true);
++    //Check for 0x80000000 (MinInt)
+     compare_imm_reg(OpndSize_32, 0x80000000, PhysicalReg_EAX, true);
+-    transferToState(1);
++    transferToState(2);
+     conditional_jump(Condition_E, ".common_div_rem_int_special", true);
+ 
+-    insertLabel(".common_div_rem_int_normal", true); //merge point
++    insertLabel(".common_div_rem_int_32", true);
+     convert_integer(OpndSize_32, OpndSize_64); //cdq
+     //idiv: dividend in edx:eax; quotient in eax; remainder in edx
+     alu_unary_reg(OpndSize_32, idiv_opc, 2, false);
++    rememberState(3);
++    unconditional_jump(".common_div_rem_int_divdone", true);
++
++    //Do 8-bit unsigned divide:
++    //div: dividend in ax; quotient in al; remainder in ah
++    //We are forced to use a hard-coded register, since the register allocator
++    //can allocate a register not capable of 8-bit operation, like ESI,
++    //which will cause undefined behaviour.
++    goToState(1);
++    insertLabel(".common_div_rem_int_8", true);
++    move_reg_to_reg(OpndSize_32, 2, false, PhysicalReg_EBX, true);
++    alu_unary_reg(OpndSize_8, div_opc, PhysicalReg_EBX, true);
++    if (isRem) {
++        move_reg_to_reg(OpndSize_32, PhysicalReg_EAX, true, PhysicalReg_EDX, true);
++        alu_binary_imm_reg(OpndSize_32, shr_opc, 8, PhysicalReg_EDX, true);
++    } else
++        alu_binary_imm_reg(OpndSize_32, and_opc, 0x000000FF, PhysicalReg_EAX, true);
++    transferToState(3);
++    unconditional_jump(".common_div_rem_int_divdone", true);
++
++    //Do 16-bit divide:
++    //div: dividend in dx:ax; quotient in ax; remainder in dx
++    goToState(1);
++    insertLabel(".common_div_rem_int_16", true);
++    move_imm_to_reg(OpndSize_32, 0, PhysicalReg_EDX, true);  //clearing out.
++    alu_unary_reg(OpndSize_16, div_opc, 2, false);
++
++
++    transferToState(3);
++    insertLabel(".common_div_rem_int_divdone", true);
+     if(isRem)
+         set_virtual_reg(vA, OpndSize_32, PhysicalReg_EDX, true);
+     else //divide: quotient in %eax
+         set_virtual_reg(vA, OpndSize_32, PhysicalReg_EAX, true);
+-    rememberState(2);
++    rememberState(4);
+     unconditional_jump(".common_div_rem_int_okay", true);
+ 
++    goToState(2);
+     insertLabel(".common_div_rem_int_special", true);
+-    goToState(1);
+     if(isRem)
+         set_VR_to_imm(vA, OpndSize_32, 0);
+     else
+         set_VR_to_imm(vA, OpndSize_32, 0x80000000);
+-    transferToState(2);
+-    insertLabel(".common_div_rem_int_okay", true); //merge point 2
++
++    transferToState(4);
++    insertLabel(".common_div_rem_int_okay", true);
+     return 0;
+ }
+ #undef P_GPR_1
+diff --git a/vm/compiler/codegen/x86/libenc/enc_tabl.cpp b/vm/compiler/codegen/x86/libenc/enc_tabl.cpp
+index 8a0789a..e18f214 100644
+--- a/vm/compiler/codegen/x86/libenc/enc_tabl.cpp
++++ b/vm/compiler/codegen/x86/libenc/enc_tabl.cpp
+@@ -984,7 +984,12 @@ END_MNEMONIC()
+ 
+ BEGIN_MNEMONIC(DIV, MF_AFFECTS_FLAGS, DU_DU_U)
+ BEGIN_OPCODES()
++#if !defined(_EM64T_)
++    {OpcodeInfo::all,   {0xF6, _6},         {AH, AL, r_m8},     DU_DU_U },
++    {OpcodeInfo::all,   {Size16, 0xF7, _6}, {DX, AX, r_m16},    DU_DU_U },
++#endif
+     {OpcodeInfo::all,   {0xF7, _6},         {EDX, EAX, r_m32},  DU_DU_U },
++    {OpcodeInfo::em64t, {REX_W, 0xF7, _6},  {RDX, RAX, r_m64},  DU_DU_U },
+ END_OPCODES()
+ END_MNEMONIC()
+ 
+diff --git a/vm/compiler/codegen/x86/libenc/enc_wrapper.cpp b/vm/compiler/codegen/x86/libenc/enc_wrapper.cpp
+index 0a1cca4..8ba9c5d 100644
+--- a/vm/compiler/codegen/x86/libenc/enc_wrapper.cpp
++++ b/vm/compiler/codegen/x86/libenc/enc_wrapper.cpp
+@@ -207,7 +207,7 @@ extern "C" ENCODER_DECLARE_EXPORT char * encoder_mem(Mnemonic m, OpndSize size,
+ extern "C" ENCODER_DECLARE_EXPORT char * encoder_reg(Mnemonic m, OpndSize size,
+                int reg, bool isPhysical, LowOpndRegType type, char * stream) {
+     EncoderBase::Operands args;
+-    if(m == Mnemonic_IDIV || m == Mnemonic_MUL || m == Mnemonic_IMUL) {
++    if(m == Mnemonic_DIV || m == Mnemonic_IDIV || m == Mnemonic_MUL || m == Mnemonic_IMUL) {
+       add_r(args, 0/*eax*/, size);
+       add_r(args, 3/*edx*/, size);
+     }
+diff --git a/vm/compiler/codegen/x86/libenc/encoder.h b/vm/compiler/codegen/x86/libenc/encoder.h
+index e29efce..9ac0219 100644
+--- a/vm/compiler/codegen/x86/libenc/encoder.h
++++ b/vm/compiler/codegen/x86/libenc/encoder.h
+@@ -504,6 +504,7 @@ ENCODER_DECLARE_EXPORT char * imul(char * stream, const R_Opnd & r, const RM_Opn
+ 
+ // divide instructions: div, idiv
+ ENCODER_DECLARE_EXPORT char * idiv(char * stream, const RM_Opnd & rm, Opnd_Size sz = size_platf);
++ENCODER_DECLARE_EXPORT char * div(char * stream, const RM_Opnd & rm, Opnd_Size sz = size_platf);
+ 
+ // data movement: mov
+ ENCODER_DECLARE_EXPORT char * mov(char * stream, const M_Opnd & m,  const R_Opnd & r, Opnd_Size sz = size_platf);
+diff --git a/vm/compiler/codegen/x86/libenc/encoder.inl b/vm/compiler/codegen/x86/libenc/encoder.inl
+index 663d492..ec72097 100644
+--- a/vm/compiler/codegen/x86/libenc/encoder.inl
++++ b/vm/compiler/codegen/x86/libenc/encoder.inl
+@@ -301,6 +301,19 @@ ENCODER_DECLARE_EXPORT char * idiv(char * stream, const RM_Opnd & rm, Opnd_Size
+     return (char*)EncoderBase::encode(stream, Mnemonic_IDIV, args);
+ }
+ 
++ENCODER_DECLARE_EXPORT char * div(char * stream, const RM_Opnd & rm, Opnd_Size sz) {
++    EncoderBase::Operands args;
++#ifdef _EM64T_
++    add_r(args, rdx_opnd, sz);
++    add_r(args, rax_opnd, sz);
++#else
++    add_r(args, edx_opnd, sz);
++    add_r(args, eax_opnd, sz);
++#endif
++    add_rm(args, rm, sz);
++    return (char*)EncoderBase::encode(stream, Mnemonic_DIV, args);
++}
++
+ // data movement: mov
+ ENCODER_DECLARE_EXPORT char * mov(char * stream, const M_Opnd & m, const R_Opnd & r, Opnd_Size sz) {
+     EncoderBase::Operands args;
+diff --git a/vm/mterp/out/InterpAsm-x86.S b/vm/mterp/out/InterpAsm-x86.S
+index 96a6c1c..6836e0c 100644
+--- a/vm/mterp/out/InterpAsm-x86.S
++++ b/vm/mterp/out/InterpAsm-x86.S
+@@ -5518,33 +5518,48 @@ dvmAsmInstructionStartCode = .L_OP_NOP
+ .L_OP_DIV_INT: /* 0x93 */
+ /* File: x86/OP_DIV_INT.S */
+ /* File: x86/bindiv.S */
+-
+     /*
+      * 32-bit binary div/rem operation.  Handles special case of op0=minint and
+      * op1=-1.
+      */
+-    /* binop vAA, vBB, vCC */
++
++    /* div/rem vAA, vBB, vCC */
+     movzbl   2(rPC),%eax            # eax<- BB
+     movzbl   3(rPC),%ecx            # ecx<- CC
+     GET_VREG_R %eax %eax            # eax<- vBB
+-    GET_VREG_R %ecx %ecx            # eax<- vBB
++    GET_VREG_R %ecx %ecx            # ecx<- vCC
+     SPILL(rIBASE)
+     cmpl     $0,%ecx
+     je       common_errDivideByZero
++    movl     %eax, %edx
++    orl      %ecx, %edx
++    test     $0xFFFFFF00, %edx     # If both arguments are less than 8-bit and +ve
++    jz      .LOP_DIV_INT_8         # Do 8-bit divide
++    test     $0xFFFF0000, %edx     # If both arguments are less than 16-bit and +ve
++    jz      .LOP_DIV_INT_16        # Do 16-bit divide
+     cmpl     $-1,%ecx
+-    jne      .LOP_DIV_INT_continue_div
++    jne      .LOP_DIV_INT_32
+     cmpl     $0x80000000,%eax
+-    jne      .LOP_DIV_INT_continue_div
++    jne      .LOP_DIV_INT_32
+     movl     $0x80000000,%eax
+-    SET_VREG %eax rINST
+-    UNSPILL(rIBASE)
+-    FETCH_INST_OPCODE 2 %ecx
+-    ADVANCE_PC 2
+-    GOTO_NEXT_R %ecx
+-
+-.LOP_DIV_INT_continue_div:
++    jmp      .LOP_DIV_INT_finish
++.LOP_DIV_INT_32:
+     cltd
+-    idivl   %ecx
++    idivl    %ecx
++    jmp      .LOP_DIV_INT_finish
++.LOP_DIV_INT_8:
++    div      %cl                    # 8-bit divide otherwise. Remainder in %ah, quotient in %al
++    .if 0
++    movl     %eax, %edx
++    shr      $8, %edx
++    .else
++    andl     $0x000000FF, %eax
++    .endif
++    jmp      .LOP_DIV_INT_finish
++.LOP_DIV_INT_16:
++    xorl    %edx, %edx              # Clear %edx before divide
++    div     %cx
++.LOP_DIV_INT_finish:
+     SET_VREG %eax rINST
+     UNSPILL(rIBASE)
+     FETCH_INST_OPCODE 2 %ecx
+@@ -5552,38 +5567,54 @@ dvmAsmInstructionStartCode = .L_OP_NOP
+     GOTO_NEXT_R %ecx
+ 
+ 
++
+ /* ------------------------------ */
+     .balign 16
+ .L_OP_REM_INT: /* 0x94 */
+ /* File: x86/OP_REM_INT.S */
+ /* File: x86/bindiv.S */
+-
+     /*
+      * 32-bit binary div/rem operation.  Handles special case of op0=minint and
+      * op1=-1.
+      */
+-    /* binop vAA, vBB, vCC */
++
++    /* div/rem vAA, vBB, vCC */
+     movzbl   2(rPC),%eax            # eax<- BB
+     movzbl   3(rPC),%ecx            # ecx<- CC
+     GET_VREG_R %eax %eax            # eax<- vBB
+-    GET_VREG_R %ecx %ecx            # eax<- vBB
++    GET_VREG_R %ecx %ecx            # ecx<- vCC
+     SPILL(rIBASE)
+     cmpl     $0,%ecx
+     je       common_errDivideByZero
++    movl     %eax, %edx
++    orl      %ecx, %edx
++    test     $0xFFFFFF00, %edx     # If both arguments are less than 8-bit and +ve
++    jz      .LOP_REM_INT_8         # Do 8-bit divide
++    test     $0xFFFF0000, %edx     # If both arguments are less than 16-bit and +ve
++    jz      .LOP_REM_INT_16        # Do 16-bit divide
+     cmpl     $-1,%ecx
+-    jne      .LOP_REM_INT_continue_div
++    jne      .LOP_REM_INT_32
+     cmpl     $0x80000000,%eax
+-    jne      .LOP_REM_INT_continue_div
++    jne      .LOP_REM_INT_32
+     movl     $0,rIBASE
+-    SET_VREG rIBASE rINST
+-    UNSPILL(rIBASE)
+-    FETCH_INST_OPCODE 2 %ecx
+-    ADVANCE_PC 2
+-    GOTO_NEXT_R %ecx
+-
+-.LOP_REM_INT_continue_div:
++    jmp      .LOP_REM_INT_finish
++.LOP_REM_INT_32:
+     cltd
+-    idivl   %ecx
++    idivl    %ecx
++    jmp      .LOP_REM_INT_finish
++.LOP_REM_INT_8:
++    div      %cl                    # 8-bit divide otherwise. Remainder in %ah, quotient in %al
++    .if 1
++    movl     %eax, %edx
++    shr      $8, %edx
++    .else
++    andl     $0x000000FF, %eax
++    .endif
++    jmp      .LOP_REM_INT_finish
++.LOP_REM_INT_16:
++    xorl    %edx, %edx              # Clear %edx before divide
++    div     %cx
++.LOP_REM_INT_finish:
+     SET_VREG rIBASE rINST
+     UNSPILL(rIBASE)
+     FETCH_INST_OPCODE 2 %ecx
+@@ -5591,6 +5622,7 @@ dvmAsmInstructionStartCode = .L_OP_NOP
+     GOTO_NEXT_R %ecx
+ 
+ 
++
+ /* ------------------------------ */
+     .balign 16
+ .L_OP_AND_INT: /* 0x95 */
+diff --git a/vm/mterp/x86/OP_DIV_INT.S b/vm/mterp/x86/OP_DIV_INT.S
+index 8afdcb0..9cb5e34 100644
+--- a/vm/mterp/x86/OP_DIV_INT.S
++++ b/vm/mterp/x86/OP_DIV_INT.S
+@@ -1,2 +1,2 @@
+ %verify "executed"
+-%include "x86/bindiv.S" {"result":"%eax","special":"$0x80000000"}
++%include "x86/bindiv.S" {"result":"%eax","special":"$0x80000000","rem":"0"}
+diff --git a/vm/mterp/x86/OP_REM_INT.S b/vm/mterp/x86/OP_REM_INT.S
+index 6e4fd04..f125141 100644
+--- a/vm/mterp/x86/OP_REM_INT.S
++++ b/vm/mterp/x86/OP_REM_INT.S
+@@ -1,2 +1,2 @@
+ %verify "executed"
+-%include "x86/bindiv.S" {"result":"rIBASE","special":"$0"}
++%include "x86/bindiv.S" {"result":"rIBASE","special":"$0","rem":"1"}
+diff --git a/vm/mterp/x86/bindiv.S b/vm/mterp/x86/bindiv.S
+index cbd2f3d..16f43c8 100644
+--- a/vm/mterp/x86/bindiv.S
++++ b/vm/mterp/x86/bindiv.S
+@@ -1,31 +1,46 @@
+-
+-%default {"result":"","special":""}
++%default {"result":"","special":"","rem":""}
+     /*
+      * 32-bit binary div/rem operation.  Handles special case of op0=minint and
+      * op1=-1.
+      */
+-    /* binop vAA, vBB, vCC */
++
++    /* div/rem vAA, vBB, vCC */
+     movzbl   2(rPC),%eax            # eax<- BB
+     movzbl   3(rPC),%ecx            # ecx<- CC
+     GET_VREG_R %eax %eax            # eax<- vBB
+-    GET_VREG_R %ecx %ecx            # eax<- vBB
++    GET_VREG_R %ecx %ecx            # ecx<- vCC
+     SPILL(rIBASE)
+     cmpl     $$0,%ecx
+     je       common_errDivideByZero
++    movl     %eax, %edx
++    orl      %ecx, %edx
++    test     $$0xFFFFFF00, %edx     # If both arguments are less than 8-bit and +ve
++    jz      .L${opcode}_8         # Do 8-bit divide
++    test     $$0xFFFF0000, %edx     # If both arguments are less than 16-bit and +ve
++    jz      .L${opcode}_16        # Do 16-bit divide
+     cmpl     $$-1,%ecx
+-    jne      .L${opcode}_continue_div
++    jne      .L${opcode}_32
+     cmpl     $$0x80000000,%eax
+-    jne      .L${opcode}_continue_div
++    jne      .L${opcode}_32
+     movl     $special,$result
+-    SET_VREG $result rINST
+-    UNSPILL(rIBASE)
+-    FETCH_INST_OPCODE 2 %ecx
+-    ADVANCE_PC 2
+-    GOTO_NEXT_R %ecx
+-
+-.L${opcode}_continue_div:
++    jmp      .L${opcode}_finish
++.L${opcode}_32:
+     cltd
+-    idivl   %ecx
++    idivl    %ecx
++    jmp      .L${opcode}_finish
++.L${opcode}_8:
++    div      %cl                    # 8-bit divide otherwise. Remainder in %ah, quotient in %al
++    .if $rem
++    movl     %eax, %edx
++    shr      $$8, %edx
++    .else
++    andl     $$0x000000FF, %eax
++    .endif
++    jmp      .L${opcode}_finish
++.L${opcode}_16:
++    xorl    %edx, %edx              # Clear %edx before divide
++    div     %cx
++.L${opcode}_finish:
+     SET_VREG $result rINST
+     UNSPILL(rIBASE)
+     FETCH_INST_OPCODE 2 %ecx
+-- 
+1.7.4.1
+

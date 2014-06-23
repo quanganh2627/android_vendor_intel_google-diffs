@@ -1,0 +1,191 @@
+From 711cafb6e841bcf885e505c6c2b7a1ed8b1e35d1 Mon Sep 17 00:00:00 2001
+From: Udayan Banerji <udayan.banerji@intel.com>
+Date: Fri, 30 Aug 2013 11:54:38 -0700
+Subject: Dalvik: Apply pass on-demand to a Compilation Unit
+
+BZ: 134688
+
+This changes the pass system so that the passes can now be called standalone
+on a cUnit, separate from the pass driver.
+
+The pass driver has been changed to use this API now.
+
+This new API is needed to run passes from the pass system on method CFGs
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Ib6c542c45f1e1fa59d7b0cee2d4915792895c2a2
+Orig-MCG-Change-Id: I24c8636c70922a82cf77e0751c6ca3147c22af91
+Signed-off-by: Udayan Banerji <udayan.banerji@intel.com>
+Reviewed-on: http://android.intel.com:8080/128666
+Reviewed-by: lab_aqa <lab_aqa@intel.com>
+Reviewed-by: Provodin, Vitaly A <vitaly.a.provodin@intel.com>
+Reviewed-by: Beyler, Jean Christophe <jean.christophe.beyler@intel.com>
+Reviewed-by: Lupusoru, Razvan A <razvan.a.lupusoru@intel.com>
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/LoopOpt.cpp |  105 ++++++++++++++++++++++++++++++++++------------
+ vm/compiler/LoopOpt.h   |   17 ++++++++
+ 2 files changed, 94 insertions(+), 28 deletions(-)
+
+diff --git a/vm/compiler/LoopOpt.cpp b/vm/compiler/LoopOpt.cpp
+index 3ef15fd..12ceaaa 100644
+--- a/vm/compiler/LoopOpt.cpp
++++ b/vm/compiler/LoopOpt.cpp
+@@ -170,6 +170,81 @@ void handlePassFlag (CompilationUnit *cUnit, Pass *pass)
+     }
+ }
+ 
++bool dvmCompilerRunPass (CompilationUnit *cUnit, Pass *curPass)
++{
++    //Paranoid
++    if (cUnit == 0 || curPass == 0 || curPass->getName() == "")
++    {
++        return false;
++    }
++
++    //Check the pass gate first
++    bool applyPass = curPass->gate (cUnit, curPass);
++
++    //If the pass gate said ok
++    if (applyPass == true)
++    {
++        //Applying the pass: first start, doWork, and end calls
++        curPass->start (cUnit, curPass);
++
++        //Get work function
++        bool (*doWork) (CompilationUnit *, BasicBlock *) = curPass->getWork ();
++
++        if (doWork != 0)
++        {
++            //Set the data in cUnit
++            cUnit->passData = curPass->getData ();
++
++            //Determine if pass is iterative
++            bool isIterative = curPass->getFlag (kOptimizationNeedIterative);
++
++            dvmCompilerDataFlowAnalysisDispatcher (cUnit, doWork, curPass->getTraversal (), isIterative);
++            cUnit->passData = 0;
++        }
++
++        curPass->end (cUnit, curPass);
++
++        //Do we need any clean up?
++        handlePassFlag (cUnit, curPass);
++    }
++
++    //If the pass gate passed, we can declare success
++    return applyPass;
++}
++
++bool dvmCompilerRunPass (CompilationUnit *cUnit, const char *passName)
++{
++    //Paranoid
++    if (cUnit == 0 || passName == 0)
++    {
++        return false;
++    }
++
++    //Go through all the passes and find the requested pass
++    Pass *pass = gDvmJit.jitFramework.firstPass;
++
++    //To record successful application of a pass
++    bool success = false;
++
++    //Now loop and check the name
++    while (pass != 0 && pass->getName() != "")
++    {
++        //See if the name matches
++        if (strcmp(pass->getName().c_str(), passName) == 0)
++        {
++            success = dvmCompilerRunPass (cUnit, pass);
++
++            //There will be only one matching pass
++            break;
++        }
++
++        //Go to the next pass
++        pass = pass->getNext ();
++    }
++
++    return success;
++}
++
+  /**
+   * @brief The loop
+   * @param cUnit the CompilationUnit
+@@ -206,34 +281,8 @@ void dvmCompilerLoopOptimizationDriver (CompilationUnit *cUnit)
+         //If the general gate did not invalidate the pass, continue
+         if (applyPass == true)
+         {
+-            applyPass = curPass->gate (cUnit, curPass);
+-
+-            //If the specific gate said ok
+-            if (applyPass == true)
+-            {
+-                //Applying the pass: first start, doWork, and end calls
+-                curPass->start (cUnit, curPass);
+-
+-                //Get work function
+-                bool (*doWork) (CompilationUnit *, BasicBlock *) = curPass->getWork ();
+-
+-                if (doWork != 0)
+-                {
+-                    //Set the data in cUnit
+-                    cUnit->passData = curPass->getData ();
+-
+-                    //Determine if pass is iterative
+-                    bool isIterative = curPass->getFlag (kOptimizationNeedIterative);
+-
+-                    dvmCompilerDataFlowAnalysisDispatcher (cUnit, doWork, curPass->getTraversal (), isIterative);
+-                    cUnit->passData = 0;
+-                }
+-
+-                curPass->end (cUnit, curPass);
+-
+-                //Do we need any clean up?
+-                handlePassFlag (cUnit, curPass);
+-            }
++            //Apply the pass (Ignore the return value of this call)
++            dvmCompilerRunPass (cUnit, curPass);
+         }
+ 
+         //Go to next pass
+diff --git a/vm/compiler/LoopOpt.h b/vm/compiler/LoopOpt.h
+index b78e838..0740ae6 100644
+--- a/vm/compiler/LoopOpt.h
++++ b/vm/compiler/LoopOpt.h
+@@ -32,6 +32,23 @@ struct CompilationUnit;
+ class Pass;
+ 
+ /**
++ * @brief Run the pass on the cUnit
++ * @details The pass is run completely, including the gate, pre and post functions
++ * @param cUnit The CompilationUnit to run the pass on
++ * @param pass The Pass which needs to be run
++ * @return Whether the pass could be successfully applied
++ */
++bool dvmCompilerRunPass (CompilationUnit *cUnit, Pass *pass);
++
++/**
++ * @brief Find the pass with the passName and run it with the cUnit
++ * @param cUnit The CompilationUnit to run the pass on
++ * @param passName The name of the pass which should be run
++ * @return Whether the pass could be successfully applied
++ */
++bool dvmCompilerRunPass (CompilationUnit *cUnit, const char *passName);
++
++/**
+   * @brief The loop optimization driver: calls each pass from the gPasses array
+   * @param cUnit the Compilation Unit
+   */
+-- 
+1.7.4.1
+

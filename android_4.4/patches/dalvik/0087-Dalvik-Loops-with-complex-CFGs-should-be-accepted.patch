@@ -1,0 +1,4791 @@
+From eaa5ab9a30404d05ffcf8acdb6950236d2cd05e7 Mon Sep 17 00:00:00 2001
+From: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Date: Sat, 9 Feb 2013 17:57:09 -0800
+Subject: Dalvik: Loops with complex CFGs should be accepted
+
+BZ: 81172
+
+Loops with complex CFGs are now accepted as long as they do not have complex
+  instructions.
+Loops also will always have the loop test as the end basic block, backward
+  branching to the head.
+Inlinable functions (getter and setters) are also inlined.
+
+Added a few new options that can tweak what is being done:
+  -Xjitnestedloops: allows nested loops to be handled
+  -Xjitbranchloops: allows branches in loops to be handled (only tested if nested is off)
+  -Xjitoldloops: uses the old loop detection system
+  -Xjitignorepasses: allows the user to turn off certain passes
+  -Xjitlooppasses: displays the current loop passes
+
+BitVector.h, BitVector.cpp:
+  - Added a dumping system for the Dot format
+  - Fixed the dumping of indices for the normal output
+
+Dvm.mk:
+  - Added BBOptimization and LoopInformation to compilation
+
+Globals.h:
+  - Added loop cache
+
+BBOptimization.cpp, BBOptimization.h:
+  - Added loop formation pass via a few new functions
+  - Added BasicBlock reorganization
+
+Checks.cpp, Loop.h, CompilerIR.h:
+  - Simplified the CompilationUnit structure by defining LoopInformation for x86
+  - LoopAnalysis structure simplified by removing passData
+  - Added loopForward, loopBackward to provide information about the loop
+
+CompilerIR.h, IntermediateRep.cpp:
+  - Added a few BasicBlock functions: remove MIR, insert BB, copy BB
+
+Compiler.h, IntermediateRep.cpp:
+  - Added a dvmCompilerHandleInlining that tries to inline a MIRinstruction
+
+CompilerIR.h:
+  - Added a dvmCompilerRemoveMIR function to remove a MIR from aBasicBlock
+  - Moved the calculatePredecessors into a global view
+     dvmCompilerCalculatePredecessors
+  - Added a new dvmCompilerBuildDomination to calculate domination information
+
+Frontend.cpp:
+  - Put the compilation of a loop at the start of the trace compilation
+  - A loop compilation accepts invokes in the loop now
+  - Added a print function for accepted loops
+
+InlineTransformation.cpp:
+  - Updated inlineGetter/inlineSetter to handle the more generic case:
+  - The invoke is not always in the end of the BasicBlock
+  - Removed the invoke and move result from the CFG
+
+Loop.cpp:
+  - Added the code to allow complex loops but restricting the instructions
+     accepted
+  - Inlinable invokes are accepted
+  - Removed the old loop filtering code
+  - Added functions to limit the loop compilation BasicBlocks
+
+Dataflow.cpp:
+  - Removed non x86 functions from older passes: induction variable, constant
+     propagation
+  - Always allocate the dataFlowInfo for a BasicBlock
+
+LoopInformation.cpp, LoopInformation.h:
+  - LoopInformation implementation to provide information for the accepted loops
+
+LoopOpt.cpp, LoopOpt.h:
+  - Removed old passes
+  - Renamed dvmCalculateBasicBlockInformation into
+     dvmCompilerCalculateBasicBlockInformation
+
+SSATransformation.cpp:
+  - Skip cases where dominators is 0
+  - Move domination functions into a global function
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME; AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Ic0b2cdf132ade83625fb43c9c9145047e8a9abce
+Orig-MCG-Change-Id: I4c42194b387f91445594ed2690dde17f9002c7b6
+Signed-off-by: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/BitVector.cpp                             |   96 +++-
+ vm/BitVector.h                               |    5 +
+ vm/Dvm.mk                                    |    3 +-
+ vm/Globals.h                                 |   20 +
+ vm/Init.cpp                                  |   36 +-
+ vm/compiler/BBOptimization.cpp               |  617 ++++++++++++++++++
+ vm/compiler/BBOptimization.h                 |   23 +
+ vm/compiler/Checks.cpp                       |    4 +-
+ vm/compiler/Compiler.h                       |   12 +-
+ vm/compiler/CompilerIR.h                     |   19 +
+ vm/compiler/CompilerUtility.h                |    1 +
+ vm/compiler/Dataflow.cpp                     |   10 +-
+ vm/compiler/Frontend.cpp                     |  296 ++++++---
+ vm/compiler/InlineTransformation.cpp         |  319 +++++++---
+ vm/compiler/IntermediateRep.cpp              |  132 ++++
+ vm/compiler/Loop.cpp                         |  884 ++++++++++++++++++++++++--
+ vm/compiler/Loop.h                           |   11 +-
+ vm/compiler/LoopInformation.cpp              |  425 +++++++++++++
+ vm/compiler/LoopInformation.h                |  222 +++++++
+ vm/compiler/LoopOpt.cpp                      |  352 +++--------
+ vm/compiler/LoopOpt.h                        |   31 +-
+ vm/compiler/SSATransformation.cpp            |   43 +-
+ vm/compiler/Utility.cpp                      |   78 ++-
+ vm/compiler/codegen/x86/CodegenInterface.cpp |   10 +-
+ vm/compiler/codegen/x86/LowerJump.cpp        |  131 ++--
+ 25 files changed, 3166 insertions(+), 614 deletions(-)
+ create mode 100644 vm/compiler/LoopInformation.cpp
+ create mode 100644 vm/compiler/LoopInformation.h
+
+diff --git a/vm/BitVector.cpp b/vm/BitVector.cpp
+index ced3f5d..edb84ce 100644
+--- a/vm/BitVector.cpp
++++ b/vm/BitVector.cpp
+@@ -578,32 +578,102 @@ bool dvmCheckMergeBitVectors(BitVector* dst, const BitVector* src)
+     return changed;
+ }
+ 
+-void dvmDumpBitVector (const char *prefix, const BitVector *bitVector, bool printIndices)
++/**
++ * @brief Helper to dump a BitVector, it dumps to a string buffer
++ * @param buffer the string buffer in which we dump the BitVector
++ * @param prefix a prefix before dumping
++ * @param bitVector the BitVector we wish to dump
++ * @param printIndices do we print indices or not?
++ */
++static void dvmDumpBitVectorHelper (std::string &buffer, const char *prefix, const BitVector *bitVector, bool printIndices)
+ {
++    //Initialize it
+     if (prefix != 0)
+-        ALOGW ("%s", prefix);
++    {
++        buffer = prefix;
++    }
++    else
++    {
++        buffer = "";
++    }
+ 
+-    int max = dvmHighestBitSet (bitVector);
++    //Null checking
++    if (bitVector == 0)
++    {
++        buffer += "BitVector null";
++        return;
++    }
+ 
+-    std::string buffer = "";
++    int max = dvmHighestBitSet (bitVector);
+ 
+-    for (int i = max - 1; i >= 0; i--)
++    //Are we printing indices or not
++    if (printIndices == true)
+     {
+-        bool res = dvmIsBitSet (bitVector, i);
+-
+-        if (printIndices == true && res == true)
++        //If it's indices, we go upwards
++        for (int i = 0; i <= max; i++)
+         {
+-            std::ostringstream oss;
+-            oss << i << " ";
+-            buffer += oss.str ();
++            bool res = dvmIsBitSet (bitVector, i);
++
++            if (res == true)
++            {
++                std::ostringstream oss;
++                oss << i << " ";
++                buffer += oss.str ();
++            }
+         }
+-        else
++    }
++    else
++    {
++        //Otherwise, we go downwards
++        for (int i = max; i >= 0; i--)
+         {
++            bool res = dvmIsBitSet (bitVector, i);
++
+             char c = res + '0';
+             buffer += c;
+         }
+     }
++}
++
++/**
++ * @brief Dump a bitvector to ALOGD
++ * @param prefix do we want a prefix
++ * @param bitVector the BitVector to dump
++ * @param printIndices do we wish to print indices instead of bit representation (default: false)
++ */
++void dvmDumpBitVector (const char *prefix, const BitVector *bitVector, bool printIndices)
++{
++    std::string buffer;
+ 
+-    ALOGW ("Contents of BitVector %p: %s", bitVector, buffer.c_str ());
++    dvmDumpBitVectorHelper (buffer, prefix, bitVector, printIndices);
++
++    //Now debug log it
++    ALOGD ("%s", buffer.c_str ());
+ }
+ 
++/**
++ * @brief Dump a bitvector in DOT format
++ * @param file the File in which to dump
++ * @param prefix do we want a prefix
++ * @param bitVector the BitVector to dump
++ * @param printIndices do we wish to print indices instead of bit representation (default: false)
++ * @param lastEntry is it the last entry of the structure (default: false)
++ */
++void dvmDumpBitVectorDotFormat (FILE *file, const char *prefix, const BitVector *bitVector, bool printIndices, bool lastEntry)
++{
++    std::string buffer;
++
++    dvmDumpBitVectorHelper (buffer, prefix, bitVector, printIndices);
++
++    //Now print it to the file
++    fprintf (file, "    {%s}", buffer.c_str ());
++
++    //If it isn't the last entry, add a |
++    if (lastEntry == false)
++    {
++        fprintf (file, "|");
++    }
++
++    //Add the \n
++    fprintf (file, "\\\n");
++}
+diff --git a/vm/BitVector.h b/vm/BitVector.h
+index d36e9da..f98a930 100644
+--- a/vm/BitVector.h
++++ b/vm/BitVector.h
+@@ -111,4 +111,9 @@ int dvmHighestBitSet (const BitVector *bv);
+  * Dump out a BitVector
+  */
+ void dvmDumpBitVector (const char *prefix, const BitVector *bitVector, bool printIndices = false);
++
++/**
++ * Dump out a BitVector, Dot format
++ */
++void dvmDumpBitVectorDotFormat (FILE *file, const char *prefix, const BitVector *bitVector, bool printIndices = false, bool lastEntry = false);
+ #endif  // DALVIK_BITVECTOR_H_
+diff --git a/vm/Dvm.mk b/vm/Dvm.mk
+index 93fbb83..ea18ee0 100644
+--- a/vm/Dvm.mk
++++ b/vm/Dvm.mk
+@@ -356,7 +356,8 @@ ifeq ($(dvm_arch),x86)
+               compiler/LoopOpt.cpp \
+               compiler/Checks.cpp \
+               compiler/Pass.cpp \
+-              compiler/BBOptimization.cpp
++              compiler/BBOptimization.cpp \
++              compiler/LoopInformation.cpp
+        # need apache harmony x86 encoder/decoder
+        LOCAL_C_INCLUDES += \
+ 	      dalvik/vm/compiler/codegen/x86/libenc
+diff --git a/vm/Globals.h b/vm/Globals.h
+index 7ef1f9a..4923f6f 100644
+--- a/vm/Globals.h
++++ b/vm/Globals.h
+@@ -29,6 +29,7 @@
+ #ifndef DALVIK_GLOBALS_H_
+ #define DALVIK_GLOBALS_H_
+ 
++#include <map>
+ #include <string>
+ #include <vector>
+ 
+@@ -868,6 +869,13 @@ struct DvmJitGlobals {
+     /* Translation cache version (protected by compilerLock */
+     int cacheVersion;
+ 
++    /*
++     * Loop cache information: map telling us if the loop is not a header
++     * The loop cache is used to know if an offset is a loop head or not. It helps reduce compilation time.
++     * The loop cache contains all the BasicBlocks that are known to NOT be loop heads
++     */
++    std::map<const u2 *, bool> knownNonLoopHeaderCache;
++
+     /* Bytes used by the code templates */
+     unsigned int templateSize;
+ 
+@@ -928,6 +936,18 @@ struct DvmJitGlobals {
+     /* Flag to control instruction scheduling */
+     bool scheduling;
+ 
++    /* Flag to control nested loops in JIT mode or not */
++    bool nestedLoops;
++
++    /* Flag to control loops with branches in JIT mode or not */
++    bool branchLoops;
++
++    /* Flag to control which loop detection system is being used */
++    bool oldLoopDetection;
++
++    /* Flag to control the loop passes executed */
++    char *ignorePasses;
++
+     /* Per-process debug flag toggled when receiving a SIGUSR2 */
+     bool receivedSIGUSR2;
+ 
+diff --git a/vm/Init.cpp b/vm/Init.cpp
+index 09142a3..fe35fb4 100644
+--- a/vm/Init.cpp
++++ b/vm/Init.cpp
+@@ -40,6 +40,7 @@
+ 
+ #ifdef ARCH_IA32
+ #include "compiler/CompilerUtility.h"
++#include "compiler/LoopOpt.h"
+ #endif
+ 
+ #if defined(WITH_JIT)
+@@ -155,8 +156,13 @@ static void usage(const char* progName)
+     dvmFprintf(stderr, "  -Xjitcheckcg\n");
+     dvmFprintf(stderr, "  -Xjitverbose\n");
+     dvmFprintf(stderr, "  -Xjit[no]scheduling (Turn on/off Atom Instruction Scheduling)\n");
+-    dvmFprintf(stderr, "  -Xjitarenatrimstyle:<none|onlyOne|average|user> select arena triming style\n");
+-    dvmFprintf(stderr, "  -Xjitarenatrimvalue:<value> the value for the user based arena trim style\n");
++    dvmFprintf(stderr, "  -Xjitarenatrimstyle:<none|onlyOne|average|user> (Select arena triming style)\n");
++    dvmFprintf(stderr, "  -Xjitarenatrimvalue:<value> (The value for the user based arena trim style)\n");
++    dvmFprintf(stderr, "  -Xjitnestedloops (Allows nested loops to be compiled or not)\n");
++    dvmFprintf(stderr, "  -Xjitbranchloops (Allows branches in loops, only tested if nestedloops is also off)\n");
++    dvmFprintf(stderr, "  -Xjitoldloops (Only accept the old loop detection system)\n");
++    dvmFprintf(stderr, "  -Xjitignorepasses:<value> (Ignore certain loop passes, the full name of the pass must be included, see -Xjitlooppasses to get a list)\n");
++    dvmFprintf(stderr, "  -Xjitlooppasses (Prints the loop passes available)\n");
+ #if defined(VTUNE_DALVIK)
+     dvmFprintf(stderr, "  -Xjitsepdalvik\n");
+     dvmFprintf(stderr, "  -Xjitvtuneinfo:{none,jit,dex,src}\n");
+@@ -1164,6 +1170,28 @@ static int processOptions(int argc, const char* const argv[],
+             gDvmJit.scheduling = true;
+         } else if (strncmp(argv[i], "-Xjitnoscheduling", 17) == 0) {
+             gDvmJit.scheduling = false;
++        } else if (strncmp(argv[i], "-Xjitnestedloops", 16) == 0) {
++            gDvmJit.nestedLoops = true;
++        } else if (strncmp(argv[i], "-Xjitbranchloops", 16) == 0) {
++            gDvmJit.branchLoops = true;
++        } else if (strncmp(argv[i], "-Xjitoldloops", 13) == 0) {
++            gDvmJit.oldLoopDetection = true;
++        } else if (strncmp(argv[i], "-Xjitignorepasses:", 18) == 0) {
++            const unsigned int max = 64;
++            //Get a copy of the names
++            gDvmJit.ignorePasses = strndup (argv[i] + 18, max);
++
++            //Paranoid: let's not let people do anything they want
++            if (strlen (gDvmJit.ignorePasses) >= max)
++            {
++                ALOGD ("Warning: -Xjitignorepasses' parameter was too long, are you sure it was wanted? Only part was accepted");
++            }
++
++            //Print what we will be ignoring
++            dvmCompilerPrintIgnorePasses ();
++        } else if (strncmp(argv[i], "-Xjitlooppasses", 15) == 0) {
++            //Simply call the loop pass printer
++            dvmCompilerPrintPassNames ();
+         } else if (strncmp (argv[i], "-Xjitarenatrimstyle:", 20) == 0) {
+             const char *style = argv[i] + 20;
+             const char *acceptedStyles[] = {"none", "onlyOne", "average", "user"};
+@@ -1374,6 +1402,10 @@ static void setCommandLineDefaults()
+      */
+ #if defined(WITH_JIT)
+     gDvm.executionMode = kExecutionModeJit;
++    gDvmJit.nestedLoops = false;
++    gDvmJit.branchLoops = false;
++    gDvmJit.oldLoopDetection = false;
++    gDvmJit.ignorePasses = 0;
+ #if defined(ARCH_IA32)
+     gDvmJit.num_entries_pcTable = 0;
+     gDvmJit.scheduling = true;
+diff --git a/vm/compiler/BBOptimization.cpp b/vm/compiler/BBOptimization.cpp
+index dd48a03..013e3e9 100644
+--- a/vm/compiler/BBOptimization.cpp
++++ b/vm/compiler/BBOptimization.cpp
+@@ -17,6 +17,7 @@
+ #include "Dalvik.h"
+ #include "Dataflow.h"
+ #include "Loop.h"
++#include "LoopInformation.h"
+ #include "LoopOpt.h"
+ #include "BBOptimization.h"
+ 
+@@ -128,3 +129,619 @@ bool dvmCompilerMergeBasicBlocks (CompilationUnit *cUnit, BasicBlock *bb)
+     return true;
+ }
+ 
++/**
++ * @brief Handle the insertion of the pre-loop header
++ * @param cUnit the CompilationUnit
++ * @param newBlock the new block to be added
++ * @param bb the current backward chaining cell
++ * @return whether we succeeded or not
++ */
++static bool handlePreLoopInsertion (CompilationUnit *cUnit, BasicBlock *newBlock, BasicBlock *bb)
++{
++    bool res = false;
++
++    BitVectorIterator bvIterator;
++
++    //Get its fall through
++    bb = bb->fallThrough;
++
++    //Paranoid
++    if (bb == 0)
++    {
++        return false;
++    }
++
++    //Get predecessors
++    dvmBitVectorIteratorInit(bb->predecessors, &bvIterator);
++    while (true) {
++        //Get the next iterator
++        int blockIdx = dvmBitVectorIteratorNext(&bvIterator);
++
++        //If it is finished, exit
++        if (blockIdx == -1)
++        {
++            break;
++        }
++        BasicBlock *predBB = (BasicBlock*) (dvmGrowableListGetElement(&cUnit->blockList, blockIdx));
++
++        //Paranoid
++        if (predBB == 0)
++        {
++            break;
++        }
++
++        //If the type is a backward chaining cell, go to the next one
++        if (predBB->blockType == kChainingCellBackwardBranch)
++        {
++            continue;
++        }
++
++        //If we have a taken and it leads toward the bb and it is Dalvik bytecode
++        if (predBB->taken != 0 && predBB->taken == bb && ( (predBB->blockType == kDalvikByteCode) || (predBB->blockType == kEntryBlock)))
++
++        {
++            //Insert the new block between the two
++            if (dvmCompilerInsertBasicBlockBetween (newBlock, predBB, bb) == true)
++            {
++                //Found one, we can return true
++                res = true;
++            }
++        }
++        else
++        {
++            //If we have a fallthrough and it leads toward the bb and it is Dalvik bytecode
++            if (predBB->fallThrough != 0 && predBB->fallThrough == bb && ( (predBB->blockType == kDalvikByteCode) || (predBB->blockType == kEntryBlock)))
++            {
++                //Insert the new block between the two
++                if (dvmCompilerInsertBasicBlockBetween (newBlock, predBB, bb) == true)
++                {
++                    //Found one, we can return true
++                    res = true;
++                }
++            }
++        }
++    }
++
++    return res;
++}
++
++/**
++ * @brief Insert the pre-loop header
++ * @param cUnit the CompilationUnit
++ * @param info the LoopInformation for the loop
++ * @param bb the current backward branch
++ */
++static void insertPreLoopHeader (CompilationUnit *cUnit, LoopInformation *info, BasicBlock *bb)
++{
++    //Now, we have a little bit of work: we want to create a preheader
++    //Don't define its ID or add it yet, we might not use it
++    BasicBlock *preHeader = dvmCompilerNewBB(kDalvikByteCode, 0);
++    preHeader->startOffset = bb->startOffset;
++
++    //Set the links correctly
++    bool res = handlePreLoopInsertion (cUnit, preHeader, bb);
++
++    if (res == true)
++    {
++        //Set its ID
++        preHeader->id = cUnit->numBlocks;
++        cUnit->numBlocks++;
++
++        //Actually add it in, we've used it
++        dvmInsertGrowableList(&cUnit->blockList, (intptr_t) preHeader);
++
++        //Add to the information
++        info->setPreHeader (preHeader);
++    }
++    else
++    {
++        //This should never happen
++        ALOGD ("Warning: Loop does not have a header: %s%s, for %x",
++                        cUnit->method->clazz->descriptor, cUnit->method->name, bb->startOffset);
++        cUnit->quitLoopMode = true;
++
++        //In the assert world, we'd prefer this never happens
++        assert (0);
++    }
++}
++
++/**
++ * @brief Insert a loop exit block: this helps sink any code from the loop to before getting to the rest of the code
++ * @param cUnit the CompilationUnit
++ * @param info the LoopInformation
++ * @param cur the current BasicBlock we are attaching the loop exit block to
++ * @param exit the loop exit BasicBlock
++ */
++static void insertLoopExitBlock (CompilationUnit *cUnit, LoopInformation *info, BasicBlock *cur, BasicBlock *exitBB)
++{
++    //Create and set up the loop exit block, it goes to the exit BasicBlock
++    BasicBlock *exitBlock = dvmCompilerNewBB(kDalvikByteCode, cUnit->numBlocks++);
++    dvmInsertGrowableList(&cUnit->blockList, (intptr_t) exitBlock);
++
++    exitBlock->startOffset = exitBB->startOffset;
++    exitBlock->fallThrough = exitBB;
++
++    //Now link it
++    if (cur->taken == exitBB)
++    {
++        cur->taken = exitBlock;
++    }
++    else
++    {
++        //Paranoid
++        assert (cur->fallThrough == exitBB);
++
++        cur->fallThrough = exitBlock;
++    }
++
++    //Finally add it to the loop information
++    info->addExitLoop (exitBlock);
++}
++
++/**
++ * @brief Handle the top loop case and push down the test to make it a bottom loop
++ * @param cUnit the CompilationUnit
++ * @param info the LoopInformation
++ * @param bb the BasicBlock that represents the head of the loop for the top formed loop
++ * @param predBB the predecessor of bb currently being handled
++ * @param backward the backward chaining cell
++ */
++static void handleTopLoop (CompilationUnit *cUnit, LoopInformation *info, BasicBlock *bb, BasicBlock *predBB, BasicBlock *backward)
++{
++    //Paranoid: we should have a branch
++    assert (bb->taken != 0 || bb->fallThrough != 0);
++
++    //First find if taken or fallthrough is the loop
++    //By default, let's suppose it is bb->taken
++    BasicBlock *notLoop = bb->taken;
++
++    if (notLoop == 0)
++    {
++        notLoop = bb->fallThrough;
++    }
++    else
++    {
++        //If notLoop is really that, it won't be dominating predBB
++        if (dvmIsBitSet (predBB->dominators, notLoop->id) != 0)
++        {
++            notLoop = bb->fallThrough;
++        }
++    }
++
++    //Inform loop information
++    info->setPostExitBlock (notLoop);
++
++    //Attach the current predBB to backward, it might be predBB->taken
++    if (predBB->taken == bb)
++    {
++        predBB->taken = backward;
++    }
++    else
++    {
++        //Is it fallThrough ?
++        if (predBB->fallThrough == bb)
++        {
++            predBB->fallThrough = backward;
++        }
++    }
++
++    //Now, we must copy the if statements for the loop
++    BasicBlock *cur = bb;
++
++    //Have work to do from bb all the way down:
++    //Until either cur is 0 (paranoid) and either branch leads to the loop exit
++    while (cur != 0 && (cur->taken == notLoop || cur->fallThrough == notLoop))
++    {
++        //Copy current
++        BasicBlock *newBB = dvmCompilerCopyBasicBlock (cUnit, cur);
++
++        //Attach predBB to newBB, between predBB and backward, it's our bottom test now
++        if (predBB->taken == backward)
++        {
++            predBB->taken = newBB;
++        }
++        else
++        {
++            predBB->fallThrough = newBB;
++        }
++
++        //Now attach newBB to backward, we attach the not notLoop branch
++        if (newBB->taken != notLoop)
++        {
++            //Taken is thus going to the backward
++            newBB->taken = backward;
++        }
++        else
++        {
++            //FallThrough is thus going to the backward
++            newBB->fallThrough = backward;
++        }
++
++        //Add an exit block here between newBB and notLoop
++        insertLoopExitBlock (cUnit, info, newBB, notLoop);
++
++        //If we only have one child, go there
++        if (
++            (cur->taken == 0 && cur->fallThrough != 0) ||
++            (cur->taken != 0 && cur->taken == 0))
++        {
++            if (cur->taken != 0)
++            {
++                cur = cur->taken;
++            }
++            else
++            {
++                cur = cur->fallThrough;
++            }
++        }
++        else
++        {
++            //We have two children, so:
++            //Choose the right child, we want the one that is still in the loop
++            if (cur->taken == notLoop)
++            {
++                cur = cur->fallThrough;
++            }
++            else
++            {
++                cur = cur->taken;
++            }
++        }
++        //Update predBB to now be newBB
++        predBB = newBB;
++    }
++
++    //When we are done, we've copied the chain of BasicBlocks that form the continuation test
++    //Now redirect backward to cur, we don't want to do the tests twice each iteration
++    backward->fallThrough = cur;
++    //Paranoid
++    assert (cur != 0);
++    //Also set its offset, it might have changed and the chaining cell needs this
++    backward->startOffset = cur->startOffset;
++
++    //Update the information for the entry
++    info->setEntryBlock (cur);
++}
++
++/**
++ * Form a loop if bb is a loop head
++ *  - If it is, make sure it is a bottom formed loop (or make it so), add a preloop block and an exit block
++ */
++void dvmCompilerFormOldLoop (CompilationUnit *cUnit, Pass *pass)
++{
++    //Put a backward chaining cell before every predecessor of the entry block
++    BitVectorIterator bvIterator;
++
++    //Get first BasicBlock
++    BasicBlock *bb = cUnit->entryBlock->fallThrough;
++
++    dvmBitVectorIteratorInit(bb->predecessors, &bvIterator);
++    while (true) {
++        int blockIdx = dvmBitVectorIteratorNext(&bvIterator);
++
++        //If done, bail
++        if (blockIdx == -1)
++        {
++            break;
++        }
++
++        //Get predecessor
++        BasicBlock *predBB = (BasicBlock *) dvmGrowableListGetElement(&cUnit->blockList, blockIdx);
++
++        //Paranoid
++        if (predBB == 0)
++        {
++            continue;
++        }
++
++        //We only care if it's a kDalvikByteCode
++        if (predBB->blockType != kDalvikByteCode)
++        {
++            continue;
++        }
++
++        //Put a backward chaining cell between the predecessor and the entry block
++        BasicBlock *backward = dvmCompilerNewBB(kChainingCellBackwardBranch, cUnit->numBlocks++);
++        dvmInsertGrowableList(&cUnit->blockList, (intptr_t) backward);
++        backward->startOffset = bb->startOffset;
++
++        //Backward will fall through to the current BasicBlock directly
++        backward->fallThrough = bb;
++
++        //Now link predBB
++        if (predBB->taken == bb)
++        {
++            predBB->taken = backward;
++        }
++        else
++        {
++            //Paranoid
++            assert (predBB->fallThrough == bb);
++
++            predBB->fallThrough = backward;
++        }
++    }
++
++    //In this case, we just put the
++    //cUnit->quitLoopMode = true;
++    (void) pass;
++}
++
++/**
++ * Form a loop if bb is a loop head
++ *  - If it is, make sure it is a bottom formed loop (or make it so), add a preloop block and an exit block
++ */
++bool dvmCompilerFormLoop (CompilationUnit *cUnit, BasicBlock *bb)
++{
++    BasicBlock *backward = 0;
++    LoopInformation *info = 0;
++
++    BitVectorIterator bvIterator;
++
++    //Paranoid
++    assert (bb->predecessors != 0);
++
++    //Get predecessors
++    dvmBitVectorIteratorInit(bb->predecessors, &bvIterator);
++    while (true) {
++        //Get the next iterator
++        int blockIdx = dvmBitVectorIteratorNext(&bvIterator);
++
++        //If it is finished, exit
++        if (blockIdx == -1)
++        {
++            break;
++        }
++
++        BasicBlock *predBB = (BasicBlock*) (dvmGrowableListGetElement(&cUnit->blockList, blockIdx));
++
++        //Paranoid
++        if (predBB == 0)
++        {
++            break;
++        }
++
++        //If we have no dominator information, we can skip it
++        if (predBB->dominators == 0)
++        {
++            continue;
++        }
++
++        //Check if predecessor still leads to bb:
++        //This can happen if other changes have happened in between
++        if (predBB->taken != bb && predBB->fallThrough != bb)
++        {
++            continue;
++        }
++
++        //If the predecessor is dominated by this one, it is a backward branch
++        if (dvmIsBitSet (predBB->dominators, bb->id) != 0)
++        {
++            //First time we require info? Then, create it
++            if (info == 0)
++            {
++                //The loop information
++                info = static_cast<LoopInformation *> (dvmCompilerNew (sizeof (*info), true));
++
++                //Call explicitly init
++                info->init (cUnit->method);
++
++                //Set entry
++                info->setEntryBlock (bb);
++            }
++
++            //If we don't already have a BasicBlock for it, create it
++            backward = dvmCompilerNewBB(kChainingCellBackwardBranch, cUnit->numBlocks++);
++            dvmInsertGrowableList(&cUnit->blockList, (intptr_t) backward);
++            backward->startOffset = bb->startOffset;
++
++            //Backward will fall through to the current BasicBlock directly
++            backward->fallThrough = bb;
++
++            //Add information about it
++            info->addBackwardBlock (backward);
++
++            //Is the loop a top loop or not? Suppose it is
++            bool topLoop = true;
++
++            BasicBlock *notLoop = 0;
++
++            //If predBB has a taken it isn't the bb, it is a bottom loop
++            if (predBB->taken != 0 && predBB->taken != bb)
++            {
++                topLoop = false;
++                notLoop = predBB->taken;
++            }
++
++            //If predBB has a fallThrough it isn't the bb, it is a bottom loop
++            if (predBB->fallThrough != 0 && predBB->fallThrough != bb)
++            {
++                topLoop = false;
++                notLoop = predBB->fallThrough;
++            }
++
++            //There is a corner case where the bb might be also going to where we aren't
++            //It must be not hidden though
++            if (notLoop != 0 && notLoop->blockType == kDalvikByteCode && (notLoop == bb->taken || notLoop == bb->fallThrough))
++            {
++                topLoop = true;
++            }
++
++            //Last case: if predBB is bb then it isn't a top loop at all
++            if (predBB == bb)
++            {
++                topLoop = false;
++            }
++
++            if (topLoop == true)
++            {
++                //We have a top loop case here
++                handleTopLoop (cUnit, info, bb, predBB, backward);
++            }
++            else
++            {
++                //Otherwise, it is already a bottom loop
++                BasicBlock *notLoop = 0;
++
++                //Handle links from predBB to bb
++                if (predBB->taken == bb)
++                {
++                    //Link taken to backward, it will go to bb
++                    predBB->taken = backward;
++                    //The not loop is predBB->fallThrough, it is the exit
++                    notLoop = predBB->fallThrough;
++                }
++                else
++                {
++                    if (predBB->fallThrough == bb)
++                    {
++                        //Link FT to backward, it will go to bb
++                        predBB->fallThrough = backward;
++                        //The not loop is predBB->taken, it is the exit
++                        notLoop = predBB->taken;
++                    }
++                }
++
++                //There is a case where notLoop can be 0:
++                //  - If bb directly goes to itself and it's an infinite loop
++                if (notLoop != 0)
++                {
++                    //Inform loop information
++                    info->setPostExitBlock (notLoop);
++
++                    //Add a landing pad here
++                    insertLoopExitBlock (cUnit, info, predBB, notLoop);
++                }
++            }
++
++            //Fill in the last information about the loop
++            info->fillLoopInformation ();
++
++            //We now have a new loop information
++            if (cUnit->loopInformation == 0)
++            {
++                cUnit->loopInformation = info;
++            }
++            else
++            {
++                //Nest it with the current loop information
++                cUnit->loopInformation = cUnit->loopInformation->nest (info);
++            }
++        }
++    }
++
++
++    //If we have a backward chaining cell, insert the preheader now
++    if (backward != 0)
++    {
++        //Now create a pre loop header
++        insertPreLoopHeader (cUnit, info, backward);
++    }
++
++    //We don't want to iterate on the changes
++    return false;
++}
++
++/**
++ * @brief Reorder the BasicBlocks in a DFS order
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock currently considered
++ */
++static void reorderHelper (CompilationUnit *cUnit, BasicBlock *bb)
++{
++    //Has it been visited or is it 0?
++    if (bb == 0 || dvmIsBitSet (cUnit->tempBlockV, bb->id))
++    {
++        return;
++    }
++
++    //Is it hidden?
++    if (bb->hidden == true)
++    {
++        return;
++    }
++
++    //Start by setting it in tempBlockV
++    //Update the id using the size of blockList
++    dvmSetBit (cUnit->tempBlockV, bb->id);
++    dvmInsertGrowableList (& (cUnit->blockList), (intptr_t) bb);
++
++    //Now handle children: get local versions for taken first, fallThrough second
++    BasicBlock *taken = bb->taken;
++    BasicBlock *fallThrough = bb->fallThrough;
++
++    //Now we prefer Bytecodes but for the moment we have no idea which is the "hot" path
++    BasicBlock *childFirst = taken,
++               *childSecond = fallThrough;
++
++    //If we can have a preference
++    if (childFirst != 0 && childSecond != 0)
++    {
++        //If the first child is not code but the second is, prefer the second first
++        if (childFirst->blockType != kDalvikByteCode)
++        {
++            if (childSecond->blockType == kDalvikByteCode)
++            {
++                childFirst = fallThrough;
++                childSecond = taken;
++            }
++        }
++        else
++        {
++            //Otherwise the first child is code but is it empty?
++            if (childFirst->firstMIRInsn == 0)
++            {
++                childFirst = fallThrough;
++                childSecond = taken;
++            }
++        }
++    }
++
++    //Recursive
++    reorderHelper (cUnit, childFirst);
++    reorderHelper (cUnit, childSecond);
++}
++
++void dvmCompilerReorder (CompilationUnit *cUnit, Pass *pass)
++{
++    //First let us reset the block list
++    dvmClearGrowableList (& (cUnit->blockList));
++
++    //Paranoid
++    assert (cUnit->tempBlockV != 0);
++
++    //Clear tempBlockV
++    dvmClearAllBits (cUnit->tempBlockV);
++
++    //Now go through the BasicBlocks DFS with a twist for the loops
++    reorderHelper (cUnit, cUnit->entryBlock);
++
++    //Finally, if we have the puntBlock add it
++    if (cUnit->puntBlock != 0)
++    {
++        dvmInsertGrowableList (& (cUnit->blockList), (intptr_t) (cUnit->puntBlock));
++        dvmSetBit (cUnit->tempBlockV, cUnit->puntBlock->id);
++    }
++
++    //Now go through the list and update the ids
++    //This is done because certain parts of the compiler suppose that the id and the
++    //position in the blockList are the same...
++    GrowableListIterator iterator;
++    dvmGrowableListIteratorInit(&cUnit->blockList, &iterator);
++    int id = 0;
++    while (true)
++    {
++        //Get next BasicBlock
++        BasicBlock *bb = (BasicBlock *) dvmGrowableListIteratorNext(&iterator);
++
++        //Have we finished
++        if (bb == NULL)
++        {
++            break;
++        }
++
++        //Update id for the BasicBlock
++        bb->id = id;
++        id++;
++    }
++}
+diff --git a/vm/compiler/BBOptimization.h b/vm/compiler/BBOptimization.h
+index 5ae57bd..af288c1 100644
+--- a/vm/compiler/BBOptimization.h
++++ b/vm/compiler/BBOptimization.h
+@@ -20,6 +20,7 @@
+ //Forward declarations
+ struct BasicBlock;
+ struct CompilationUnit;
++class Pass;
+ 
+ /**
+  * @brief Merge BasicBlocks together to reduce unnecessary jumps
+@@ -29,4 +30,26 @@ struct CompilationUnit;
+  */
+ bool dvmCompilerMergeBasicBlocks (CompilationUnit *cUnit, BasicBlock *bb);
+ 
++/**
++ * @brief Form the loop by inserting pre/post blocks and backward branches for loops
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock
++ * @return returns whether we changed anything in the BasicBlock
++ */
++bool dvmCompilerFormLoop (CompilationUnit *cUnit, BasicBlock *bb);
++
++/**
++ * @brief Form the loop by inserting pre/post blocks and backward branches for loops
++ * @param cUnit the CompilationUnit
++ * @param pass the Pass
++ */
++void dvmCompilerFormOldLoop (CompilationUnit *cUnit, Pass *pass);
++
++/**
++ * @brief Reorder BasicBlocks
++ * @param cUnit the CompilationUnit
++ * @param pass the Pass
++ */
++void dvmCompilerReorder (CompilationUnit *cUnit, Pass *pass);
++
+ #endif
+diff --git a/vm/compiler/Checks.cpp b/vm/compiler/Checks.cpp
+index c295e8c..fc6e706 100644
+--- a/vm/compiler/Checks.cpp
++++ b/vm/compiler/Checks.cpp
+@@ -392,10 +392,10 @@ void initializeData (CompilationUnit *cUnit, SRemoveData **ptrRemoveData, BasicB
+     GrowableList *blockList = &cUnit->blockList;
+ 
+     //Get data if in loop mode
+-    if (cUnit->loopAnalysis != NULL)
++    if (cUnit->passData != NULL)
+     {
+         //Get the removeData
+-        removeData = static_cast<SRemoveData *> (cUnit->loopAnalysis->passData);
++        removeData = static_cast<SRemoveData *> (cUnit->passData);
+         *ptrRemoveData = removeData;
+ 
+         if (removeData != NULL)
+diff --git a/vm/compiler/Compiler.h b/vm/compiler/Compiler.h
+index 28bcf3d..4ee6d39 100644
+--- a/vm/compiler/Compiler.h
++++ b/vm/compiler/Compiler.h
+@@ -217,6 +217,9 @@ void dvmJitUnchainAll(void);
+ void dvmJitScanAllClassPointers(void (*callback)(void *ptr));
+ void dvmCompilerSortAndPrintTraceProfiles(void);
+ void dvmCompilerPerformSafePointChecks(void);
++
++/* Handle the inlining of a given MIR, returns whether it was inlined */
++bool dvmCompilerHandleInlining (CompilationUnit *cUnit, JitTranslationInfo *info, BasicBlock *bb, MIR *mir);
+ void dvmCompilerInlineMIR(struct CompilationUnit *cUnit,
+                           JitTranslationInfo *info);
+ void dvmInitializeSSAConversion(struct CompilationUnit *cUnit);
+@@ -267,7 +270,14 @@ extern "C" void *dvmCompilerGetInterpretTemplate();
+ JitInstructionSetType dvmCompilerGetInterpretTemplateSet();
+ u8 dvmGetRegResourceMask(int reg);
+ void dvmDumpCFG(struct CompilationUnit *cUnit, const char *dirPrefix, const char *suffix="");
+-void dvmCompilerDumpBasicBlocks (CompilationUnit *cUnit, const char *dirPrefix, const char *suffix = "");
++void dvmCompilerDumpBasicBlocks (CompilationUnit *cUnit, const char *dirPrefix, const char *suffix = "", bool dumpLoopInformation = false);
+ 
+ bool dvmIsOpcodeSupportedByJit(const DecodedInstruction & insn);
++
++/* Calculate the predecessor information for the CompilationUnit */
++void dvmCompilerCalculatePredecessors (CompilationUnit *cUnit);
++
++/* Build domination information */
++void dvmCompilerBuildDomination (CompilationUnit *cUnit);
++
+ #endif  // DALVIK_VM_COMPILER_H_
+diff --git a/vm/compiler/CompilerIR.h b/vm/compiler/CompilerIR.h
+index fe50c75..555ca09 100644
+--- a/vm/compiler/CompilerIR.h
++++ b/vm/compiler/CompilerIR.h
+@@ -20,6 +20,7 @@
+ #include "codegen/Optimizer.h"
+ #ifdef ARCH_IA32
+ #include "CompilerUtility.h"
++#include "LoopInformation.h"
+ #endif
+ 
+ typedef enum RegisterClass {
+@@ -182,6 +183,8 @@ typedef enum BlockListType {
+ typedef struct BasicBlock {
+     int id;
+     bool visited;
++    bool topLoop;                       //Is this a loop head and is it a top loop?
++    bool bottomLoop;                    //Is this a loop head and is it a bottom loop?
+     bool hidden;
+     unsigned int startOffset;
+     const Method *containingMethod;     // For blocks from the callee
+@@ -215,7 +218,9 @@ typedef struct SuccessorBlockInfo {
+     int key;
+ } SuccessorBlockInfo;
+ 
++//Forward Declarations
+ struct LoopAnalysis;
++class LoopInformation;
+ struct RegisterPool;
+ 
+ typedef enum AssemblerStatus {
+@@ -240,6 +245,7 @@ typedef struct CompilationUnit {
+ #ifdef ARCH_IA32
+     int exceptionBlockId;               /**< @brief The block corresponding to exception handling */
+     bool singletonInlined;              /**< @brief TRUE if singleton call inlined */
++    void *passData;                     /**< @brief Pass data */
+ #endif
+     const JitTraceDescription *traceDesc;
+     LIR *firstLIRInsn;
+@@ -284,7 +290,11 @@ typedef struct CompilationUnit {
+     int *constantValues;                // length == numSSAReg
+ 
+     /* Data structure for loop analysis and optimizations */
++#ifndef ARCH_IA32
+     struct LoopAnalysis *loopAnalysis;
++#else
++    LoopInformation *loopInformation;
++#endif
+ 
+     /* Map SSA names to location */
+     RegLocation *regLocation;
+@@ -342,6 +352,15 @@ void dvmCompilerInsertLIRAfter(LIR *currentLIR, LIR *newLIR);
+ 
+ void dvmCompilerAbort(CompilationUnit *cUnit);
+ 
++/* Remove a MIR from a BasicBlock: returns true on success */
++bool dvmCompilerRemoveMIR (BasicBlock *bb, const MIR *mir);
++
++/* Insert a BasicBlock between a parent and child */
++bool dvmCompilerInsertBasicBlockBetween (BasicBlock *newBlock, BasicBlock *parent, BasicBlock *child);
++
++/* Insert a BasicBlock between a parent and child */
++BasicBlock *dvmCompilerCopyBasicBlock (CompilationUnit *cUnit, const BasicBlock *old, bool addIt = true);
++
+ /* Debug Utilities */
+ void dvmCompilerDumpCompilationUnit(CompilationUnit *cUnit);
+ 
+diff --git a/vm/compiler/CompilerUtility.h b/vm/compiler/CompilerUtility.h
+index 8b637cc..6c6c4fc 100644
+--- a/vm/compiler/CompilerUtility.h
++++ b/vm/compiler/CompilerUtility.h
+@@ -66,6 +66,7 @@ void dvmInsertGrowableList(GrowableList *gList, intptr_t elem);
+ void dvmGrowableListIteratorInit(GrowableList *gList,
+                                  GrowableListIterator *iterator);
+ intptr_t dvmGrowableListIteratorNext(GrowableListIterator *iterator);
++bool dvmGrowableListSetLastIterator(GrowableListIterator *iterator, intptr_t elem);
+ intptr_t dvmGrowableListGetElement(const GrowableList *gList, size_t idx);
+ 
+ BitVector* dvmCompilerAllocBitVector(unsigned int startBits, bool expandable);
+diff --git a/vm/compiler/Dataflow.cpp b/vm/compiler/Dataflow.cpp
+index dc550cf..251f361 100644
+--- a/vm/compiler/Dataflow.cpp
++++ b/vm/compiler/Dataflow.cpp
+@@ -1662,6 +1662,7 @@ bool dvmCompilerDoConstantPropagation(CompilationUnit *cUnit, BasicBlock *bb)
+     return true;
+ }
+ 
++#ifndef ARCH_IA32
+ bool dvmCompilerFindInductionVariables(struct CompilationUnit *cUnit,
+                                        struct BasicBlock *bb)
+ {
+@@ -1825,6 +1826,7 @@ bool dvmCompilerFindInductionVariables(struct CompilationUnit *cUnit,
+     }
+     return true;
+ }
++#endif
+ 
+ /* Setup the basic data structures for SSA conversion */
+ void dvmInitializeSSAConversion(CompilationUnit *cUnit)
+@@ -1922,13 +1924,7 @@ void dvmInitializeSSAConversion(CompilationUnit *cUnit)
+             continue;
+         }
+ 
+-        if (bb->blockType == kDalvikByteCode ||
+-            bb->blockType == kEntryBlock ||
+-            bb->blockType == kExitBlock) {
+-            bb->dataFlowInfo = (BasicBlockDataFlow *)
+-                dvmCompilerNew(sizeof(BasicBlockDataFlow),
+-                               true);
+-        }
++        bb->dataFlowInfo = (BasicBlockDataFlow *) dvmCompilerNew(sizeof(BasicBlockDataFlow), true);
+     }
+ }
+ 
+diff --git a/vm/compiler/Frontend.cpp b/vm/compiler/Frontend.cpp
+index 3fc6316..e3d4cbf 100644
+--- a/vm/compiler/Frontend.cpp
++++ b/vm/compiler/Frontend.cpp
+@@ -20,7 +20,9 @@
+ #include "interp/Jit.h"
+ #include "CompilerInternals.h"
+ #include "Dataflow.h"
++#include "Loop.h"
+ #include "LoopOpt.h"
++#include "LoopInformation.h"
+ 
+ #define BYTECODE_FILTER
+ 
+@@ -769,65 +771,9 @@ void dvmDumpBasicBlock (CompilationUnit *cUnit, BasicBlock *bb, FILE *file, bool
+             fprintf(file, "    {block id %d\\l}%s\\\n", bb->id,
+                     bb->firstMIRInsn ? " | " : " ");
+             for (mir = bb->firstMIRInsn; mir; mir = mir->next) {
+-                const char *tmp = NULL;
+-                //Prefer the full information with SSA
+-                if (mir->ssaRep != NULL)
+-                {
+-                    tmp = dvmCompilerFullDisassembler(cUnit, mir);
+-                }
+-                else
+-                {
+-                    //Otherwise, prefer the dvmCompilerGetDalvikDisassembly output
+-                    tmp = dvmCompilerGetDalvikDisassembly (&(mir->dalvikInsn), NULL);
+-
+-                    //If all else fails, get the opcode name but only if not extended
+-                    if (tmp == NULL)
+-                    {
+-                        if (static_cast<int> (mir->dalvikInsn.opcode) < static_cast<int> (kMirOpFirst))
+-                        {
+-                            tmp = dexGetOpcodeName(mir->dalvikInsn.opcode);
+-                        }
+-                        else
+-                        {
+-                            ExtendedMIROpcode value = static_cast<ExtendedMIROpcode> (mir->dalvikInsn.opcode);
+-
+-                            switch (value)
+-                            {
+-                                case kMirOpPhi:
+-                                    tmp = "kMirOpPhi";
+-                                    break;
+-                                case kMirOpNullNRangeUpCheck:
+-                                    tmp = "kMirOpNullNRangeUpCheck";
+-                                    break;
+-                                case kMirOpNullNRangeDownCheck:
+-                                    tmp = "kMirOpNullNRangeDownCheck";
+-                                    break;
+-                                case kMirOpLowerBound:
+-                                    tmp = "kMirOpLowerBound";
+-                                    break;
+-                                case kMirOpPunt:
+-                                    tmp = "kMirPunt";
+-                                    break;
+-                                case kMirOpCheckInlinePrediction:
+-                                    {
+-                                        int len = 0;
+-                                        const char *start = "kMirOpCheckInlinePrediction: ";
+-                                        len = 1 + strlen (start) + strlen (mir->meta.callsiteInfo->classDescriptor);
+-                                        char *intern = static_cast<char *> (dvmCompilerNew (len, false));
+-
+-                                        snprintf (intern, len, "%s%s", start, mir->meta.callsiteInfo->classDescriptor);
+-                                        tmp = intern;
+-                                    }
+-                                    break;
+-                                default:
+-                                    tmp = "Unknown Extended Opcode";
+-                                    break;
+-                            }
+-                        }
+-                    }
+-                }
+-
+-                fprintf(file, "    {%04x %s\\l}%s\\\n", mir->offset, tmp, mir->next ? " | " : " ");
++                char buffer[256];
++                dvmCompilerExtendedDisassembler (cUnit, mir, & (mir->dalvikInsn), buffer, sizeof (buffer));
++                fprintf(file, "    {%04x %s\\l}%s\\\n", mir->offset, buffer, mir->next ? " | " : " ");
+             }
+ 
+             //Add information about fallThrough branches
+@@ -986,9 +932,10 @@ static bool dvmCompilerDumpBasicBlockHandler (CompilationUnit *cUnit, BasicBlock
+  * @brief Dump the CFG of every BasicBlock into a DOT graph
+  * @param cUnit the CompilationUnit
+  * @param dirPrefix the directory prefix to be used
+- * @param suffix a suffix string for the file name
++ * @param suffix a suffix string for the file name (default: "")
++ * @param dumpLoopInformation do we dump the loop information (default: false)
+  */
+-void dvmCompilerDumpBasicBlocks (CompilationUnit *cUnit, const char *dirPrefix, const char *suffix)
++void dvmCompilerDumpBasicBlocks (CompilationUnit *cUnit, const char *dirPrefix, const char *suffix, bool dumpLoopInformation)
+ {
+     //Clear visiting flags
+     dvmCompilerDataFlowAnalysisDispatcher(cUnit,
+@@ -1010,6 +957,17 @@ void dvmCompilerDumpBasicBlocks (CompilationUnit *cUnit, const char *dirPrefix,
+                 kAllNodes,
+                 false);
+ 
++#ifdef ARCH_IA32
++        //Do we dump the loop information?
++        if (dumpLoopInformation == true)
++        {
++            if (cUnit->loopInformation != 0)
++            {
++                cUnit->loopInformation->dumpInformationDotFormat (dvmCreateGraphFile);
++            }
++        }
++#endif
++
+         //Print out epilogue
+         fprintf (dvmCreateGraphFile, "}\n");
+ 
+@@ -1629,8 +1587,23 @@ static bool exhaustTrace(CompilationUnit *cUnit, BasicBlock *curBlock)
+         codePtr += width;
+         int flags = dexGetFlagsFromOpcode(insn->dalvikInsn.opcode);
+ 
+-        /* Stop extending the trace after seeing these instructions */
+-        if (flags & (kInstrCanReturn | kInstrCanSwitch | kInstrInvoke)) {
++        /*
++         * Stop extending the trace after seeing these instructions:
++         *  It depends on the style of loop formation we are in:
++         *      - New style: Whether it returns, switches or is the OP_THROW instruction
++         *      - Old style: Whether it returns, switches, calls or is the OP_THROW instruction
++         */
++        bool test = false;
++
++        if (gDvmJit.oldLoopDetection == true)
++        {
++            test = (flags & (kInstrCanReturn | kInstrCanSwitch | kInstrInvoke));
++        }
++        else {
++            test = ( (flags & (kInstrCanReturn | kInstrCanSwitch)) || (insn->dalvikInsn.opcode == OP_THROW));
++        }
++
++        if (test == true) {
+             curBlock->fallThrough = cUnit->exitBlock;
+             dvmCompilerSetBit(cUnit->exitBlock->predecessors, curBlock->id);
+             break;
+@@ -1680,6 +1653,32 @@ static bool exhaustTrace(CompilationUnit *cUnit, BasicBlock *curBlock)
+     return true;
+ }
+ 
++/**
++ * @brief Print out the information about the loop
++ * @param cUnit the CompilationUnit
++ */
++static void printAcceptedLoop (CompilationUnit *cUnit)
++{
++    const Method *method;
++    char *signature;
++
++    //Start with some paranoid handling:
++    if (cUnit == NULL || cUnit->method == NULL || cUnit->method->clazz == NULL)
++        return;
++
++    //Get method and signature
++    method = cUnit->method;
++    signature = dexProtoCopyMethodDescriptor(&method->prototype);
++
++    //Print out the acceptance
++    ALOGD ("Accepted Loop from method %s%s, its signature is %s, offset is %d",
++            method->clazz->descriptor, method->name, signature,
++            cUnit->entryBlock->startOffset);
++
++    //De-allocation
++    free (signature), signature = NULL;
++}
++
+ /* Compile a loop */
+ static bool compileLoop(CompilationUnit *cUnit, unsigned int startOffset,
+                         JitTraceDescription *desc, int numMaxInsts,
+@@ -1694,6 +1693,16 @@ static bool compileLoop(CompilationUnit *cUnit, unsigned int startOffset,
+     CompilerMethodStats *methodStats;
+ #endif
+ 
++    //Calculate code pointer
++    const u2 *codePtr = cUnit->method->insns + curOffset;
++
++    if (gDvmJit.knownNonLoopHeaderCache.find (codePtr) != gDvmJit.knownNonLoopHeaderCache.end ())
++    {
++        /* Retry the original trace with JIT_OPT_NO_LOOP disabled */
++        dvmCompilerArenaReset();
++        return dvmCompileTrace(desc, numMaxInsts, info, bailPtr, optHints | JIT_OPT_NO_LOOP);
++    }
++
+     cUnit->jitMode = kJitLoop;
+ 
+     /* Initialize the block list */
+@@ -1729,9 +1738,9 @@ static bool compileLoop(CompilationUnit *cUnit, unsigned int startOffset,
+ 
+     do {
+         dvmCompilerDataFlowAnalysisDispatcher(cUnit,
+-                                              dvmCompilerClearVisitedFlag,
+-                                              kAllNodes,
+-                                              false /* isIterative */);
++                dvmCompilerClearVisitedFlag,
++                kAllNodes,
++                false /* isIterative */);
+         changed = exhaustTrace(cUnit, curBlock);
+     } while (changed);
+ 
+@@ -1750,14 +1759,11 @@ static bool compileLoop(CompilationUnit *cUnit, unsigned int startOffset,
+     }
+ #endif
+ 
+-    /* Backward chaining block */
+-    bb = dvmCompilerNewBB(kChainingCellBackwardBranch, cUnit->numBlocks++);
+-    dvmInsertGrowableList(&cUnit->blockList, (intptr_t) bb);
+-    cUnit->backChainBlock = bb;
+-
++#ifndef ARCH_IA32
+     /* A special block to host PC reconstruction code */
+     bb = dvmCompilerNewBB(kPCReconstruction, cUnit->numBlocks++);
+     dvmInsertGrowableList(&cUnit->blockList, (intptr_t) bb);
++#endif
+ 
+     /* And one final block that publishes the PC and raises the exception */
+     bb = dvmCompilerNewBB(kExceptionHandling, cUnit->numBlocks++);
+@@ -1769,33 +1775,126 @@ static bool compileLoop(CompilationUnit *cUnit, unsigned int startOffset,
+     /* Verify if all blocks are connected as claimed */
+     /* FIXME - to be disabled in the future */
+     dvmCompilerDataFlowAnalysisDispatcher(cUnit, verifyPredInfo,
+-                                          kAllNodes,
+-                                          false /* isIterative */);
++            kAllNodes,
++            false /* isIterative */);
++
++    //Mark off any non loop header block for future reference
++    dvmCompilerLoopMarkOffNonHeaderBlocks (cUnit);
+ 
+ #ifndef ARCH_IA32
+     /* Try to identify a loop */
+     if (!dvmCompilerBuildLoop(cUnit))
++    {
+         goto bail;
++    }
+ #else
+-    if (dvmCalculateBasicBlockInformation (cUnit) == false)
++    if (dvmCompilerCalculateBasicBlockInformation (cUnit) == false)
++    {
+         goto bail;
++    }
+ #endif
+ 
+     //Set that the CompilationUnit is a loop
+     dvmCompilerLoopOpt(cUnit);
+ 
+-    /*
+-     * Change the backward branch to the backward chaining cell after dataflow
+-     * analsys/optimizations are done.
+-     * Backward branching can fail, if it does, reject the loop
+-     */
+-    if (dvmCompilerInsertBackwardChaining(cUnit) == false)
++    //If anybody wanted to quit, exit now
++    if (cUnit->quitLoopMode == true)
+     {
+-        ALOGD ("WARNING: Loop formation: Insert Backward Chaining Failed");
+         goto bail;
+     }
+ 
+ #if defined(ARCH_IA32)
++    //Now consider nested loops or not
++    //First check if we have the information for it
++    {
++        LoopInformation *loopInfo = cUnit->loopInformation;
++
++        if (loopInfo != 0)
++        {
++            //If it is nested and option says no, bail
++            if (gDvmJit.nestedLoops == false)
++            {
++                if (loopInfo->getNestedNbr () != 0)
++                {
++                    goto bail;
++                }
++
++                //Ok second possibility to reject is if we only want simple loops
++                if (gDvmJit.branchLoops == false)
++                {
++                    //Now check if we have only one backward branch: to only enable "simple" loops
++                    const BitVector *backwards = loopInfo->getBackwardBranches ();
++
++                    if (backwards == 0)
++                    {
++                        goto bail;
++                    }
++
++                    if (dvmCountSetBits (backwards) != 1)
++                    {
++                        goto bail;
++                    }
++
++                    //Finally, get the basic block for the backward branch
++                    int backwardIdx = dvmHighestBitSet (backwards);
++
++                    if (backwardIdx < 0)
++                    {
++                        goto bail;
++                    }
++
++                    BasicBlock *backward = (BasicBlock *) dvmGrowableListGetElement (&cUnit->blockList, backwardIdx);
++
++                    //If nil or no domination loopInformation, bail
++                    if (backward == 0 || backward->dominators == 0)
++                    {
++                        goto bail;
++                    }
++
++                    //Now go through each BB and see if it dominates backward
++                    BitVector *blocks = const_cast<BitVector*> (loopInfo->getBasicBlocks ());
++
++                    BitVectorIterator bvIterator;
++
++                    dvmBitVectorIteratorInit(blocks, &bvIterator);
++                    while (true) {
++                        int blockIdx = dvmBitVectorIteratorNext(&bvIterator);
++                        //If done, bail
++                        if (blockIdx == -1)
++                        {
++                            break;
++                        }
++
++                        BasicBlock *bb = (BasicBlock *) dvmGrowableListGetElement(&cUnit->blockList, blockIdx);
++
++                        if (bb == 0)
++                        {
++                            break;
++                        }
++
++                        if (bb == backward)
++                        {
++                            continue;
++                        }
++
++                        //We bail if it doesn't dominate
++                        if (dvmIsBitSet (backward->dominators, bb->id) == 0)
++                        {
++                            goto bail;
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    //Before lowering, print out the compilation unit
++    if (cUnit->printMe == true)
++    {
++        //Finally dump the compilation unit
++        dvmCompilerDumpCompilationUnit (cUnit);
++    }
++
+     /* Convert MIR to LIR, etc. */
+     dvmCompilerMIR2LIR(cUnit, info);
+ #else
+@@ -1812,18 +1911,24 @@ static bool compileLoop(CompilationUnit *cUnit, unsigned int startOffset,
+     if (cUnit->quitLoopMode) {
+         if (cUnit->printMe || gDvmJit.receivedSIGUSR2) {
+             ALOGD("Loop trace @ offset %04x aborted due to unresolved code info",
+-                 cUnit->entryBlock->startOffset);
++                    cUnit->entryBlock->startOffset);
+         }
+         goto bail;
+     }
+ 
++    //We got to this point, the loop is accepted by the middle end
++    if (cUnit->printMe == true)
++    {
++        printAcceptedLoop (cUnit);
++    }
++
+     /* Convert LIR into machine code. Loop for recoverable retries */
+     do {
+         dvmCompilerAssembleLIR(cUnit, info);
+         cUnit->assemblerRetries++;
+         if (cUnit->printMe && cUnit->assemblerStatus != kSuccess)
+             ALOGD("Assembler abort #%d on %d", cUnit->assemblerRetries,
+-                  cUnit->assemblerStatus);
++                    cUnit->assemblerStatus);
+     } while (cUnit->assemblerStatus == kRetryAll);
+ 
+     /* Loop is too big - bail out */
+@@ -1876,8 +1981,7 @@ static bool compileLoop(CompilationUnit *cUnit, unsigned int startOffset,
+ bail:
+     /* Retry the original trace with JIT_OPT_NO_LOOP disabled */
+     dvmCompilerArenaReset();
+-    return dvmCompileTrace(desc, numMaxInsts, info, bailPtr,
+-                           optHints | JIT_OPT_NO_LOOP);
++    return dvmCompileTrace(desc, numMaxInsts, info, bailPtr, optHints | JIT_OPT_NO_LOOP);
+ }
+ 
+ static bool searchClassTablePrefix(const Method* method) {
+@@ -2065,6 +2169,13 @@ bool dvmCompileTrace(JitTraceDescription *desc, int numMaxInsts,
+         return false;
+     }
+ 
++    //Compile as a loop first: only do this in the new loop detection system
++    if ( (gDvmJit.oldLoopDetection == false) && (optHints & JIT_OPT_NO_LOOP) == 0) {
++        dvmCompilerArenaReset();
++        return compileLoop(&cUnit, startOffset, desc, numMaxInsts,
++                info, bailPtr, optHints);
++    }
++
+     /* Allocate the entry block */
+     curBB = dvmCompilerNewBB(kEntryBlock, numBlocks++);
+     dvmInsertGrowableList(blockList, (intptr_t) curBB);
+@@ -2221,14 +2332,15 @@ bool dvmCompileTrace(JitTraceDescription *desc, int numMaxInsts,
+             cUnit.hasInvoke = true;
+         }
+ 
+-        /* Backward branch seen */
+-        if (isInvoke == false &&
+-            (flags & kInstrCanBranch) != 0 &&
+-            targetOffset < curOffset &&
+-            (optHints & JIT_OPT_NO_LOOP) == 0) {
++        /* Backward branch seen: only care if we are in the old loop system */
++        if (gDvmJit.oldLoopDetection == true &&
++                isInvoke == false &&
++                (flags & kInstrCanBranch) != 0 &&
++                targetOffset < curOffset &&
++                (optHints & JIT_OPT_NO_LOOP) == 0) {
+             dvmCompilerArenaReset();
+             return compileLoop(&cUnit, startOffset, desc, numMaxInsts,
+-                               info, bailPtr, optHints);
++                    info, bailPtr, optHints);
+         }
+ 
+         /* No backward branch in the trace - start searching the next BB */
+@@ -2418,7 +2530,7 @@ bool dvmCompileTrace(JitTraceDescription *desc, int numMaxInsts,
+     dvmCompilerInitializeRegAlloc(&cUnit);  // Needs to happen after SSA naming
+ #else
+     //set that the CompilationUnit is not a loop
+-    dvmCalculateBasicBlockInformation (&cUnit);
++    dvmCompilerCalculateBasicBlockInformation (&cUnit);
+ #endif
+ 
+     if (cUnit.printMe) {
+diff --git a/vm/compiler/InlineTransformation.cpp b/vm/compiler/InlineTransformation.cpp
+index 1feb658..d7aa497 100644
+--- a/vm/compiler/InlineTransformation.cpp
++++ b/vm/compiler/InlineTransformation.cpp
+@@ -41,9 +41,25 @@ static bool inlineGetter(CompilationUnit *cUnit,
+                          bool isPredicted,
+                          bool isRange)
+ {
+-    BasicBlock *moveResultBB = invokeBB->fallThrough;
+-    MIR *moveResultMIR = moveResultBB->firstMIRInsn;
+-    MIR *newGetterMIR = (MIR *)dvmCompilerNew(sizeof(MIR), true);
++    //Suppose the move result is the next MIR
++    MIR *moveResultMIR = invokeMIR->next;
++    //Suppose the move result BB is the same as the invoke
++    BasicBlock *moveResultBB = invokeBB;
++
++    //If the invokeMIR is not the last MIR, the move result should be the next MIR
++    if (moveResultMIR == 0)
++    {
++        moveResultBB = invokeBB->fallThrough;
++
++        //Paranoid, in case we don't have it
++        if (moveResultBB == 0) {
++            return false;
++        }
++
++        //Get the first instruction: testing whether it is a move result is done below
++        moveResultMIR = moveResultBB->firstMIRInsn;
++    }
++
+     DecodedInstruction getterInsn;
+ 
+     /*
+@@ -90,6 +106,7 @@ static bool inlineGetter(CompilationUnit *cUnit,
+     getterInsn.vA = moveResultMIR->dalvikInsn.vA;
+ 
+     /* Now setup the Dalvik instruction with converted src/dst registers */
++    MIR *newGetterMIR = static_cast <MIR *> (dvmCompilerNew(sizeof(MIR), true));
+     newGetterMIR->dalvikInsn = getterInsn;
+ 
+     newGetterMIR->width = dexGetWidthFromOpcode(getterInsn.opcode);
+@@ -124,8 +141,57 @@ static bool inlineGetter(CompilationUnit *cUnit,
+         gDvmJit.invokePolyGetterInlined++;
+ #endif
+     } else {
++#ifndef ARCH_IA32
+         invokeMIR->OptimizationFlags |= MIR_INLINED;
+         moveResultMIR->OptimizationFlags |= MIR_INLINED;
++#else
++        //In the x86 world, we prefer removing the MIR to clean up the Middle-End
++        //This makes it cleaner when traversing, dumping, etc.
++        //It adds nothing to keep it
++
++        //Remember prev/next
++        MIR *prev = invokeMIR->prev;
++        MIR *next = invokeMIR->next;
++
++        bool res = dvmCompilerRemoveMIR (invokeBB, invokeMIR);
++
++        //If we removed the invoke, we try to remove the moveResult
++        if (res == true)
++        {
++            res = dvmCompilerRemoveMIR (moveResultBB, moveResultMIR);
++        }
++
++        if (res == false)
++        {
++            //If it failed, we should insert it back
++            invokeMIR->prev = prev;
++            //Was the invoke the first instruction?
++            if (prev == 0)
++            {
++                invokeBB->firstMIRInsn = invokeMIR;
++            }
++            else
++            {
++                //Otherwise just set next for prev
++                prev->next = invokeMIR;
++            }
++
++            //Set the next back
++            invokeMIR->next = next;
++            //Was the invoke the last instruction?
++            if (next == 0)
++            {
++                invokeBB->lastMIRInsn = invokeMIR;
++            }
++            else
++            {
++                //Otherwise just set prev for next
++                next->prev = invokeMIR;
++            }
++            ALOGD ("Inlining failed in inlineGetter");
++            return false;
++        }
++#endif
+ #if defined(WITH_JIT_TUNING)
+         gDvmJit.invokeMonoGetterInlined++;
+ #endif
+@@ -208,12 +274,22 @@ static bool inlineSetter(CompilationUnit *cUnit,
+         gDvmJit.invokePolySetterInlined++;
+ #endif
+     } else {
++#ifndef ARCH_IA32
+         /*
+          * The invoke becomes no-op so it needs an explicit branch to jump to
+          * the chaining cell.
+          */
+         invokeBB->needFallThroughBranch = true;
+         invokeMIR->OptimizationFlags |= MIR_INLINED;
++#else
++        bool res = dvmCompilerRemoveMIR (invokeBB, invokeMIR);
++
++        if (res == false)
++        {
++            ALOGD ("Inlining failed in inlineSetter");
++            return false;
++        }
++#endif
+ #if defined(WITH_JIT_TUNING)
+         gDvmJit.invokeMonoSetterInlined++;
+ #endif
+@@ -256,6 +332,7 @@ static bool tryInlineSingletonCallsite(CompilationUnit *cUnit,
+     return false;
+ }
+ 
++#ifndef ARCH_IA32
+ static bool inlineEmptyVirtualCallee(CompilationUnit *cUnit,
+                                      const Method *calleeMethod,
+                                      MIR *invokeMIR,
+@@ -297,141 +374,199 @@ static bool tryInlineVirtualCallsite(CompilationUnit *cUnit,
+     }
+     return false;
+ }
++#endif
+ 
+-
+-void dvmCompilerInlineMIR(CompilationUnit *cUnit, JitTranslationInfo *info)
++bool dvmCompilerHandleInlining (CompilationUnit *cUnit, JitTranslationInfo *info, BasicBlock *bb, MIR *mir)
+ {
+-    bool isRange = false;
+-    GrowableListIterator iterator;
++    Opcode opcode = mir->dalvikInsn.opcode;
++    int flags = (int)dexGetFlagsFromOpcode(opcode);
++
++    /* No invoke - continue */
++    if ((flags & kInstrInvoke) == 0)
++        return false;
++
++    /* Disable inlining when doing method tracing */
++    if (gDvmJit.methodTraceSupport)
++        return false;
+ 
+-    dvmGrowableListIteratorInit(&cUnit->blockList, &iterator);
+     /*
+-     * Analyze the basic block containing an invoke to see if it can be inlined
++     * If the invoke itself is selected for single stepping, don't bother
++     * to inline it.
+      */
+-    while (true) {
+-        BasicBlock *bb = (BasicBlock *) dvmGrowableListIteratorNext(&iterator);
+-        if (bb == NULL) break;
+-        if (bb->blockType != kDalvikByteCode)
+-            continue;
+-        MIR *lastMIRInsn = bb->lastMIRInsn;
+-        Opcode opcode = lastMIRInsn->dalvikInsn.opcode;
+-        int flags = (int)dexGetFlagsFromOpcode(opcode);
++    if (SINGLE_STEP_OP(opcode))
++        return false;
+ 
+-        /* No invoke - continue */
+-        if ((flags & kInstrInvoke) == 0)
+-            continue;
++    const Method *calleeMethod;
++    bool isRange = false;
+ 
+-        /* Disable inlining when doing method tracing */
+-        if (gDvmJit.methodTraceSupport)
+-            continue;
++    //Get a local version
++    DecodedInstruction &insn = mir->dalvikInsn;
+ 
+-        /*
+-         * If the invoke itself is selected for single stepping, don't bother
+-         * to inline it.
+-         */
+-        if (SINGLE_STEP_OP(opcode))
+-            continue;
++    //Paranoid
++    assert (cUnit != 0 && cUnit->method != 0 && cUnit->method->clazz != 0);
+ 
+-        const Method *calleeMethod;
++    if (cUnit->jitMode == kJitLoop)
++    {
++        //In loop mode, we go via the DvmDex system
++        // This is because the meta system only works for one call per trace but we might have more
++        // However it might not be filled entirely so we might not be able to resolve it
++        // Whereas in the trace system, the frontend does the job to at least fill that
+ 
++        //Get DvmDex and method index
++        DvmDex *pDvmDex = cUnit->method->clazz->pDvmDex;
++
++        //Paranoid
++        assert (pDvmDex != 0);
++
++        //Method index is in vB
++        u4 methodIdx = insn.vB;
++
++        switch (opcode) {
++            case OP_INVOKE_SUPER:
++            case OP_INVOKE_DIRECT:
++            case OP_INVOKE_STATIC:
++            case OP_INVOKE_SUPER_QUICK:
++                calleeMethod = dvmDexGetResolvedMethod (pDvmDex, methodIdx);
++                break;
++            case OP_INVOKE_SUPER_RANGE:
++            case OP_INVOKE_DIRECT_RANGE:
++            case OP_INVOKE_STATIC_RANGE:
++            case OP_INVOKE_SUPER_QUICK_RANGE:
++                isRange = true;
++                calleeMethod = dvmDexGetResolvedMethod (pDvmDex, methodIdx);
++                break;
++            default:
++                calleeMethod = NULL;
++                break;
++        }
++    }
++    else
++    {
++        //In trace mode, we go via the meta callsite information
+         switch (opcode) {
+             case OP_INVOKE_SUPER:
+             case OP_INVOKE_DIRECT:
+             case OP_INVOKE_STATIC:
+             case OP_INVOKE_SUPER_QUICK:
+-                calleeMethod = lastMIRInsn->meta.callsiteInfo->method;
++                calleeMethod = mir->meta.callsiteInfo->method;
+                 break;
+             case OP_INVOKE_SUPER_RANGE:
+             case OP_INVOKE_DIRECT_RANGE:
+             case OP_INVOKE_STATIC_RANGE:
+             case OP_INVOKE_SUPER_QUICK_RANGE:
+                 isRange = true;
+-                calleeMethod = lastMIRInsn->meta.callsiteInfo->method;
++                calleeMethod = mir->meta.callsiteInfo->method;
+                 break;
+             default:
+                 calleeMethod = NULL;
+                 break;
+         }
++    }
++
++    if (calleeMethod) {
++        bool inlined = tryInlineSingletonCallsite(cUnit, calleeMethod, mir, bb, isRange);
+ 
+-        if (calleeMethod) {
+-            bool inlined = tryInlineSingletonCallsite(cUnit, calleeMethod,
+-                                                      lastMIRInsn, bb, isRange);
+ #ifdef ARCH_IA32
+             if (inlined)
+                cUnit->singletonInlined = true;
+ #endif
+-            if (!inlined &&
+-                !(gDvmJit.disableOpt & (1 << kMethodJit)) &&
+-                !dvmIsNativeMethod(calleeMethod)) {
+-                CompilerMethodStats *methodStats =
+-                    dvmCompilerAnalyzeMethodBody(calleeMethod, true);
+-                if ((methodStats->attributes & METHOD_IS_LEAF) &&
+-                    !(methodStats->attributes & METHOD_CANNOT_COMPILE)) {
+-                    /* Callee has been previously compiled */
++
++        if (!inlined && !(gDvmJit.disableOpt & (1 << kMethodJit)) && !dvmIsNativeMethod(calleeMethod) && info != 0) {
++
++            CompilerMethodStats *methodStats = dvmCompilerAnalyzeMethodBody(calleeMethod, true);
++
++            if ((methodStats->attributes & METHOD_IS_LEAF) && !(methodStats->attributes & METHOD_CANNOT_COMPILE)) {
++                /* Callee has been previously compiled */
++                if (dvmJitGetMethodAddr(calleeMethod->insns)) {
++                    mir->OptimizationFlags |= MIR_INVOKE_METHOD_JIT;
++                } else {
++                    /* Compile the callee first */
++                    dvmCompileMethod(calleeMethod, info);
++
+                     if (dvmJitGetMethodAddr(calleeMethod->insns)) {
+-                        lastMIRInsn->OptimizationFlags |= MIR_INVOKE_METHOD_JIT;
++                        mir->OptimizationFlags |= MIR_INVOKE_METHOD_JIT;
+                     } else {
+-                        /* Compile the callee first */
+-                        dvmCompileMethod(calleeMethod, info);
+-                        if (dvmJitGetMethodAddr(calleeMethod->insns)) {
+-                            lastMIRInsn->OptimizationFlags |=
+-                                MIR_INVOKE_METHOD_JIT;
+-                        } else {
+-                            methodStats->attributes |= METHOD_CANNOT_COMPILE;
+-                        }
++                        methodStats->attributes |= METHOD_CANNOT_COMPILE;
+                     }
+                 }
+             }
+-            return;
+         }
+ 
+-        switch (opcode) {
+-            case OP_INVOKE_VIRTUAL:
+-            case OP_INVOKE_VIRTUAL_QUICK:
+-            case OP_INVOKE_INTERFACE:
+-                isRange = false;
+-                calleeMethod = lastMIRInsn->meta.callsiteInfo->method;
+-                break;
+-            case OP_INVOKE_VIRTUAL_RANGE:
+-            case OP_INVOKE_VIRTUAL_QUICK_RANGE:
+-            case OP_INVOKE_INTERFACE_RANGE:
+-                isRange = true;
+-                calleeMethod = lastMIRInsn->meta.callsiteInfo->method;
+-                break;
+-            default:
+-                break;
+-        }
++        //Return whether it was inlined or not
++        return inlined;
++    }
++
++    switch (opcode) {
++        case OP_INVOKE_VIRTUAL:
++        case OP_INVOKE_VIRTUAL_QUICK:
++        case OP_INVOKE_INTERFACE:
++            isRange = false;
++            calleeMethod = mir->meta.callsiteInfo->method;
++            break;
++        case OP_INVOKE_VIRTUAL_RANGE:
++        case OP_INVOKE_VIRTUAL_QUICK_RANGE:
++        case OP_INVOKE_INTERFACE_RANGE:
++            isRange = true;
++            calleeMethod = mir->meta.callsiteInfo->method;
++            break;
++        default:
++            break;
++    }
+ 
+-        // TODO Temporarily disable this code path until x86 JIT adds support
+-        // for inlining virtual invokes
++    // TODO Temporarily disable this code path until x86 JIT adds support
++    // for inlining virtual invokes
+ #ifndef ARCH_IA32
+-        if (calleeMethod) {
+-            bool inlined = tryInlineVirtualCallsite(cUnit, calleeMethod,
+-                                                    lastMIRInsn, bb, isRange);
+-            if (!inlined &&
+-                !(gDvmJit.disableOpt & (1 << kMethodJit)) &&
+-                !dvmIsNativeMethod(calleeMethod)) {
+-                CompilerMethodStats *methodStats =
+-                    dvmCompilerAnalyzeMethodBody(calleeMethod, true);
+-                if ((methodStats->attributes & METHOD_IS_LEAF) &&
+-                    !(methodStats->attributes & METHOD_CANNOT_COMPILE)) {
+-                    /* Callee has been previously compiled */
++    if (calleeMethod) {
++        bool inlined = tryInlineVirtualCallsite(cUnit, calleeMethod,
++                lastMIRInsn, bb, isRange);
++        if (!inlined && !(gDvmJit.disableOpt & (1 << kMethodJit)) && !dvmIsNativeMethod(calleeMethod)) {
++
++            CompilerMethodStats *methodStats = dvmCompilerAnalyzeMethodBody(calleeMethod, true);
++
++            if ((methodStats->attributes & METHOD_IS_LEAF) && !(methodStats->attributes & METHOD_CANNOT_COMPILE)) {
++                /* Callee has been previously compiled */
++                if (dvmJitGetMethodAddr(calleeMethod->insns)) {
++                    lastMIRInsn->OptimizationFlags |= MIR_INVOKE_METHOD_JIT;
++                } else {
++                    /* Compile the callee first */
++                    dvmCompileMethod(calleeMethod, info);
+                     if (dvmJitGetMethodAddr(calleeMethod->insns)) {
+-                        lastMIRInsn->OptimizationFlags |= MIR_INVOKE_METHOD_JIT;
++                        mir->OptimizationFlags |= MIR_INVOKE_METHOD_JIT;
+                     } else {
+-                        /* Compile the callee first */
+-                        dvmCompileMethod(calleeMethod, info);
+-                        if (dvmJitGetMethodAddr(calleeMethod->insns)) {
+-                            lastMIRInsn->OptimizationFlags |=
+-                                MIR_INVOKE_METHOD_JIT;
+-                        } else {
+-                            methodStats->attributes |= METHOD_CANNOT_COMPILE;
+-                        }
++                        methodStats->attributes |= METHOD_CANNOT_COMPILE;
+                     }
+                 }
+             }
+-            return;
+         }
++        return inlined;
++    }
+ #endif
++
++    //We did not inline anything
++    return false;
++}
++
++void dvmCompilerInlineMIR(CompilationUnit *cUnit, JitTranslationInfo *info)
++{
++    GrowableListIterator iterator;
++    dvmGrowableListIteratorInit(&cUnit->blockList, &iterator);
++
++    /*
++     * Analyze the basic block containing an invoke to see if it can be inlined
++     */
++    while (true) {
++        BasicBlock *bb = (BasicBlock *) dvmGrowableListIteratorNext(&iterator);
++        if (bb == NULL) break;
++        if (bb->blockType != kDalvikByteCode)
++            continue;
++
++        MIR *lastMIRInsn = bb->lastMIRInsn;
++
++        //If we have a last instruction
++        if (lastMIRInsn != 0)
++        {
++            //Try to inline the last instruction
++            dvmCompilerHandleInlining (cUnit, info, bb, lastMIRInsn);
++        }
+     }
+ }
+diff --git a/vm/compiler/IntermediateRep.cpp b/vm/compiler/IntermediateRep.cpp
+index db68c3c..609433c 100644
+--- a/vm/compiler/IntermediateRep.cpp
++++ b/vm/compiler/IntermediateRep.cpp
+@@ -122,3 +122,135 @@ void dvmCompilerInsertLIRAfter(LIR *currentLIR, LIR *newLIR)
+     currentLIR->next = newLIR;
+     newLIR->next->prev = newLIR;
+ }
++
++/*
++ * @brief Remove an MIR from a BasicBlock
++ * @param bb the BasicBlock
++ * @param mir the MIR
++ * @return whether it succeeded
++ */
++bool dvmCompilerRemoveMIR (BasicBlock *bb, const MIR *mir)
++{
++    //Paranoid
++    if (bb == 0 || mir == 0)
++    {
++        return false;
++    }
++
++    //Find the MIR: this makes sure we are in the right BB
++    MIR *current = 0;
++
++    for (current = bb->firstMIRInsn; current != 0; current = current->next)
++    {
++        //If found: break
++        if (current == mir)
++        {
++            break;
++        }
++    }
++
++    //Did we find it?
++    if (current != 0)
++    {
++        MIR *prev = current->prev;
++        MIR *next = current->next;
++
++        //Just update the links of prev and next and current is almost gone
++        if (prev != 0)
++        {
++            prev->next = next;
++        }
++
++        if (next != 0)
++        {
++            next->prev = prev;
++        }
++
++        //Exceptions are if first or last mirs are invoke
++        if (bb->firstMIRInsn == current)
++        {
++            bb->firstMIRInsn = next;
++        }
++
++        if (bb->lastMIRInsn == current)
++        {
++            bb->lastMIRInsn = prev;
++        }
++
++        //Found it and removed it
++        return true;
++    }
++
++    //We did not find it
++    return false;
++}
++
++bool dvmCompilerInsertBasicBlockBetween (BasicBlock *newBlock, BasicBlock *parent, BasicBlock *child)
++{
++    //Paranoid
++    if (parent == 0 || child == 0 || (parent->taken != child && parent->fallThrough != child))
++    {
++        return false;
++    }
++
++    //Find the link
++    if (parent->taken == child)
++    {
++        parent->taken = newBlock;
++    }
++    else
++    {
++        if (parent->fallThrough == child)
++        {
++            parent->fallThrough = newBlock;
++        }
++    }
++
++    //Link to child
++    newBlock->fallThrough = child;
++    newBlock->taken = 0;
++
++    //Success
++    return true;
++}
++
++BasicBlock *dvmCompilerCopyBasicBlock (CompilationUnit *cUnit, const BasicBlock *old, bool addIt)
++{
++    BasicBlock *res = dvmCompilerNewBB (old->blockType, cUnit->numBlocks++);
++
++    //We don't do a superficial copy here because it would lead to a lot of things
++    //To clean up. Let us do it by hand instead
++
++    //Copy in taken and fallthrough
++    res->fallThrough = old->fallThrough;
++    res->taken = old->taken;
++
++    //Copy offset, method
++    res->startOffset = old->startOffset;
++    res->containingMethod = old->containingMethod;
++
++    //Now copy instructions
++    for (MIR *mir = old->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        MIR *copy = static_cast<MIR *> (dvmCompilerNew (sizeof (*copy), true));
++
++        //Superficial copy because it's easier in this case
++        *copy = *mir;
++
++        //Now remove prev, next, and ssaRep
++        copy->next = 0;
++        copy->prev = 0;
++        copy->ssaRep = 0;
++
++        //Append it
++        dvmCompilerAppendMIR (res, copy);
++    }
++
++    //Do we insert it to the cUnit list?
++    if (addIt == true)
++    {
++        dvmInsertGrowableList (&cUnit->blockList, (intptr_t) res);
++    }
++
++    return res;
++}
+diff --git a/vm/compiler/Loop.cpp b/vm/compiler/Loop.cpp
+index 63eb196..7869f82 100644
+--- a/vm/compiler/Loop.cpp
++++ b/vm/compiler/Loop.cpp
+@@ -96,6 +96,7 @@ static void dumpHoistedChecks(CompilationUnit *cUnit)
+ 
+ #endif
+ 
++#ifndef ARCH_IA32
+ /**
+  * Find the predecessor block of a given BasicBlock: the single predecessor whichever if only one predecessor,
+  *      the entry block if there are two predecessors and the entry block is a predecessor, 0 otherwise
+@@ -537,6 +538,7 @@ static void genHoistedChecks(CompilationUnit *cUnit)
+         }
+     }
+ }
++#endif
+ 
+ void resetBlockEdges(BasicBlock *bb)
+ {
+@@ -552,17 +554,418 @@ static bool clearPredecessorVector(struct CompilationUnit *cUnit,
+     return false;
+ }
+ 
+-bool dvmCompilerFilterLoopBlocks(CompilationUnit *cUnit)
++/**
++ * @brief Handle fixable opcodes: a fixable opcode means that the function resolved the issue and it can be included into a loop formation
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock
++ * @param mir the MIR instruction
++ * @return whether or not the function fixed the issue
++ */
++static bool handleFixableOpcodes (CompilationUnit *cUnit, BasicBlock *bb, MIR *mir)
+ {
+-    BasicBlock *firstBB = cUnit->entryBlock->fallThrough;
++    switch (mir->dalvikInsn.opcode)
++    {
++        case OP_INVOKE_VIRTUAL:
++        case OP_INVOKE_VIRTUAL_RANGE:
++        case OP_INVOKE_INTERFACE:
++        case OP_INVOKE_INTERFACE_RANGE:
++        case OP_INVOKE_OBJECT_INIT_RANGE:
++        case OP_INVOKE_VIRTUAL_QUICK:
++        case OP_INVOKE_VIRTUAL_QUICK_RANGE:
++            //No support for virtual calls for the moment
++            return false;
++        case OP_INVOKE_SUPER_RANGE:
++        case OP_INVOKE_DIRECT_RANGE:
++        case OP_INVOKE_STATIC_RANGE:
++        case OP_INVOKE_SUPER_QUICK_RANGE:
++        case OP_INVOKE_SUPER:
++        case OP_INVOKE_DIRECT:
++        case OP_INVOKE_STATIC:
++        case OP_INVOKE_SUPER_QUICK:
++            //Return whether the inlining succeeded
++            return dvmCompilerHandleInlining (cUnit, 0, bb, mir);
++        default:
++            //By default, we cannot handle it
++            return false;
++    }
+ 
+-    int numPred = dvmCountSetBits(firstBB->predecessors);
+-    /*
+-     * A loop body should have at least two incoming edges.
+-     */
+-    if (numPred < 2) return false;
++    //Paranoid: the default case should handle this return anyway
++    return false;
++}
+ 
+-    GrowableList *blockList = &cUnit->blockList;
++/**
++ * @brief Check if a BasicBlock has a restricted instruction for a loop
++ *        Certain opcodes cannot be included in a loop formation (in the nonFixableOpcodes array)
++ *        Certain opcodes can be "fixed" if the function handleFixableOpcode returns true and thus won't be cause to reject the loop
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock
++ * @return whether or not we accept the BasicBlock in regards to the instructions
++ */
++static bool checkBBInstructionsForCFGLoop (CompilationUnit *cUnit, BasicBlock *bb)
++{
++    //Non fixable opcodes: tested against the bb's MIR instructions
++    //If present, there is nothing we can do about it
++    static unsigned int nonFixableOpcodes[] = {
++            OP_RETURN_VOID,
++            OP_RETURN,
++            OP_RETURN_WIDE,
++            OP_RETURN_OBJECT,
++            OP_MONITOR_ENTER,
++            OP_MONITOR_EXIT,
++            OP_NEW_INSTANCE,
++            OP_NEW_ARRAY,
++            OP_THROW,
++            OP_EXECUTE_INLINE,
++            OP_EXECUTE_INLINE_RANGE,
++            OP_RETURN_VOID_BARRIER,
++            OP_BREAKPOINT,
++            OP_THROW_VERIFICATION_ERROR
++    };
++
++    //Fixable opcodes: tested against the bb's MIR instructions
++    //If present, we call the fixer function, if it fixes it, we move on
++    static unsigned int fixableOpcodes[] = {
++            OP_INVOKE_VIRTUAL,
++            OP_INVOKE_SUPER,
++            OP_INVOKE_DIRECT,
++            OP_INVOKE_STATIC,
++            OP_INVOKE_INTERFACE,
++            OP_INVOKE_VIRTUAL_RANGE,
++            OP_INVOKE_SUPER_RANGE,
++            OP_INVOKE_DIRECT_RANGE,
++            OP_INVOKE_STATIC_RANGE,
++            OP_INVOKE_INTERFACE_RANGE,
++            OP_INVOKE_OBJECT_INIT_RANGE,
++            OP_INVOKE_SUPER_QUICK,
++            OP_INVOKE_VIRTUAL_QUICK,
++            OP_INVOKE_SUPER_QUICK_RANGE,
++            OP_INVOKE_VIRTUAL_QUICK_RANGE
++    };
++
++    //Go through each instruction
++    unsigned int nbr = sizeof (nonFixableOpcodes) / sizeof (nonFixableOpcodes[0]);
++    for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        //Go through each non supported instructions
++        for (unsigned int i = 0; i < nbr; i++)
++        {
++            //If we don't support it, just quit
++            if (mir->dalvikInsn.opcode == nonFixableOpcodes[i])
++                return false;
++        }
++    }
++
++    //Now handle the ones we can perhaps fix
++    nbr = sizeof (fixableOpcodes) / sizeof (fixableOpcodes[0]);
++    for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        //Go through each non supported instructions
++        for (unsigned int i = 0; i < nbr; i++)
++        {
++            //If we don't support it, just quit
++            if (mir->dalvikInsn.opcode == fixableOpcodes[i])
++            {
++                //If we can't fix it, we bail
++                if (handleFixableOpcodes (cUnit, bb, mir) == false)
++                {
++                    return false;
++                }
++            }
++        }
++    }
++
++    //If we got here we are good to go
++    return true;
++}
++
++/**
++ * @brief Accept a CFG as a loop (Helper function)
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock
++ * @return whether or not the trace is a loop but acceptCFGLoops must still check min and max
++ */
++static bool acceptCFGLoopsHelper (CompilationUnit *cUnit, BasicBlock *bb)
++{
++    //Paranoid check
++    if (bb == 0)
++    {
++        return true;
++    }
++
++    //Visited check
++    if (bb->visited == true)
++    {
++        return true;
++    }
++
++    //Color it now
++    bb->visited = true;
++
++    //If hidden, we stop
++    if (bb->hidden == true)
++    {
++        return true;
++    }
++
++    //Check instructions: add the restrictive, we will try to inline later
++    bool res = checkBBInstructionsForCFGLoop (cUnit, bb);
++
++    //If it says no, we say no
++    if (res == false)
++    {
++        return false;
++    }
++
++    //Now mark it as a BasicBlock of the loop
++    dvmCompilerSetBit(cUnit->tempBlockV, bb->id);
++
++    //Now recurse
++    res = acceptCFGLoopsHelper (cUnit, bb->taken) && acceptCFGLoopsHelper (cUnit, bb->fallThrough);
++
++    //Return it, whatever it is
++    return res;
++}
++
++/**
++ * @brief Go from the BasicBlock cur to its predecessors, up until first
++ * @param cUnit the CompilationUnit
++ * @param cur the current BasicBlock
++ * @param first the start of the loop
++ */
++static void climbTheLoopHelper (CompilationUnit *cUnit, BasicBlock *cur, const BasicBlock *first)
++{
++    BitVectorIterator bvIterator;
++
++    //Paranoid
++    assert (cur != 0 && cur->predecessors != 0);
++
++    //Have we visited it yet: normally redundant but paranoid
++    if (cur->visited == true)
++    {
++        return;
++    }
++    cur->visited = true;
++
++    //Unhide the current block
++    cur->hidden = false;
++
++    //Are we done?
++    if (cur == first)
++    {
++        return;
++    }
++
++    //Get predecessors
++    dvmBitVectorIteratorInit(cur->predecessors, &bvIterator);
++
++    while (true) {
++        //Get the next iterator
++        int blockIdx = dvmBitVectorIteratorNext(&bvIterator);
++
++        //If it is finished, exit
++        if (blockIdx == -1)
++        {
++            break;
++        }
++
++        BasicBlock *predBB = (BasicBlock*) (dvmGrowableListGetElement(&cUnit->blockList, blockIdx));
++
++        //Paranoid
++        if (predBB == 0)
++        {
++            break;
++        }
++
++        //We found a trail, enable it from first
++        if (predBB->taken == cur)
++        {
++            predBB->taken->hidden = false;
++        }
++        else
++        {
++            //Then it must be fallThrough
++            assert (predBB->fallThrough == cur);
++
++            predBB->fallThrough->hidden = false;
++        }
++
++        //Continue up
++        climbTheLoopHelper (cUnit, predBB, first);
++    }
++}
++
++/*
++ * @brief Go from the BasicBlock cur downwards to bottom but bail at notLoop
++ * @param cUnit the CompilationUnit
++ * @param cur the current BasicBlock
++ * @param bottom the end of the loop
++ * @param notLoop the exit of the loop
++ */
++static void descendTheLoopHelper (CompilationUnit *cUnit, BasicBlock *cur, BasicBlock *bottom, BasicBlock *notLoop)
++{
++    //If nil, or notLoop
++    if (cur == 0 || cur == notLoop)
++    {
++        return;
++    }
++
++    //Have we visited it yet: normally redundant but paranoid
++    if (cur->visited == true)
++    {
++        return;
++    }
++    cur->visited = true;
++
++    //Unhide the current block
++    cur->hidden = false;
++
++    //Are we done?
++    if (cur == bottom)
++    {
++        return;
++    }
++
++    //Now call children
++    descendTheLoopHelper (cUnit, cur->taken, bottom, notLoop);
++    descendTheLoopHelper (cUnit, cur->fallThrough, bottom, notLoop);
++}
++
++/**
++ * @brief Walk the loop from its predecessors that form the loop
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock that is the start of the loop
++ */
++static bool walkTheLoop (CompilationUnit *cUnit, BasicBlock *bb)
++{
++    //Get first BasicBlock of the loop
++    BasicBlock *first = cUnit->entryBlock->fallThrough;
++
++    //Is it a backward branch
++    if (bb->bottomLoop == true)
++    {
++        climbTheLoopHelper (cUnit, bb, first);
++
++        //Now what can happen is that we have inter-twined loops,
++        //So actually now hide again any child of bb that is not the first
++        if (bb->taken != 0 && bb->taken != first)
++        {
++            bb->taken->hidden = true;
++        }
++        if (bb->fallThrough != 0 && bb->fallThrough != first)
++        {
++            bb->fallThrough->hidden = true;
++        }
++    }
++    else
++    {
++        //Or is it a forward loop
++        if (bb->topLoop == true)
++        {
++            //A BB could be both, but we reject the double case if it is a bottomLoop
++            //To the first BB
++            if (bb->bottomLoop == true &&
++                    (bb->taken == first || bb->fallThrough == first))
++            {
++                return false;
++            }
++
++            //Find the notLoop
++            BasicBlock *notLoop = bb->taken;
++
++            if (notLoop == first)
++            {
++                notLoop = bb->fallThrough;
++            }
++
++            descendTheLoopHelper (cUnit, first, bb, notLoop);
++        }
++    }
++
++    return false;
++}
++
++/**
++ * @brief Clear visited and hide dispatched function
++ * @param cUnit the CompilationUnit
++ * @param bb the current BasicBlock
++ * @return returns true to signal we changed the BasicBlock
++ */
++static bool clearVisitedAndHide (CompilationUnit *cUnit, BasicBlock *bb)
++{
++    bb->visited = false;
++    bb->hidden = true;
++    return true;
++}
++
++/**
++ * @brief Is the loop bottom formed?
++ * @param cUnit the CompilationUnit
++ * @param first the first BasicBlock of the trace
++ * @return whether or not the loop is bottom formed
++ */
++static bool isBottomFormed (CompilationUnit *cUnit, BasicBlock *first)
++{
++    //We still have work to do if it isn't topFormed
++    BitVectorIterator bvIterator;
++
++    //Paranoid
++    assert (first->predecessors != 0);
++
++    //Get predecessors
++    dvmBitVectorIteratorInit(first->predecessors, &bvIterator);
++
++    while (true) {
++        //Get the next iterator
++        int blockIdx = dvmBitVectorIteratorNext(&bvIterator);
++
++        //If it is finished, exit
++        if (blockIdx == -1)
++        {
++            break;
++        }
++
++        BasicBlock *predBB = (BasicBlock*) (dvmGrowableListGetElement(&cUnit->blockList, blockIdx));
++
++        if (predBB == 0)
++        {
++            continue;
++        }
++
++        //If predBB is first, we can skip it
++        if (first == predBB)
++        {
++            continue;
++        }
++
++        //Is the predBB kDalvikByteCode, one child must be towards first
++        if (predBB->blockType == kDalvikByteCode)
++        {
++            if (predBB->taken == first)
++            {
++                if (predBB->fallThrough == 0 || predBB->fallThrough->hidden == false)
++                {
++                    return false;
++                }
++            }
++            else
++            {
++                if (predBB->fallThrough == first)
++                {
++                    if (predBB->taken == 0 || predBB->taken->hidden == false)
++                    {
++                        return false;
++                    }
++                }
++            }
++        }
++    }
++
++    return true;
++}
++
++bool acceptOldLoops (CompilationUnit *cUnit)
++{
++    BasicBlock *firstBB = cUnit->entryBlock->fallThrough;
+ 
+     /* Record blocks included in the loop */
+     dvmClearAllBits(cUnit->tempBlockV);
+@@ -581,16 +984,14 @@ bool dvmCompilerFilterLoopBlocks(CompilationUnit *cUnit)
+         /* Loop formed */
+         if (bodyBB->taken == firstBB) {
+             /* Check if the fallThrough edge will cause a nested loop */
+-            if (bodyBB->fallThrough &&
+-                dvmIsBitSet(cUnit->tempBlockV, bodyBB->fallThrough->id)) {
++            if (bodyBB->fallThrough && dvmIsBitSet(cUnit->tempBlockV, bodyBB->fallThrough->id)) {
+                 return false;
+             }
+             /* Single loop formed */
+             break;
+         } else if (bodyBB->fallThrough == firstBB) {
+             /* Check if the taken edge will cause a nested loop */
+-            if (bodyBB->taken &&
+-                dvmIsBitSet(cUnit->tempBlockV, bodyBB->taken->id)) {
++            if (bodyBB->taken && dvmIsBitSet(cUnit->tempBlockV, bodyBB->taken->id)) {
+                 return false;
+             }
+             /* Single loop formed */
+@@ -598,12 +999,11 @@ bool dvmCompilerFilterLoopBlocks(CompilationUnit *cUnit)
+         }
+ 
+         /* Inner loops formed first - quit */
+-        if (bodyBB->fallThrough &&
+-            dvmIsBitSet(cUnit->tempBlockV, bodyBB->fallThrough->id)) {
++        if (bodyBB->fallThrough && dvmIsBitSet(cUnit->tempBlockV, bodyBB->fallThrough->id)) {
+             return false;
+         }
+-        if (bodyBB->taken &&
+-            dvmIsBitSet(cUnit->tempBlockV, bodyBB->taken->id)) {
++
++        if (bodyBB->taken && dvmIsBitSet(cUnit->tempBlockV, bodyBB->taken->id)) {
+             return false;
+         }
+ 
+@@ -636,8 +1036,124 @@ bool dvmCompilerFilterLoopBlocks(CompilationUnit *cUnit)
+         return false;
+     }
+ 
++    //Loop accepted
++    return true;
++}
++
++/**
++ * @brief Accept a CFG as a loop (Helper function
++ * @param cUnit the CompilationUnit
++ * @return whether or not the trace is a loop
++ */
++static bool acceptCFGLoops (CompilationUnit *cUnit)
++{
++    BasicBlock *first = cUnit->entryBlock->fallThrough;
++
++    //Clear visiting flags
++    dvmCompilerDataFlowAnalysisDispatcher(cUnit, clearVisitedAndHide, kAllNodes, false /* isIterative */);
++
++    //We must go through the list by hand because the dispatcher looks at hidden and we set it to true
++    GrowableListIterator iterator;
++    dvmGrowableListIteratorInit(&cUnit->blockList, &iterator);
++    while (true) {
++        BasicBlock *bb = (BasicBlock *) dvmGrowableListIteratorNext(&iterator);
++
++        //Paranoid
++        if (bb == NULL)
++        {
++            break;
++        }
++
++        //Ok, either it is the first, or it goes towards the first
++        if (bb != first && bb->taken != first && bb->fallThrough != first)
++        {
++            continue;
++        }
++
++        //Call back to walk the loop: we only care about the outer loop
++        walkTheLoop (cUnit, bb);
++    }
++
++    //Unhide the entry
++    cUnit->entryBlock->hidden = false;
++
++    //We have a loop if first->taken or first->fallThrough are not hidden and we aren't either
++    bool res = first->hidden;
++
++    if (res == true)
++    {
++        return false;
++    }
++
++    //Otherwise, look at the children
++    res = (first->taken != 0 && first->taken->hidden == false) ||
++          (first->fallThrough != 0 && first->fallThrough->hidden == false);
++
++    if (res == false)
++    {
++        return false;
++    }
++
++    //Clear bits
++    dvmClearAllBits (cUnit->tempBlockV);
++
++    //Reset flags
++    dvmCompilerDataFlowAnalysisDispatcher(cUnit, dvmCompilerClearVisitedFlag, kAllNodes, false);
++
++    //Call the helper
++    bool found = acceptCFGLoopsHelper (cUnit, cUnit->entryBlock);
++
++    //Ok, if the acceptance returned false, we are done
++    if (found == false)
++    {
++        return false;
++    }
++
++    //Final step check if it is top formed or bottom formed
++    bool topFormed = (first->taken != 0 && first->taken->hidden == true) ||
++                      (first->fallThrough != 0 && first->fallThrough->hidden == true);
++
++    if (topFormed == false)
++    {
++        //If it isn't top formed, it must be bottom formed
++        bool res = isBottomFormed (cUnit, first);
++        return res;
++    }
++
++    return true;
++}
++
++bool dvmCompilerFilterLoopBlocks(CompilationUnit *cUnit)
++{
++    BasicBlock *firstBB = cUnit->entryBlock->fallThrough;
++
++    int numPred = dvmCountSetBits(firstBB->predecessors);
++    /*
++     * A loop body should have at least two incoming edges.
++     */
++    if (numPred < 2) return false;
++
++    //Let us see if we can accept the loop
++    //We have two loop acceptance systems: the new system and the old one, which one do we want?
++    bool acceptIt = false;
++
++    if (gDvmJit.oldLoopDetection == false)
++    {
++        acceptIt = acceptCFGLoops (cUnit);
++    }
++    else
++    {
++        acceptIt = acceptOldLoops (cUnit);
++    }
++
++    //If the acceptance bailed on us, we bail as well
++    if (acceptIt == false)
++    {
++        return false;
++    }
+ 
+     /* Now mark blocks not included in the loop as hidden */
++    GrowableList *blockList = &cUnit->blockList;
+     GrowableListIterator iterator;
+     dvmGrowableListIteratorInit(blockList, &iterator);
+     while (true) {
+@@ -691,6 +1207,7 @@ bool dvmCompilerFilterLoopBlocks(CompilationUnit *cUnit)
+             assert(bb->successorBlockList.blockListType == kNotUsed);
+         }
+     }
++
+     return true;
+ }
+ 
+@@ -702,46 +1219,12 @@ bool dvmCompilerFilterLoopBlocks(CompilationUnit *cUnit)
+ bool dvmCompilerLoopOpt(CompilationUnit *cUnit)
+ {
+     //Create the loop analysis
+-    LoopAnalysis *loopAnalysis =
+-        (LoopAnalysis *)dvmCompilerNew(sizeof(LoopAnalysis), true);
+-    cUnit->loopAnalysis = loopAnalysis;
+ 
+     //Call the loop optimizer driver
+     dvmCompilerLoopOptimizationDriver (cUnit);
+ 
+     return true;
+ }
+-
+-//Handlers for the static functions here
+-bool dvmCompilerSimpleCountedLoop (CompilationUnit *cUnit)
+-{
+-    return isSimpleCountedLoop (cUnit);
+-}
+-
+-bool dvmCompilerIVArrayAccess (CompilationUnit *cUnit)
+-{
+-    return doLoopBodyCodeMotion (cUnit);
+-}
+-
+-void dvmCompilerHoistIVArrayAccess (CompilationUnit *cUnit)
+-{
+-    genHoistedChecks (cUnit);
+-}
+-
+-void dvmCompilerDumpIVList (CompilationUnit *cUnit)
+-{
+-    DEBUG_LOOP (dumpIVList (cUnit));
+-}
+-
+-void dvmCompilerDumpConstants (CompilationUnit *cUnit)
+-{
+-    DEBUG_LOOP (dumpConstants (cUnit));
+-}
+-
+-void dvmCompilerDumpHoistedChecks (CompilationUnit *cUnit)
+-{
+-    DEBUG_LOOP (dumpHoistedChecks(cUnit));
+-}
+ #else
+ /*
+  * Main entry point to do loop optimization.
+@@ -792,7 +1275,6 @@ bool dvmCompilerLoopOpt(CompilationUnit *cUnit)
+     genHoistedChecks(cUnit);
+     return true;
+ }
+-#endif
+ 
+ /*
+  * Select the target block of the backward branch.
+@@ -845,3 +1327,303 @@ bool dvmCompilerInsertBackwardChaining(CompilationUnit *cUnit)
+     //Report success
+     return true;
+ }
++#endif
++
++/**
++ * @brief Recursive function to find the minimum offset of a loop: it is located in the BasicBlock with the smallest startOffset
++ * @param cUnit the CompilationUnit
++ * @param bb the current BasicBlock
++ * @return the minimum offset BasicBlock
++ */
++static BasicBlock *findMinimumHelper (CompilationUnit *cUnit, BasicBlock *bb)
++{
++    //If null, not dalvik byte code, or visited, return 0
++    if (bb == 0 || (bb->blockType != kDalvikByteCode) || (bb->visited == true))
++    {
++        return 0;
++    }
++
++    //Mark it
++    bb->visited = true;
++
++    //Paranoid
++    if (bb->predecessors == 0)
++    {
++        return 0;
++    }
++
++    //Suppose the minimum is bb
++    BasicBlock *min = bb;
++
++    //Go through the predecessors
++    BitVectorIterator bvIterator;
++
++    dvmBitVectorIteratorInit(bb->predecessors, &bvIterator);
++    while (true) {
++        int blockIdx = dvmBitVectorIteratorNext(&bvIterator);
++
++        if (blockIdx == -1)
++        {
++            break;
++        }
++
++        BasicBlock *predBB = (BasicBlock *) dvmGrowableListGetElement(&cUnit->blockList, blockIdx);
++
++        BasicBlock *curMin = findMinimumHelper (cUnit, predBB);
++
++        if (curMin != 0 && curMin->startOffset < min->startOffset)
++        {
++            min = curMin;
++        }
++    }
++
++    //Return minium
++    return min;
++}
++
++/**
++ * @brief Function to the minimum offset of a loop
++ * @param cUnit the CompilationUnit
++ * @return the minimum offset BasicBlock of cUnit
++ */
++static BasicBlock *findMinimum (CompilationUnit *cUnit)
++{
++    //Reset flags
++    dvmCompilerDataFlowAnalysisDispatcher(cUnit, dvmCompilerClearVisitedFlag, kAllNodes, false);
++
++    //Call recursive function
++    return findMinimumHelper (cUnit, cUnit->entryBlock->fallThrough);
++}
++
++/**
++ * @brief Mark the BasicBlock in the loop cache
++ *  The loop cache is used to know if an offset is a loop head or not. It helps reduce compilation time.
++ *  The loop cache contains all the BasicBlocks that are NOT loop heads
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock
++ * @return returns false, the function does not change the BasicBlock
++ */
++static bool markBasicBlocksInLoopCache (CompilationUnit *cUnit, BasicBlock *bb)
++{
++    //Only care about dalvik byte code
++    if (bb->blockType == kDalvikByteCode)
++    {
++        gDvmJit.knownNonLoopHeaderCache[cUnit->method->insns + bb->startOffset];
++    }
++    //We did not change anything to bb
++    return false;
++}
++
++/**
++ * @brief Mark off any BasicBlock, which is not a loop header
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock
++ * @return always return false, we don't change the BasicBlock
++ */
++static bool markOffNonHeadersHelper (CompilationUnit *cUnit, BasicBlock *bb)
++{
++    BitVectorIterator bvIterator;
++
++    //Paranoid
++    assert (bb->predecessors != 0);
++
++    //Get predecessors
++    dvmBitVectorIteratorInit(bb->predecessors, &bvIterator);
++
++    //Only mark off BasicBlocks that are dalvik code
++    if (bb->blockType != kDalvikByteCode)
++    {
++        return false;
++    }
++
++    while (true) {
++        //Get the next iterator
++        int blockIdx = dvmBitVectorIteratorNext(&bvIterator);
++
++        //If it is finished, exit
++        if (blockIdx == -1)
++        {
++            break;
++        }
++
++        BasicBlock *predBB = (BasicBlock*) (dvmGrowableListGetElement(&cUnit->blockList, blockIdx));
++
++        //Paranoid
++        if (predBB == 0)
++        {
++            break;
++        }
++
++        //If no dominator information, skip it
++        if (predBB->dominators == 0)
++        {
++            continue;
++        }
++
++        //If the predecessor is dominated by this one, it is a backward branch
++        if (dvmIsBitSet (predBB->dominators, bb->id) == true)
++        {
++            unsigned int entryOffset = cUnit->entryBlock->startOffset;
++
++            //Now here are some assumptions:
++            // If bb is the startOffset of cUnit->entryBlock, it is the original head
++            if (entryOffset == bb->startOffset)
++            {
++                predBB->bottomLoop = true;
++            }
++            else
++            {
++                //Now the if handled top loop cases where the head of the loop is
++                //actually the head of the trace. Sometimes it happens that the branch
++                //into the loop is the head. Check this here
++
++                //First do we have only one branch towards it:
++                if (bb->taken != 0 && bb->fallThrough == 0 && bb->taken->startOffset == entryOffset)
++                {
++                    bb->topLoop = true;
++                }
++                else
++                {
++                    //Same but the other side
++                    if (bb->fallThrough != 0 && bb->taken == 0 && bb->fallThrough->startOffset == entryOffset)
++                    {
++                        bb->topLoop = true;
++                    }
++                    else
++                    {
++                        //Otherwise, we have two children and that means this is exiting the loop
++                        bb->bottomLoop = true;
++                    }
++                }
++            }
++
++            //Now mark it as a potential loop head and its children
++            gDvmJit.knownNonLoopHeaderCache.erase (cUnit->method->insns + bb->startOffset);
++
++            //Now we mark both children because we don't know which one is towards a loop
++            //A subsequent call will handle it
++            if (bb->taken != 0)
++            {
++                if (dvmIsBitSet (predBB->dominators, bb->taken->id) == true)
++                {
++                    gDvmJit.knownNonLoopHeaderCache.erase (cUnit->method->insns + bb->taken->startOffset);
++                }
++            }
++
++            if (bb->fallThrough != 0)
++            {
++                if (dvmIsBitSet (predBB->dominators, bb->fallThrough->id) == true)
++                {
++                    gDvmJit.knownNonLoopHeaderCache.erase (cUnit->method->insns + bb->fallThrough->startOffset);
++                }
++            }
++        }
++    }
++
++    //We did not change the BasicBlock
++    return false;
++}
++
++
++/**
++ * @brief Clear predecessor information
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock
++ * @return returns whether we changed something in the BasicBlock or not
++ */
++static bool clearPredecessors (CompilationUnit *cUnit, BasicBlock *bb)
++{
++    //We only need to set it if there is a bit set,
++    //normally we wouldn't care about this test but the dispatcher might care
++    if (dvmCountSetBits (bb->predecessors) != 0)
++    {
++        dvmClearAllBits (bb->predecessors);
++        return true;
++    }
++    return false;
++}
++
++/**
++ * @brief Calculate Predecessor Information Helper
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock
++ * @return returns false, the BasicBlock is not changed
++ */
++static bool calculatePredecessorsHelper (CompilationUnit *cUnit, BasicBlock *bb)
++{
++    //We only care about non hidden blocks
++    if (bb->hidden == true)
++    {
++        return false;
++    }
++
++    //Go through taken and fallthrough
++    if (bb->taken != 0)
++    {
++        dvmCompilerSetBit (bb->taken->predecessors, bb->id);
++    }
++
++    if (bb->fallThrough != 0)
++    {
++        dvmCompilerSetBit (bb->fallThrough->predecessors, bb->id);
++    }
++
++    //We did change something but not our own basic block
++    return false;
++}
++
++/**
++ * @brief Calculate Predecessor Information
++ * @param cUnit the CompilationUnit
++ */
++void dvmCompilerCalculatePredecessors (CompilationUnit *cUnit)
++{
++    //First job is to clear the predecessors
++    dvmCompilerDataFlowAnalysisDispatcher (cUnit, clearPredecessors, kAllNodes, false);
++
++    //Second part is to calculate them again
++    dvmCompilerDataFlowAnalysisDispatcher (cUnit, calculatePredecessorsHelper, kAllNodes, false);
++}
++
++/**
++ * @brief Mark off BasicBlocks from the loop cache
++ * @param cUnit the CompilationUnit
++ */
++void dvmCompilerLoopMarkOffNonHeaderBlocks (CompilationUnit *cUnit)
++{
++    //Recalculate the predecessors with this new formation
++    dvmCompilerCalculatePredecessors (cUnit);
++
++    //Find the minimum offset
++    BasicBlock *minimum = findMinimum (cUnit);
++
++    //Now entry should temporarily go to the minimum
++    BasicBlock *tmpEntry = cUnit->entryBlock->fallThrough;
++    cUnit->entryBlock->fallThrough = minimum;
++
++    //Recalculate the predecessors with this new formation
++    dvmCompilerCalculatePredecessors (cUnit);
++
++    //Ok, now we can calculate dominators
++    dvmCompilerBuildDomination (cUnit);
++
++    //Clear the temporary bits
++    dvmClearAllBits (cUnit->tempBlockV);
++
++    dvmCompilerDataFlowAnalysisDispatcher(cUnit,
++            markBasicBlocksInLoopCache,
++            kAllNodes,
++            false /* isIterative */);
++
++    //Now we can go through the BasicBlocks and mark off those that are not loops
++    dvmCompilerDataFlowAnalysisDispatcher(cUnit,
++            markOffNonHeadersHelper,
++            kAllNodes,
++            false /* isIterative */);
++
++    //Put it back as it was, and recalculate the predecessors
++    cUnit->entryBlock->fallThrough = tmpEntry;
++    dvmCompilerCalculatePredecessors (cUnit);
++
++    //Domination is done later so no need here
++}
+diff --git a/vm/compiler/Loop.h b/vm/compiler/Loop.h
+index c31de14..efd692a 100644
+--- a/vm/compiler/Loop.h
++++ b/vm/compiler/Loop.h
+@@ -33,15 +33,16 @@ typedef struct LoopAnalysis {
+     LIR *branchToBody;                  // branch over to the body from entry
+     LIR *branchToPCR;                   // branch over to the PCR cell
+     bool bodyIsClean;                   // loop body cannot throw any exceptions
+-
+-#ifdef ARCH_IA32
+-    void *passData;                     // Pass data
+-    bool isSimpleCountedLoop;           // Is the loop simple counted
+-#endif
+ } LoopAnalysis;
+ 
+ bool dvmCompilerFilterLoopBlocks(CompilationUnit *cUnit);
+ 
++/**
++ * @brief Mark off any non loop header block and register them in the gDvm.knownNonLoopHeaderCache
++ * @param cUnit the CompilationUnit
++ */
++void dvmCompilerLoopMarkOffNonHeaderBlocks (CompilationUnit *cUnit);
++
+ /*
+  * An unexecuted code path may contain unresolved fields or classes. Before we
+  * have a quiet resolver we simply bail out of the loop compilation mode.
+diff --git a/vm/compiler/LoopInformation.cpp b/vm/compiler/LoopInformation.cpp
+new file mode 100644
+index 0000000..aa12389
+--- /dev/null
++++ b/vm/compiler/LoopInformation.cpp
+@@ -0,0 +1,425 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "CompilerIR.h"
++#include "Dalvik.h"
++#include "LoopInformation.h"
++
++LoopInformation::LoopInformation (void)
++{
++    //Call initialization
++    init ();
++}
++
++LoopInformation::~LoopInformation (void)
++{
++}
++
++void LoopInformation::init (const Method *method)
++{
++    parent = 0;
++    depth = 0;
++    basicBlocks = 0;
++    exitLoop = 0;
++    backward = 0;
++    entry = 0;
++    preHeader = 0;
++    backward = 0;
++    postExitLoop = 0;
++
++    if (method != 0)
++    {
++        scratchRegisters = method->registersSize + 1;
++    }
++    else
++    {
++        //Put an excessively high number
++        scratchRegisters = ~0;
++    }
++    dvmInitGrowableList (&nested, 1);
++}
++
++/**
++ * Nest takes a new LoopInformation and determines if info is nested with this instance or not.
++ * If it is nested in this instance, we fill our nested information with it
++ * Otherwise, we are nested in it and we request it to nest us
++ * The function returns the outer nested loop, it can nest any level of a nested loop
++ */
++LoopInformation *LoopInformation::nest (LoopInformation *info)
++{
++    BasicBlock *entry = info->getEntryBlock ();
++
++    //Paranoid
++    if (info == this)
++    {
++        return this;
++    }
++
++    //Are we included in the current loop ?
++    if (contains (entry) == true)
++    {
++        //Search in the children if anybody includes them
++        GrowableListIterator iterator;
++        dvmGrowableListIteratorInit (&nested, &iterator);
++        while (true)
++        {
++            LoopInformation *inner = (LoopInformation*) dvmGrowableListIteratorNext(&iterator);
++            if (inner == 0)
++            {
++                break;
++            }
++
++            //Does inner contain it or does info contain inner?
++            if (inner->contains (entry) == true || info->contains (inner->getEntryBlock ()) == true)
++            {
++                //This loop goes there
++                inner = inner->nest (info);
++
++                //Update entry
++                dvmGrowableListSetLastIterator (&iterator, (intptr_t) inner);
++
++                //Return this
++                return this;
++            }
++
++            //We have to update the pointer in the growable list
++        }
++
++        //No child contained it, add it there
++        //For the moment just add nest it in the first level
++        dvmInsertGrowableList (&nested, (intptr_t) info);
++
++        //Set depth
++        info->setDepth (getDepth () + 1);
++        //Set Parent
++        info->setParent (this);
++    }
++    else
++    {
++        //Otherwise, info contains us
++        if (info->contains (getEntryBlock ()) == true)
++        {
++            return info->nest (this);
++        }
++        else
++        {
++            //These are outer sibling loops, but this should not happen
++            ALOGD ("Outer sibling loops should not happen");
++        }
++    }
++
++    return this;
++}
++
++void LoopInformation::addExitLoop (BasicBlock *bb)
++{
++    //Paranoid
++    assert (bb != 0);
++
++    //If not allocated yet
++    if (exitLoop == 0)
++    {
++        exitLoop = dvmCompilerAllocBitVector (1, true);
++    }
++
++    dvmSetBit (exitLoop, bb->id);
++}
++
++/**
++ * Return the LoopInformation that has entry as the entry BasicBlock
++ */
++LoopInformation *LoopInformation::getLoopInformationByEntry (const BasicBlock *entry)
++{
++    //Is our entry this entry ?
++    if (this->entry == entry)
++    {
++        return this;
++    }
++
++    //Go through the nested iteration
++    GrowableListIterator iterator;
++
++    dvmGrowableListIteratorInit(&nested, &iterator);
++
++    while (true)
++    {
++        LoopInformation *inner = (LoopInformation *) dvmGrowableListIteratorNext(&iterator);
++        if (inner == 0)
++        {
++            break;
++        }
++
++        LoopInformation *res = inner->getLoopInformationByEntry (entry);
++
++        //If found, we can leave
++        if (res != 0)
++        {
++            return res;
++        }
++    }
++
++    //Did not find it
++    return 0;
++}
++
++/**
++ * Go through the BasicBlocks and assign to the loop
++ */
++void LoopInformation::fillBasicBlockVector (BasicBlock *current)
++{
++    //If 0, exit, get out
++    if (current == 0 || current == postExitLoop)
++    {
++        return;
++    }
++
++    //If already in vector, we are done
++    if (dvmIsBitSet (basicBlocks, current->id) == true)
++    {
++        return;
++    }
++
++    //Is it in the loop?
++    bool isInLoop = true;
++
++    //Mark it as visited
++    dvmSetBit (basicBlocks, current->id);
++
++    //If we are going back to first, we are a backward
++    if (current->fallThrough == entry)
++    {
++        //Normally backwards are only fallThrough
++        assert (current->taken == 0);
++        addBackwardBlock (current);
++
++        //Backward is not considered in the loop
++        isInLoop = false;
++    }
++    else
++    {
++        //Other question is anything that leads to exit is a exitLoop
++        if (current->fallThrough == postExitLoop)
++        {
++            assert (current->taken == 0);
++            addExitLoop (current);
++            //Post is not considered in the loop
++            isInLoop = false;
++        }
++        else
++        {
++            //Otherwise, go there
++            fillBasicBlockVector (current->fallThrough);
++        }
++    }
++
++    //Add it if it is in the loop
++    if (isInLoop == true)
++    {
++        //Look at children: taken first, then fallThrough
++        fillBasicBlockVector (current->taken);
++    }
++    else
++    {
++        //Remove it from the bitvector, we do it this way to make the system use basicBlocks as a visited BV at the same time
++        dvmClearBit (basicBlocks, current->id);
++    }
++}
++
++void LoopInformation::fillLoopInformation (void)
++{
++    //Clear certain vectors
++    if (basicBlocks == 0)
++    {
++        basicBlocks = dvmCompilerAllocBitVector (1, true);
++    }
++
++    dvmClearAllBits (basicBlocks);
++
++    if (backward != 0)
++    {
++        dvmClearAllBits (backward);
++    }
++
++    if (exitLoop != 0)
++    {
++        dvmClearAllBits (exitLoop);
++    }
++
++    //Start at the header
++    fillBasicBlockVector (entry);
++
++    //Call for the inner too
++    //Go through loop children
++    GrowableListIterator iterator;
++    dvmGrowableListIteratorInit(&nested, &iterator);
++    while (true)
++    {
++        //Get next
++        LoopInformation *inner = (LoopInformation*) dvmGrowableListIteratorNext(&iterator);
++
++        //Done ?
++        if (inner == 0)
++        {
++            break;
++        }
++
++        //Update parentage
++        inner->setParent (this);
++        inner->setDepth (getDepth () + 1);
++
++        //Fill information
++        inner->fillLoopInformation ();
++    }
++}
++
++bool LoopInformation::contains (const BasicBlock *bb) const
++{
++    if (bb == 0 || basicBlocks == 0)
++    {
++        return false;
++    }
++
++    return dvmIsBitSet (basicBlocks, bb->id);
++}
++
++void LoopInformation::dumpInformation (unsigned int tab)
++{
++    char buffer[256];
++    char tabs[10];
++    unsigned int i;
++
++    //Set tabs to 0
++    memset (tabs, 0, sizeof (tabs));
++
++    //Set up tab array
++    for (i = 0; i < tab && i < sizeof(tabs) - 1; i++)
++        tabs[i] = ' ';
++    tabs[i] = '\0';
++
++    //Print out base information
++    snprintf (buffer, sizeof (buffer), "%sThis: %p", tabs, this);
++    ALOGD ("%s", buffer);
++    snprintf (buffer, sizeof (buffer), "%sDepth: %d", tabs, depth);
++    ALOGD ("%s", buffer);
++    snprintf (buffer, sizeof (buffer), "%sEntry: %d", tabs, entry?entry->id:-1);
++    ALOGD ("%s", buffer);
++    snprintf (buffer, sizeof (buffer), "%sExit: %d", tabs, postExitLoop?postExitLoop->id:-1);
++    ALOGD ("%s", buffer);
++
++    //Print the BitVector
++    dvmDumpBitVector ("BasicBlocks: ", basicBlocks, true);
++
++    //Go through loop children
++    GrowableListIterator iterator;
++    dvmGrowableListIteratorInit(&nested, &iterator);
++    while (true)
++    {
++        //Get next
++        LoopInformation *inner = (LoopInformation*) dvmGrowableListIteratorNext(&iterator);
++
++        //Done ?
++        if (inner == 0)
++        {
++            break;
++        }
++
++        //Print it out with an extra tab
++        inner->dumpInformation (tab + 1);
++    }
++}
++
++void LoopInformation::dumpInformationDotFormat (FILE *file)
++{
++    char buffer[256];
++
++    //Create a node
++    unsigned long uid = (unsigned long) (this);
++
++    fprintf (file, "%lu [shape=record, label =\"{ \\\n", uid);
++
++    //Print out base information
++    snprintf (buffer, sizeof (buffer), "{Loop:} | \\\n");
++    fprintf (file, "%s", buffer);
++    snprintf (buffer, sizeof (buffer), "{Depth: %d} | \\\n", depth);
++    fprintf (file, "%s", buffer);
++    snprintf (buffer, sizeof (buffer), "{Entry: %d} | \\\n", entry?entry->id:-1);
++    fprintf (file, "%s", buffer);
++    snprintf (buffer, sizeof (buffer), "{Post Exit: %d} | \\\n", postExitLoop?postExitLoop->id:-1);
++    fprintf (file, "%s", buffer);
++    snprintf (buffer, sizeof (buffer), "{PreHeader: %d} | \\\n", preHeader?preHeader->id:-1);
++    fprintf (file, "%s", buffer);
++
++    //Print the backward chaining blocks
++    dvmDumpBitVectorDotFormat (file, "Post Loop: ", exitLoop, true);
++
++    //Print the backward chaining blocks
++    dvmDumpBitVectorDotFormat (file, "Backward: ", backward, true);
++
++    //Print the BasicBlocks BitVector
++    dvmDumpBitVectorDotFormat (file, "BasicBlocks: ", basicBlocks, true, true);
++
++    //End the block
++    fprintf (file, "}\"];\n\n");
++
++    //Go through loop children
++    GrowableListIterator iterator;
++    dvmGrowableListIteratorInit(&nested, &iterator);
++    while (true)
++    {
++        //Get next
++        LoopInformation *inner = (LoopInformation*) dvmGrowableListIteratorNext(&iterator);
++
++        //Done ?
++        if (inner == 0)
++        {
++            break;
++        }
++
++        //Print it out with an extra tab
++        inner->dumpInformationDotFormat (file);
++
++        //Now make the link
++        unsigned long childUID = (unsigned long) (inner);
++
++        fprintf (file, "%lu:s -> %lu:n\n", uid, childUID);
++    }
++}
++
++void LoopInformation::addBackwardBlock (BasicBlock *bb)
++{
++    //Paranoid
++    assert (bb != 0);
++
++    //Do we have to initialize it ?
++    if (backward == 0)
++    {
++        backward = dvmCompilerAllocBitVector (1, true);
++    }
++
++    //Set it
++    dvmSetBit (backward, bb->id);
++}
++
++LoopInformation *LoopInformation::getNested (unsigned int i) const
++{
++    //Error checking
++    if (i >= nested.numUsed)
++    {
++        return 0;
++    }
++
++    return (LoopInformation *) dvmGrowableListGetElement (&nested, i);
++}
+diff --git a/vm/compiler/LoopInformation.h b/vm/compiler/LoopInformation.h
+new file mode 100644
+index 0000000..cce839a
+--- /dev/null
++++ b/vm/compiler/LoopInformation.h
+@@ -0,0 +1,222 @@
++/*
++ * Copyright (C) 2013 Intel Corporation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef DALVIK_VM_LOOPINFORMATION
++#define DALVIK_VM_LOOPINFORMATION
++
++#include "CompilerUtility.h"
++
++//Forward declarations
++struct BasicBlock;
++struct BitVector;
++
++/**
++  * @class LoopInformation
++  * @brief LoopInformation provides information about the loop structure
++  */
++class LoopInformation
++{
++    protected:
++        /** @brief Nested Loops */
++        GrowableList nested;
++
++        /** @brief Parent loop, can be 0 */
++        LoopInformation *parent;
++
++        /** @brief Depth of the current loop */
++        unsigned int depth;
++
++        /** @brief Bitvector for the BasicBlocks of the loop */
++        BitVector *basicBlocks;
++
++        /** @brief Entry of the loop */
++        BasicBlock *entry;
++
++        /** @brief Preheader of the loop */
++        BasicBlock *preHeader;
++
++        /** @brief Backward Chaining Cell of the loop */
++        BitVector *backward;
++
++        /** @brief Post loop basic block */
++        BitVector *exitLoop;
++
++        /** @brief Exit Block */
++        BasicBlock *postExitLoop;
++
++        /** @brief Registers available */
++        unsigned int scratchRegisters;
++
++        /**
++         * @brief Fill the basicBlock vector with the BasicBlocks composing the loop
++         * @param bb the current BasicBlock
++         */
++        void fillBasicBlockVector (BasicBlock *bb);
++
++    public:
++        /** @brief Constructor */
++        LoopInformation (void);
++
++        /** @brief Destructor */
++        ~LoopInformation (void);
++
++        /**
++         * @brief Initialize
++         * @param method the containing Method (default: 0)
++         */
++        void init (const Method *method = 0);
++
++        /**
++         * @brief Set Exit Loop Block
++         * @param bb the exit block
++         */
++        void setPostExitBlock (BasicBlock *bb) {postExitLoop = bb;}
++
++        /**
++         * @brief Add a backward chaining cell
++         * @param bb the backward chaining cell block
++         */
++        void addBackwardBlock (BasicBlock *bb);
++
++        /**
++         * @brief Get entry block
++         * @return the entry block
++         */
++        BasicBlock *getEntryBlock (void) const {return entry;}
++
++        /**
++         * @brief Set entry block
++         * @param bb the entry block
++         */
++        void setEntryBlock (BasicBlock *bb) {entry = bb;}
++
++        /**
++         * @brief Set preheader block
++         * @param bb the preheader block
++         */
++        void setPreHeader (BasicBlock *bb) {preHeader = bb;}
++
++        /**
++         * @brief Get preHeader block
++         * @return the preHeader block
++         */
++        BasicBlock *getPreHeader (void) const {return preHeader;}
++
++        /**
++         * @brief Set depth
++         * @param depth new depth value
++         */
++        void setDepth (int depth) {this->depth = depth;}
++
++        /**
++         * @brief Set Parent
++         * @param p new parent
++         */
++        void setParent (LoopInformation *p) {parent = p;}
++
++        /**
++         * @brief Get Depth
++         * @return the depth
++         */
++        int getDepth (void) const {return depth;}
++
++        /**
++         * @brief Nest loop information
++         * @param info another LoopInformation to next
++         * @return the overall LoopInformation
++         */
++        LoopInformation *nest (LoopInformation *info);
++
++        /**
++         * @brief Get a LoopInformation, search in the nested and use entry as the ID
++         * @param entry the entry BasicBlock
++         * @return the found LoopInformation, 0 otherwise
++         */
++        LoopInformation *getLoopInformationByEntry (const BasicBlock *entry);
++
++        /**
++         * @brief Add an exit loop BasicBlock
++         * @param bb the new exit loop BasicBlock
++         */
++        void addExitLoop (BasicBlock *bb);
++
++        /**
++         * @brief Fill the loop information details
++         */
++        void fillLoopInformation (void);
++
++        /**
++         * @brief Does the Loop contain a given BasicBlock ?
++         */
++        bool contains (const BasicBlock *bb) const;
++
++        /**
++         * @brief Dump loop information
++         * @param tab number of tabs before outputting anything
++         */
++        void dumpInformation (unsigned int tab = 0);
++
++        /**
++         * @brief Dump loop information
++         * @param file file in which to dump the information
++         */
++        void dumpInformationDotFormat (FILE *file);
++
++        /**
++         * @brief Get a nested LoopInformation
++         * @param i the index
++         * @return the nested LoopInformation at index i
++         */
++        LoopInformation *getNested (unsigned int i) const;
++
++        /**
++         * @brief Get the number of nested loops
++         * @return the number of nested loops
++         */
++        unsigned int getNestedNbr (void) const {return nested.numUsed;}
++
++        /**
++         * @brief Get the exit loop BitVector
++         * @return the exit loop BitVector
++         */
++        const BitVector *getExitLoop (void) const {return exitLoop;}
++
++        /**
++         * @brief Get the BasicBlocks of the loop
++         * @return the BitVector that represents the BasicBlocks of the loop
++         */
++        const BitVector *getBasicBlocks (void) const {return basicBlocks;}
++
++        /**
++         * @brief Get the Backward branch BasicBlocks of the loop
++         * @return the BitVector that represents the Backward branches
++         */
++        const BitVector *getBackwardBranches (void) const {return backward;}
++
++        /**
++         * @brief Get the next scratch register
++         * @return the next scratch register
++         */
++        unsigned int getScratchRegisters (void) const {return scratchRegisters;}
++
++        /**
++         * @brief Set the next scratch register
++         * @param value the new value for the scratch register
++         */
++         void setScratchRegisters (unsigned int value) {scratchRegisters = value;}
++};
++
++#endif
+diff --git a/vm/compiler/LoopOpt.cpp b/vm/compiler/LoopOpt.cpp
+index 1150755..6004e94 100644
+--- a/vm/compiler/LoopOpt.cpp
++++ b/vm/compiler/LoopOpt.cpp
+@@ -25,22 +25,9 @@
+ /**
+  * @brief Static functions defined below
+  */
+-static void startConstant (CompilationUnit *cUnit, Pass *curPass);
+-static void endConstant (CompilationUnit *cUnit, Pass *curPass);
+-static void startInductionVariable (CompilationUnit *cUnit, Pass *curPass);
+-static void endInductionVariable (CompilationUnit *cUnit, Pass *curPass);
+-static void startInductionAccessDetection (CompilationUnit *cUnit, Pass *curPass);
+-static void endInductionAccessDetection (CompilationUnit *cUnit, Pass *curPass);
+-static void simpleCountedLoopHandler (CompilationUnit *cUnit, Pass *curPass);
+-static void endHoisting (CompilationUnit *cUnit, Pass *curPass);
+-static bool simpleCountedGate (const CompilationUnit *cUnit, const Pass *curPass);
+ static void handlePassFlag (CompilationUnit *cUnit, Pass *pass);
+-static void calculatePredecessors (CompilationUnit *cUnit);
+ static bool clearPHIInformationHelper (CompilationUnit *cUnit, BasicBlock *bb);
+ static void clearPHIInformation (CompilationUnit *cUnit);
+-static bool clearPredecessors (CompilationUnit *cUnit, BasicBlock *bb);
+-static bool calculatePredecessorsHelper (CompilationUnit *cUnit, BasicBlock *bb);
+-static void calculatePredecessors (CompilationUnit *cUnit);
+ 
+ /**
+  * @brief Three macros to help pass definitions
+@@ -58,49 +45,51 @@ static void calculatePredecessors (CompilationUnit *cUnit);
+     };
+ 
+ START_PASSES
+-    NEW_PASS ("Constant values detection", kAllNodes, NULL, dvmCompilerTraceIsLoop,
+-            startConstant, endConstant, dvmCompilerDoConstantPropagation,0, 0),
+-    NEW_PASS ("Induction variable detection", kAllNodes, NULL, dvmCompilerTraceIsLoop,
+-                 startInductionVariable, endInductionVariable, dvmCompilerFindInductionVariables,0, 0),
+-    NEW_PASS ("Simple Counted Loop Detection", kAllNodes, NULL, dvmCompilerTraceIsLoop,
+-                 NULL, simpleCountedLoopHandler, NULL, 0, 0),
+-    NEW_PASS ("Induction variable detection", kAllNodes, NULL, simpleCountedGate,
+-                 startInductionVariable, endInductionVariable, dvmCompilerFindInductionVariables, 0, 0),
+-    NEW_PASS ("Induction array based checks", kAllNodes, NULL, simpleCountedGate,
+-                 startInductionAccessDetection, endInductionAccessDetection, NULL, 0, 0),
+-    NEW_PASS ("Generate the hoisted code from induction array", kAllNodes, NULL, simpleCountedGate,
+-                 NULL, endHoisting, NULL, 0, 0),
+-    NEW_PASS ("Check Removal", kAllNodes, NULL, NULL,
++    //This loop formation is used when the new loop filtering is active
++    NEW_PASS ("Form Loop", kAllNodes, 0, dvmCompilerTraceIsLoopNewSystem,
++                0, 0, dvmCompilerFormLoop, 0, kOptimizationBasicBlockChange),
++    //This loop formation is used when the old loop filtering is active
++    NEW_PASS ("Old Loop Formation", kAllNodes, 0, dvmCompilerTraceIsLoopOldSystem,
++                dvmCompilerFormOldLoop, 0, 0, 0, kOptimizationBasicBlockChange),
++    NEW_PASS ("Check Removal", kAllNodes, 0, 0,
+                 dvmCompilerStartCheckRemoval, dvmCompilerEndCheckRemoval, dvmCompilerCheckRemoval, 0, 0),
+-    NEW_PASS ("Merge Blocks", kAllNodes, NULL, NULL,
+-                NULL, NULL, dvmCompilerMergeBasicBlocks, 0, kOptimizationBasicBlockChange),
+-
++    NEW_PASS ("Merge Blocks", kAllNodes, 0, 0,
++                0, NULL, dvmCompilerMergeBasicBlocks, 0, kOptimizationBasicBlockChange),
++    NEW_PASS ("Reorder Blocks", kBreadthFirstTraversal, 0, dvmCompilerTraceIsLoop,
++                dvmCompilerReorder, 0, 0, 0, kOptimizationBasicBlockChange),
+     /* Last element must have and be the only one to have a "" as name, it's our ending check */
+-    NEW_PASS ("",       /** Pass name */
+-         kAllNodes,     /** Type of traversal */
+-         NULL,          /** Data */
+-         NULL,          /** Gate function */
+-         NULL,          /** Start function */
+-         NULL,          /** End function */
+-         NULL,          /** Work function */
+-         NULL,          /** Free function */
+-         0              /** Flags */
++    NEW_PASS ("",        /** Pass name */
++         kAllNodes,      /** Type of traversal */
++         0,              /** Data */
++         0,              /** Gate function */
++         0,              /** Start function */
++         0,              /** End function */
++         0,              /** Work function */
++         0,              /** Free function */
++         0               /** Flags */
+          ),
+ END_PASSES
+ 
+-bool dvmCalculateBasicBlockInformation (CompilationUnit *cUnit, bool filter)
++bool dvmCompilerCalculateBasicBlockInformation (CompilationUnit *cUnit, bool filter)
+ {
+     //Clear SSA information
+     clearPHIInformation (cUnit);
+ 
+     //Calculate Predecessors
+-    calculatePredecessors (cUnit);
++    dvmCompilerCalculatePredecessors (cUnit);
+ 
+     //Now it depends if cUnit is a loop
+     if (cUnit->jitMode == kJitLoop)
+     {
+         //Call build loop it does the work for us
+-        return dvmCompilerBuildLoop (cUnit, filter);
++        bool res = dvmCompilerBuildLoop (cUnit, filter);
++
++        //Then call loop information fill
++        if (cUnit->loopInformation != 0)
++        {
++            cUnit->loopInformation->fillLoopInformation ();
++        }
++        return res;
+     }
+     else
+     {
+@@ -115,7 +104,7 @@ bool dvmCalculateBasicBlockInformation (CompilationUnit *cUnit, bool filter)
+ }
+ 
+ /**
+-  * @brief Handle pass flag, if it is kOptimizationBasicBlockChange, call back dvmCalculateBasicBlockInformation
++  * @brief Handle pass flag, if it is kOptimizationBasicBlockChange, call back dvmCompilerCalculateBasicBlockInformation
+   * @param cUnit the CompilationUnit
+   * @param pass the Pass
+   */
+@@ -124,7 +113,7 @@ void handlePassFlag (CompilationUnit *cUnit, Pass *pass)
+     //For the moment we only check for BasicBlock change requests
+     if (pass->getFlag (kOptimizationBasicBlockChange) == true)
+     {
+-        dvmCalculateBasicBlockInformation (cUnit, false);
++        dvmCompilerCalculateBasicBlockInformation (cUnit, false);
+     }
+ }
+ 
+@@ -137,8 +126,18 @@ void dvmCompilerLoopOptimizationDriver (CompilationUnit *cUnit)
+     //Go through the different elements
+     Pass *curPass = gPasses;
+ 
+-    while (curPass->getName () != "")
++    //As long as we have a pass and we haven't decided to quit the loop mode
++    while (curPass->getName () != "" && cUnit->quitLoopMode == false)
+     {
++        //First, did someone want us to skip this pass?
++        //If they did, they used the option -Xjitignorepass:"Pass name"
++        //So if strstr returns something, someone wanted to ignore that pass
++        if (gDvmJit.ignorePasses != 0 && strstr (gDvmJit.ignorePasses, curPass->getName ().c_str ()) != 0)
++        {
++            curPass++;
++            continue;
++        }
++
+         //We have a pass: do we apply it? By default yes
+         bool applyPass = curPass->gate (cUnit, curPass);
+ 
+@@ -153,10 +152,9 @@ void dvmCompilerLoopOptimizationDriver (CompilationUnit *cUnit)
+             if (doWork != 0)
+             {
+                 //Set the data in cUnit
+-                LoopAnalysis *loopAnalysis = cUnit->loopAnalysis;
+-                loopAnalysis->passData = curPass->getData ();
++                cUnit->passData = curPass->getData ();
+                 dvmCompilerDataFlowAnalysisDispatcher (cUnit, doWork, curPass->getTraversal (), false /* isIterative */);
+-                loopAnalysis->passData = 0;
++                cUnit->passData = 0;
+             }
+ 
+             curPass->end (cUnit, curPass);
+@@ -170,166 +168,6 @@ void dvmCompilerLoopOptimizationDriver (CompilationUnit *cUnit)
+     }
+ }
+ 
+-
+-//Functions used to emulate the original code structure
+-/**
+-  * @brief Initializes the constant detection data structures
+-  * @param cUnit the CompilationUnit
+-  * @param curPass the Pass
+-  */
+-void startConstant (CompilationUnit *cUnit, Pass *curPass)
+-{
+-    /* Constant propagation */
+-    cUnit->isConstantV = dvmCompilerAllocBitVector(cUnit->numSSARegs, false);
+-    cUnit->constantValues = (int *)dvmCompilerNew(sizeof(int) * cUnit->numSSARegs, true);
+-
+-    //Remove warning
+-    (void) curPass;
+-}
+-
+-/**
+-  * @brief Dumps the loop constants
+-  * @param cUnit the CompilationUnit
+-  * @param curPass the Pass
+-  */
+-void endConstant (CompilationUnit *cUnit, Pass *curPass)
+-{
+-    dvmCompilerDumpConstants (cUnit);
+-
+-    //Remove warnings
+-    (void) cUnit;
+-    (void) curPass;
+-}
+-
+-/**
+-  * @brief Initializes the data for the induction detection pass
+-  * @param cUnit the CompilationUnit
+-  * @param curPass the Pass
+-  */
+-void startInductionVariable (CompilationUnit *cUnit, Pass *curPass)
+-{
+-    LoopAnalysis *loopAnalysis = cUnit->loopAnalysis;
+-
+-    /* Find induction variables - basic and dependent */
+-    loopAnalysis->ivList = (GrowableList *)dvmCompilerNew(sizeof(GrowableList), true);
+-    dvmInitGrowableList(loopAnalysis->ivList, 4);
+-    loopAnalysis->isIndVarV = dvmCompilerAllocBitVector(cUnit->numSSARegs, false);
+-
+-    //Remove warning
+-    (void) curPass;
+-}
+-
+-/**
+-  * @brief Dumps the Induction variable list
+-  * @param cUnit the CompilationUnit
+-  * @param curPass the Pass
+-  */
+-void endInductionVariable (CompilationUnit *cUnit, Pass *curPass)
+-{
+-    dvmCompilerDumpIVList (cUnit);
+-
+-    //Remove warnings
+-    (void) cUnit;
+-    (void) curPass;
+-}
+-
+-/**
+-  * @brief Initializes data for the induction access pass
+-  * @param cUnit the CompilationUnit
+-  * @param curPass the Pass
+-  */
+-void startInductionAccessDetection (CompilationUnit *cUnit, Pass *curPass)
+-{
+-    LoopAnalysis *loopAnalysis = cUnit->loopAnalysis;
+-    loopAnalysis->arrayAccessInfo = (GrowableList *)dvmCompilerNew(sizeof(GrowableList), true);
+-    dvmInitGrowableList(loopAnalysis->arrayAccessInfo, 4);
+-
+-    //Remove warning
+-    (void) curPass;
+-}
+-
+-/**
+-  * @brief Perform the body code motion function: handles induction access detection
+-  * @param cUnit the CompilationUnit
+-  * @param curPass the Pass
+-  */
+-void endInductionAccessDetection (CompilationUnit *cUnit, Pass *curPass)
+-{
+-    LoopAnalysis *loopAnalysis = cUnit->loopAnalysis;
+-    loopAnalysis->bodyIsClean = dvmCompilerIVArrayAccess (cUnit);
+-
+-    dvmCompilerDumpHoistedChecks (cUnit);
+-
+-    //Remove warning
+-    (void) curPass;
+-}
+-
+-/**
+-  * @brief Determines whether the loop is a simple counted loop, ie:
+-        - Only one induction variable, knowing the lower/upper bounds
+-    Function also fills in the loopAnalysis->isSimpleCountedLoop variable
+-  * @param cUnit the CompilationUnit
+-  * @param curPass the Pass
+-  */
+-void simpleCountedLoopHandler (CompilationUnit *cUnit, Pass *curPass)
+-{
+-    bool res = dvmCompilerSimpleCountedLoop(cUnit);
+-
+-    //Set it in the loop analysis information
+-    LoopAnalysis *loopAnalysis = cUnit->loopAnalysis;
+-    loopAnalysis->isSimpleCountedLoop = res;
+-
+-    //Remove warning
+-    (void) curPass;
+-}
+-
+-/**
+-  * @brief Generates the hoisting of the checks
+-  * @param cUnit the CompilationUnit
+-  * @param curPass the Pass
+-  */
+-void endHoisting (CompilationUnit *cUnit, Pass *curPass)
+-{
+-    /*
+-     * Convert the array access information into extended MIR code in the loop header.
+-     */
+-    dvmCompilerHoistIVArrayAccess (cUnit);
+-
+-    //Remove warning
+-    (void) curPass;
+-}
+-
+-/**
+-  * @brief The simple counted gate, checks the simple counted loop boolean in the LoopAnalysis data structure.
+-    It is filled up by the Simple Counted Loop Detection pass
+-  * @param cUnit the CompilationUnit
+-  * @param curPass the Pass
+-  * @return whether or not the isSimpleCountedLoop variable is set
+-  */
+-bool simpleCountedGate (const CompilationUnit *cUnit, const Pass *curPass)
+-{
+-    //First is it a loop ?
+-    bool res = dvmCompilerTraceIsLoop (cUnit, curPass);
+-
+-    //If not, we are done
+-    if (res == false)
+-    {
+-        return res;
+-    }
+-
+-    LoopAnalysis *loopAnalysis = cUnit->loopAnalysis;
+-
+-    //Remove warning
+-    (void) curPass;
+-
+-    return loopAnalysis->isSimpleCountedLoop;
+-}
+-
+-bool dvmCompilerTraceIsLoop (const CompilationUnit *cUnit, const Pass *curPass)
+-{
+-    return cUnit->jitMode == kJitLoop;
+-}
+-
+ /**
+  * @brief Helper to remove all PHI nodes from BasicBlocks
+  * @param cUnit the CompilationUnit
+@@ -397,60 +235,72 @@ void clearPHIInformation (CompilationUnit *cUnit)
+     dvmCompilerDataFlowAnalysisDispatcher (cUnit, clearPHIInformationHelper, kAllNodes, false);
+ }
+ 
+-/**
+- * @brief Clear predecessor information
+- * @param cUnit the CompilationUnit
+- * @param bb the BasicBlock
+- */
+-bool clearPredecessors (CompilationUnit *cUnit, BasicBlock *bb)
++bool dvmCompilerTraceIsLoop (const CompilationUnit *cUnit, const Pass *curPass)
+ {
+-    //We only need to set it if there is a bit set,
+-    //normally we wouldn't care about this test but the dispatcher might care
+-    if (dvmCountSetBits (bb->predecessors) != 0)
+-    {
+-        dvmClearAllBits (bb->predecessors);
+-        return true;
+-    }
+-    return false;
++    (void) curPass;
++    return cUnit->jitMode == kJitLoop;
+ }
+ 
+-/**
+- * @brief Calculate Predecessor Information Helper
+- * @param cUnit the CompilationUnit
+- * @param bb the BasicBlock
+- */
+-bool calculatePredecessorsHelper (CompilationUnit *cUnit, BasicBlock *bb)
++bool dvmCompilerTraceIsLoopNewSystem (const CompilationUnit *cUnit, const Pass *curPass)
+ {
+-    //We only care about non hidden blocks
+-    if (bb->hidden == true)
+-    {
+-        return false;
+-    }
++    (void) curPass;
++    return dvmCompilerTraceIsLoop (cUnit, curPass) && (gDvmJit.oldLoopDetection == false);
++}
+ 
+-    //Go through taken and fallthrough
+-    if (bb->taken != 0)
+-    {
+-        dvmCompilerSetBit (bb->taken->predecessors, bb->id);
+-    }
++bool dvmCompilerTraceIsLoopOldSystem (const CompilationUnit *cUnit, const Pass *curPass)
++{
++    (void) curPass;
++    return dvmCompilerTraceIsLoop (cUnit, curPass) && (gDvmJit.oldLoopDetection == true);
++}
++
++void dvmCompilerPrintPassNames (void)
++{
++    //Go through the different elements
++    Pass *curPass = gPasses;
+ 
+-    if (bb->fallThrough != 0)
++    ALOGI ("Loop Passes are:");
++    //As long as we have a pass and we haven't decided to quit the loop mode
++    while (curPass->getName () != "")
+     {
+-        dvmCompilerSetBit (bb->fallThrough->predecessors, bb->id);
++        ALOGI ("\t-%s", curPass->getName ().c_str ());
++        curPass++;
+     }
+-
+-    //We did change something but not our own basic block
+-    return false;
+ }
+ 
+-/**
+- * @brief Calculate Predecessor Information
+- * @param cUnit the CompilationUnit
+- */
+-void calculatePredecessors (CompilationUnit *cUnit)
++void dvmCompilerPrintIgnorePasses (void)
+ {
+-    //First job is to clear the predecessors
+-    dvmCompilerDataFlowAnalysisDispatcher (cUnit, clearPredecessors, kAllNodes, false);
++    //Suppose the worse
++    bool ignoredSomething = false;
+ 
+-    //Second part is to calculate them again
+-    dvmCompilerDataFlowAnalysisDispatcher (cUnit, calculatePredecessorsHelper, kAllNodes, false);
++    //Go through the different elements
++    Pass *curPass = gPasses;
++    ALOGI ("Ignoring Passes:");
++    //As long as we have a pass and we haven't decided to quit the loop mode
++    while (curPass->getName () != "")
++    {
++        if (gDvmJit.ignorePasses != 0 && strstr (gDvmJit.ignorePasses, curPass->getName ().c_str ()) != 0)
++        {
++            ALOGI ("\t-%s", curPass->getName ().c_str ());
++            //Set flag to true, we are going to ignore something
++            ignoredSomething = true;
++        }
++        curPass++;
++    }
++
++    //If nothing got ignored, print out information about it
++    if (ignoredSomething == false)
++    {
++        //Paranoid
++        if (gDvmJit.ignorePasses == 0)
++        {
++            ALOGI ("\tThe ignore pass information is missing, please use -Xjitignorepasses");
++        }
++        else
++        {
++            ALOGI ("\t- Nothing got ignored, you must put in the parameter of -Xjitignorepasses the exact spelling of one of the passes");
++            ALOGI ("\t- Here is what you provided %s", gDvmJit.ignorePasses);
++            ALOGI ("\t- Here are the loop passes for reference:");
++            dvmCompilerPrintPassNames ();
++        }
++    }
+ }
+diff --git a/vm/compiler/LoopOpt.h b/vm/compiler/LoopOpt.h
+index 5475b50..debd6f7 100644
+--- a/vm/compiler/LoopOpt.h
++++ b/vm/compiler/LoopOpt.h
+@@ -19,7 +19,7 @@
+ 
+ #include "CompilerInternals.h"
+ 
+-//Forwad Declaration
++//Forward Declaration
+ struct CompilationUnit;
+ class Pass;
+ 
+@@ -30,7 +30,7 @@ class Pass;
+ void dvmCompilerLoopOptimizationDriver (CompilationUnit *cUnit);
+ 
+ /**
+-  * @brief The is a trace a loop gate, checks if the CompilationUnit is a loop
++  * @brief Is the trace a loop?
+   * @param cUnit the CompilationUnit
+   * @param curPass the Pass
+   * @return whether or not the cUnit represents a loop
+@@ -38,11 +38,36 @@ void dvmCompilerLoopOptimizationDriver (CompilationUnit *cUnit);
+ bool dvmCompilerTraceIsLoop (const CompilationUnit *cUnit, const Pass *curPass);
+ 
+ /**
++  * @brief Is the trace a loop formed by the new system?
++  * @param cUnit the CompilationUnit
++  * @param curPass the Pass
++  * @return whether or not the cUnit represents a loop
++  */
++bool dvmCompilerTraceIsLoopNewSystem (const CompilationUnit *cUnit, const Pass *curPass);
++
++/**
++  * @brief Is the trace a loop formed by the old system?
++  * @param cUnit the CompilationUnit
++  * @param curPass the Pass
++  * @return whether or not the cUnit represents a loop
++  */
++bool dvmCompilerTraceIsLoopOldSystem (const CompilationUnit *cUnit, const Pass *curPass);
++
++/**
+  * @brief Calculate the BasicBlock information
+  * @param cUnit the CompilationUnit
+  * @param filter do we wish to filter the loop? (default: true)
+  * @return whether the calculation succeeded or not
+  */
+-bool dvmCalculateBasicBlockInformation (CompilationUnit *cUnit, bool filter = true);
++bool dvmCompilerCalculateBasicBlockInformation (CompilationUnit *cUnit, bool filter = true);
++
++/**
++ * @brief Print the pass names
++ */
++void dvmCompilerPrintPassNames (void);
+ 
++/**
++ * @brief Print the pass names we are going to ignore
++ */
++void dvmCompilerPrintIgnorePasses (void);
+ #endif
+diff --git a/vm/compiler/SSATransformation.cpp b/vm/compiler/SSATransformation.cpp
+index a1b270b..f8301d3 100644
+--- a/vm/compiler/SSATransformation.cpp
++++ b/vm/compiler/SSATransformation.cpp
+@@ -256,6 +256,12 @@ static bool computeBlockDominators(CompilationUnit *cUnit, BasicBlock *bb)
+         if (predIdx == -1) break;
+         BasicBlock *predBB = (BasicBlock *) dvmGrowableListGetElement(
+                                  blockList, predIdx);
++
++        //If we don't have dominator information, skip it
++        if (predBB->dominators == 0)
++        {
++            continue;
++        }
+         /* tempBlockV = tempBlockV ^ dominators */
+         dvmIntersectBitVectors(tempBlockV, tempBlockV, predBB->dominators);
+     }
+@@ -295,6 +301,12 @@ static bool computeImmediateDominator(CompilationUnit *cUnit, BasicBlock *bb)
+             if (nextDom == -1) break;
+             BasicBlock *nextDomBB = (BasicBlock *)
+                 dvmGrowableListGetElement(blockList, nextDom);
++
++            //If we don't have dominator information, skip it
++            if (nextDomBB->dominators == 0)
++            {
++                continue;
++            }
+             /* iDom dominates nextDom - set new iDom */
+             if (dvmIsBitSet(nextDomBB->dominators, iDomIdx)) {
+                 iDomIdx = nextDom;
+@@ -627,6 +639,19 @@ void dvmCompilerMethodSSATransformation(CompilationUnit *cUnit)
+                                           false /* isIterative */);
+ }
+ 
++/**
++ * @brief Build the domination information
++ * @param cUnit the CompilationUnit
++ */
++void dvmCompilerBuildDomination (CompilationUnit *cUnit)
++{
++    /* Compute the DFS order */
++    computeDFSOrder (cUnit);
++
++    /* Compute the dominator info */
++    computeDominators (cUnit);
++}
++
+ /*
+  * @brief Build a loop. Return true if a loop structure is successfully identified.
+  * @param cUnit the CompilationUnit
+@@ -638,11 +663,7 @@ bool dvmCompilerBuildLoop(CompilationUnit *cUnit, bool filter)
+     //If we want to filter the loop
+     if (filter == true)
+     {
+-        /* Compute the DFS order */
+-        computeDFSOrder(cUnit);
+-
+-        /* Compute the dominator info */
+-        computeDominators(cUnit);
++        dvmCompilerBuildDomination (cUnit);
+ 
+         /* Loop structure not recognized/supported - return false */
+         if (dvmCompilerFilterLoopBlocks(cUnit) == false)
+@@ -650,10 +671,7 @@ bool dvmCompilerBuildLoop(CompilationUnit *cUnit, bool filter)
+     }
+ 
+     /* Re-compute the DFS order just for the loop */
+-    computeDFSOrder(cUnit);
+-
+-    /* Re-compute the dominator info just for the loop */
+-    computeDominators(cUnit);
++    dvmCompilerBuildDomination (cUnit);
+ 
+     /* Allocate data structures in preparation for SSA conversion */
+     dvmInitializeSSAConversion(cUnit);
+@@ -677,8 +695,7 @@ bool dvmCompilerBuildLoop(CompilationUnit *cUnit, bool filter)
+      */
+     if (cUnit->tempSSARegisterV == 0)
+     {
+-        cUnit->tempSSARegisterV = dvmCompilerAllocBitVector(cUnit->numSSARegs,
+-                false);
++        cUnit->tempSSARegisterV = dvmCompilerAllocBitVector(cUnit->numSSARegs, true);
+     }
+     else
+     {
+@@ -690,9 +707,5 @@ bool dvmCompilerBuildLoop(CompilationUnit *cUnit, bool filter)
+                                           kReachableNodes,
+                                           false /* isIterative */);
+ 
+-    if (gDvmJit.receivedSIGUSR2 || gDvmJit.printMe) {
+-        dvmDumpCFG(cUnit, "/sdcard/cfg/");
+-    }
+-
+     return true;
+ }
+diff --git a/vm/compiler/Utility.cpp b/vm/compiler/Utility.cpp
+index 85018dc..94d4dd6 100644
+--- a/vm/compiler/Utility.cpp
++++ b/vm/compiler/Utility.cpp
+@@ -266,6 +266,26 @@ intptr_t dvmGrowableListIteratorNext(GrowableListIterator *iterator)
+     return iterator->list->elemList[iterator->idx++];
+ }
+ 
++/**
++ * @brief Set the last element retrieved by dvmGrowableListIteratorNext, return false if not yet done
++ * @param iterator the iterator
++ * @param elem the new element
++ * @return true on success
++ */
++bool dvmGrowableListSetLastIterator(GrowableListIterator *iterator, intptr_t elem)
++{
++    //Make sure we already got one element
++    if (iterator->idx == 0)
++    {
++        return false;
++    }
++
++    //Otherwise we can do it
++    iterator->list->elemList[iterator->idx - 1] = elem;
++
++    return true;
++}
++
+ intptr_t dvmGrowableListGetElement(const GrowableList *gList, size_t idx)
+ {
+     assert(idx < gList->numUsed);
+@@ -289,6 +309,7 @@ void dvmCompilerDumpCompilationUnit(CompilationUnit *cUnit)
+         "Exit Block",
+         "PC Reconstruction",
+         "Exception Handling",
++        "Catch Entry",
+     };
+ 
+     ALOGD("Compiling %s %s", cUnit->method->clazz->descriptor,
+@@ -302,12 +323,27 @@ void dvmCompilerDumpCompilationUnit(CompilationUnit *cUnit)
+     while (true) {
+         bb = (BasicBlock *) dvmGrowableListIteratorNext(&iterator);
+         if (bb == NULL) break;
++
++        //Show only non hidden bb
++        if (bb->hidden == true) {
++            continue;
++        }
++
+         ALOGD("Block %d (%s) (insn %04x - %04x%s)",
+              bb->id,
+              blockTypeNames[bb->blockType],
+              bb->startOffset,
+              bb->lastMIRInsn ? bb->lastMIRInsn->offset : bb->startOffset,
+              bb->lastMIRInsn ? "" : " empty");
++
++        //Dump instructions
++        for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next) {
++            char buffer[256];
++            dvmCompilerExtendedDisassembler (cUnit, mir, & (mir->dalvikInsn), buffer, sizeof (buffer));
++            ALOGD ("\t%04x %s", mir->offset, buffer);
++        }
++
++        //Dump branches
+         if (bb->taken) {
+             ALOGD("  Taken branch: block %d (%04x)",
+                  bb->taken->id, bb->taken->startOffset);
+@@ -316,6 +352,17 @@ void dvmCompilerDumpCompilationUnit(CompilationUnit *cUnit)
+             ALOGD("  Fallthrough : block %d (%04x)",
+                  bb->fallThrough->id, bb->fallThrough->startOffset);
+         }
++
++        //Dump predecessors
++        if (bb->predecessors != 0)
++        {
++            dvmDumpBitVector ("  Predecessors: ", bb->predecessors, true);
++        }
++        else
++        {
++            ALOGD ("  No predecessor information");
++        }
++
+     }
+ }
+ 
+@@ -475,21 +522,15 @@ void dvmDumpBlockBitVector(const GrowableList *blocks, char *msg,
+ void dvmGetBlockName(BasicBlock *bb, char *name)
+ {
+     switch (bb->blockType) {
+-        case kEntryBlock:
+-            snprintf(name, BLOCK_NAME_LEN, "entry");
+-            break;
+-        case kExitBlock:
+-            snprintf(name, BLOCK_NAME_LEN, "exit");
+-            break;
+-         case kDalvikByteCode:
+-            snprintf(name, BLOCK_NAME_LEN, "block%04x", bb->id);
+-             break;
+          case kChainingCellNormal:
+             snprintf(name, BLOCK_NAME_LEN, "chain%04x", bb->id);
+             break;
+         case kChainingCellHot:
+             snprintf(name, BLOCK_NAME_LEN, "chainhot%04x", bb->id);
+             break;
++        case kChainingCellInvokeSingleton:
++            snprintf(name, BLOCK_NAME_LEN, "chainsingleton%04x", bb->id);
++            break;
+         case kChainingCellInvokePredicted:
+             snprintf(name, BLOCK_NAME_LEN, "chaininvokepred%04x", bb->id);
+             break;
+@@ -498,10 +539,25 @@ void dvmGetBlockName(BasicBlock *bb, char *name)
+             break;
+         case kChainingCellGap:
+             snprintf(name, BLOCK_NAME_LEN, "chain%04x", bb->id);
+-             break;
++            break;
++        case kChainingCellLast:
++            snprintf(name, BLOCK_NAME_LEN, "lastchain%04x", bb->id);
++            break;
++        case kEntryBlock:
++            snprintf(name, BLOCK_NAME_LEN, "entry");
++            break;
++         case kDalvikByteCode:
++            snprintf(name, BLOCK_NAME_LEN, "block%04x", bb->id);
++            break;
++        case kExitBlock:
++            snprintf(name, BLOCK_NAME_LEN, "exit");
++            break;
++         case kPCReconstruction:
++            snprintf(name, BLOCK_NAME_LEN, "pcreconstruction%04x", bb->id);
++            break;
+          case kExceptionHandling:
+             snprintf(name, BLOCK_NAME_LEN, "exception%04x", bb->id);
+-             break;
++            break;
+          default:
+             snprintf(name, BLOCK_NAME_LEN, "??");
+             break;
+diff --git a/vm/compiler/codegen/x86/CodegenInterface.cpp b/vm/compiler/codegen/x86/CodegenInterface.cpp
+index 9ff5f7f..34e5136 100644
+--- a/vm/compiler/codegen/x86/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/CodegenInterface.cpp
+@@ -1004,11 +1004,17 @@ static int handleBackwardBranchChainingCell(CompilationUnit *cUnit,
+     call_dvmJitToInterpBackwardBranch();
+     unsigned int *ptr = (unsigned int*)stream;
+     *ptr++ = (unsigned int)(cUnit->method->insns + offset);
+-    char* codePtr = searchLabelWorklist(".vr_store_at_loop_back");
++
++    //Make the label using the blockID
++    char storeBackLabel[LABEL_SIZE];
++    snprintf(storeBackLabel, LABEL_SIZE, ".vr_store_at_loop_back_%d", blockId);
++
++    char* codePtr = searchLabelWorklist(storeBackLabel);
++
+     if (codePtr == NULL)
+         codePtr = searchNCGWorklist(blockId);
+     else {
+-        vrStoreCodePtr = findCodeForLabel(".vr_store_at_loop_back");
++        vrStoreCodePtr = findCodeForLabel(storeBackLabel);
+     }
+     *ptr++ = (unsigned int)codePtr;
+     *ptr++ = (unsigned int)loopHeaderAddr;
+diff --git a/vm/compiler/codegen/x86/LowerJump.cpp b/vm/compiler/codegen/x86/LowerJump.cpp
+index c4bf49a..2f8db8e 100644
+--- a/vm/compiler/codegen/x86/LowerJump.cpp
++++ b/vm/compiler/codegen/x86/LowerJump.cpp
+@@ -439,7 +439,7 @@ static void deleteVRStoreLabelGlobalMap()
+     LabelMap * prePtr = NULL;
+ 
+     while(ptr != NULL) {
+-        if (!strcmp(ptr->label, ".vr_store_at_loop_back")) {
++        if (strstr(ptr->label, ".vr_store_at_loop_back") != 0) {
+             if (prePtr == NULL)
+                 globalMap = ptr->nextItem;
+             else
+@@ -1194,77 +1194,76 @@ int common_if(s4 tmp, ConditionCode cc_next, ConditionCode cc) {
+     OpndSize size = OpndSize_Null;
+     int relativeNCG;
+ 
+-    if (traceMode == kJitLoop && !branchInLoop && hasVRStoreExitOfLoop()) {
+-        if (traceCurrentBB->taken && traceCurrentBB->taken->blockType == kChainingCellBackwardBranch) {
+-            if(gDvmJit.scheduling)
+-                singletonPtr<Scheduler>()->signalEndOfNativeBasicBlock();
+-            rememberState(1);
+-            alignOffset(2); // 2 is (instruction size of "jcc rel32" - sizeof(rel32))
+-            conditional_jump(cc, ".vr_store_at_loop_back", false);
+-            storeVRExitOfLoop();
++    if (traceCurrentBB->taken && traceCurrentBB->taken->blockType == kChainingCellBackwardBranch) {
++        char buffer[80];
++        snprintf (buffer, sizeof(buffer), ".vr_store_at_loop_back_%d", traceCurrentBB->taken->id);
+ 
+-            if(gDvmJit.scheduling && traceCurrentBB->fallThrough) {
+-                unconditional_jump_block(traceCurrentBB->fallThrough->id,
+-                        isBasicBlockAChainingCell(traceCurrentBB->fallThrough));
+-            } else {
+-                alignOffset(1); // 1 is (instruction size of "jmp rel32" - sizeof(rel32))
+-                relativeNCG = traceCurrentBB->fallThrough ? traceCurrentBB->fallThrough->id : 0;
+-                if(traceCurrentBB->fallThrough)
+-                    relativeNCG = getRelativeNCG(traceCurrentBB->fallThrough->id, JmpCall_uncond, &unknown, &size);
+-                unconditional_jump_int(relativeNCG, size);
+-            }
+-
+-            if (insertLabel(".vr_store_at_loop_back", false) == -1)
+-                return -1;
+-            goToState(1);
+-            storeVRExitOfLoop();
++        if(gDvmJit.scheduling)
++            singletonPtr<Scheduler>()->signalEndOfNativeBasicBlock();
++        rememberState(1);
++        alignOffset(2); // 2 is (instruction size of "jcc rel32" - sizeof(rel32))
++        conditional_jump(cc, buffer, false);
++        storeVRExitOfLoop();
+ 
+-            if(gDvmJit.scheduling && traceCurrentBB->taken) {
+-                unconditional_jump_block(traceCurrentBB->taken->id, false);
+-            } else {
+-                relativeNCG = traceCurrentBB->taken ? traceCurrentBB->taken->id : 0;
+-                if(traceCurrentBB->taken)
+-                    relativeNCG = getRelativeNCG(traceCurrentBB->taken->id, JmpCall_uncond, &unknown, &size);
+-                unconditional_jump_int(relativeNCG, size);
+-            }
++        if(gDvmJit.scheduling && traceCurrentBB->fallThrough) {
++            unconditional_jump_block(traceCurrentBB->fallThrough->id,
++                    isBasicBlockAChainingCell(traceCurrentBB->fallThrough));
++        } else {
++            alignOffset(1); // 1 is (instruction size of "jmp rel32" - sizeof(rel32))
++            relativeNCG = traceCurrentBB->fallThrough ? traceCurrentBB->fallThrough->id : 0;
++            if(traceCurrentBB->fallThrough)
++                relativeNCG = getRelativeNCG(traceCurrentBB->fallThrough->id, JmpCall_uncond, &unknown, &size);
++            unconditional_jump_int(relativeNCG, size);
+         }
+-        else if (traceCurrentBB->fallThrough && traceCurrentBB->fallThrough->blockType == kChainingCellBackwardBranch) {
+-            if(gDvmJit.scheduling)
+-                singletonPtr<Scheduler>()->signalEndOfNativeBasicBlock();
+-            rememberState(1);
+-            alignOffset(2);
+-            conditional_jump(cc_next, ".vr_store_at_loop_back", false);
+-            storeVRExitOfLoop();
+ 
+-            if(gDvmJit.scheduling && traceCurrentBB->taken) {
+-                unconditional_jump_block(traceCurrentBB->taken->id,
+-                        isBasicBlockAChainingCell(traceCurrentBB->taken));
+-            } else {
+-                alignOffset(1);
+-                relativeNCG = traceCurrentBB->taken ? traceCurrentBB->taken->id : 0;
+-                if(traceCurrentBB->taken)
+-                    relativeNCG = getRelativeNCG(traceCurrentBB->taken->id, JmpCall_uncond, &unknown, &size);
+-                unconditional_jump_int(relativeNCG, size);
+-            }
++        if (insertLabel(buffer, false) == -1)
++            return -1;
++        goToState(1);
++        storeVRExitOfLoop();
++
++        if(gDvmJit.scheduling && traceCurrentBB->taken) {
++            unconditional_jump_block(traceCurrentBB->taken->id, false);
++        } else {
++            relativeNCG = traceCurrentBB->taken ? traceCurrentBB->taken->id : 0;
++            if(traceCurrentBB->taken)
++                relativeNCG = getRelativeNCG(traceCurrentBB->taken->id, JmpCall_uncond, &unknown, &size);
++            unconditional_jump_int(relativeNCG, size);
++        }
++    }
++    else if (traceCurrentBB->fallThrough && traceCurrentBB->fallThrough->blockType == kChainingCellBackwardBranch) {
++        char buffer[80];
++        snprintf (buffer, sizeof(buffer), ".vr_store_at_loop_back_%d", traceCurrentBB->fallThrough->id);
+ 
+-            if (insertLabel(".vr_store_at_loop_back", false) == -1)
+-                return -1;
+-            goToState(1);
+-            storeVRExitOfLoop();
++        if(gDvmJit.scheduling)
++            singletonPtr<Scheduler>()->signalEndOfNativeBasicBlock();
++        rememberState(1);
++        alignOffset(2);
++        conditional_jump(cc_next, buffer, false);
++        storeVRExitOfLoop();
+ 
+-            if(gDvmJit.scheduling && traceCurrentBB->fallThrough) {
+-                unconditional_jump_block(traceCurrentBB->fallThrough->id, false);
+-            } else {
+-                relativeNCG = traceCurrentBB->fallThrough ? traceCurrentBB->fallThrough->id : 0;
+-                if(traceCurrentBB->fallThrough)
+-                    relativeNCG = getRelativeNCG(traceCurrentBB->fallThrough->id, JmpCall_uncond, &unknown, &size);
+-                unconditional_jump_int(relativeNCG, size);
+-            }
++        if(gDvmJit.scheduling && traceCurrentBB->taken) {
++            unconditional_jump_block(traceCurrentBB->taken->id,
++                    isBasicBlockAChainingCell(traceCurrentBB->taken));
++        } else {
++            alignOffset(1);
++            relativeNCG = traceCurrentBB->taken ? traceCurrentBB->taken->id : 0;
++            if(traceCurrentBB->taken)
++                relativeNCG = getRelativeNCG(traceCurrentBB->taken->id, JmpCall_uncond, &unknown, &size);
++            unconditional_jump_int(relativeNCG, size);
+         }
+-        else {
+-           ALOGE("JIT_ERROR: Invalid branch type in common_if\n");
+-           SET_JIT_ERROR(kJitErrorTraceFormation);
+-           return -1;
++
++        if (insertLabel(buffer, false) == -1)
++            return -1;
++        goToState(1);
++        storeVRExitOfLoop();
++
++        if(gDvmJit.scheduling && traceCurrentBB->fallThrough) {
++            unconditional_jump_block(traceCurrentBB->fallThrough->id, false);
++        } else {
++            relativeNCG = traceCurrentBB->fallThrough ? traceCurrentBB->fallThrough->id : 0;
++            if(traceCurrentBB->fallThrough)
++                relativeNCG = getRelativeNCG(traceCurrentBB->fallThrough->id, JmpCall_uncond, &unknown, &size);
++            unconditional_jump_int(relativeNCG, size);
+         }
+     }
+     else {
+-- 
+1.7.4.1
+

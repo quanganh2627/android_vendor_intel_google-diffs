@@ -1,0 +1,250 @@
+From cfdd996b3b99261d485cd1c13326858d3bd4180e Mon Sep 17 00:00:00 2001
+From: llin4 <ling.lin@intel.com>
+Date: Tue, 4 Dec 2012 09:26:23 +0800
+Subject: dalvik: houdini hook rebase on JB MR1
+
+BZ: 71657
+
+Dalvik houdini hook rebase on JB MR1
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Runtime
+Origin: internal
+Upstream-Candidate: no, proprietary
+
+Change-Id: I5a8614d3e7c498c5ac2bb38cea0832c6eb7382a4
+Orig-MCG-Change-Id: Ic3f33c01f888bae4745990066702def75a340eb3
+Signed-off-by: llin4 <ling.lin@intel.com>
+Reviewed-on: http://android.intel.com:8080/77610
+Reviewed-by: Yao, Yong <yong.yao@intel.com>
+Reviewed-by: Li, XiaojingX <xiaojingx.li@intel.com>
+Tested-by: Li, XiaojingX <xiaojingx.li@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/Jni.cpp           |   19 ++++++++++++++++++
+ vm/Native.cpp        |   51 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ vm/ReconfigureDvm.mk |    7 ++++++
+ vm/oo/Object.h       |   11 ++++++++++
+ 4 files changed, 88 insertions(+), 0 deletions(-)
+
+diff --git a/vm/Jni.cpp b/vm/Jni.cpp
+index 0e77fab..01770d7 100644
+--- a/vm/Jni.cpp
++++ b/vm/Jni.cpp
+@@ -703,6 +703,14 @@ static void throwNoSuchMethodError(ClassObject* c, const char* name, const char*
+     dvmThrowNoSuchMethodError(msg.c_str());
+ }
+ 
++#ifdef WITH_HOUDINI
++namespace houdini {
++bool hookCheckMethod(void *fnPtr);
++void dvmHookPlatformInvoke(void* pEnv, void* clazz, int argInfo, int argc,
++    const int* argv, const char* shorty, void* func, void* pReturn);
++}
++#endif
++
+ /*
+  * Register a method that uses JNI calling conventions.
+  */
+@@ -762,6 +770,10 @@ static bool dvmRegisterJNIMethod(ClassObject* clazz, const char* methodName,
+         ALOGV("Note: %s.%s:%s was already registered", clazz->descriptor, methodName, signature);
+     }
+ 
++#ifdef WITH_HOUDINI
++    method->needHoudini = houdini::hookCheckMethod(fnPtr);
++#endif
++
+     method->fastJni = fastJni;
+     dvmUseJNIBridge(method, fnPtr);
+ 
+@@ -1153,6 +1165,13 @@ void dvmCallJNIMethod(const u4* args, JValue* pResult, const Method* method, Thr
+ 
+     JNIEnv* env = self->jniEnv;
+     COMPUTE_STACK_SUM(self);
++#ifdef WITH_HOUDINI
++    if (dvmNeedHoudiniMethod(method))
++        houdini::dvmHookPlatformInvoke(env, (ClassObject*)staticMethodClass,
++            method->jniArgInfo, method->insSize, (const int*)modArgs, method->shorty,
++            (void*)method->insns, pResult);
++    else
++#endif
+     dvmPlatformInvoke(env,
+             (ClassObject*) staticMethodClass,
+             method->jniArgInfo, method->insSize, modArgs, method->shorty,
+diff --git a/vm/Native.cpp b/vm/Native.cpp
+index a12c4e0..b39beef 100644
+--- a/vm/Native.cpp
++++ b/vm/Native.cpp
+@@ -29,6 +29,26 @@
+ static void freeSharedLibEntry(void* ptr);
+ static void* lookupSharedLibMethod(const Method* method);
+ 
++#ifdef WITH_HOUDINI
++/*
++ * Pointer to hold Houdini Hook structure defined in libhoudini_hook.a
++ */
++void *gHoudiniHook = NULL;
++
++namespace houdini {
++void* hookDlopen(const char* filename, int flag, bool* useHoudini);
++void* hookDlsym(bool useHoudini, void* handle, const char* symbol);
++int hookJniOnload(bool useHoudini, void* func, void* jniVm, void* arg);
++}
++/*
++ * Get the shorty string for a method.
++ */
++const char* dvmGetMethodShorty(void* method)
++{
++    const Method* meth = (const Method*)method;
++    return meth->shorty;
++}
++#endif
+ 
+ /*
+  * Initialize the native code loader.
+@@ -156,6 +176,9 @@ struct SharedLib {
+     pthread_cond_t  onLoadCond;     /* wait for JNI_OnLoad in other thread */
+     u4              onLoadThreadId; /* recursive invocation guard */
+     OnLoadState     onLoadResult;   /* result of earlier JNI_OnLoad */
++#ifdef WITH_HOUDINI
++    bool        useHoudini;
++#endif
+ };
+ 
+ /*
+@@ -380,7 +403,12 @@ bool dvmLoadNativeCode(const char* pathName, Object* classLoader,
+      */
+     Thread* self = dvmThreadSelf();
+     ThreadStatus oldStatus = dvmChangeStatus(self, THREAD_VMWAIT);
++#ifdef WITH_HOUDINI
++    bool useHoudini = false;
++    handle = houdini::hookDlopen(pathName, RTLD_LAZY, &useHoudini);
++#else
+     handle = dlopen(pathName, RTLD_LAZY);
++#endif
+     dvmChangeStatus(self, oldStatus);
+ 
+     if (handle == NULL) {
+@@ -394,6 +422,9 @@ bool dvmLoadNativeCode(const char* pathName, Object* classLoader,
+     pNewEntry = (SharedLib*) calloc(1, sizeof(SharedLib));
+     pNewEntry->pathName = strdup(pathName);
+     pNewEntry->handle = handle;
++#ifdef WITH_HOUDINI
++    pNewEntry->useHoudini = useHoudini;
++#endif
+     pNewEntry->classLoader = classLoader;
+     dvmInitMutex(&pNewEntry->onLoadLock);
+     pthread_cond_init(&pNewEntry->onLoadCond, NULL);
+@@ -415,7 +446,11 @@ bool dvmLoadNativeCode(const char* pathName, Object* classLoader,
+         void* vonLoad;
+         int version;
+ 
++#ifdef WITH_HOUDINI
++        vonLoad = houdini::hookDlsym(useHoudini, handle, "JNI_OnLoad");
++#else
+         vonLoad = dlsym(handle, "JNI_OnLoad");
++#endif
+         if (vonLoad == NULL) {
+             ALOGD("No JNI_OnLoad found in %s %p, skipping init", pathName, classLoader);
+             result = true;
+@@ -434,7 +469,11 @@ bool dvmLoadNativeCode(const char* pathName, Object* classLoader,
+             if (gDvm.verboseJni) {
+                 ALOGI("[Calling JNI_OnLoad for \"%s\"]", pathName);
+             }
++#ifdef WITH_HOUDINI
++            version = houdini::hookJniOnload(useHoudini, (void*)func, (void*)gDvmJni.jniVm, NULL);
++#else
+             version = (*func)(gDvmJni.jniVm, NULL);
++#endif
+             dvmChangeStatus(self, oldStatus);
+             self->classLoaderOverride = prevOverride;
+ 
+@@ -705,6 +744,10 @@ static int findMethodInLib(void* vlib, void* vmethod)
+     } else
+         ALOGV("+++ scanning '%s' for '%s'", pLib->pathName, meth->name);
+ 
++#ifdef WITH_HOUDINI
++    dvmSetHoudiniMethod((Method*)vmethod, pLib->useHoudini);
++#endif
++
+     /*
+      * First, we try it without the signature.
+      */
+@@ -718,7 +761,11 @@ static int findMethodInLib(void* vlib, void* vmethod)
+         goto bail;
+ 
+     ALOGV("+++ calling dlsym(%s)", mangleCM);
++#ifdef WITH_HOUDINI
++    func = houdini::hookDlsym(pLib->useHoudini, pLib->handle, mangleCM);
++#else
+     func = dlsym(pLib->handle, mangleCM);
++#endif
+     if (func == NULL) {
+         mangleSig =
+             createMangledSignature(&meth->prototype);
+@@ -732,7 +779,11 @@ static int findMethodInLib(void* vlib, void* vmethod)
+         sprintf(mangleCMSig, "%s__%s", mangleCM, mangleSig);
+ 
+         ALOGV("+++ calling dlsym(%s)", mangleCMSig);
++#ifdef WITH_HOUDINI
++        func = houdini::hookDlsym(pLib->useHoudini, pLib->handle, mangleCMSig);
++#else
+         func = dlsym(pLib->handle, mangleCMSig);
++#endif
+         if (func != NULL) {
+             ALOGV("Found '%s' with dlsym", mangleCMSig);
+         }
+diff --git a/vm/ReconfigureDvm.mk b/vm/ReconfigureDvm.mk
+index 6e161c9..d96c628 100644
+--- a/vm/ReconfigureDvm.mk
++++ b/vm/ReconfigureDvm.mk
+@@ -30,8 +30,15 @@ LOCAL_SHARED_LIBRARIES += \
+ 	libselinux \
+ 	libz
+ 
++ifeq ($(INTEL_HOUDINI),true)
++    LOCAL_CFLAGS += -DWITH_HOUDINI
++endif
+ LOCAL_STATIC_LIBRARIES += libdex
+ 
++ifeq ($(INTEL_HOUDINI),true)
++    LOCAL_STATIC_LIBRARIES += libhoudini_hook
++endif
++
+ LOCAL_C_INCLUDES += external/stlport/stlport bionic/ bionic/libstdc++/include
+ LOCAL_SHARED_LIBRARIES += libstlport
+ 
+diff --git a/vm/oo/Object.h b/vm/oo/Object.h
+index 92438ba..034f74f 100644
+--- a/vm/oo/Object.h
++++ b/vm/oo/Object.h
+@@ -578,6 +578,9 @@ struct Method {
+ 
+     /* set if method was called during method profiling */
+     bool            inProfile;
++#ifdef WITH_HOUDINI
++    bool            needHoudini;
++#endif
+ };
+ 
+ u4 dvmGetMethodIdx(const Method* method);
+@@ -691,6 +694,14 @@ INLINE bool dvmIsFinalMethod(const Method* method) {
+ INLINE bool dvmIsNativeMethod(const Method* method) {
+     return (method->accessFlags & ACC_NATIVE) != 0;
+ }
++#ifdef WITH_HOUDINI
++INLINE void dvmSetHoudiniMethod(Method* method, bool needHoudini) {
++    method->needHoudini = needHoudini;
++}
++INLINE bool dvmNeedHoudiniMethod(const Method* method) {
++    return (method->needHoudini);
++}
++#endif
+ INLINE bool dvmIsAbstractMethod(const Method* method) {
+     return (method->accessFlags & ACC_ABSTRACT) != 0;
+ }
+-- 
+1.7.4.1
+

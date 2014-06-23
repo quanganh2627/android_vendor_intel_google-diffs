@@ -1,0 +1,168 @@
+From 746d4f2ec6ad365be53d44785fe1bc66d52845dc Mon Sep 17 00:00:00 2001
+From: Bijoy Jose <bijoy.a.jose@intel.com>
+Date: Mon, 27 Aug 2012 15:07:04 -0700
+Subject: Dalvik: Jump over the nop padding used at the beginning of a chaining cell.
+
+BZ: 75820
+
+Nop inserted for alignment reasons is also part of the instructions being
+executed. This patch causes the execution to jump over the nop and thus
+improve performance of generated code.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: I3c6deaa3549a235dff9d03a8f1a96ded540a40c6
+Orig-MCG-Change-Id: I5a04a05a03c6ae9a5c9482810a3391080e63d517
+Signed-off-by: Bijoy Jose <bijoy.a.jose@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/codegen/x86/CodegenInterface.cpp |   39 ++++++++++++++++----------
+ 1 files changed, 24 insertions(+), 15 deletions(-)
+
+diff --git a/vm/compiler/codegen/x86/CodegenInterface.cpp b/vm/compiler/codegen/x86/CodegenInterface.cpp
+index 6e0813c..2d31d5a 100644
+--- a/vm/compiler/codegen/x86/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/CodegenInterface.cpp
+@@ -681,14 +681,14 @@ void dvmJitUnchainAll()
+ }
+ 
+ #define P_GPR_1 PhysicalReg_EBX
+-/* Add an additional jump instruction, keep jump target 4 bytes aligned.*/
+-static void insertJumpHelp()
++/* Add an additional jump instruction, keeping jump target 4 bytes aligned. Returns the amount of nop padding used before chaining cell head*/
++static int insertJumpHelp()
+ {
+     int rem = (uint)stream % 4;
+     int nop_size = 3 - rem;
+     dump_nop(nop_size);
+     unconditional_jump_int(0, OpndSize_32);
+-    return;
++    return nop_size;
+ }
+ 
+ /* Chaining cell for code that may need warmup. */
+@@ -703,7 +703,7 @@ static void insertJumpHelp()
+                   call %eax
+                   <-- return address
+ */
+-static void handleNormalChainingCell(CompilationUnit *cUnit,
++static int handleNormalChainingCell(CompilationUnit *cUnit,
+                                      unsigned int offset, int blockId, LowOpBlockLabel* labelList)
+ {
+     ALOGV("in handleNormalChainingCell for method %s block %d BC offset %x NCG offset %x",
+@@ -714,18 +714,19 @@ static void handleNormalChainingCell(CompilationUnit *cUnit,
+     /* Add one additional "jump 0" instruction, it may be modified during jit chaining. This helps
+      * reslove the multithreading issue.
+      */
+-    insertJumpHelp();
++    int nop_size = insertJumpHelp();
+     move_imm_to_reg(OpndSize_32, (int) (cUnit->method->insns + offset), P_GPR_1, true);
+     scratchRegs[0] = PhysicalReg_EAX;
+     call_dvmJitToInterpNormal();
+     //move_imm_to_reg(OpndSize_32, (int) (cUnit->method->insns + offset), P_GPR_1, true); /* used when unchaining */
++    return nop_size;
+ }
+ 
+ /*
+  * Chaining cell for instructions that immediately following already translated
+  * code.
+  */
+-static void handleHotChainingCell(CompilationUnit *cUnit,
++static int handleHotChainingCell(CompilationUnit *cUnit,
+                                   unsigned int offset, int blockId, LowOpBlockLabel* labelList)
+ {
+     ALOGV("in handleHotChainingCell for method %s block %d BC offset %x NCG offset %x",
+@@ -736,15 +737,16 @@ static void handleHotChainingCell(CompilationUnit *cUnit,
+     /* Add one additional "jump 0" instruction, it may be modified during jit chaining. This helps
+      * reslove the multithreading issue.
+      */
+-    insertJumpHelp();
++    int nop_size = insertJumpHelp();
+     move_imm_to_reg(OpndSize_32, (int) (cUnit->method->insns + offset), P_GPR_1, true);
+     scratchRegs[0] = PhysicalReg_EAX;
+     call_dvmJitToInterpTraceSelect();
+     //move_imm_to_reg(OpndSize_32, (int) (cUnit->method->insns + offset), P_GPR_1, true); /* used when unchaining */
++    return nop_size;
+ }
+ 
+ /* Chaining cell for branches that branch back into the same basic block */
+-static void handleBackwardBranchChainingCell(CompilationUnit *cUnit,
++static int handleBackwardBranchChainingCell(CompilationUnit *cUnit,
+                                      unsigned int offset, int blockId, LowOpBlockLabel* labelList)
+ {
+     ALOGV("in handleBackwardBranchChainingCell for method %s block %d BC offset %x NCG offset %x",
+@@ -755,15 +757,16 @@ static void handleBackwardBranchChainingCell(CompilationUnit *cUnit,
+     /* Add one additional "jump 0" instruction, it may be modified during jit chaining. This helps
+      * reslove the multithreading issue.
+      */
+-    insertJumpHelp();
++    int nop_size = insertJumpHelp();
+     move_imm_to_reg(OpndSize_32, (int) (cUnit->method->insns + offset), P_GPR_1, true);
+     scratchRegs[0] = PhysicalReg_EAX;
+     call_dvmJitToInterpNormal();
+     //move_imm_to_reg(OpndSize_32, (int) (cUnit->method->insns + offset), P_GPR_1, true); /* used when unchaining */
++    return nop_size;
+ }
+ 
+ /* Chaining cell for monomorphic method invocations. */
+-static void handleInvokeSingletonChainingCell(CompilationUnit *cUnit,
++static int handleInvokeSingletonChainingCell(CompilationUnit *cUnit,
+                                               const Method *callee, int blockId, LowOpBlockLabel* labelList)
+ {
+     ALOGV("in handleInvokeSingletonChainingCell for method %s block %d callee %s NCG offset %x",
+@@ -774,11 +777,12 @@ static void handleInvokeSingletonChainingCell(CompilationUnit *cUnit,
+     /* Add one additional "jump 0" instruction, it may be modified during jit chaining. This helps
+      * reslove the multithreading issue.
+      */
+-    insertJumpHelp();
++    int nop_size = insertJumpHelp();
+     move_imm_to_reg(OpndSize_32, (int) (callee->insns), P_GPR_1, true);
+     scratchRegs[0] = PhysicalReg_EAX;
+     call_dvmJitToInterpTraceSelect();
+     //move_imm_to_reg(OpndSize_32, (int) (callee->insns), P_GPR_1, true); /* used when unchaining */
++    return nop_size;
+ }
+ #undef P_GPR_1
+ 
+@@ -1441,25 +1445,30 @@ gen_fallthrough:
+             dvmCompilerAppendLIR(cUnit, (LIR *) &labelList[blockId]);
+ 
+ 
++            int nop_size;
+             switch (chainingBlock->blockType) {
+                 case kChainingCellNormal:
+-                    handleNormalChainingCell(cUnit,
++                    nop_size = handleNormalChainingCell(cUnit,
+                      chainingBlock->startOffset, blockId, labelList);
++                    labelList[blockId].lop.generic.offset += nop_size; //skip over nop
+                     break;
+                 case kChainingCellInvokeSingleton:
+-                    handleInvokeSingletonChainingCell(cUnit,
++                    nop_size = handleInvokeSingletonChainingCell(cUnit,
+                         chainingBlock->containingMethod, blockId, labelList);
++                    labelList[blockId].lop.generic.offset += nop_size; //skip over nop
+                     break;
+                 case kChainingCellInvokePredicted:
+                     handleInvokePredictedChainingCell(cUnit, blockId);
+                     break;
+                 case kChainingCellHot:
+-                    handleHotChainingCell(cUnit,
++                    nop_size = handleHotChainingCell(cUnit,
+                         chainingBlock->startOffset, blockId, labelList);
++                    labelList[blockId].lop.generic.offset += nop_size; //skip over nop
+                     break;
+                 case kChainingCellBackwardBranch:
+-                    handleBackwardBranchChainingCell(cUnit,
++                    nop_size = handleBackwardBranchChainingCell(cUnit,
+                         chainingBlock->startOffset, blockId, labelList);
++                    labelList[blockId].lop.generic.offset += nop_size; //skip over nop
+                     break;
+                 default:
+                     ALOGE("Bad blocktype %d", chainingBlock->blockType);
+-- 
+1.7.4.1
+

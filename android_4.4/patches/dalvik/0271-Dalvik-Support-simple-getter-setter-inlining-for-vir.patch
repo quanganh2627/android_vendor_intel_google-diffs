@@ -1,0 +1,482 @@
+From 482d31b60942f56b651fd863f3b3b022cf0bd576 Mon Sep 17 00:00:00 2001
+From: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Date: Thu, 13 Jun 2013 15:08:47 -0700
+Subject: Dalvik: Support simple getter/setter inlining for virtual invokes
+
+BZ: 66163
+
+Inlining of getters, setters, and empty methods is now supported for
+virtual invokes. Supported empty methods have a single return-void
+bytecode. Supported setters have a single put bytecode (aput*, sput*,
+iput*) and a return. Supported getters have a single get bytecode (aget*,
+sget*, iget*) and a return. No other forms of setters and getters are
+supported.
+
+The virtual invokes supported are invoke-virtual, invoke-virtual-quick,
+invoke-interface and all range variants of the listed invokes.
+
+An extended MIR named kMirOpCheckInlinePrediction is used to devirtualize
+and check whether the class of the inlined method matches the actual class.
+If yes, it jumps to the actual inlined body. Otherwise, it executes the
+invoke normally.
+
+Both PCG and lightCG backends are supported.
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: If0817544535951dfe7a45f74fdd6e0629d4249d0
+Orig-MCG-Change-Id: If9416080617ebba8c3696838c83fc8d17f8a7ad3
+Signed-off-by: Razvan A Lupusoru <razvan.a.lupusoru@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Reviewed-on: http://android.intel.com:8080/124381
+Reviewed-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Tested-by: Chen, Dong-Yuan <dong-yuan.chen@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/InlineTransformation.cpp               |   11 ----
+ vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp     |    1 +
+ .../codegen/x86/lightcg/BytecodeVisitor.cpp        |   45 +++++++++++++++++
+ .../codegen/x86/lightcg/CodegenInterface.cpp       |   16 ++++--
+ .../codegen/x86/lightcg/InstructionGeneration.cpp  |   52 ++++++++++++--------
+ .../codegen/x86/lightcg/InstructionGeneration.h    |    9 ++-
+ vm/compiler/codegen/x86/lightcg/LowerHelper.cpp    |    3 +
+ vm/compiler/codegen/x86/lightcg/LowerInvoke.cpp    |   52 --------------------
+ vm/compiler/codegen/x86/pcg/Analysis.cpp           |    6 ++
+ vm/compiler/codegen/x86/pcg/CodeGeneration.cpp     |    4 ++
+ vm/compiler/codegen/x86/pcg/LowerOther.cpp         |   34 +++++++++++++
+ vm/compiler/codegen/x86/pcg/LowerOther.h           |    8 +++
+ 12 files changed, 149 insertions(+), 92 deletions(-)
+
+diff --git a/vm/compiler/InlineTransformation.cpp b/vm/compiler/InlineTransformation.cpp
+index 3798591..8aacc10 100755
+--- a/vm/compiler/InlineTransformation.cpp
++++ b/vm/compiler/InlineTransformation.cpp
+@@ -1081,19 +1081,8 @@ static InliningFailure tryInline (CompilationUnit *cUnit, const Method *calleeMe
+             || (methodStats->attributes & METHOD_IS_SETTER) != 0
+             || (methodStats->attributes & METHOD_IS_EMPTY) != 0)
+     {
+-#ifndef ARCH_IA32
+         //Getters and setters have a single bytecode and a return
+         inlined = doInline (cUnit->blockList, calleeMethod, invoke, isPredicted);
+-#else
+-        if (isPredicted == false)
+-        {
+-            inlined = doInline (cUnit->blockList, calleeMethod, invoke, isPredicted);
+-        }
+-        else
+-        {
+-            inlined = kInliningNoVirtualSupport;
+-        }
+-#endif
+ 
+ #if defined(WITH_JIT_TUNING)
+         //When we are trying to tune JIT, keep track of how many getters/setters we inlined
+diff --git a/vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp b/vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp
+index 4968d50..f2e7eb4 100644
+--- a/vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp
++++ b/vm/compiler/codegen/x86/lightcg/AnalysisO1.cpp
+@@ -1255,6 +1255,7 @@ bool skipExtendedMir(Opcode opc) {
+     ExtendedMIROpcode extendedOpCode = static_cast<ExtendedMIROpcode> (opc);
+ 
+     switch (extendedOpCode) {
++        case kMirOpCheckInlinePrediction:
+         case kMirOpRegisterize:
+             return false;
+         default:
+diff --git a/vm/compiler/codegen/x86/lightcg/BytecodeVisitor.cpp b/vm/compiler/codegen/x86/lightcg/BytecodeVisitor.cpp
+index 670fe6a..b1bd30e 100644
+--- a/vm/compiler/codegen/x86/lightcg/BytecodeVisitor.cpp
++++ b/vm/compiler/codegen/x86/lightcg/BytecodeVisitor.cpp
+@@ -1525,6 +1525,15 @@ int getVirtualRegInfo (VirtualRegInfo* infoArray, const MIR * currentMIR, bool u
+                 }
+                 num_regs_per_bytecode = 1;
+                 break;
++            case kMirOpCheckInlinePrediction:
++                //vC holds the register which represents the "this" reference
++                infoArray[0].regNum = currentMIR->dalvikInsn.vC;
++                infoArray[0].refCount = 1;
++                infoArray[0].accessType = REGACCESS_U;
++                infoArray[0].physicalType = LowOpndRegType_gp;
++
++                num_regs_per_bytecode = 1;
++                break;
+             default:
+                 ALOGI("JIT_INFO: Extended MIR not supported in getVirtualRegInfo");
+                 SET_JIT_ERROR(kJitErrorUnsupportedBytecode);
+@@ -3646,6 +3655,42 @@ int getTempRegInfo(TempRegInfo* infoArray, const MIR * currentMIR, const u2* dal
+                         break;
+                 }
+                 return 1;
++            case kMirOpCheckInlinePrediction:
++            {
++                unsigned int tempRegCount = 0;
++
++                //Use temp1 to hold the "this" object reference
++                infoArray[0].regNum = 1;
++                infoArray[0].refCount = 3; //DUU
++                infoArray[0].physicalType = LowOpndRegType_gp;
++                tempRegCount++;
++
++                //Use temp2 to hold the object's actual class
++                infoArray[1].regNum = 2;
++                infoArray[1].refCount = 2; //DU
++                infoArray[1].physicalType = LowOpndRegType_gp;
++                tempRegCount++;
++
++                //If we won't be generating a null check on object, then we have fewer references
++                if ((currentMIR->OptimizationFlags & MIR_IGNORE_NULL_CHECK) != 0)
++                {
++                    //Null check requires two references so we subtract that right now
++                    infoArray[0].refCount -= 2;
++                }
++                else
++                {
++                    //When nullCheck is called it expects that it can update references to EDX.
++                    //Although EDX is not explicitly used, we must add two references now in order to satisfy
++                    //this dependency. Eventually when nullCheck is fixed this can be removed.
++                    infoArray[2].regNum = PhysicalReg_EDX;
++                    infoArray[2].physicalType = LowOpndRegType_gp | LowOpndRegType_hard;
++                    infoArray[2].refCount = 2;
++                    tempRegCount++;
++                }
++
++                //Return the number of temps being used
++                return tempRegCount;
++            }
+             default:
+                 ALOGI("JIT_INFO: Extended MIR not supported in getTempRegInfo");
+                 SET_JIT_ERROR(kJitErrorUnsupportedBytecode);
+diff --git a/vm/compiler/codegen/x86/lightcg/CodegenInterface.cpp b/vm/compiler/codegen/x86/lightcg/CodegenInterface.cpp
+index 77da115..adecc76 100644
+--- a/vm/compiler/codegen/x86/lightcg/CodegenInterface.cpp
++++ b/vm/compiler/codegen/x86/lightcg/CodegenInterface.cpp
+@@ -1420,11 +1420,16 @@ bool handleExtendedMIR (CompilationUnit *cUnit, BasicBlock_O1 *bb, MIR *mir)
+         ALOGI("LOWER %s @%p\n", decodedString, stream);
+     }
+ 
+-    //Eagerly assume that we will be able to handle it
++    //Assume that we will be able to handle it
+     bool result = true;
+ 
++    //Some of the extended MIRs only have implementations that use hardcoded registers.
++    //For that reason we switch the "NCGO0" mode manually now. However, since that will
++    //eventually be deprecated all new extended MIRs are implemented with "NCGO1" mode
++    //and thus below we manually switch back the execution mode
+     ExecutionMode origMode = gDvm.executionMode;
+     gDvm.executionMode = kExecutionModeNcgO0;
++
+     switch ((ExtendedMIROpcode)mir->dalvikInsn.opcode) {
+         case kMirOpPhi: {
+             break;
+@@ -1457,12 +1462,12 @@ bool handleExtendedMIR (CompilationUnit *cUnit, BasicBlock_O1 *bb, MIR *mir)
+             result = genRegisterize (cUnit, bb, mir);
+             break;
+         }
+-#ifdef WITH_JIT_INLINING_PHASE2
+-        case kMirOpCheckInlinePrediction: { //handled in ncg_o1_data.c
+-            genValidationForPredictedInline(cUnit, mir);
++        case kMirOpCheckInlinePrediction:
++        {
++            gDvm.executionMode = origMode;
++            result = genValidationForPredictedInline (cUnit, mir);
+             break;
+         }
+-#endif
+         default:
+         {
+             char * decodedString = dvmCompilerGetDalvikDisassembly(&mir->dalvikInsn, NULL);
+@@ -1471,6 +1476,7 @@ bool handleExtendedMIR (CompilationUnit *cUnit, BasicBlock_O1 *bb, MIR *mir)
+             break;
+         }
+     }
++
+     gDvm.executionMode = origMode;
+ 
+     return result;
+diff --git a/vm/compiler/codegen/x86/lightcg/InstructionGeneration.cpp b/vm/compiler/codegen/x86/lightcg/InstructionGeneration.cpp
+index c6edaad..2d79514 100644
+--- a/vm/compiler/codegen/x86/lightcg/InstructionGeneration.cpp
++++ b/vm/compiler/codegen/x86/lightcg/InstructionGeneration.cpp
+@@ -179,31 +179,41 @@ void genHoistedLowerBoundCheck(CompilationUnit *cUnit, MIR *mir)
+ }
+ #undef P_GPR_1
+ 
+-#ifdef WITH_JIT_INLINING_PHASE2
+-void genValidationForPredictedInline(CompilationUnit *cUnit, MIR *mir)
++bool genValidationForPredictedInline (CompilationUnit *cUnit, MIR *mir)
+ {
+-    CallsiteInfo *callsiteInfo = mir->meta.callsiteInfo;
+-    if(gDvm.executionMode == kExecutionModeNcgO0) {
+-        get_virtual_reg(mir->dalvikInsn.vC, OpndSize_32, PhysicalReg_EBX, true);
+-        move_imm_to_reg(OpndSize_32, (int) callsiteInfo->clazz, PhysicalReg_ECX, true);
+-        compare_imm_reg(OpndSize_32, 0, PhysicalReg_EBX, true);
+-        export_pc(); //use %edx
+-        conditional_jump_global_API(, Condition_E, "common_errNullObject", false);
+-        move_mem_to_reg(OpndSize_32, offObject_clazz, PhysicalReg_EBX, true, PhysicalReg_EAX, true);
+-        compare_reg_reg(PhysicalReg_ECX, true, PhysicalReg_EAX, true);
+-    } else {
+-        get_virtual_reg(mir->dalvikInsn.vC, OpndSize_32, 5, false);
+-        move_imm_to_reg(OpndSize_32, (int) callsiteInfo->clazz, 4, false);
+-        nullCheck(5, false, 1, mir->dalvikInsn.vC);
+-        move_mem_to_reg(OpndSize_32, offObject_clazz, 5, false, 6, false);
+-        compare_reg_reg(4, false, 6, false);
++    //This function should only be called when generating inline prediction
++    assert (static_cast<ExtendedMIROpcode> (mir->dalvikInsn.opcode) == kMirOpCheckInlinePrediction);
++
++    //Now create some locals to make it easier to read
++    const int temp1 = 1;
++    const int temp2 = 2;
++    const int vrThisPtr = mir->dalvikInsn.vC;
++    const int clazzLiteral = mir->dalvikInsn.vB;
++
++    //Now that we got the desired information we start generating some code.
++    //First we get the "this" pointer and put it in temp1
++    get_virtual_reg (vrThisPtr, OpndSize_32, temp1, false);
++
++    //Now we do a null check unless it is not needed
++    if ((mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK) == 0)
++    {
++        nullCheck (temp1, false, 1, vrThisPtr);
+     }
+ 
+-    //immdiate will be updated later in genLandingPadForMispredictedCallee
+-    streamMisPred = stream;
+-    callsiteInfo->misPredBranchOver = (LIR*)conditional_jump_int(Condition_NE, 0, OpndSize_8);
++    //Load the class of "this" into temp2
++    move_mem_to_reg (OpndSize_32, OFFSETOF_MEMBER (Object, clazz), temp1, false, temp2, false);
++
++    //Compare the predicted class with the actual class
++    compare_imm_reg (OpndSize_32, clazzLiteral, temp2, false);
++
++    //If the classes are not equal, then conditionally jump to the taken branch which is the invoke.
++    //Otherwise, fall through to the inlined method. Since this has same semantics as the if bytecode,
++    //we can use the common_if implementation
++    generateConditionalJumpToTakenBlock (Condition_NE);
++
++    //We successfully generated the prediction validation if we get here
++    return true;
+ }
+-#endif
+ 
+ /**
+  * @brief Uses heuristics to determine whether a registerize request should be satisfied.
+diff --git a/vm/compiler/codegen/x86/lightcg/InstructionGeneration.h b/vm/compiler/codegen/x86/lightcg/InstructionGeneration.h
+index da71a61..cfc19c7 100644
+--- a/vm/compiler/codegen/x86/lightcg/InstructionGeneration.h
++++ b/vm/compiler/codegen/x86/lightcg/InstructionGeneration.h
+@@ -78,12 +78,15 @@ void genHoistedChecksForCountDownLoop(CompilationUnit *cUnit, MIR *mir);
+ void genHoistedLowerBoundCheck(CompilationUnit *cUnit, MIR *mir);
+ 
+ /**
+- * @brief Generate the validation for a predicted inline
+- * vC actual class
++ * @brief Generates the validation for a predicted inline.
++ * @details Generates code that checks the class of inlined method against the actual class.
++ * In case of mispredict it jumps to "taken" path which contains the actual invoke.
++ * vC: The register that holds "this" reference
++ * vB: Class object pointer
+  * @param cUnit the CompilationUnit
+  * @param mir the MIR instruction
+  */
+-void genValidationForPredictedInline(CompilationUnit *cUnit, MIR *mir);
++bool genValidationForPredictedInline (CompilationUnit *cUnit, MIR *mir);
+ 
+ /**
+  * @brief Generate native code for the registerize extended instruction
+diff --git a/vm/compiler/codegen/x86/lightcg/LowerHelper.cpp b/vm/compiler/codegen/x86/lightcg/LowerHelper.cpp
+index cbcc482..48de310 100644
+--- a/vm/compiler/codegen/x86/lightcg/LowerHelper.cpp
++++ b/vm/compiler/codegen/x86/lightcg/LowerHelper.cpp
+@@ -2947,6 +2947,9 @@ int nullCheck(int reg, bool isPhysical, int exceptionNum, int vr) {
+     if(gDvm.executionMode == kExecutionModeNcgO1 && isVRNullCheck(vr, OpndSize_32)) {
+         updateRefCount2(reg, LowOpndRegType_gp, isPhysical);
+         if(exceptionNum <= 1) {
++            //TODO Updating edx references is an artifact of older codebase where null checking didn't
++            //punt to the exception handling cell. These manual reference count updates should be removed
++            //along with BytecodeVisitor.cpp updated to not refer to these.
+             updateRefCount2(PhysicalReg_EDX, LowOpndRegType_gp, true);
+             updateRefCount2(PhysicalReg_EDX, LowOpndRegType_gp, true);
+         }
+diff --git a/vm/compiler/codegen/x86/lightcg/LowerInvoke.cpp b/vm/compiler/codegen/x86/lightcg/LowerInvoke.cpp
+index d2143ba..bbddf9d 100644
+--- a/vm/compiler/codegen/x86/lightcg/LowerInvoke.cpp
++++ b/vm/compiler/codegen/x86/lightcg/LowerInvoke.cpp
+@@ -57,28 +57,6 @@ void gen_predicted_chain(bool isRange, u2 tmp, int IMMC, bool isInterface,
+ #define PP_GPR_3 PhysicalReg_EAX
+ #define PP_GPR_4 PhysicalReg_EDX
+ 
+-#ifdef WITH_JIT_INLINING_PHASE2
+-/*
+- * The function here takes care the
+- * branch over if prediction is correct and the misprediction target for misPredBranchOver.
+- */
+-static void genLandingPadForMispredictedCallee(MIR* mir) {
+-    BasicBlock *fallThrough = traceCurrentBB->fallThrough;
+-    /* Bypass the move-result block if there is one */
+-    if (fallThrough->firstMIRInsn) {
+-        assert(fallThrough->firstMIRInsn->OptimizationFlags & MIR_INLINED_PRED);
+-        fallThrough = fallThrough->fallThrough;
+-    }
+-    /* Generate a branch over if the predicted inlining is correct */
+-    jumpToBasicBlock(stream, fallThrough->id);
+-    /* Hook up the target to the verification branch */
+-    int relativeNCG = stream - streamMisPred;
+-    unsigned instSize = encoder_get_inst_size(streamMisPred);
+-    relativeNCG -= instSize; //size of the instruction
+-    updateJumpInst(streamMisPred, OpndSize_8, relativeNCG);
+-}
+-#endif
+-
+ //! LOWER bytecode INVOKE_VIRTUAL without usage of helper function
+ 
+ //!
+@@ -86,16 +64,6 @@ int common_invoke_virtual_nohelper(bool isRange, u2 tmp, int vD, const MIR *mir)
+ {
+     const DecodedInstruction &decodedInst = mir->dalvikInsn;
+ 
+-#ifdef WITH_JIT_INLINING_PHASE2
+-    /*
+-     * If the invoke has non-null misPredBranchOver, we need to generate
+-     * the non-inlined version of the invoke here to handle the
+-     * mispredicted case.
+-     */
+-    if (mir->meta.callsiteInfo->misPredBranchOver) {
+-        genLandingPadForMispredictedCallee (mir);
+-    }
+-#endif
+     scratchRegs[2] = PhysicalReg_Null; scratchRegs[3] = PhysicalReg_Null;
+     export_pc();
+     beforeCall("exception"); //dump GG, GL VRs
+@@ -358,16 +326,6 @@ int common_invoke_interface(bool isRange, u2 tmp, int vD, const MIR *mir) {
+ 
+     const DecodedInstruction &decodedInst = mir->dalvikInsn;
+ 
+-#ifdef WITH_JIT_INLINING_PHASE2
+-    /*
+-     * If the invoke has non-null misPredBranchOver, we need to generate
+-     * the non-inlined version of the invoke here to handle the
+-     * mispredicted case.
+-     */
+-    if (mir->meta.callsiteInfo->misPredBranchOver) {
+-        genLandingPadForMispredictedCallee (mir);
+-    }
+-#endif
+     export_pc(); //use %edx
+     beforeCall("exception"); //dump GG, GL VRs
+     ///////////////////////
+@@ -1573,16 +1531,6 @@ int common_invoke_virtual_quick(bool hasRange, int vD, u2 IMMC, const MIR *mir)
+ 
+     const DecodedInstruction &decodedInst = mir->dalvikInsn;
+ 
+-#ifdef WITH_JIT_INLINING_PHASE2
+-    /*
+-     * If the invoke has non-null misPredBranchOver, we need to generate
+-     * the non-inlined version of the invoke here to handle the
+-     * mispredicted case.
+-     */
+-    if (mir->meta.callsiteInfo->misPredBranchOver) {
+-        genLandingPadForMispredictedCallee (mir);
+-    }
+-#endif
+     export_pc();
+     beforeCall("exception"); //dump GG, GL VRs
+     /////////////////////////////////////////////////
+diff --git a/vm/compiler/codegen/x86/pcg/Analysis.cpp b/vm/compiler/codegen/x86/pcg/Analysis.cpp
+index 24752de..e9ca418 100644
+--- a/vm/compiler/codegen/x86/pcg/Analysis.cpp
++++ b/vm/compiler/codegen/x86/pcg/Analysis.cpp
+@@ -1206,6 +1206,12 @@ bool dvmCompilerPcgNewRegisterizeVRAnalysis (CompilationUnitPCG *cUnit)
+                         }
+                         break;
+                     }
++                    else if ( (ExtendedMIROpcode)dalvikOpCode == kMirOpCheckInlinePrediction)
++                    {
++                        // Reference the "this" pointer
++                        pcgRef (cUnit, ssaRep->uses[0], INTreg, true);
++                        break;
++                    }
+ 
+                     ALOGI ("Unsupported instruction in trace for new registerization:");
+                     char mybuf[2048];
+diff --git a/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp b/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
+index 529cf86..58c2e41 100644
+--- a/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
++++ b/vm/compiler/codegen/x86/pcg/CodeGeneration.cpp
+@@ -70,6 +70,10 @@ static bool dvmCompilerPcgTranslateInsn (CompilationUnitPCG *cUnit, MIR *mir)
+             case kMirOpRegisterize:
+                 break;
+ 
++            case kMirOpCheckInlinePrediction:
++                dvmCompilerPcgTranslatePredictionInlineCheck (cUnit, mir);
++                break;
++
+             default:
+                 LOGE ("Jit (PCG): unsupported externded MIR opcode");
+                 assert (0);
+diff --git a/vm/compiler/codegen/x86/pcg/LowerOther.cpp b/vm/compiler/codegen/x86/pcg/LowerOther.cpp
+index b0365f3..0138a49 100644
+--- a/vm/compiler/codegen/x86/pcg/LowerOther.cpp
++++ b/vm/compiler/codegen/x86/pcg/LowerOther.cpp
+@@ -643,3 +643,37 @@ void dvmCompilerPcgAddVRInterfaceCode (CompilationUnitPCG *cUnit)
+                 "    ===========================\n");
+     }
+ }
++
++void dvmCompilerPcgTranslatePredictionInlineCheck (CompilationUnitPCG *cUnit, MIR *mir)
++{
++    //This function should only be called when generating inline prediction
++    assert (static_cast<ExtendedMIROpcode> (mir->dalvikInsn.opcode) == kMirOpCheckInlinePrediction);
++
++    BasicBlockPCG *bb = static_cast<BasicBlockPCG *> (mir->bb);
++
++    //Paranoid
++    assert (bb != 0);
++
++    //Instruction has conditional branching semantics so it should be block ending
++    assert (mir->next == 0 && bb->lastMIRInsn == mir && bb->fallThrough != 0 && bb->taken != 0);
++
++    //Get the SSARepresentation
++    SSARepresentation *ssaRep = mir->ssaRep;
++
++    assert (ssaRep != 0);
++
++    //Get the "this" pointer
++    CGInst thisPtr = dvmCompilerPcgGetVirtualReg (cUnit, ssaRep->uses[0], "mov", 4);
++
++    //Check it for null
++    dvmCompilerPcgGenerateNullCheck (cUnit, thisPtr, mir, ssaRep->uses[0]);
++
++    //The class literal is in vB
++    CGInst clazzLiteral = CGCreateNewInst ("mov", "i", mir->dalvikInsn.vB);
++
++    //Get the class from "this"
++    CGInst clazz = dvmCompilerPcgCreateSimpleLoad (thisPtr, OFFSETOF_MEMBER (Object, clazz));
++
++    //We take the taken branch if the class of this doesn't match our expected class
++    dvmCompilerPcgTranslateConditionalJump (bb, clazz, "ne", clazzLiteral);
++}
+diff --git a/vm/compiler/codegen/x86/pcg/LowerOther.h b/vm/compiler/codegen/x86/pcg/LowerOther.h
+index a1cb070..b1d0841 100644
+--- a/vm/compiler/codegen/x86/pcg/LowerOther.h
++++ b/vm/compiler/codegen/x86/pcg/LowerOther.h
+@@ -101,4 +101,12 @@ void dvmCompilerPcgTranslateSparseSwitch (CompilationUnitPCG *cUnit, MIR *mir);
+  */
+ void dvmCompilerPcgAddVRInterfaceCode (CompilationUnitPCG *cUnit);
+ 
++/**
++ * @brief Translate the extended prediction inline check MIR
++ * @details Does a class check to verify if the inlined path should be taken or the path with invoke in case of mispredict.
++ * @param cUnit The Compilation Unit
++ * @param mir The MIR with opcode kMirOpCheckInlinePrediction
++ */
++void dvmCompilerPcgTranslatePredictionInlineCheck (CompilationUnitPCG *cUnit, MIR *mir);
++
+ #endif
+-- 
+1.7.4.1
+

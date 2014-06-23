@@ -1,0 +1,687 @@
+From b0f5d952e4c1fd13b144b673467ae3742d2cd877 Mon Sep 17 00:00:00 2001
+From: Qiming Shi <qiming.shi@intel.com>
+Date: Sat, 1 Jun 2013 15:05:27 +0800
+Subject: Dalvik: Adding Object null check hoist support
+
+BZ: 65481
+
+Object Null Check Removal and Hoisting
+
+Adding support for Object Null Check Removal and hoisting
+The prior patch only handled arrays, this one handles objects as well
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-CG; AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Iec6936503023502022d5694d972dd5eae855ab64
+Orig-MCG-Change-Id: I7dccce7d1252267bbfcd9b57cc740377728e83a8
+Signed-off-by: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/Checks.cpp                  |   22 ++++++++-
+ vm/compiler/Dataflow.cpp                |   74 +++++++++++++++---------------
+ vm/compiler/Dataflow.h                  |   10 ++++
+ vm/compiler/codegen/x86/LowerGetPut.cpp |   78 +++++++++++++++++++++++++------
+ vm/compiler/codegen/x86/LowerInvoke.cpp |   68 ++++++++++++++++----------
+ vm/compiler/codegen/x86/LowerObject.cpp |   46 ++++++++++++++----
+ 6 files changed, 206 insertions(+), 92 deletions(-)
+
+diff --git a/vm/compiler/Checks.cpp b/vm/compiler/Checks.cpp
+index e9bbc0c..0a211c9 100644
+--- a/vm/compiler/Checks.cpp
++++ b/vm/compiler/Checks.cpp
+@@ -481,7 +481,8 @@ void walkBasicBlock (CompilationUnit *cUnit, SRemoveData *removeData, MIR *first
+          * Currently we can only optimize away null and range checks. Punt on
+          * instructions that can throw due to other exceptions.
+          */
+-        if (!(dfAttributes & DF_HAS_NR_CHECKS)) {
++        if ( (dfAttributes & (DF_HAS_NR_CHECKS | DF_HAS_OBJECT_CHECKS)) == 0)
++        {
+             continue;
+         }
+ 
+@@ -489,6 +490,8 @@ void walkBasicBlock (CompilationUnit *cUnit, SRemoveData *removeData, MIR *first
+         //Set to -1 both
+         int nullCheck = -1;
+         int boundCheck = -1;
++
++        //Depending on the instruction, the array and index are in different registers
+         switch (dfAttributes & DF_HAS_NR_CHECKS) {
+             case DF_NULL_N_RANGE_CHECK_0:
+                 nullCheck = 0;
+@@ -503,8 +506,21 @@ void walkBasicBlock (CompilationUnit *cUnit, SRemoveData *removeData, MIR *first
+                 boundCheck = nullCheck + 1;
+                 break;
+             default:
+-                ALOGE("Jit: bad case in dvmCompilerCheckRemoval");
+-                dvmCompilerAbort(cUnit);
++                break;
++        }
++
++        switch (dfAttributes & DF_HAS_OBJECT_CHECKS)
++        {
++            case DF_NULL_OBJECT_CHECK_0:
++                nullCheck = 0;
++                break;
++            case DF_NULL_OBJECT_CHECK_1:
++                nullCheck = 1;
++                break;
++            case DF_NULL_OBJECT_CHECK_2:
++                nullCheck = 2;
++                break;
++            default:
+                 break;
+         }
+ 
+diff --git a/vm/compiler/Dataflow.cpp b/vm/compiler/Dataflow.cpp
+index 0707bdc..10399f9 100644
+--- a/vm/compiler/Dataflow.cpp
++++ b/vm/compiler/Dataflow.cpp
+@@ -119,10 +119,10 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_DA,
+ 
+     // 1D OP_MONITOR_ENTER vAA
+-    DF_UA,
++    DF_UA | DF_NULL_OBJECT_CHECK_0,
+ 
+     // 1E OP_MONITOR_EXIT vAA
+-    DF_UA,
++    DF_UA | DF_NULL_OBJECT_CHECK_0,
+ 
+     // 1F OP_CHECK_CAST vAA, type@BBBB
+     DF_UA,
+@@ -131,7 +131,7 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_DA | DF_UB,
+ 
+     // 21 OP_ARRAY_LENGTH vA, vB
+-    DF_DA | DF_UB,
++    DF_DA | DF_UB | DF_NULL_OBJECT_CHECK_0,
+ 
+     // 22 OP_NEW_INSTANCE vAA, type@BBBB
+     DF_DA,
+@@ -279,46 +279,46 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_UA | DF_UB | DF_UC | DF_NULL_N_RANGE_CHECK_1 | DF_IS_SETTER,
+ 
+     // 52 OP_IGET vA, vB, field@CCCC
+-    DF_DA | DF_UB | DF_IS_GETTER,
++    DF_DA | DF_UB | DF_IS_GETTER | DF_NULL_OBJECT_CHECK_0,
+ 
+     // 53 OP_IGET_WIDE vA, vB, field@CCCC
+-    DF_DA_WIDE | DF_UB | DF_IS_GETTER,
++    DF_DA_WIDE | DF_UB | DF_IS_GETTER | DF_NULL_OBJECT_CHECK_0,
+ 
+     // 54 OP_IGET_OBJECT vA, vB, field@CCCC
+-    DF_DA | DF_UB | DF_IS_GETTER,
++    DF_DA | DF_UB | DF_IS_GETTER | DF_NULL_OBJECT_CHECK_0,
+ 
+     // 55 OP_IGET_BOOLEAN vA, vB, field@CCCC
+-    DF_DA | DF_UB | DF_IS_GETTER,
++    DF_DA | DF_UB | DF_IS_GETTER | DF_NULL_OBJECT_CHECK_0,
+ 
+-    // 56 OP_IGET_BYTE vA, vB, field@CCCC
+-    DF_DA | DF_UB | DF_IS_GETTER,
++    // 56 OP_IGET_BYTE vA , vB, field@CCCC
++    DF_DA | DF_UB | DF_IS_GETTER | DF_NULL_OBJECT_CHECK_0,
+ 
+-    // 57 OP_IGET_CHAR vA, vB, field@CCCC
+-    DF_DA | DF_UB | DF_IS_GETTER,
++    // 57 OP_IGET_CHAR vA , vB, field@CCCC
++    DF_DA | DF_UB | DF_IS_GETTER | DF_NULL_OBJECT_CHECK_0,
+ 
+-    // 58 OP_IGET_SHORT vA, vB, field@CCCC
+-    DF_DA | DF_UB | DF_IS_GETTER,
++    // 58 OP_IGET_SHORT vA , vB, field@CCCC
++    DF_DA | DF_UB | DF_IS_GETTER | DF_NULL_OBJECT_CHECK_0,
+ 
+-    // 59 OP_IPUT vA, vB, field@CCCC
+-    DF_UA | DF_UB | DF_IS_SETTER,
++    // 59 OP_IPUT vA , vB, field@CCCC
++    DF_UA | DF_UB | DF_IS_SETTER | DF_NULL_OBJECT_CHECK_1,
+ 
+     // 5A OP_IPUT_WIDE vA, vB, field@CCCC
+-    DF_UA_WIDE | DF_UB | DF_IS_SETTER,
++    DF_UA_WIDE | DF_UB | DF_IS_SETTER | DF_NULL_OBJECT_CHECK_2,
+ 
+     // 5B OP_IPUT_OBJECT vA, vB, field@CCCC
+-    DF_UA | DF_UB | DF_IS_SETTER,
++    DF_UA | DF_UB | DF_IS_SETTER | DF_NULL_OBJECT_CHECK_1,
+ 
+     // 5C OP_IPUT_BOOLEAN vA, vB, field@CCCC
+-    DF_UA | DF_UB | DF_IS_SETTER,
++    DF_UA | DF_UB | DF_IS_SETTER | DF_NULL_OBJECT_CHECK_1,
+ 
+     // 5D OP_IPUT_BYTE vA, vB, field@CCCC
+-    DF_UA | DF_UB | DF_IS_SETTER,
++    DF_UA | DF_UB | DF_IS_SETTER | DF_NULL_OBJECT_CHECK_1,
+ 
+     // 5E OP_IPUT_CHAR vA, vB, field@CCCC
+-    DF_UA | DF_UB | DF_IS_SETTER,
++    DF_UA | DF_UB | DF_IS_SETTER | DF_NULL_OBJECT_CHECK_1,
+ 
+     // 5F OP_IPUT_SHORT vA, vB, field@CCCC
+-    DF_UA | DF_UB | DF_IS_SETTER,
++    DF_UA | DF_UB | DF_IS_SETTER | DF_NULL_OBJECT_CHECK_1,
+ 
+     // 60 OP_SGET vAA, field@BBBB
+     DF_DA | DF_IS_GETTER,
+@@ -363,37 +363,37 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_UA | DF_IS_SETTER,
+ 
+     // 6E OP_INVOKE_VIRTUAL {vD, vE, vF, vG, vA}
+-    DF_FORMAT_35C,
++    DF_FORMAT_35C | DF_NULL_OBJECT_CHECK_0,
+ 
+     // 6F OP_INVOKE_SUPER {vD, vE, vF, vG, vA}
+-    DF_FORMAT_35C,
++    DF_FORMAT_35C | DF_NULL_OBJECT_CHECK_0,
+ 
+     // 70 OP_INVOKE_DIRECT {vD, vE, vF, vG, vA}
+-    DF_FORMAT_35C,
++    DF_FORMAT_35C | DF_NULL_OBJECT_CHECK_0,
+ 
+     // 71 OP_INVOKE_STATIC {vD, vE, vF, vG, vA}
+     DF_FORMAT_35C,
+ 
+     // 72 OP_INVOKE_INTERFACE {vD, vE, vF, vG, vA}
+-    DF_FORMAT_35C,
++    DF_FORMAT_35C | DF_NULL_OBJECT_CHECK_0,
+ 
+     // 73 OP_UNUSED_73
+     DF_NOP,
+ 
+     // 74 OP_INVOKE_VIRTUAL_RANGE {vCCCC .. vNNNN}
+-    DF_FORMAT_3RC,
++    DF_FORMAT_3RC | DF_NULL_OBJECT_CHECK_0,
+ 
+     // 75 OP_INVOKE_SUPER_RANGE {vCCCC .. vNNNN}
+     DF_FORMAT_3RC,
+ 
+     // 76 OP_INVOKE_DIRECT_RANGE {vCCCC .. vNNNN}
+-    DF_FORMAT_3RC,
++    DF_FORMAT_3RC | DF_NULL_OBJECT_CHECK_0,
+ 
+     // 77 OP_INVOKE_STATIC_RANGE {vCCCC .. vNNNN}
+-    DF_FORMAT_3RC,
++    DF_FORMAT_3RC | DF_NULL_OBJECT_CHECK_0,
+ 
+     // 78 OP_INVOKE_INTERFACE_RANGE {vCCCC .. vNNNN}
+-    DF_FORMAT_3RC,
++    DF_FORMAT_3RC | DF_NULL_OBJECT_CHECK_0,
+ 
+     // 79 OP_UNUSED_79
+     DF_NOP,
+@@ -759,28 +759,28 @@ int dvmCompilerDataFlowAttributes[kMirOpLast] = {
+     DF_NOP,
+ 
+     // F2 OP_IGET_QUICK
+-    DF_DA | DF_UB | DF_IS_GETTER,
++    DF_DA | DF_UB | DF_IS_GETTER | DF_NULL_OBJECT_CHECK_0,
+ 
+     // F3 OP_IGET_WIDE_QUICK
+-    DF_DA_WIDE | DF_UB | DF_IS_GETTER,
++    DF_DA_WIDE | DF_UB | DF_IS_GETTER | DF_NULL_OBJECT_CHECK_0,
+ 
+     // F4 OP_IGET_OBJECT_QUICK
+-    DF_DA | DF_UB | DF_IS_GETTER,
++    DF_DA | DF_UB | DF_IS_GETTER | DF_NULL_OBJECT_CHECK_0,
+ 
+     // F5 OP_IPUT_QUICK
+-    DF_UA | DF_UB | DF_IS_SETTER,
++    DF_UA | DF_UB | DF_IS_SETTER | DF_NULL_OBJECT_CHECK_1,
+ 
+     // F6 OP_IPUT_WIDE_QUICK
+-    DF_UA_WIDE | DF_UB | DF_IS_SETTER,
++    DF_UA_WIDE | DF_UB | DF_IS_SETTER | DF_NULL_OBJECT_CHECK_2,
+ 
+     // F7 OP_IPUT_OBJECT_QUICK
+-    DF_UA | DF_UB | DF_IS_SETTER,
++    DF_UA | DF_UB | DF_IS_SETTER | DF_NULL_OBJECT_CHECK_1,
+ 
+     // F8 OP_INVOKE_VIRTUAL_QUICK
+-    DF_FORMAT_35C,
++    DF_FORMAT_35C | DF_NULL_OBJECT_CHECK_0,
+ 
+     // F9 OP_INVOKE_VIRTUAL_QUICK_RANGE
+-    DF_FORMAT_3RC,
++    DF_FORMAT_3RC | DF_NULL_OBJECT_CHECK_0,
+ 
+     // FA OP_INVOKE_SUPER_QUICK
+     DF_FORMAT_35C,
+diff --git a/vm/compiler/Dataflow.h b/vm/compiler/Dataflow.h
+index f04c91c..e6e66ce 100644
+--- a/vm/compiler/Dataflow.h
++++ b/vm/compiler/Dataflow.h
+@@ -38,6 +38,9 @@ typedef enum DataFlowAttributePos {
+     kNullNRangeCheck0,
+     kNullNRangeCheck1,
+     kNullNRangeCheck2,
++    kNullObjectCheck0,
++    kNullObjectCheck1,
++    kNullObjectCheck2,
+     kFPA,
+     kFPB,
+     kFPC,
+@@ -63,6 +66,9 @@ typedef enum DataFlowAttributePos {
+ #define DF_NULL_N_RANGE_CHECK_0 (1 << kNullNRangeCheck0)
+ #define DF_NULL_N_RANGE_CHECK_1 (1 << kNullNRangeCheck1)
+ #define DF_NULL_N_RANGE_CHECK_2 (1 << kNullNRangeCheck2)
++#define DF_NULL_OBJECT_CHECK_0  (1 << kNullObjectCheck0)
++#define DF_NULL_OBJECT_CHECK_1  (1 << kNullObjectCheck1)
++#define DF_NULL_OBJECT_CHECK_2  (1 << kNullObjectCheck2)
+ #define DF_FP_A                 (1 << kFPA)
+ #define DF_FP_B                 (1 << kFPB)
+ #define DF_FP_C                 (1 << kFPC)
+@@ -78,6 +84,10 @@ typedef enum DataFlowAttributePos {
+                                  DF_NULL_N_RANGE_CHECK_1 | \
+                                  DF_NULL_N_RANGE_CHECK_2)
+ 
++#define DF_HAS_OBJECT_CHECKS    (DF_NULL_OBJECT_CHECK_0 | \
++                                 DF_NULL_OBJECT_CHECK_1 | \
++                                 DF_NULL_OBJECT_CHECK_2)
++
+ #define DF_A_IS_REG             (DF_UA | DF_UA_WIDE | DF_DA | DF_DA_WIDE)
+ #define DF_B_IS_REG             (DF_UB | DF_UB_WIDE)
+ #define DF_C_IS_REG             (DF_UC | DF_UC_WIDE)
+diff --git a/vm/compiler/codegen/x86/LowerGetPut.cpp b/vm/compiler/codegen/x86/LowerGetPut.cpp
+index 2b5cbdc..1a94b8d 100644
+--- a/vm/compiler/codegen/x86/LowerGetPut.cpp
++++ b/vm/compiler/codegen/x86/LowerGetPut.cpp
+@@ -580,13 +580,25 @@ int iget_iput_common_nohelper(u2 referenceIndex, InstanceAccess flag, u2 vA,
+     fieldOffset = pInstField->byteOffset;
+     move_imm_to_reg(OpndSize_32, fieldOffset, 8, false);
+ #endif
++
+     // Request VR delay before transfer to temporary. Only vB needs delay.
+     // vA will have non-zero reference count since transfer to temporary for
+     // it happens after null check, thus no delay is needed.
+-    requestVRFreeDelay(vB,VRDELAY_NULLCHECK);
++    if((mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK) == 0)
++    {
++        requestVRFreeDelay(vB,VRDELAY_NULLCHECK);
++    }
+     get_virtual_reg(vB, OpndSize_32, 7, false);
+-    nullCheck(7, false, 2, vB); //maybe optimized away, if not, call
+-    cancelVRFreeDelayRequest(vB,VRDELAY_NULLCHECK);
++    //If we can't ignore the NULL check
++    if((mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK) == 0)
++    {
++        nullCheck(7, false, 2, vB); //maybe optimized away, if not, call
++        cancelVRFreeDelayRequest(vB,VRDELAY_NULLCHECK);
++    }
++
++#if !defined(WITH_JIT)
++    move_mem_to_reg(OpndSize_32, offInstField_byteOffset, PhysicalReg_EAX, true, 8, false); //byte offest
++#endif
+     if(flag == IGET) {
+         move_mem_scale_to_reg(OpndSize_32, 7, false, 8, false, 1, 9, false);
+         set_virtual_reg(vA, OpndSize_32, 9, false);
+@@ -1162,10 +1174,19 @@ int op_iget_quick(const MIR * mir) {
+     u2 vB = mir->dalvikInsn.vB; //object
+     u2 fieldByteOffset = mir->dalvikInsn.vC;
+ 
+-    requestVRFreeDelay(vB,VRDELAY_NULLCHECK); // Request VR delay before transfer to temporary
++    if((mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK) == 0)
++    {
++        requestVRFreeDelay(vB,VRDELAY_NULLCHECK); // Request VR delay before transfer to temporary
++    }
++
+     get_virtual_reg(vB, OpndSize_32, 1, false);
+-    nullCheck(1, false, 1, vB); //maybe optimized away, if not, call
+-    cancelVRFreeDelayRequest(vB,VRDELAY_NULLCHECK);
++
++    //If we can't ignore the NULL check
++    if((mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK) == 0)
++    {
++        nullCheck(1, false, 1, vB); //maybe optimized away, if not, call
++        cancelVRFreeDelayRequest(vB,VRDELAY_NULLCHECK);
++    }
+ 
+     move_mem_to_reg(OpndSize_32, fieldByteOffset, 1, false, 2, false);
+     set_virtual_reg(vA, OpndSize_32, 2, false);
+@@ -1186,10 +1207,19 @@ int op_iget_wide_quick(const MIR * mir) {
+     u2 vB = mir->dalvikInsn.vB; //object
+     u2 fieldByteOffset = mir->dalvikInsn.vC;
+ 
+-    requestVRFreeDelay(vB,VRDELAY_NULLCHECK); // Request VR delay before transfer to temporary
++    if((mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK) == 0)
++    {
++        requestVRFreeDelay(vB,VRDELAY_NULLCHECK); // Request VR delay before transfer to temporary
++    }
++
+     get_virtual_reg(vB, OpndSize_32, 1, false);
+-    nullCheck(1, false, 1, vB); //maybe optimized away, if not, call
+-    cancelVRFreeDelayRequest(vB,VRDELAY_NULLCHECK);
++
++    //If we can't ignore the NULL check
++    if((mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK) == 0)
++    {
++        nullCheck(1, false, 1, vB); //maybe optimized away, if not, call
++        cancelVRFreeDelayRequest(vB,VRDELAY_NULLCHECK);
++    }
+ 
+     move_mem_to_reg(OpndSize_64, fieldByteOffset, 1, false, 1, false);
+     set_virtual_reg(vA, OpndSize_64, 1, false);
+@@ -1223,10 +1253,19 @@ int iput_quick_common(const MIR * mir, bool isObj) {
+     // Request VR delay before transfer to temporary. Only vB needs delay.
+     // vA will have non-zero reference count since transfer to temporary for
+     // it happens after null check, thus no delay is needed.
+-    requestVRFreeDelay(vB,VRDELAY_NULLCHECK);
++    if((mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK) == 0)
++    {
++        requestVRFreeDelay(vB,VRDELAY_NULLCHECK);
++    }
++
+     get_virtual_reg(vB, OpndSize_32, 1, false);
+-    nullCheck(1, false, 1, vB); //maybe optimized away, if not, call
+-    cancelVRFreeDelayRequest(vB,VRDELAY_NULLCHECK);
++
++    //If we can't ignore the NULL check
++    if((mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK) == 0)
++    {
++        nullCheck(1, false, 1, vB); //maybe optimized away, if not, call
++        cancelVRFreeDelayRequest(vB,VRDELAY_NULLCHECK);
++    }
+ 
+     get_virtual_reg(vA, OpndSize_32, 2, false);
+     move_reg_to_mem(OpndSize_32, 2, false, fieldByteOffset, 1, false);
+@@ -1262,10 +1301,19 @@ int op_iput_wide_quick(const MIR * mir) {
+     // Request VR delay before transfer to temporary. Only vB needs delay.
+     // vA will have non-zero reference count since transfer to temporary for
+     // it happens after null check, thus no delay is needed.
+-    requestVRFreeDelay(vB,VRDELAY_NULLCHECK);
++    if((mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK) == 0)
++    {
++        requestVRFreeDelay(vB,VRDELAY_NULLCHECK);
++    }
++
+     get_virtual_reg(vB, OpndSize_32, 1, false);
+-    nullCheck(1, false, 1, vB); //maybe optimized away, if not, call
+-    cancelVRFreeDelayRequest(vB,VRDELAY_NULLCHECK);
++
++    //If we can't ignore the NULL check
++    if((mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK) == 0)
++    {
++        nullCheck(1, false, 1, vB); //maybe optimized away, if not, call
++        cancelVRFreeDelayRequest(vB,VRDELAY_NULLCHECK);
++    }
+ 
+     get_virtual_reg(vA, OpndSize_64, 1, false);
+     move_reg_to_mem(OpndSize_64, 1, false, fieldByteOffset, 1, false);
+diff --git a/vm/compiler/codegen/x86/LowerInvoke.cpp b/vm/compiler/codegen/x86/LowerInvoke.cpp
+index 25830ad..911f62d 100644
+--- a/vm/compiler/codegen/x86/LowerInvoke.cpp
++++ b/vm/compiler/codegen/x86/LowerInvoke.cpp
+@@ -82,8 +82,10 @@ static void genLandingPadForMispredictedCallee(MIR* mir) {
+ //! LOWER bytecode INVOKE_VIRTUAL without usage of helper function
+ 
+ //!
+-int common_invoke_virtual_nohelper(bool isRange, u2 tmp, u2 vD,
+-        const DecodedInstruction &decodedInst) {
++int common_invoke_virtual_nohelper(bool isRange, u2 tmp, u2 vD, const MIR *mir)
++{
++    const DecodedInstruction &decodedInst = mir->dalvikInsn;
++
+ #ifdef WITH_JIT_INLINING_PHASE2
+     /*
+      * If the invoke has non-null misPredBranchOver, we need to generate
+@@ -100,7 +102,11 @@ int common_invoke_virtual_nohelper(bool isRange, u2 tmp, u2 vD,
+     beforeCall("exception"); //dump GG, GL VRs
+ 
+     get_virtual_reg(vD, OpndSize_32, 5, false);
+-    simpleNullCheck(5, false, vD);
++
++    if ( (mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK) == 0)
++    {
++        simpleNullCheck(5, false, vD);
++    }
+ #ifndef PREDICTED_CHAINING
+     move_mem_to_reg(OpndSize_32, offObject_clazz, 5, false, 6, false); //clazz of "this"
+     move_mem_to_reg(OpndSize_32, offClassObject_vtable, 6, false, 7, false); //vtable
+@@ -229,8 +235,9 @@ int invoke_super_nsm() {
+ //! common section to lower INVOKE_DIRECT
+ 
+ //! It will use helper function if the switch is on
+-int common_invoke_direct(bool isRange, u2 tmp, u2 vD,
+-        const DecodedInstruction &decodedInst) {
++int common_invoke_direct(bool isRange, u2 tmp, u2 vD, const MIR *mir)
++{
++    const DecodedInstruction &decodedInst = mir->dalvikInsn;
+     //%ecx can be used as scratch when calling export_pc, get_res_methods and resolve_method
+     export_pc();
+     constVREndOfBB();
+@@ -243,7 +250,10 @@ int common_invoke_direct(bool isRange, u2 tmp, u2 vD,
+         move_mem_to_reg(OpndSize_32, tmp*4, 3, false, PhysicalReg_ECX, true);
+ #endif
+         get_virtual_reg(vD, OpndSize_32, 5, false);
+-        simpleNullCheck(5, false, vD);
++        if ( (mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK) == 0)
++        {
++            simpleNullCheck(5, false, vD);
++        }
+ #if !defined(WITH_JIT)
+         //cmp $0, LR[4]
+         compare_imm_reg(OpndSize_32, 0, PhysicalReg_ECX, true);
+@@ -345,8 +355,10 @@ int common_invoke_static(bool isRange, u2 tmp,
+ //! common section to lower INVOKE_INTERFACE
+ 
+ //! It will use helper function if the switch is on
+-int common_invoke_interface(bool isRange, u2 tmp, u2 vD,
+-        const DecodedInstruction &decodedInst) {
++int common_invoke_interface(bool isRange, u2 tmp, u2 vD, const MIR *mir) {
++
++    const DecodedInstruction &decodedInst = mir->dalvikInsn;
++
+ #ifdef WITH_JIT_INLINING_PHASE2
+     /*
+      * If the invoke has non-null misPredBranchOver, we need to generate
+@@ -363,7 +375,11 @@ int common_invoke_interface(bool isRange, u2 tmp, u2 vD,
+     ///////////////////////
+     scratchRegs[2] = PhysicalReg_Null; scratchRegs[3] = PhysicalReg_Null;
+     get_virtual_reg(vD, OpndSize_32, 1, false);
+-    simpleNullCheck(1, false, vD);
++
++    if ( (mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK) == 0)
++    {
++        simpleNullCheck(1, false, vD);
++    }
+ 
+ #ifndef PREDICTED_CHAINING
+     load_effective_addr(-16, PhysicalReg_ESP, true, PhysicalReg_ESP, true);
+@@ -422,8 +438,7 @@ int op_invoke_virtual(const MIR * mir) {
+                                                of historical reasons. In reality, first
+                                                argument is in vC */
+     u2 tmp = mir->dalvikInsn.vB;
+-    int retval = common_invoke_virtual_nohelper(false/*not range*/, tmp, vD,
+-            mir->dalvikInsn);
++    int retval = common_invoke_virtual_nohelper(false/*not range*/, tmp, vD, mir);
+ #if defined(ENABLE_TRACING) && !defined(TRACING_OPTION2)
+     insertMapWorklist(offsetPC+3, stream - streamMethodStart, 1); //check when helper switch is on
+ #endif
+@@ -468,8 +483,7 @@ int op_invoke_direct(const MIR * mir) {
+                                                of historical reasons. In reality, first
+                                                argument is in vC */
+     u2 tmp = mir->dalvikInsn.vB;
+-    int retval = common_invoke_direct(false/*not range*/, tmp, vD,
+-            mir->dalvikInsn);
++    int retval = common_invoke_direct(false/*not range*/, tmp, vD, mir);
+ #if defined(ENABLE_TRACING) && !defined(TRACING_OPTION2)
+     insertMapWorklist(offsetPC+3, stream - streamMethodStart, 1); //check when helper switch is on
+ #endif
+@@ -514,8 +528,7 @@ int op_invoke_interface(const MIR * mir) {
+                                                of historical reasons. In reality, first
+                                                argument is in vC */
+     u2 tmp = mir->dalvikInsn.vB;
+-    int retval = common_invoke_interface(false/*not range*/, tmp, vD,
+-            mir->dalvikInsn);
++    int retval = common_invoke_interface(false/*not range*/, tmp, vD, mir);
+ #if defined(ENABLE_TRACING) && !defined(TRACING_OPTION2)
+     insertMapWorklist(offsetPC+3, stream - streamMethodStart, 1); //check when helper switch is on
+ #endif
+@@ -538,8 +551,7 @@ int op_invoke_virtual_range(const MIR * mir) {
+                                                of historical reasons. In reality, first
+                                                argument is in vCCCC */
+     u2 tmp = mir->dalvikInsn.vB; //BBBB, method index
+-    int retval = common_invoke_virtual_nohelper(true/*range*/, tmp, vD,
+-            mir->dalvikInsn);
++    int retval = common_invoke_virtual_nohelper(true/*range*/, tmp, vD, mir);
+ #if defined(ENABLE_TRACING) && !defined(TRACING_OPTION2)
+     insertMapWorklist(offsetPC+3, stream - streamMethodStart, 1); //check when helper switch is on
+ #endif
+@@ -576,7 +588,7 @@ int op_invoke_direct_range(const MIR * mir) {
+                                                of historical reasons. In reality, first
+                                                argument is in vCCCC */
+     u2 tmp = mir->dalvikInsn.vB; //BBBB, method index
+-    int retval = common_invoke_direct(true/*range*/, tmp, vD, mir->dalvikInsn);
++    int retval = common_invoke_direct(true/*range*/, tmp, vD, mir);
+ #if defined(ENABLE_TRACING) && !defined(TRACING_OPTION2)
+     insertMapWorklist(offsetPC+3, stream - streamMethodStart, 1); //check when helper switch is on
+ #endif
+@@ -613,10 +625,9 @@ int op_invoke_interface_range(const MIR * mir) {
+                                                of historical reasons. In reality, first
+                                                argument is in vCCCC */
+     u2 tmp = mir->dalvikInsn.vB; //BBBB, method index
+-    int retval = common_invoke_interface(true/*range*/, tmp, vD,
+-            mir->dalvikInsn);
++    int retval = common_invoke_interface(true/*range*/, tmp, vD, mir);
+ #if defined(ENABLE_TRACING) && !defined(TRACING_OPTION2)
+-    insertMapWorklist(offsetPC+3, stream - streamMethodStart, 1); //check when helper switch is on
++    insertMapWorklist(offsetPC+3, stream - streamMethodStart1); //check when helper switch is on
+ #endif
+     return retval;
+ }
+@@ -1395,8 +1406,10 @@ int op_execute_inline(const MIR * mir, bool isRange) {
+ //! common code for INVOKE_VIRTUAL_QUICK
+ 
+ //! It uses helper function if the switch is on
+-int common_invoke_virtual_quick(bool hasRange, u2 vD, u2 IMMC,
+-        const DecodedInstruction &decodedInst) {
++int common_invoke_virtual_quick(bool hasRange, u2 vD, u2 IMMC, const MIR *mir) {
++
++    const DecodedInstruction &decodedInst = mir->dalvikInsn;
++
+ #ifdef WITH_JIT_INLINING_PHASE2
+     /*
+      * If the invoke has non-null misPredBranchOver, we need to generate
+@@ -1412,7 +1425,10 @@ int common_invoke_virtual_quick(bool hasRange, u2 vD, u2 IMMC,
+     beforeCall("exception"); //dump GG, GL VRs
+     /////////////////////////////////////////////////
+     get_virtual_reg(vD, OpndSize_32, 1, false);
+-    simpleNullCheck(1, false, vD);
++    if ( (mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK) == 0)
++    {
++        simpleNullCheck(1, false, vD);
++    }
+ #ifndef PREDICTED_CHAINING
+     move_mem_to_reg(OpndSize_32, 0, 1, false, 2, false);
+     move_mem_to_reg(OpndSize_32, offClassObject_vtable, 2, false, 3, false);
+@@ -1449,7 +1465,7 @@ int op_invoke_virtual_quick(const MIR * mir) {
+ #endif
+     u2 vD = mir->dalvikInsn.vC;
+     u2 IMMC = 4 * mir->dalvikInsn.vB;
+-    int retval = common_invoke_virtual_quick(false, vD, IMMC, mir->dalvikInsn);
++    int retval = common_invoke_virtual_quick(false, vD, IMMC, mir);
+ #if defined(ENABLE_TRACING) && !defined(TRACING_OPTION2)
+     insertMapWorklist(offsetPC+3, stream - streamMethodStart, 1); //check when helper switch is on
+ #endif
+@@ -1467,7 +1483,7 @@ int op_invoke_virtual_quick_range(const MIR * mir) {
+ #endif
+     u2 vD = mir->dalvikInsn.vC;
+     u2 IMMC = 4 * mir->dalvikInsn.vB;
+-    int retval = common_invoke_virtual_quick(true, vD, IMMC, mir->dalvikInsn);
++    int retval = common_invoke_virtual_quick(true, vD, IMMC, mir);
+ #if defined(ENABLE_TRACING) && !defined(TRACING_OPTION2)
+     insertMapWorklist(offsetPC+3, stream - streamMethodStart, 1); //check when helper switch is on
+ #endif
+diff --git a/vm/compiler/codegen/x86/LowerObject.cpp b/vm/compiler/codegen/x86/LowerObject.cpp
+index 1a5b348..cd15343 100644
+--- a/vm/compiler/codegen/x86/LowerObject.cpp
++++ b/vm/compiler/codegen/x86/LowerObject.cpp
+@@ -205,17 +205,25 @@ int op_instance_of(const MIR * mir) {
+ //! LOWER bytecode MONITOR_ENTER without usage of helper function
+ 
+ //!   CALL dvmLockObject
+-int monitor_enter_nohelper(u2 vA) {
++int monitor_enter_nohelper(u2 vA, const MIR *mir) {
+     scratchRegs[0] = PhysicalReg_SCRATCH_1;
+     scratchRegs[2] = PhysicalReg_Null; scratchRegs[3] = PhysicalReg_Null;
+ 
+-    requestVRFreeDelay(vA,VRDELAY_NULLCHECK); // Request VR delay before transfer to temporary
++    if((mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK) == 0)
++    {
++        requestVRFreeDelay(vA,VRDELAY_NULLCHECK); // Request VR delay before transfer to temporary
++    }
++
+     //get_self_pointer is separated
+     get_virtual_reg(vA, OpndSize_32, 1, false);
+     //to optimize redundant null check, NCG O1 wraps up null check in a function: nullCheck
+     get_self_pointer(3, false);
+-    nullCheck(1, false, 1, vA); //maybe optimized away
+-    cancelVRFreeDelayRequest(vA,VRDELAY_NULLCHECK);
++    //If we can't ignore the NULL check
++    if((mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK) == 0)
++    {
++        nullCheck(1, false, 1, vA); //maybe optimized away
++        cancelVRFreeDelayRequest(vA,VRDELAY_NULLCHECK);
++    }
+ 
+     /////////////////////////////
+     //prepare to call dvmLockObject, inputs: object reference and self
+@@ -263,7 +271,7 @@ int op_monitor_enter(const MIR * mir) {
+ #endif
+     {
+         export_pc();
+-        monitor_enter_nohelper(vA);
++        monitor_enter_nohelper(vA, mir);
+     }
+     return 0;
+ }
+@@ -301,10 +309,18 @@ int op_monitor_exit(const MIR * mir) {
+         scratchRegs[0] = PhysicalReg_SCRATCH_1; scratchRegs[1] = PhysicalReg_SCRATCH_2;
+         scratchRegs[2] = PhysicalReg_Null; scratchRegs[3] = PhysicalReg_Null;
+ 
+-        requestVRFreeDelay(vA,VRDELAY_NULLCHECK); // Request VR delay before transfer to temporary
++        if((mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK) == 0)
++        {
++            requestVRFreeDelay(vA,VRDELAY_NULLCHECK); // Request VR delay before transfer to temporary
++        }
++
+         get_virtual_reg(vA, OpndSize_32, 1, false);
+-        nullCheck(1, false, 1, vA); //maybe optimized away
+-        cancelVRFreeDelayRequest(vA,VRDELAY_NULLCHECK);
++
++        if((mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK) == 0)
++        {
++            nullCheck(1, false, 1, vA); //maybe optimized away
++            cancelVRFreeDelayRequest(vA,VRDELAY_NULLCHECK);
++        }
+ 
+         /////////////////////////////
+         //prepare to call dvmUnlockObject, inputs: object reference and self
+@@ -366,10 +382,18 @@ int op_array_length(const MIR * mir) {
+     {
+         ////////////////////
+         //no usage of helper function
+-        requestVRFreeDelay(vB,VRDELAY_NULLCHECK); // Request VR delay before transfer to temporary
++        if((mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK) == 0)
++        {
++            requestVRFreeDelay(vB,VRDELAY_NULLCHECK); // Request VR delay before transfer to temporary
++        }
++
+         get_virtual_reg(vB, OpndSize_32, 1, false);
+-        nullCheck(1, false, 1, vB); //maybe optimized away
+-        cancelVRFreeDelayRequest(vB,VRDELAY_NULLCHECK);
++
++        if((mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK) == 0)
++        {
++            nullCheck(1, false, 1, vB); //maybe optimized away
++            cancelVRFreeDelayRequest(vB,VRDELAY_NULLCHECK);
++        }
+ 
+         move_mem_to_reg(OpndSize_32, offArrayObject_length, 1, false, 2, false);
+         set_virtual_reg(vA, OpndSize_32, 2, false);
+-- 
+1.7.4.1
+

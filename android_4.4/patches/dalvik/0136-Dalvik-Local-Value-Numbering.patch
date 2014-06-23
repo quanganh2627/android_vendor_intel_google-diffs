@@ -1,0 +1,346 @@
+From b02f1150e4be98e2323b9302d586b492623142cf Mon Sep 17 00:00:00 2001
+From: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Date: Sat, 6 Apr 2013 13:15:21 -0700
+Subject: Dalvik: Local Value Numbering
+
+BZ: 98296
+
+Added a local value numbering pass to the compiler.
+
+BBOptimization:
+ - The implementation for the local value numbering algorithm
+
+CompilerIR.h:
+ - Added the localValueNumber to the MIR
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Ie0bf1037d4a902c6e0a2302eb172e8f979ea37dd
+Orig-MCG-Change-Id: I97adee58296b3bace429ab94f42a7a4cedcb6a89
+Signed-off-by: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/BBOptimization.cpp |  242 ++++++++++++++++++++++++++++++++++++++++
+ vm/compiler/BBOptimization.h   |    8 ++
+ vm/compiler/CompilerIR.h       |    7 +-
+ vm/compiler/LoopOpt.cpp        |    2 +
+ 4 files changed, 256 insertions(+), 3 deletions(-)
+
+diff --git a/vm/compiler/BBOptimization.cpp b/vm/compiler/BBOptimization.cpp
+index 1fd3883..27bef4b 100644
+--- a/vm/compiler/BBOptimization.cpp
++++ b/vm/compiler/BBOptimization.cpp
+@@ -1187,6 +1187,34 @@ static Opcode convertFrom2addr (Opcode opcode)
+     return result;
+ }
+ 
++/*
++ * @brief Is the opcode commutative?
++ * @param opcode the instruction opcode
++ * @return is the opcode representing a commutative operation?
++ */
++static bool isOpcodeCommutative (int opcode)
++{
++    switch (opcode)
++    {
++        case OP_ADD_INT:
++        case OP_MUL_INT:
++        case OP_AND_INT:
++        case OP_OR_INT:
++        case OP_XOR_INT:
++        case OP_ADD_LONG:
++        case OP_MUL_LONG:
++        case OP_AND_LONG:
++        case OP_OR_LONG:
++        case OP_XOR_LONG:
++            return true;
++        default:
++            break;
++    }
++
++    //Is not commutative
++    return false;
++}
++
+ bool dvmCompilerConvert2addr (CompilationUnit *cUnit, BasicBlock *bb)
+ {
+     bool result = false;
+@@ -1602,3 +1630,217 @@ void dvmCompilerPeel (CompilationUnit *cUnit, Pass *pass)
+     //Call the recursive function to peel the inner loop
+     peelLoopRecursive (cUnit, info);
+ }
++
++/**
++ * @brief Integer comparison for the qsort
++ * @param aptr the pointer to element a
++ * @param bptr the pointer to element b
++ * @return negative, 0, positive if a < 0, a == 0, a > 0
++ */
++int intCompare (const void *aptr, const void *bptr)
++{
++    const int *a = static_cast<const int *> (aptr);
++    const int *b = static_cast<const int *> (bptr);
++
++    //Get difference
++    int res = (*a) - (*b);
++
++    //Return it
++    return res;
++}
++
++typedef struct sLocalValueNumberingAssociation
++{
++    int opcode;
++    std::vector<int> uses;
++    unsigned int constant;
++
++    bool operator< (const struct sLocalValueNumberingAssociation &b) const
++    {
++        //Order of the tests: opcode first, uses second, constant third
++        if (opcode < b.opcode)
++        {
++            return true;
++        }
++
++        //Only care about the rest if opcodes are identical
++        if (opcode > b.opcode)
++        {
++            return false;
++        }
++
++        //Consider size
++        unsigned int size = uses.size ();
++        if (size < b.uses.size ())
++        {
++            return true;
++        }
++
++        //Only care about the rest if sizes are identical
++        if (size > b.uses.size ())
++        {
++            return false;
++        }
++
++        //Consider uses
++        for (unsigned int i = 0; i < size; i++)
++        {
++            if (uses[i] < b.uses[i])
++            {
++                return true;
++            }
++
++            //Only care about rest if current use is identical
++            if (uses[i] > b.uses[i])
++            {
++                return false;
++            }
++        }
++
++        //Consider the constants
++        if (constant < b.constant)
++        {
++            return true;
++        }
++
++        return false;
++    }
++}SLocalValueNumberingAssociation;
++
++/**
++ * @brief Handle the local value numbering for the instruction
++ * @param mir MIR instruction
++ * @param color the current color
++ * @return the new color
++ */
++static void handleLocalValueNumbering (MIR *mir,
++                                       std::map<SLocalValueNumberingAssociation, unsigned int> &associations,
++                                       std::map<unsigned int, unsigned int> &ssaAssociations)
++{
++    //Get DecodedInstruction
++    DecodedInstruction &insn = mir->dalvikInsn;
++
++    //Get the opcode
++    int opcode = insn.opcode;
++
++    //Create an association entry
++    SLocalValueNumberingAssociation association;
++    association.opcode = opcode;
++
++    //First, get SSA representation
++    SSARepresentation *ssaRep = mir->ssaRep;
++
++    //If no ssa rep, we have a new color
++    if (ssaRep != 0)
++    {
++        //Get number of uses
++        int numUses = ssaRep->numUses;
++
++        //Get values
++        int uses[numUses];
++
++        //Copy them
++        for (int i = 0; i < numUses; i++)
++        {
++            uses[i] = ssaRep->uses[i];
++        }
++
++        //Is the opcode commutative?
++        if (isOpcodeCommutative (opcode) == true)
++        {
++            //Sort the operands
++            qsort (uses, numUses, sizeof (uses[0]), intCompare);
++        }
++
++        for (int i = 0; i < numUses; i++)
++        {
++            //Get hash value
++            unsigned int tmp = 0;
++
++            std::map<unsigned int, unsigned int>::const_iterator it = ssaAssociations.find (uses[i]);
++
++            //If not found, use its ssa value
++            if (it == ssaAssociations.end ())
++            {
++                tmp = uses[i];
++            }
++            else
++            {
++                tmp = it->second;
++            }
++
++            //Add to the vector
++            association.uses.push_back (tmp);
++        }
++    }
++
++    //Add the constant if there is one (default value 0)
++    association.constant = 0;
++    //Get flags first
++    int flags = dvmCompilerDataFlowAttributes[opcode];
++
++    //If vB is being used, vC might be a constant
++    if ( (flags & (DF_UB | DF_UB_WIDE)) != 0)
++    {
++        //If vC is not being used, it's the constant, otherwise there is no constant
++        if ( (flags & (DF_UC | DF_UC_WIDE)) == 0)
++        {
++            association.constant = insn.vC;
++        }
++    }
++    else
++    {
++        //Otherwise vB is the constant
++        association.constant = insn.vB;
++    }
++
++    //Can we find it in the map?
++    std::map<SLocalValueNumberingAssociation, unsigned int>::const_iterator it;
++    it = associations.find (association);
++
++    //If found, get its color
++    int hash = 0;
++    if (it != associations.end ())
++    {
++        hash = it->second;
++    }
++    else
++    {
++        //Otherwise the hash value is the map's size
++        hash = associations.size ();
++
++        //Put it in the map
++        associations[association] = hash;
++    }
++
++    //Set the hash for the defines
++    int numDefs = ssaRep->numDefs;
++    int *defs = ssaRep->defs;
++    for (int i = 0; i < numDefs; i++)
++    {
++        ssaAssociations[defs[i]] = hash;
++    }
++
++    //Also set the instruction color
++    mir->localValueNumber = hash;
++}
++
++/* Perform local value numbering */
++bool dvmCompilerLocalValueNumbering (CompilationUnit *cunit, BasicBlock *bb)
++{
++    //A map for the value numbering hash
++    std::map<SLocalValueNumberingAssociation, unsigned int> localValueNumberingAssociations;
++
++    //A map for the value numbering for SSA registers
++    std::map<unsigned int, unsigned int> ssaAssociations;
++
++    //Walk the BasicBlock
++    for (MIR *mir = bb->firstMIRInsn; mir != 0; mir = mir->next)
++    {
++        //Handle the MIR
++        handleLocalValueNumbering (mir, localValueNumberingAssociations, ssaAssociations);
++    }
++
++    //Nothing changed in the BasicBlock except the localValueNumber in the instructions
++    return false;
++}
+diff --git a/vm/compiler/BBOptimization.h b/vm/compiler/BBOptimization.h
+index 83b1d98..48cce52 100644
+--- a/vm/compiler/BBOptimization.h
++++ b/vm/compiler/BBOptimization.h
+@@ -101,4 +101,12 @@ bool dvmCompilerPeelGate (const CompilationUnit *cUnit, const Pass *curPass);
+  * @param curPass the current Pass
+  */
+ void dvmCompilerPeel (CompilationUnit *cUnit, Pass *curPass);
++
++/*
++ * @brief Perform local value numbering
++ * @param cUnit the CompilationUnit
++ * @param bb the BasicBlock
++ * @return returns whether we changed anything in the BasicBlock
++ */
++bool dvmCompilerLocalValueNumbering (CompilationUnit *cunit, BasicBlock *bb);
+ #endif
+diff --git a/vm/compiler/CompilerIR.h b/vm/compiler/CompilerIR.h
+index 38bd405..194b3b9 100644
+--- a/vm/compiler/CompilerIR.h
++++ b/vm/compiler/CompilerIR.h
+@@ -168,15 +168,16 @@ typedef struct CallsiteInfo {
+  * @brief The instruction color to disambiguate memory aliasing
+  */
+ typedef struct sInstructionColor {
+-    unsigned int aliasingColor; /**< @brief Aliasing color */
+-    MIR *prev;                  /**< @brief Previous instruction in the color */
+-    MIR *next;                  /**< @brief Next instruction in the color */
++    unsigned int aliasingColor;         /**< @brief Aliasing color */
++    MIR *prev;                          /**< @brief Previous instruction in the color */
++    MIR *next;                          /**< @brief Next instruction in the color */
+ }SInstructionColor;
+ 
+ typedef struct MIR {
+     DecodedInstruction dalvikInsn;
+     unsigned int width;
+     unsigned int offset;
++    unsigned int localValueNumber;      //Local value number
+     unsigned int topologicalOrder;      //Topological order of the MIR in the entire CFG
+     BasicBlock *bb;                     //BasicBlock containing the MIR
+     SInstructionColor color;            //Instruction color
+diff --git a/vm/compiler/LoopOpt.cpp b/vm/compiler/LoopOpt.cpp
+index 26592a5..17d60bc 100644
+--- a/vm/compiler/LoopOpt.cpp
++++ b/vm/compiler/LoopOpt.cpp
+@@ -68,6 +68,8 @@ START_PASSES
+                 0, 0, dvmCompilerMergeBasicBlocks, 0, kOptimizationBasicBlockChange),
+     NEW_PASS ("Memory Aliasing", kAllNodes, 0, dvmCompilerVerySimpleLoopGate,
+               0, 0, dvmCompilerMemoryAliasing, 0, 0),
++    NEW_PASS ("Local Value Numbering", kAllNodes, 0, dvmCompilerVerySimpleLoopGate,
++              0, 0, dvmCompilerLocalValueNumbering, 0, 0),
+     NEW_PASS ("Variant", kAllNodes, 0, dvmCompilerVerySimpleLoopGate,
+               0, 0, dvmCompilerVariant, 0, 0),
+     NEW_PASS ("Peel", kAllNodes, 0, dvmCompilerPeelGate,
+-- 
+1.7.4.1
+

@@ -1,0 +1,355 @@
+From 0a977d86bab4ad6f548885bd9eecc354d77018d2 Mon Sep 17 00:00:00 2001
+From: Marc Mao <marc.mao@intel.com>
+Date: Wed, 28 Nov 2012 15:58:07 +0800
+Subject: [PATCH 14/35] Add Display scaling interface for HDMISetting
+
+BZ: 70713
+
+In JB MR1, HDMI display is rendered by SurfaceFlinger. HDMI scaling
+should be processed by SurfaceFlinger too. This patch adds a new
+SurfaceFlinger interface which will be called by MDS to set HDMI
+scaling mode and scaling calibration.
+
+DO NOT UPSTREAM
+
+Change-Id: If69466a8d04e33649b208077ce446e8c181032d6
+Signed-off-by: Marc Mao <marc.mao@intel.com>
+Reviewed-on: http://android.intel.com:8080/76821
+Reviewed-by: Yao, Yong <yong.yao@intel.com>
+Tested-by: Tong, BoX <box.tong@intel.com>
+Reviewed-by: Tong, BoX <box.tong@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+---
+ include/gui/SurfaceComposerClient.h        |   12 +++
+ include/private/gui/LayerState.h           |   18 +++++-
+ libs/gui/LayerState.cpp                    |    2 +
+ libs/gui/SurfaceComposerClient.cpp         |   25 +++++++
+ services/surfaceflinger/SurfaceFlinger.cpp |  105 +++++++++++++++++++++++++++-
+ services/surfaceflinger/SurfaceFlinger.h   |   14 ++++
+ 6 files changed, 172 insertions(+), 4 deletions(-)
+
+diff --git a/include/gui/SurfaceComposerClient.h b/include/gui/SurfaceComposerClient.h
+index cbe399f..3e0a86e 100644
+--- a/include/gui/SurfaceComposerClient.h
++++ b/include/gui/SurfaceComposerClient.h
+@@ -142,6 +142,18 @@ public:
+             const Rect& layerStackRect,
+             const Rect& displayRect);
+ 
++    /* setDisplayScaling is used to change HDMI display projection mode and
++     * calibrate HDMI display area on HDTVs.
++     *
++     * - scaleMode defines the scaling mode, aspect, center or fullscreen.
++     * - scaleStepX defines the calibration steps in both horizontal direction.
++     * - scaleStepY defines the calibration steps in vertial direction.
++     */
++    static void setDisplayScaling(const sp<IBinder>& token,
++            uint32_t scaleMode,
++            uint32_t scaleStepX,
++            uint32_t scaleStepY);
++
+ private:
+     virtual void onFirstRef();
+     Composer& getComposer();
+diff --git a/include/private/gui/LayerState.h b/include/private/gui/LayerState.h
+index a7eb48c..37305bf 100644
+--- a/include/private/gui/LayerState.h
++++ b/include/private/gui/LayerState.h
+@@ -109,7 +109,15 @@ struct DisplayState {
+     enum {
+         eSurfaceChanged             = 0x01,
+         eLayerStackChanged          = 0x02,
+-        eDisplayProjectionChanged   = 0x04
++        eDisplayProjectionChanged   = 0x04,
++        eDisplayScaleChanged        = 0x08
++    };
++
++    enum {
++        eDisplayScaleNone            = 0,
++        eDisplayScaleFullscreen      = 1,
++        eDisplayScaleCenter          = 2,
++        eDisplayScaleAspect          = 3
+     };
+ 
+     uint32_t what;
+@@ -119,6 +127,14 @@ struct DisplayState {
+     uint32_t orientation;
+     Rect viewport;
+     Rect frame;
++    union {
++        uint32_t scale;
++        struct {
++            uint16_t scaleMode;
++            uint8_t  scaleStepX;
++            uint8_t  scaleStepY;
++        };
++    };
+     status_t write(Parcel& output) const;
+     status_t read(const Parcel& input);
+ };
+diff --git a/libs/gui/LayerState.cpp b/libs/gui/LayerState.cpp
+index e2604f8..ab43d9f 100644
+--- a/libs/gui/LayerState.cpp
++++ b/libs/gui/LayerState.cpp
+@@ -69,6 +69,7 @@ status_t DisplayState::write(Parcel& output) const {
+     output.writeInt32(orientation);
+     output.write(viewport);
+     output.write(frame);
++    output.writeInt32(scale);
+     return NO_ERROR;
+ }
+ 
+@@ -80,6 +81,7 @@ status_t DisplayState::read(const Parcel& input) {
+     orientation = input.readInt32();
+     input.read(viewport);
+     input.read(frame);
++    scale = input.readInt32();
+     return NO_ERROR;
+ }
+ 
+diff --git a/libs/gui/SurfaceComposerClient.cpp b/libs/gui/SurfaceComposerClient.cpp
+index f549578..acd2e86 100644
+--- a/libs/gui/SurfaceComposerClient.cpp
++++ b/libs/gui/SurfaceComposerClient.cpp
+@@ -161,6 +161,10 @@ public:
+             uint32_t orientation,
+             const Rect& layerStackRect,
+             const Rect& displayRect);
++    void setDisplayScaling(const sp<IBinder>& token,
++            uint32_t scaleMode,
++            uint32_t scaleStepX,
++            uint32_t scaleStepY);
+ 
+     static void setAnimationTransaction() {
+         Composer::getInstance().setAnimationTransactionImpl();
+@@ -393,6 +397,19 @@ void Composer::setDisplayProjection(const sp<IBinder>& token,
+     mForceSynchronous = true; // TODO: do we actually still need this?
+ }
+ 
++void Composer::setDisplayScaling(const sp<IBinder>& token,
++        uint32_t scaleMode,
++        uint32_t scaleStepX,
++        uint32_t scaleStepY) {
++    Mutex::Autolock _l(mLock);
++    DisplayState& s(getDisplayStateLocked(token));
++    s.scaleMode = (uint16_t)scaleMode;
++    s.scaleStepX = (uint8_t)scaleStepX;
++    s.scaleStepY = (uint8_t)scaleStepY;
++    s.what |= DisplayState::eDisplayScaleChanged;
++    mForceSynchronous = true; // TODO: do we actually still need this?
++}
++
+ // ---------------------------------------------------------------------------
+ 
+ SurfaceComposerClient::SurfaceComposerClient()
+@@ -567,6 +584,14 @@ void SurfaceComposerClient::setDisplayProjection(const sp<IBinder>& token,
+             layerStackRect, displayRect);
+ }
+ 
++void SurfaceComposerClient::setDisplayScaling(const sp<IBinder>& token,
++        uint32_t scaleMode,
++        uint32_t scaleStepX,
++        uint32_t scaleStepY) {
++    Composer::getInstance().setDisplayScaling(token, scaleMode,
++            scaleStepX, scaleStepY);
++}
++
+ // ----------------------------------------------------------------------------
+ 
+ status_t SurfaceComposerClient::getDisplayInfo(
+diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinger/SurfaceFlinger.cpp
+index 742ce9b..d267b3b 100644
+--- a/services/surfaceflinger/SurfaceFlinger.cpp
++++ b/services/surfaceflinger/SurfaceFlinger.cpp
+@@ -88,6 +88,7 @@ SurfaceFlinger::SurfaceFlinger()
+         mTransactionFlags(0),
+         mTransactionPending(false),
+         mAnimTransactionPending(false),
++        mDisplayScaleState(0),
+         mLayersRemoved(false),
+         mRepaintEverything(0),
+         mBootTime(systemTime()),
+@@ -750,6 +751,7 @@ void SurfaceFlinger::onHotplugReceived(int type, bool connected) {
+             mCurrentState.displays.removeItem(mDefaultDisplays[type]);
+         } else {
+             DisplayDeviceState info((DisplayDevice::DisplayType)type);
++            info.scale = mDisplayScaleState;
+             mCurrentState.displays.add(mDefaultDisplays[type], info);
+         }
+         setTransactionFlags(eDisplayTransactionNeeded);
+@@ -1138,10 +1140,14 @@ void SurfaceFlinger::handleTransactionLocked(uint32_t transactionFlags)
+                         }
+                         if ((state.orientation != draw[i].orientation)
+                                 || (state.viewport != draw[i].viewport)
+-                                || (state.frame != draw[i].frame))
++                                || (state.frame != draw[i].frame)
++                                || (state.scale != draw[i].scale))
+                         {
++                            Rect frame = state.frame;
++                            Rect viewport = state.viewport;
++                            handleDisplayScaling(state, viewport, frame);
+                             disp->setProjection(state.orientation,
+-                                    state.viewport, state.frame);
++                                    viewport, frame);
+                         }
+ 
+                         // Walk through all the layers in currentLayers,
+@@ -1259,6 +1265,92 @@ void SurfaceFlinger::commitTransaction()
+     mTransactionCV.broadcast();
+ }
+ 
++void SurfaceFlinger::handleDisplayScaling(const DisplayDeviceState& state,
++        Rect& viewport, Rect& frame)
++{
++    if (state.type == DisplayDevice::DISPLAY_EXTERNAL) {
++        uint32_t width;
++        uint32_t height;
++        HWComposer& hwc(getHwComposer());
++
++        if (!hwc.isConnected(state.type))
++            return;
++
++        width = hwc.getWidth(state.type);
++        height = hwc.getHeight(state.type);
++
++        switch (state.scaleMode) {
++        case DisplayState::eDisplayScaleFullscreen:
++            frame.left = frame.top = 0;
++            frame.right = width;
++            frame.bottom = height;
++            break;
++        case DisplayState::eDisplayScaleCenter:
++        {
++            int viewWidth;
++            int viewHeight;
++            bool isRot90_270;
++
++            isRot90_270 = (state.orientation == DisplayState::eOrientation90 ||
++                 state.orientation == DisplayState::eOrientation270);
++            if (isRot90_270) {
++                viewWidth = viewport.bottom - viewport.top;
++                viewHeight = viewport.right - viewport.left;
++            } else {
++                viewWidth = viewport.right - viewport.left;
++                viewHeight = viewport.bottom - viewport.top;
++            }
++
++            if (width < viewWidth) {
++                frame.left = 0;
++                frame.right = width;
++                if (isRot90_270) {
++                    viewport.top = 0;
++                    viewport.bottom = width;
++                } else {
++                    viewport.left = 0;
++                    viewport.right = width;
++                }
++            } else {
++                frame.left = (width - viewWidth) / 2;
++                frame.right = (width + viewWidth) / 2;
++            }
++
++            if (height < viewHeight) {
++                frame.top = 0;
++                frame.bottom = height;
++                if (isRot90_270) {
++                    viewport.left = 0;
++                    viewport.right = height;
++                } else {
++                    viewport.top = 0;
++                    viewport.bottom = height;
++                }
++            } else {
++                frame.top = (height - viewHeight) / 2;
++                frame.bottom = (height + viewHeight) / 2;
++            }
++            break;
++        }
++        case DisplayState::eDisplayScaleAspect:
++        case DisplayState::eDisplayScaleNone:
++        default:
++            break;
++        }
++
++        if (state.scaleStepX) {
++            int frameWidth = frame.right - frame.left;
++            frame.left += state.scaleStepX * frameWidth / 100;
++            frame.right -= state.scaleStepX * frameWidth / 100;
++        }
++        if (state.scaleStepY) {
++            int frameHeight = frame.bottom - frame.left;
++            frame.top += state.scaleStepY * frameHeight / 100;
++            frame.bottom -= state.scaleStepY * frameHeight / 100;
++        }
++    }
++}
++
+ void SurfaceFlinger::computeVisibleRegions(
+         const LayerVector& currentLayers, uint32_t layerStack,
+         Region& outDirtyRegion, Region& outOpaqueRegion)
+@@ -1791,6 +1883,13 @@ uint32_t SurfaceFlinger::setDisplayStateLocked(const DisplayState& s)
+                 flags |= eDisplayTransactionNeeded;
+             }
+         }
++        if (what & DisplayState::eDisplayScaleChanged) {
++            if (disp.scale != s.scale) {
++                disp.scale = s.scale;
++                flags |= eDisplayTransactionNeeded;
++                mDisplayScaleState = disp.scale;
++            }
++        }
+     }
+     return flags;
+ }
+@@ -2831,7 +2930,7 @@ SurfaceFlinger::DisplayDeviceState::DisplayDeviceState()
+ }
+ 
+ SurfaceFlinger::DisplayDeviceState::DisplayDeviceState(DisplayDevice::DisplayType type)
+-    : type(type), layerStack(0), orientation(0) {
++    : type(type), layerStack(0), orientation(0), scale(0) {
+     viewport.makeInvalid();
+     frame.makeInvalid();
+ }
+diff --git a/services/surfaceflinger/SurfaceFlinger.h b/services/surfaceflinger/SurfaceFlinger.h
+index b71d4dd..890f846 100644
+--- a/services/surfaceflinger/SurfaceFlinger.h
++++ b/services/surfaceflinger/SurfaceFlinger.h
+@@ -170,6 +170,14 @@ private:
+         uint8_t orientation;
+         String8 displayName;
+         bool isSecure;
++        union {
++            uint32_t scale;
++            struct {
++                uint16_t scaleMode;
++                uint8_t  scaleStepX;
++                uint8_t  scaleStepY;
++            };
++        };
+     };
+ 
+     struct State {
+@@ -253,6 +261,10 @@ private:
+      */
+     void handlePageFlip();
+ 
++    // handleDisplayScaling: calculate the scaled frame rect.
++    void handleDisplayScaling(const DisplayDeviceState& state,
++        Rect& viewport, Rect& frame);
++
+     /* ------------------------------------------------------------------------
+      * Transactions
+      */
+@@ -406,6 +418,8 @@ private:
+     bool mTransactionPending;
+     bool mAnimTransactionPending;
+     Vector<sp<LayerBase> > mLayersPendingRemoval;
++    // Last DisplayScaling status
++    uint32_t mDisplayScaleState;
+ 
+     // protected by mStateLock (but we could use another lock)
+     bool mLayersRemoved;
+-- 
+1.7.9
+

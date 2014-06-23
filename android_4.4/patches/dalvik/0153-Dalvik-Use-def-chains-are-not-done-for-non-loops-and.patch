@@ -1,0 +1,172 @@
+From 3e105f800598e789b464f555a47687b9eca52789 Mon Sep 17 00:00:00 2001
+From: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Date: Tue, 16 Apr 2013 14:56:06 -0700
+Subject: Dalvik: Use-def chains are not done for non loops and issue with Phi nodes
+
+BZ: 100985
+
+Added the creation of the use-def chains for non loop traces.
+Fixed an issue with Phi node related defines' use-def chains
+
+Category: device-enablement
+Domain: AOSP-Dalvik-Compiler-ME
+Origin: internal
+Upstream-Candidate: no, needs rework
+
+Change-Id: Iab0a7fa544f45a0228f29462dfe15dd370f66bc1
+Orig-MCG-Change-Id: I7a498f611aa850591c4da061e689d2929b5e4c84
+Signed-off-by: Jean Christophe Beyler <jean.christophe.beyler@intel.com>
+Signed-off-by: Qiming Shi <qiming.shi@intel.com>
+Signed-off-by: Serguei Katkov <serguei.i.katkov@intel.com>
+---
+ vm/compiler/Compiler.h            |    3 ++
+ vm/compiler/Dataflow.cpp          |   10 ++++++
+ vm/compiler/SSATransformation.cpp |   59 ++++++++++++++++++-------------------
+ 3 files changed, 42 insertions(+), 30 deletions(-)
+
+diff --git a/vm/compiler/Compiler.h b/vm/compiler/Compiler.h
+index e94987c..8044a1f 100644
+--- a/vm/compiler/Compiler.h
++++ b/vm/compiler/Compiler.h
+@@ -301,4 +301,7 @@ MIR *dvmCompilerFindLowestMIRInColor (MIR *elem);
+ 
+ /* Get the next BasicBlock from a BitVector */
+ BasicBlock *getNextBasicBlockViaBitVector (BitVectorIterator &bvIterator, const CompilationUnit *cUnit);
++
++/* Build the def use chains */
++bool dvmCompilerBuildDefUseChain (CompilationUnit *cUnit, BasicBlock *bb);
+ #endif  // DALVIK_VM_COMPILER_H_
+diff --git a/vm/compiler/Dataflow.cpp b/vm/compiler/Dataflow.cpp
+index c44c00f..a31d09e 100644
+--- a/vm/compiler/Dataflow.cpp
++++ b/vm/compiler/Dataflow.cpp
+@@ -19,6 +19,7 @@
+ #include "Loop.h"
+ #include "LoopInformation.h"
+ #include "libdex/DexOpcodes.h"
++#include "SSAWalkData.h"
+ 
+ #include <queue>
+ #include <vector>
+@@ -2414,6 +2415,15 @@ void dvmCompilerNonLoopAnalysis(CompilationUnit *cUnit)
+                                           kAllNodes,
+                                           false /* isIterative */);
+ 
++    //Set walk data: create the data on the stack, will get destroyed automatically at the end of the function
++    SSAWalkData data (cUnit);
++    cUnit->walkData = static_cast<void *> (&data);
++
++    dvmCompilerDataFlowAnalysisDispatcher (cUnit, dvmCompilerBuildDefUseChain, kAllNodes, false);
++
++    //Just for safety, reset walkData
++    cUnit->walkData = 0;
++
+     //We do this calculation to provide the backend with what is being used and defined in each BasicBlock
+     dvmCompilerDataFlowAnalysisDispatcher(cUnit, dvmCompilerFindLocalLiveIn,
+                                           kAllNodes,
+diff --git a/vm/compiler/SSATransformation.cpp b/vm/compiler/SSATransformation.cpp
+index 393cd6f..5c28c6e 100644
+--- a/vm/compiler/SSATransformation.cpp
++++ b/vm/compiler/SSATransformation.cpp
+@@ -705,7 +705,7 @@ void dvmCompilerBuildDomination (CompilationUnit *cUnit)
+  * @param bb the BasicBlock
+  * @return returns whether it changed the BasicBlock bb
+  */
+-static bool buildDefUseChain (CompilationUnit *cUnit, BasicBlock *bb)
++bool dvmCompilerBuildDefUseChain (CompilationUnit *cUnit, BasicBlock *bb)
+ {
+     //Suppose we did not change anything
+     bool res = false;
+@@ -812,33 +812,36 @@ static bool buildDefUseChain (CompilationUnit *cUnit, BasicBlock *bb)
+                     last->nextUse = elem;
+                     elem->prevUse = last;
+                 }
+-                else
++
++                //We might not have a define
++                if (defined != 0)
+                 {
+-                    //We might not have a define
+-                    if (defined != 0)
+-                    {
+-                        //It's the first, tell defined about it
+-                        SSARepresentation *defSSA = defined->ssaRep;
++                    //It's the first, tell defined about it
++                    SSARepresentation *defSSA = defined->ssaRep;
+ 
+-                        //Paranoid
+-                        assert (defSSA != 0);
++                    //Paranoid
++                    assert (defSSA != 0);
+ 
+-                        //Go through the defines and find value
+-                        int max = defSSA->numDefs;
+-                        int j;
+-                        for (j = 0; j < max; j++)
++                    //Go through the defines and find value
++                    int max = defSSA->numDefs;
++                    int j;
++                    for (j = 0; j < max; j++)
++                    {
++                        if (defSSA->defs[j] == value)
+                         {
+-                            if (defSSA->defs[j] == value)
++                            //If not yet set
++                            if (defSSA->usedNext[j] == 0)
+                             {
+                                 defSSA->usedNext[j] = elem;
+-                                //We are done here
+-                                break;
+                             }
+-                        }
+ 
+-                        //We should have found it
+-                        assert (j != max);
++                            //We are done here
++                            break;
++                        }
+                     }
++
++                    //We should have found it
++                    assert (j != max);
+                 }
+ 
+                 //Last, set it as the new last
+@@ -849,6 +852,9 @@ static bool buildDefUseChain (CompilationUnit *cUnit, BasicBlock *bb)
+             nbr = ssaRep->numDefs;
+             for (int i = 0; i < nbr; i++)
+             {
++                //Before anything clean up the usedNext
++                ssaRep->usedNext[i] = 0;
++
+                 //Get def value
+                 int value = ssaRep->defs[i];
+ 
+@@ -925,20 +931,13 @@ bool dvmCompilerBuildLoop(CompilationUnit *cUnit, bool filter)
+ 
+     //Once this is done, we fill in the def/use chain and topological order for the MIRs
+     //We suppose here that SSA has been done already
+-    dvmCompilerDataFlowAnalysisDispatcher (cUnit, buildDefUseChain, kBreadthFirstTraversal, false);
+-
+-    //Just for safety, reset walkData
+-    cUnit->walkData = 0;
+-
+-    //Now we want to handle the constant values of the trace
+-    //First clear the BitVector
+-    if (cUnit->isConstantV != 0)
+-    {
+-        dvmClearAllBits (cUnit->isConstantV);
+-    }
++    dvmCompilerDataFlowAnalysisDispatcher (cUnit, dvmCompilerBuildDefUseChain, kBreadthFirstTraversal, false);
+ 
+     //Before anything else: any value without a definition might have one now, handle them now
+     data.handleNoDefinitions ();
+ 
++    //Just for safety, reset walkData
++    cUnit->walkData = 0;
++
+     return true;
+ }
+-- 
+1.7.4.1
+

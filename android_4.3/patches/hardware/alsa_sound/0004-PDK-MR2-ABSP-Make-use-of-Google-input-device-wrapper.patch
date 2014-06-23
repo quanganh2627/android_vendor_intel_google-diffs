@@ -1,0 +1,460 @@
+From 6e4e0aebb9c129b9122dba39ba0702ffcd3599fe Mon Sep 17 00:00:00 2001
+From: Francois Gaffie <francois.gaffie@intel.com>
+Date: Fri, 3 May 2013 08:19:41 +0200
+Subject: [PDK MR2 ABSP] Make use of Google input device wrapper
+
+BZ: 105160
+
+Direction bit has been added by Google in REV2 Audio HAL APIs.
+Google provided a wrapper to keep compatibility with REV1APIs.
+Our audio HAL does not use this and reimplement this wrapper.
+
+This patch makes use of google wrapper in order to ensure port
+time of new release is low as possible.
+
+Change-Id: Ie6e80580c50ffd2dcd2e3bc472da7db299c38da7
+Signed-off-by: Francois Gaffie <francois.gaffie@intel.com>
+---
+ audio_hw_configurable/AudioHardwareALSA.cpp        |    2 +-
+ audio_hw_configurable/AudioUtils.cpp               |   13 ++
+ audio_hw_configurable/AudioUtils.h                 |    2 +
+ audio_hw_configurable/audio_hw_hal.cpp             |  155 +++++++++++++++-----
+ .../audio_route_manager/AudioRouteManager.cpp      |   26 ++--
+ audio_policy/AudioPolicyManagerALSA.cpp            |   27 +++-
+ utils/Utils.h                                      |    3 -
+ 7 files changed, 169 insertions(+), 59 deletions(-)
+
+diff --git a/audio_hw_configurable/AudioHardwareALSA.cpp b/audio_hw_configurable/AudioHardwareALSA.cpp
+index d2d5b43..fa158cf 100644
+--- a/audio_hw_configurable/AudioHardwareALSA.cpp
++++ b/audio_hw_configurable/AudioHardwareALSA.cpp
+@@ -183,7 +183,7 @@ AudioStreamIn* AudioHardwareALSA::openInputStream(uint32_t devices,
+ 
+     mMicMuteState = false;
+ 
+-    if (!audio_is_input_device(devices)) {
++    if (!CAudioUtils::isAudioInputDevice(devices)) {
+ 
+         err = BAD_VALUE;
+         return NULL;
+diff --git a/audio_hw_configurable/AudioUtils.cpp b/audio_hw_configurable/AudioUtils.cpp
+index c2d218b..9780ec1 100644
+--- a/audio_hw_configurable/AudioUtils.cpp
++++ b/audio_hw_configurable/AudioUtils.cpp
+@@ -23,6 +23,14 @@
+ #include <system/audio.h>
+ #include <limits.h>
+ #include <cerrno>
++#include "AudioPlatformHardware.h"
++#include "SampleSpec.h"
++#include "AudioUtils.h"
++
++#ifdef LOG_TAG
++#undef LOG_TAG
++#endif
++#define LOG_TAG "AudioUtils"
+ 
+ using namespace android;
+ using namespace std;
+@@ -121,5 +129,10 @@ uint32_t CAudioUtils::convertUsecToMsec(uint32_t uiTimeUsec)
+     return ((uiTimeUsec + 999) / 1000);
+ }
+ 
++bool CAudioUtils::isAudioInputDevice(uint32_t uiDevices)
++{
++    return (popcount(uiDevices) == 1) && ((uiDevices & ~AudioSystem::DEVICE_IN_ALL) == 0);
++}
++
+ }; // namespace android
+ 
+diff --git a/audio_hw_configurable/AudioUtils.h b/audio_hw_configurable/AudioUtils.h
+index 8299fe3..72abcdb 100644
+--- a/audio_hw_configurable/AudioUtils.h
++++ b/audio_hw_configurable/AudioUtils.h
+@@ -39,6 +39,8 @@ public:
+ 
+     static uint32_t convertUsecToMsec(uint32_t uiTimeUsec);
+ 
++    static bool isAudioInputDevice(uint32_t uiDevices);
++
+     /**
+       * Constante used during convert of frames to delays in micro-seconds (us).
+       * It is used for delays computation of AEC effect
+diff --git a/audio_hw_configurable/audio_hw_hal.cpp b/audio_hw_configurable/audio_hw_hal.cpp
+index 2129538..d8759d4 100644
+--- a/audio_hw_configurable/audio_hw_hal.cpp
++++ b/audio_hw_configurable/audio_hw_hal.cpp
+@@ -58,6 +58,70 @@ struct legacy_stream_in {
+     AudioStreamIn *legacy_in;
+ };
+ 
++
++enum {
++    HAL_API_REV_1_0,
++    HAL_API_REV_2_0,
++    HAL_API_REV_NUM
++} hal_api_rev;
++
++static uint32_t audio_device_conv_table[][HAL_API_REV_NUM] =
++{
++    /* output devices */
++    { AudioSystem::DEVICE_OUT_EARPIECE, AUDIO_DEVICE_OUT_EARPIECE },
++    { AudioSystem::DEVICE_OUT_SPEAKER, AUDIO_DEVICE_OUT_SPEAKER },
++    { AudioSystem::DEVICE_OUT_WIRED_HEADSET, AUDIO_DEVICE_OUT_WIRED_HEADSET },
++    { AudioSystem::DEVICE_OUT_WIRED_HEADPHONE, AUDIO_DEVICE_OUT_WIRED_HEADPHONE },
++    { AudioSystem::DEVICE_OUT_BLUETOOTH_SCO, AUDIO_DEVICE_OUT_BLUETOOTH_SCO },
++    { AudioSystem::DEVICE_OUT_BLUETOOTH_SCO_HEADSET, AUDIO_DEVICE_OUT_BLUETOOTH_SCO_HEADSET },
++    { AudioSystem::DEVICE_OUT_BLUETOOTH_SCO_CARKIT, AUDIO_DEVICE_OUT_BLUETOOTH_SCO_CARKIT },
++    { AudioSystem::DEVICE_OUT_BLUETOOTH_A2DP, AUDIO_DEVICE_OUT_BLUETOOTH_A2DP },
++    { AudioSystem::DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES, AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES },
++    { AudioSystem::DEVICE_OUT_BLUETOOTH_A2DP_SPEAKER, AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_SPEAKER },
++    { AudioSystem::DEVICE_OUT_AUX_DIGITAL, AUDIO_DEVICE_OUT_AUX_DIGITAL },
++    { AudioSystem::DEVICE_OUT_ANLG_DOCK_HEADSET, AUDIO_DEVICE_OUT_ANLG_DOCK_HEADSET },
++    { AudioSystem::DEVICE_OUT_DGTL_DOCK_HEADSET, AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET },
++    { AudioSystem::DEVICE_OUT_DEFAULT, AUDIO_DEVICE_OUT_DEFAULT },
++    { AudioSystem::DEVICE_OUT_WIDI, AUDIO_DEVICE_OUT_WIDI },
++    /* input devices */
++    { AudioSystem::DEVICE_IN_COMMUNICATION, AUDIO_DEVICE_IN_COMMUNICATION },
++    { AudioSystem::DEVICE_IN_AMBIENT, AUDIO_DEVICE_IN_AMBIENT },
++    { AudioSystem::DEVICE_IN_BUILTIN_MIC, AUDIO_DEVICE_IN_BUILTIN_MIC },
++    { AudioSystem::DEVICE_IN_BLUETOOTH_SCO_HEADSET, AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET },
++    { AudioSystem::DEVICE_IN_WIRED_HEADSET, AUDIO_DEVICE_IN_WIRED_HEADSET },
++    { AudioSystem::DEVICE_IN_AUX_DIGITAL, AUDIO_DEVICE_IN_AUX_DIGITAL },
++    { AudioSystem::DEVICE_IN_VOICE_CALL, AUDIO_DEVICE_IN_VOICE_CALL },
++    { AudioSystem::DEVICE_IN_BACK_MIC, AUDIO_DEVICE_IN_BACK_MIC },
++    { AudioSystem::DEVICE_IN_DEFAULT, AUDIO_DEVICE_IN_DEFAULT },
++};
++
++static uint32_t convert_audio_device(uint32_t from_device, int from_rev, int to_rev)
++{
++    const uint32_t k_num_devices = sizeof(audio_device_conv_table)/sizeof(uint32_t)/HAL_API_REV_NUM;
++    uint32_t to_device = AUDIO_DEVICE_NONE;
++    uint32_t in_bit = 0;
++
++    if (from_rev != HAL_API_REV_1_0) {
++        in_bit = from_device & AUDIO_DEVICE_BIT_IN;
++        from_device &= ~AUDIO_DEVICE_BIT_IN;
++    }
++
++    while (from_device) {
++        uint32_t i = 31 - __builtin_clz(from_device);
++        uint32_t cur_device = (1 << i) | in_bit;
++
++        for (i = 0; i < k_num_devices; i++) {
++            if (audio_device_conv_table[i][from_rev] == cur_device) {
++                to_device |= audio_device_conv_table[i][to_rev];
++                break;
++            }
++        }
++        from_device &= ~cur_device;
++    }
++    return to_device;
++}
++
++
+ /** audio_stream_out implementation **/
+ static uint32_t out_get_sample_rate(const struct audio_stream *stream)
+ {
+@@ -80,11 +144,11 @@ static size_t out_get_buffer_size(const struct audio_stream *stream)
+     return out->legacy_out->bufferSize();
+ }
+ 
+-static uint32_t out_get_channels(const struct audio_stream *stream)
++static audio_channel_mask_t out_get_channels(const struct audio_stream *stream)
+ {
+     const struct legacy_stream_out *out =
+         reinterpret_cast<const struct legacy_stream_out *>(stream);
+-    return out->legacy_out->channels();
++    return (audio_channel_mask_t) out->legacy_out->channels();
+ }
+ 
+ static audio_format_t out_get_format(const struct audio_stream *stream)
+@@ -121,7 +185,18 @@ static int out_set_parameters(struct audio_stream *stream, const char *kvpairs)
+ {
+     struct legacy_stream_out *out =
+         reinterpret_cast<struct legacy_stream_out *>(stream);
+-    return out->legacy_out->setParameters(String8(kvpairs));
++    int val;
++    String8 s8 = String8(kvpairs);
++    AudioParameter parms = AudioParameter(String8(kvpairs));
++
++    if (parms.getInt(String8(AUDIO_PARAMETER_STREAM_ROUTING), val) == NO_ERROR) {
++        val = convert_audio_device(val, HAL_API_REV_2_0, HAL_API_REV_1_0);
++        parms.remove(String8(AUDIO_PARAMETER_STREAM_ROUTING));
++        parms.addInt(String8(AUDIO_PARAMETER_STREAM_ROUTING), val);
++        s8 = parms.toString();
++    }
++
++    return out->legacy_out->setParameters(s8);
+ }
+ 
+ static char * out_get_parameters(const struct audio_stream *stream, const char *keys)
+@@ -129,7 +204,18 @@ static char * out_get_parameters(const struct audio_stream *stream, const char *
+     const struct legacy_stream_out *out =
+         reinterpret_cast<const struct legacy_stream_out *>(stream);
+     String8 s8;
++    int val;
++
+     s8 = out->legacy_out->getParameters(String8(keys));
++
++    AudioParameter parms = AudioParameter(s8);
++    if (parms.getInt(String8(AUDIO_PARAMETER_STREAM_ROUTING), val) == NO_ERROR) {
++        val = convert_audio_device(val, HAL_API_REV_1_0, HAL_API_REV_2_0);
++        parms.remove(String8(AUDIO_PARAMETER_STREAM_ROUTING));
++        parms.addInt(String8(AUDIO_PARAMETER_STREAM_ROUTING), val);
++        s8 = parms.toString();
++    }
++
+     return strdup(s8.string());
+ }
+ 
+@@ -211,11 +297,11 @@ static size_t in_get_buffer_size(const struct audio_stream *stream)
+     return in->legacy_in->bufferSize();
+ }
+ 
+-static uint32_t in_get_channels(const struct audio_stream *stream)
++static audio_channel_mask_t in_get_channels(const struct audio_stream *stream)
+ {
+     const struct legacy_stream_in *in =
+         reinterpret_cast<const struct legacy_stream_in *>(stream);
+-    return in->legacy_in->channels();
++    return (audio_channel_mask_t) in->legacy_in->channels();
+ }
+ 
+ static audio_format_t in_get_format(const struct audio_stream *stream)
+@@ -251,7 +337,18 @@ static int in_set_parameters(struct audio_stream *stream, const char *kvpairs)
+ {
+     struct legacy_stream_in *in =
+         reinterpret_cast<struct legacy_stream_in *>(stream);
+-    return in->legacy_in->setParameters(String8(kvpairs));
++    int val;
++    AudioParameter parms = AudioParameter(String8(kvpairs));
++    String8 s8 = String8(kvpairs);
++
++    if (parms.getInt(String8(AUDIO_PARAMETER_STREAM_ROUTING), val) == NO_ERROR) {
++        val = convert_audio_device(val, HAL_API_REV_2_0, HAL_API_REV_1_0);
++        parms.remove(String8(AUDIO_PARAMETER_STREAM_ROUTING));
++        parms.addInt(String8(AUDIO_PARAMETER_STREAM_ROUTING), val);
++        s8 = parms.toString();
++    }
++
++    return in->legacy_in->setParameters(s8);
+ }
+ 
+ static char * in_get_parameters(const struct audio_stream *stream,
+@@ -260,7 +357,18 @@ static char * in_get_parameters(const struct audio_stream *stream,
+     const struct legacy_stream_in *in =
+         reinterpret_cast<const struct legacy_stream_in *>(stream);
+     String8 s8;
++    int val;
++
+     s8 = in->legacy_in->getParameters(String8(keys));
++
++    AudioParameter parms = AudioParameter(s8);
++    if (parms.getInt(String8(AUDIO_PARAMETER_STREAM_ROUTING), val) == NO_ERROR) {
++        val = convert_audio_device(val, HAL_API_REV_1_0, HAL_API_REV_2_0);
++        parms.remove(String8(AUDIO_PARAMETER_STREAM_ROUTING));
++        parms.addInt(String8(AUDIO_PARAMETER_STREAM_ROUTING), val);
++        s8 = parms.toString();
++    }
++
+     return strdup(s8.string());
+ }
+ 
+@@ -311,36 +419,6 @@ static inline const struct legacy_audio_device * to_cladev(const struct audio_hw
+     return reinterpret_cast<const struct legacy_audio_device *>(dev);
+ }
+ 
+-static uint32_t adev_get_supported_devices(const struct audio_hw_device __UNUSED *dev)
+-{
+-    /* XXX: The old AudioHardwareInterface interface is not smart enough to
+-     * tell us this, so we'll lie and basically tell AF that we support the
+-     * below input/output devices and cross our fingers. To do things properly,
+-     * audio hardware interfaces that need advanced features (like this) should
+-     * convert to the new HAL interface and not use this wrapper. */
+-
+-    return (/* OUT */
+-            AUDIO_DEVICE_OUT_EARPIECE |
+-            AUDIO_DEVICE_OUT_SPEAKER |
+-            AUDIO_DEVICE_OUT_WIRED_HEADSET |
+-            AUDIO_DEVICE_OUT_WIRED_HEADPHONE |
+-            AUDIO_DEVICE_OUT_AUX_DIGITAL |
+-            AUDIO_DEVICE_OUT_ANLG_DOCK_HEADSET |
+-            AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET |
+-            AUDIO_DEVICE_OUT_ALL_SCO |
+-            AUDIO_DEVICE_OUT_DEFAULT |
+-            /* IN */
+-            AUDIO_DEVICE_IN_COMMUNICATION |
+-            AUDIO_DEVICE_IN_VOICE_CALL |
+-            AUDIO_DEVICE_IN_AMBIENT |
+-            AUDIO_DEVICE_IN_BUILTIN_MIC |
+-            AUDIO_DEVICE_IN_WIRED_HEADSET |
+-            AUDIO_DEVICE_IN_AUX_DIGITAL |
+-            AUDIO_DEVICE_IN_BACK_MIC |
+-            AUDIO_DEVICE_IN_ALL_SCO |
+-            AUDIO_DEVICE_IN_DEFAULT);
+-}
+-
+ static int adev_init_check(const struct audio_hw_device *dev)
+ {
+     const struct legacy_audio_device *ladev = to_cladev(dev);
+@@ -425,6 +503,8 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
+     if (!out)
+         return -ENOMEM;
+ 
++    devices = convert_audio_device(devices, HAL_API_REV_2_0, HAL_API_REV_1_0);
++
+     out->legacy_out = ladev->hwif->openOutputStream(devices, (int *) &config->format,
+                                                     &config->channel_mask,
+                                                     &config->sample_rate, &status);
+@@ -487,6 +567,8 @@ static int adev_open_input_stream(struct audio_hw_device *dev,
+     if (!in)
+         return -ENOMEM;
+ 
++    devices = convert_audio_device(devices, HAL_API_REV_2_0, HAL_API_REV_1_0);
++
+     in->legacy_in = ladev->hwif->openInputStream(devices, (int *) &config->format,
+                                                  &config->channel_mask, &config->sample_rate,
+                                                  &status, (AudioSystem::audio_in_acoustics)0);
+@@ -573,7 +655,6 @@ static int legacy_adev_open(const hw_module_t* module, const char* name,
+     ladev->device.common.module = const_cast<hw_module_t*>(module);
+     ladev->device.common.close = legacy_adev_close;
+ 
+-    ladev->device.get_supported_devices = adev_get_supported_devices;
+     ladev->device.init_check = adev_init_check;
+     ladev->device.set_voice_volume = adev_set_voice_volume;
+     ladev->device.set_master_volume = adev_set_master_volume;
+diff --git a/audio_hw_configurable/audio_route_manager/AudioRouteManager.cpp b/audio_hw_configurable/audio_route_manager/AudioRouteManager.cpp
+index 641cfa5..279b5aa 100755
+--- a/audio_hw_configurable/audio_route_manager/AudioRouteManager.cpp
++++ b/audio_hw_configurable/audio_route_manager/AudioRouteManager.cpp
+@@ -119,14 +119,14 @@ const CAudioRouteManager::SSelectionCriterionTypeValuePair CAudioRouteManager::M
+ 
+ // Selected Input Device type
+ const CAudioRouteManager::SSelectionCriterionTypeValuePair CAudioRouteManager::INPUT_DEVICE_VALUE_PAIRS[] = {
+-    { REMOVE_32_BITS_MSB(AudioSystem::DEVICE_IN_COMMUNICATION),         "Communication" },
+-    { REMOVE_32_BITS_MSB(AudioSystem::DEVICE_IN_AMBIENT),               "Ambient" },
+-    { REMOVE_32_BITS_MSB(AudioSystem::DEVICE_IN_BUILTIN_MIC),           "Main" },
+-    { REMOVE_32_BITS_MSB(AudioSystem::DEVICE_IN_BLUETOOTH_SCO_HEADSET), "SCO_Headset" },
+-    { REMOVE_32_BITS_MSB(AudioSystem::DEVICE_IN_WIRED_HEADSET),         "Headset" },
+-    { REMOVE_32_BITS_MSB(AudioSystem::DEVICE_IN_AUX_DIGITAL),           "AuxDigital" },
+-    { REMOVE_32_BITS_MSB(AudioSystem::DEVICE_IN_VOICE_CALL),            "VoiceCall" },
+-    { REMOVE_32_BITS_MSB(AudioSystem::DEVICE_IN_BACK_MIC),              "Back" }
++    { AudioSystem::DEVICE_IN_COMMUNICATION,         "Communication" },
++    { AudioSystem::DEVICE_IN_AMBIENT,               "Ambient" },
++    { AudioSystem::DEVICE_IN_BUILTIN_MIC,           "Main" },
++    { AudioSystem::DEVICE_IN_BLUETOOTH_SCO_HEADSET, "SCO_Headset" },
++    { AudioSystem::DEVICE_IN_WIRED_HEADSET,         "Headset" },
++    { AudioSystem::DEVICE_IN_AUX_DIGITAL,           "AuxDigital" },
++    { AudioSystem::DEVICE_IN_VOICE_CALL,            "VoiceCall" },
++    { AudioSystem::DEVICE_IN_BACK_MIC,              "Back" }
+ };
+ 
+ // Selected Output Device type
+@@ -1001,12 +1001,14 @@ void CAudioRouteManager::setDevices(ALSAStreamOps* pStream, uint32_t devices)
+ {
+     AutoW lock(_lock);
+ 
+-    bool bIsOut = pStream->isOut();
+-
+-    if (!bIsOut) {
++    ALOGD("%s: 0x%X", __FUNCTION__, devices);
++    if ((devices & AUDIO_DEVICE_BIT_IN) != 0) {
+ 
+-        devices = REMOVE_32_BITS_MSB(devices);
++        devices &= ~AUDIO_DEVICE_BIT_IN;
+     }
++    ALOGD("%s: 0x%X", __FUNCTION__, devices);
++
++    bool bIsOut = pStream->isOut();
+ 
+     // Update Platform state: in/out devices
+     _pPlatformState->setDevices(devices, bIsOut);
+diff --git a/audio_policy/AudioPolicyManagerALSA.cpp b/audio_policy/AudioPolicyManagerALSA.cpp
+index 17d1083..776bb7d 100644
+--- a/audio_policy/AudioPolicyManagerALSA.cpp
++++ b/audio_policy/AudioPolicyManagerALSA.cpp
+@@ -26,9 +26,15 @@
+ 
+ namespace android_audio_legacy {
+ 
++/**< Note that Audio Policy makes use of HAL_API_REV_2_0
++ * Do not use HAL_API_REV_1_0
++ * For input devices, not only a direction bit has been added but also the mapping is different
++ * As input devices is a bitfield, provides here a macro to remove the direction bit
++ */
+ #define MASK_DEVICE_NO_DIR    ((unsigned int)~AUDIO_DEVICE_BIT_IN)
+ #define REMOVE_DEVICE_DIR(device) ((unsigned int)device & MASK_DEVICE_NO_DIR)
+ 
++
+ //  Is voice volume applied after mixing while in mode IN_COMM ?
+ const String8 AudioPolicyManagerALSA::mVoiceVolumeAppliedAfterMixInCommPropName("voice_volume_applied_after_mixing_in_communication");
+ // Is voice volume applied after mixing while in mode IN_CALL ?
+@@ -115,12 +121,14 @@ audio_io_handle_t AudioPolicyManagerALSA::getInput(int inputSource,
+     if (!mInputs.isEmpty() && activeInput) {
+         AudioInputDescriptor *inputDesc = mInputs.valueFor(activeInput);
+ 
+-        uint32_t deviceMediaRecMic = (AudioSystem::DEVICE_IN_BUILTIN_MIC | AudioSystem::DEVICE_IN_BACK_MIC |
+-                                      AudioSystem::DEVICE_IN_BLUETOOTH_SCO_HEADSET | AudioSystem::DEVICE_IN_WIRED_HEADSET);
++        uint32_t deviceMediaRecMic = (AUDIO_DEVICE_IN_BUILTIN_MIC | AUDIO_DEVICE_IN_BACK_MIC |
++                                      AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET | AUDIO_DEVICE_IN_WIRED_HEADSET);
+ 
+-        if (((REMOVE_DEVICE_DIR(inputDesc->mDevice) & deviceMediaRecMic) &&
++        // If an application uses already an input and the requested input is from a VoIP call
++        // or a CSV call record, stop the current active input to enable requested input start.
++        if(((REMOVE_DEVICE_DIR(inputDesc->mDevice) & deviceMediaRecMic) &&
+             (inputDesc->mInputSource != AUDIO_SOURCE_VOICE_COMMUNICATION)) &&
+-            ((REMOVE_DEVICE_DIR(device) & AudioSystem::DEVICE_IN_VOICE_CALL) ||
++           ((REMOVE_DEVICE_DIR(device) & AUDIO_DEVICE_IN_VOICE_CALL) ||
+             (inputSource == AUDIO_SOURCE_VOICE_COMMUNICATION))) {
+             LOGI("Stop current active input %d because of higher priority input %d !",
+                 inputDesc->mInputSource, inputSource);
+@@ -136,7 +144,7 @@ audio_io_handle_t AudioPolicyManagerALSA::getInput(int inputSource,
+             // Create a concurrent input and let upper layers close the active camcorder input
+             LOGI("Grant request for input %d creation while current camcorder input", inputSource);
+         }
+-        else if ((REMOVE_DEVICE_DIR(inputDesc->mDevice) & AudioSystem::DEVICE_IN_VOICE_CALL) &&
++        else if ((REMOVE_DEVICE_DIR(inputDesc->mDevice) & AUDIO_DEVICE_IN_VOICE_CALL) &&
+                  (inputSource == AUDIO_SOURCE_VOICE_COMMUNICATION)) {
+             LOGI("Incoming VoIP call during VCR or VCR -> VoIP swap");
+         }
+@@ -148,6 +156,13 @@ audio_io_handle_t AudioPolicyManagerALSA::getInput(int inputSource,
+                  (inputSource == AUDIO_SOURCE_VOICE_RECOGNITION)){
+             LOGI("Voice recognition requested while current MIC input source");
+         }
++        // Force use of built-in mic in case of force use of the speaker in VoIP and wsHS connected
++        else if ((inputSource == AUDIO_SOURCE_VOICE_COMMUNICATION) &&
++                 (REMOVE_DEVICE_DIR(inputDesc->mDevice) & AUDIO_DEVICE_IN_WIRED_HEADSET) &&
++                 (getForceUse(AudioSystem::FOR_COMMUNICATION) == AudioSystem::FORCE_SPEAKER)) {
++            device = AUDIO_DEVICE_IN_BUILTIN_MIC;
++            LOGI("Changing input device to built-in mic as force use to speaker requested with wsHS connected");
++        }
+         else {
+             LOGW("getInput() mPhoneState : %d, device 0x%x, unhandled input source concurrency,"
+                 "return invalid audio input handle!", mPhoneState, device);
+@@ -233,7 +248,7 @@ status_t AudioPolicyManagerALSA::startInput(audio_io_handle_t input)
+         if (activeInput != 0) {
+             AudioInputDescriptor *activeInputDesc = mInputs.valueFor(activeInput);
+             if ((inputDesc->mInputSource & AUDIO_SOURCE_VOICE_COMMUNICATION) &&
+-                ( REMOVE_DEVICE_DIR(activeInputDesc->mDevice) & AudioSystem::DEVICE_IN_VOICE_CALL) &&
++                (REMOVE_DEVICE_DIR(activeInputDesc->mDevice) & AUDIO_DEVICE_IN_VOICE_CALL) &&
+                 ((activeInputDesc->mInputSource == AUDIO_SOURCE_VOICE_UPLINK) ||
+                  (activeInputDesc->mInputSource == AUDIO_SOURCE_VOICE_DOWNLINK) ||
+                  (activeInputDesc->mInputSource == AUDIO_SOURCE_VOICE_CALL))){
+diff --git a/utils/Utils.h b/utils/Utils.h
+index 67ea5a2..a3bab6c 100644
+--- a/utils/Utils.h
++++ b/utils/Utils.h
+@@ -17,9 +17,6 @@
+ 
+ #pragma once
+ 
+-#define MASK_32_BITS_MSB    0x7FFFFFFF
+-#define REMOVE_32_BITS_MSB(bitfield) bitfield & MASK_32_BITS_MSB
+-
+ #define __UNUSED __attribute__((unused))
+ 
+ class CUtils
+-- 
+1.7.4.1
+

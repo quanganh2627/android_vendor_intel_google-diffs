@@ -1,0 +1,299 @@
+From bd75cc1132be65888e8336ef1a82d73c442ba0d4 Mon Sep 17 00:00:00 2001
+From: Tianmi Chen <tianmi.chen@intel.com>
+Date: Thu, 2 May 2013 16:36:02 +0800
+Subject: libstagefright: optimize video event in Awesomeplayer to avoid frame drop issue
+
+BZ: 77315
+
+enhancement for media data reading from file and priority
+improvement for video event thread
+
+BZ: 84042
+
+Some file types are not supported for media data prefetching, which should
+be excluded in our optimization.
+
+BZ: 81360
+
+Fix a klocwork issue that WHILE statement may fall into
+infinite loop.
+
+Category: aosp improvement
+Domain: Video.Media-local playback
+Origin: internal
+Upstream-Candidate: no
+
+Change-Id: I7a3f93bb70432eb9dec6f15430c7373b3ec27640
+Orig-Change-Id: Id4ce341e96d10e56a56b93a59ba1a4454804a080
+Orig-Change-Id: Iac068383f56b53dcbe6b944bc0aa61650b72384b
+Signed-off-by: Tianmi Chen <tianmi.chen@intel.com>
+Signed-off-by: Dan Liang <dan.liang@intel.com>
+---
+ include/media/stagefright/MediaSource.h       |    4 ++
+ media/libstagefright/AVIExtractor.cpp         |    5 ++-
+ media/libstagefright/AwesomePlayer.cpp        |   23 +++++++++++++-
+ media/libstagefright/MPEG4Extractor.cpp       |    4 ++-
+ media/libstagefright/ThreadedSource.cpp       |   43 ++++++++++++++-----------
+ media/libstagefright/include/ThreadedSource.h |   14 ++++++--
+ 6 files changed, 66 insertions(+), 27 deletions(-)
+
+diff --git a/include/media/stagefright/MediaSource.h b/include/media/stagefright/MediaSource.h
+index 3818e63..65304d0 100644
+--- a/include/media/stagefright/MediaSource.h
++++ b/include/media/stagefright/MediaSource.h
+@@ -93,6 +93,10 @@ struct MediaSource : public virtual RefBase {
+         int64_t mLatenessUs;
+     };
+ 
++    enum {
++        kMaxMediaBufferSize = 20,
++    };
++
+     // Causes this source to suspend pulling data from its upstream source
+     // until a subsequent read-with-seek. Currently only supported by
+     // OMXCodec.
+diff --git a/media/libstagefright/AVIExtractor.cpp b/media/libstagefright/AVIExtractor.cpp
+index 2d89aa6..da4fe8e 100644
+--- a/media/libstagefright/AVIExtractor.cpp
++++ b/media/libstagefright/AVIExtractor.cpp
+@@ -105,8 +105,9 @@ status_t AVIExtractor::AVISource::start(MetaData *params) {
+ 
+     mBufferGroup = new MediaBufferGroup;
+ 
+-    mBufferGroup->add_buffer(new MediaBuffer(mTrack.mMaxSampleSize));
+-    mBufferGroup->add_buffer(new MediaBuffer(mTrack.mMaxSampleSize));
++    for (int i = 0; i < kMaxMediaBufferSize; i++) {
++        mBufferGroup->add_buffer(new MediaBuffer(mTrack.mMaxSampleSize));
++    }
+     mSampleIndex = 0;
+ 
+     const char *mime;
+diff --git a/media/libstagefright/AwesomePlayer.cpp b/media/libstagefright/AwesomePlayer.cpp
+index 130fe94..2d789af 100644
+--- a/media/libstagefright/AwesomePlayer.cpp
++++ b/media/libstagefright/AwesomePlayer.cpp
+@@ -31,6 +31,7 @@
+ #include "include/ThrottledSource.h"
+ #include "include/MPEG2TSExtractor.h"
+ #include "include/WVMExtractor.h"
++#include "include/ThreadedSource.h"
+ 
+ #include <binder/IPCThreadState.h>
+ #include <binder/IServiceManager.h>
+@@ -56,6 +57,11 @@
+ 
+ #include <cutils/properties.h>
+ 
++#ifdef USE_INTEL_ASF_EXTRACTOR
++#include "AsfExtractor.h"
++#include "MetaDataExt.h"
++#endif
++
+ #define USE_SURFACE_ALLOC 1
+ #define FRAME_DROP_FREQ 0
+ 
+@@ -1638,11 +1644,26 @@ status_t AwesomePlayer::initVideoDecoder(uint32_t flags) {
+         flags |= OMXCodec::kEnableGrallocUsageProtected;
+     }
+ #endif
++
++    sp<MetaData> meta = mExtractor->getMetaData();
++    const char *mime;
++    CHECK(meta->findCString(kKeyMIMEType, &mime));
++    bool isPrefetchSupported = false;
++    if (!strcasecmp(mime, MEDIA_MIMETYPE_CONTAINER_MPEG4)
++        || !strcasecmp(mime, MEDIA_MIMETYPE_CONTAINER_MATROSKA)
++        || !strcasecmp(mime, MEDIA_MIMETYPE_CONTAINER_AVI)
++#ifdef USE_INTEL_ASF_EXTRACTOR
++        || !strcasecmp(mime, MEDIA_MIMETYPE_CONTAINER_ASF)
++#endif
++    ) {
++        isPrefetchSupported = true;
++    }
++
+     ALOGV("initVideoDecoder flags=0x%x", flags);
+     mVideoSource = OMXCodec::Create(
+             mClient.interface(), mVideoTrack->getFormat(),
+             false, // createEncoder
+-            mVideoTrack,
++            isPrefetchSupported ? new ThreadedSource(mVideoTrack, MediaSource::kMaxMediaBufferSize) : mVideoTrack,
+             NULL, flags, USE_SURFACE_ALLOC ? mNativeWindow : NULL);
+ 
+     if (mVideoSource != NULL) {
+diff --git a/media/libstagefright/MPEG4Extractor.cpp b/media/libstagefright/MPEG4Extractor.cpp
+index 2bdb775..1e75bdf 100644
+--- a/media/libstagefright/MPEG4Extractor.cpp
++++ b/media/libstagefright/MPEG4Extractor.cpp
+@@ -2463,7 +2463,9 @@ status_t MPEG4Source::start(MetaData *params) {
+     int32_t max_size;
+     CHECK(mFormat->findInt32(kKeyMaxInputSize, &max_size));
+ 
+-    mGroup->add_buffer(new MediaBuffer(max_size));
++    for (int i = 0; i < kMaxMediaBufferSize; i++) {
++        mGroup->add_buffer(new MediaBuffer(max_size));
++    }
+ 
+     mSrcBuffer = new uint8_t[max_size];
+ 
+diff --git a/media/libstagefright/ThreadedSource.cpp b/media/libstagefright/ThreadedSource.cpp
+index 93b1b56..c3f3ea0 100644
+--- a/media/libstagefright/ThreadedSource.cpp
++++ b/media/libstagefright/ThreadedSource.cpp
+@@ -27,13 +27,12 @@
+ 
+ namespace android {
+ 
+-static const size_t kMaxQueueSize = 10;
+-
+-ThreadedSource::ThreadedSource(const sp<MediaSource> &source)
++ThreadedSource::ThreadedSource(const sp<MediaSource> &source, int size)
+     : mSource(source),
+       mReflector(new AHandlerReflector<ThreadedSource>(this)),
+       mLooper(new ALooper),
+-      mStarted(false) {
++      mStarted(false),
++      mMaxQueueSize(size) {
+     mLooper->registerHandler(mReflector);
+ }
+ 
+@@ -54,10 +53,10 @@ status_t ThreadedSource::start(MetaData *params) {
+ 
+     mFinalResult = OK;
+     mSeekTimeUs = -1;
+-    mDecodePending = false;
++    mReadPending = false;
+ 
+     Mutex::Autolock autoLock(mLock);
+-    postDecodeMore_l();
++    postReadMore_l();
+ 
+     CHECK_EQ(mLooper->start(), (status_t)OK);
+ 
+@@ -103,12 +102,18 @@ status_t ThreadedSource::read(
+         msg->post();
+ 
+         while (!seekComplete) {
+-            mCondition.wait(mLock);
++            status_t err = mCondition.wait(mLock);
++            if (err != OK) {
++                return err;
++            }
+         }
+     }
+ 
+     while (mQueue.empty() && mFinalResult == OK) {
+-        mCondition.wait(mLock);
++        status_t err = mCondition.wait(mLock);
++        if (err != OK) {
++            return err;
++        }
+     }
+ 
+     if (!mQueue.empty()) {
+@@ -116,7 +121,7 @@ status_t ThreadedSource::read(
+         mQueue.erase(mQueue.begin());
+ 
+         if (mFinalResult == OK) {
+-            postDecodeMore_l();
++            postReadMore_l();
+         }
+ 
+         return OK;
+@@ -146,17 +151,17 @@ void ThreadedSource::onMessageReceived(const sp<AMessage> &msg) {
+             *seekComplete = 1;
+             mCondition.signal();
+ 
+-            postDecodeMore_l();
++            postReadMore_l();
+             break;
+         }
+ 
+-        case kWhatDecodeMore:
++        case kWhatReadMore:
+         {
+             {
+                 Mutex::Autolock autoLock(mLock);
+-                mDecodePending = false;
++                mReadPending = false;
+ 
+-                if (mQueue.size() == kMaxQueueSize) {
++                if (mQueue.size() == mMaxQueueSize) {
+                     break;
+                 }
+             }
+@@ -176,8 +181,8 @@ void ThreadedSource::onMessageReceived(const sp<AMessage> &msg) {
+             } else {
+                 mQueue.push_back(buffer);
+ 
+-                if (mQueue.size() < kMaxQueueSize) {
+-                    postDecodeMore_l();
++                if (mQueue.size() < mMaxQueueSize) {
++                    postReadMore_l();
+                 }
+             }
+ 
+@@ -191,13 +196,13 @@ void ThreadedSource::onMessageReceived(const sp<AMessage> &msg) {
+     }
+ }
+ 
+-void ThreadedSource::postDecodeMore_l() {
+-    if (mDecodePending) {
++void ThreadedSource::postReadMore_l() {
++    if (mReadPending) {
+         return;
+     }
+ 
+-    mDecodePending = true;
+-    (new AMessage(kWhatDecodeMore, mReflector->id()))->post();
++    mReadPending = true;
++    (new AMessage(kWhatReadMore, mReflector->id()))->post();
+ }
+ 
+ void ThreadedSource::clearQueue_l() {
+diff --git a/media/libstagefright/include/ThreadedSource.h b/media/libstagefright/include/ThreadedSource.h
+index c67295c..42d0d96 100644
+--- a/media/libstagefright/include/ThreadedSource.h
++++ b/media/libstagefright/include/ThreadedSource.h
+@@ -27,7 +27,7 @@
+ namespace android {
+ 
+ struct ThreadedSource : public MediaSource {
+-    ThreadedSource(const sp<MediaSource> &source);
++    ThreadedSource(const sp<MediaSource> &source, int size = kMaxQueueSize);
+ 
+     virtual status_t start(MetaData *params);
+     virtual status_t stop();
+@@ -44,7 +44,7 @@ protected:
+ 
+ private:
+     enum {
+-        kWhatDecodeMore = 'deco',
++        kWhatReadMore = 'read',
+         kWhatSeek       = 'seek',
+     };
+ 
+@@ -56,13 +56,19 @@ private:
+     Condition mCondition;
+     List<MediaBuffer *> mQueue;
+     status_t mFinalResult;
+-    bool mDecodePending;
++    bool mReadPending;
+     bool mStarted;
+ 
++    int mMaxQueueSize;
++
+     int64_t mSeekTimeUs;
+     ReadOptions::SeekMode mSeekMode;
+ 
+-    void postDecodeMore_l();
++    enum {
++        kMaxQueueSize = 10,
++    };
++
++    void postReadMore_l();
+     void clearQueue_l();
+ 
+     DISALLOW_EVIL_CONSTRUCTORS(ThreadedSource);
+-- 
+1.7.4.1
+

@@ -1,0 +1,195 @@
+From e31de74e01362df73aac3545f8c965b1e1c8b024 Mon Sep 17 00:00:00 2001
+From: Andrew Boie <andrew.p.boie@intel.com>
+Date: Thu, 9 May 2013 13:31:29 -0700
+Subject: sign_target_files_apks: Re-sign kernel modules
+
+Kernel modules are not declared with LOCAL_MODULE in the build
+system; for now just provide a single key to re-sign all the
+.ko files found.
+
+Change-Id: Ia5d8c99a3e4e031eba1613853d39224c456cc919
+Signed-off-by: Andrew Boie <andrew.p.boie@intel.com>
+Signed-off-by: Daniel Leung <daniel.leung@intel.com>
+---
+ core/Makefile                             |    1 +
+ tools/releasetools/common.py              |   33 ++++++++++++++++++++++++-
+ tools/releasetools/sign_target_files_apks |   38 ++++++++++++++++++++++++++--
+ 3 files changed, 68 insertions(+), 4 deletions(-)
+
+diff --git a/core/Makefile b/core/Makefile
+index b015766..142e949 100644
+--- a/core/Makefile
++++ b/core/Makefile
+@@ -1144,6 +1144,7 @@ DISTTOOLS :=  $(HOST_OUT_EXECUTABLES)/minigzip \
+ 	  $(HOST_OUT_EXECUTABLES)/mkuserimg.sh \
+ 	  $(HOST_OUT_EXECUTABLES)/make_ext4fs \
+ 	  $(HOST_OUT_EXECUTABLES)/simg2img \
++	  $(HOST_OUT_EXECUTABLES)/sign-file \
+ 	  $(HOST_OUT_EXECUTABLES)/e2fsck
+ 
+ OTATOOLS := $(DISTTOOLS) \
+diff --git a/tools/releasetools/common.py b/tools/releasetools/common.py
+index e6ff323..c3e92ba 100644
+--- a/tools/releasetools/common.py
++++ b/tools/releasetools/common.py
+@@ -505,6 +505,37 @@ def SbsignFile(input_name, output_name, key, password):
+   cert_f.close()
+ 
+ 
++def SignKmodule(input_name, output_name, key, password):
++  """Sign the input_name binary with Linux sign-file, producing output_name.
++  Use the given key and password (the latter may be None if the key
++  does not have a password.
++  """
++
++  # sign-file wants a PEM formatted key and a DER certificate
++  key_data = GetPrivateKeyPEM(ReadPrivateKeyFile(key))
++  key_f = tempfile.NamedTemporaryFile()
++  key_f.write(key_data)
++  key_f.flush()
++
++  cert_data = GetCertificateDER(ReadCertificateFile(key))
++  cert_f = tempfile.NamedTemporaryFile()
++  cert_f.write(cert_data)
++  cert_f.flush()
++
++  cmd = ["sign-file", "-v", key_f.name, cert_f.name,
++          input_name, output_name]
++
++  p = Run(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
++  if password is not None:
++    password += "\n"
++  p.communicate(password)
++  if p.returncode != 0:
++    raise ExternalError("sign-file failed: return code %s" % (p.returncode,))
++
++  key_f.close()
++  cert_f.close()
++
++
+ def BinaryCertReplaceFile(input_name, output_name, key, password):
+   """Sign the input_name binary with sbsign, producing output_name.
+   Use the given key and password (the latter may be None if the key
+@@ -694,7 +725,7 @@ def GetPrivateKeyPEM(data):
+             stderr=subprocess.STDOUT)
+     p.communicate()
+     if not p.returncode == 0:
+-      raise ExternalError("error converting certificate from DER to PEM")
++      raise ExternalError("error converting private key from DER to PEM")
+ 
+     output = cert_der.read()
+ 
+diff --git a/tools/releasetools/sign_target_files_apks b/tools/releasetools/sign_target_files_apks
+index e385dcd..1307b4b 100755
+--- a/tools/releasetools/sign_target_files_apks
++++ b/tools/releasetools/sign_target_files_apks
+@@ -40,6 +40,10 @@ Usage:  sign_target_files_apks [flags] input_target_files output_target_files
+       that binary contained in the sbsign_certs.txt file.  Option may
+       be repeated to give multiple extra binaries.
+ 
++  -m  (--kmodule_key) <key>
++      Re-sign all .ko files under /system/lib/modules inside the target
++      files package with the provided key.
++
+   -k  (--key_mapping)  <src_key=dest_key>
+       Add a mapping from the key name as specified in apkcerts.txt (the
+       src_key) to the real key you wish to sign the package with
+@@ -101,6 +105,7 @@ OPTIONS = common.OPTIONS
+ OPTIONS.extra_apks = {}
+ OPTIONS.extra_sbsign = {}
+ OPTIONS.extra_bin_cert_replace = {}
++OPTIONS.kmodule_key = None
+ OPTIONS.key_map = {}
+ OPTIONS.replace_ota_keys = False
+ OPTIONS.tag_changes = ("-test-keys", "-dev-keys", "+release-keys")
+@@ -229,6 +234,22 @@ def SbsignBinary(data, keyname, pw):
+   return data
+ 
+ 
++def SignKmodule(data, keyname, pw):
++  unsigned = tempfile.NamedTemporaryFile()
++  unsigned.write(data)
++  unsigned.flush()
++
++  signed = tempfile.NamedTemporaryFile()
++
++  common.SignKmodule(unsigned.name, signed.name, keyname, pw)
++
++  data = signed.read()
++  unsigned.close()
++  signed.close()
++
++  return data
++
++
+ def BinaryCertReplace(data, cert_discard_data, cert_replace_prefix):
+   old_cert_data = common.GetCertificateDER(cert_discard_data)
+ 
+@@ -254,7 +275,7 @@ def BinaryCertReplace(data, cert_discard_data, cert_replace_prefix):
+ 
+ def SignFiles(input_tf_zip, output_tf_zip, apk_key_map,
+               sbsign_key_map, binary_cert_replace_map,
+-              key_passwords):
++              kmodule_key, key_passwords):
+   maxsize = max([len(os.path.basename(i.filename))
+                  for i in input_tf_zip.infolist()
+                  if i.filename.endswith('.apk')])
+@@ -293,6 +314,11 @@ def SignFiles(input_tf_zip, output_tf_zip, apk_key_map,
+         # an APK we're not supposed to sign.
+         print "NOT signing: %s" % (name,)
+         output_tf_zip.writestr(out_info, data)
++    elif kmodule_key and info.filename.endswith(".ko"):
++      name = os.path.basename(info.filename)
++      print "    signing: %-*s (%s)" % (maxsize, name, kmodule_key)
++      signed_data = SignKmodule(data, kmodule_key, key_passwords[key])
++      output_tf_zip.writestr(out_info, signed_data)
+     elif info.filename in ("SYSTEM/build.prop",
+                            "RECOVERY/RAMDISK/default.prop"):
+       print "rewriting %s:" % (info.filename,)
+@@ -446,6 +472,7 @@ def BuildKeyMap(misc_info, key_mapping_options):
+           devkeydir + "/platform": d + "/platform",
+           "uefi_shim_key":         d + "/uefi_shim_key",
+           "uefi_bios_db_key":      d + "/uefi_bios_db_key",
++          "kmodule_key":           d + "/kmodule_key",
+           })
+     else:
+       OPTIONS.key_map[s] = d
+@@ -471,6 +498,8 @@ def main(argv):
+       names = names.split(",")
+       for n in names:
+         OPTIONS.extra_bin_cert_replace[n] = key
++    elif o in ("-m", "--kmodule_key"):
++      OPTIONS.kmodule_key = a
+     elif o in ("-d", "--default_key_mappings"):
+       key_mapping_options.append((None, a))
+     elif o in ("-k", "--key_mapping"):
+@@ -490,11 +519,12 @@ def main(argv):
+     return True
+ 
+   args = common.ParseOptions(argv, __doc__,
+-                             extra_opts="e:b:r:d:k:ot:",
++                             extra_opts="e:b:r:d:k:m:ot:",
+                              extra_long_opts=["extra_apks=",
+                                               "extra_sbsign=",
+                                               "extra_bin_cert_replace=",
+                                               "default_key_mappings=",
++                                              "kmodule_key=",
+                                               "key_mapping=",
+                                               "replace_ota_keys",
+                                               "tag_changes="],
+@@ -519,9 +549,11 @@ def main(argv):
+ 
+   key_passwords = common.GetKeyPasswords(set(apk_key_map.values()))
+   key_passwords.update(common.GetKeyPasswords(set(sbsign_key_map.values())))
++  if OPTIONS.kmodule_key:
++      key_passwords.update(common.GetKeyPasswords(set([OPTIONS.kmodule_key])))
+ 
+   SignFiles(input_zip, output_zip, apk_key_map, sbsign_key_map,
+-            binary_cert_replace_map, key_passwords)
++            binary_cert_replace_map, OPTIONS.kmodule_key, key_passwords)
+ 
+   if OPTIONS.replace_ota_keys:
+     ReplaceOtaKeys(input_zip, output_zip, misc_info)
+-- 
+1.7.4.1
+
