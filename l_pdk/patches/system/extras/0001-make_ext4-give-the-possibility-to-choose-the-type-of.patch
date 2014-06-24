@@ -1,0 +1,255 @@
+From bb13cbacba8123332202098ecd2b26bf576306c4 Mon Sep 17 00:00:00 2001
+From: Marie-Cecile Afantenos <marie.cecile.afantenos@intel.com>
+Date: Tue, 6 Aug 2013 16:46:14 +0200
+Subject: make_ext4 : give the possibility to choose the type of wipe
+
+BZ: 82879
+
+emmc has two mechanism:
+BLKDISCARD which is quick but unsecure
+BLKSECDISCARD which is slow but secure
+on engineering we want to use the blkdiscard but on a default flashing we want to use
+the fallback policy.
+
+Category: aosp improvement
+Domain: PUPDR-Recovery
+Origin: internal
+Upstream-Candidate: no, need rework
+
+Change-Id: I3a489f88eb019cdf06d48d4e91bb8adbc9614aa0
+Signed-off-by: Marie-Cecile Afantenos <marie.cecile.afantenos@intel.com>
+Reviewed-on: http://android.intel.com:8080/123912
+Reviewed-by: Auger, Florent <florent.auger@intel.com>
+Reviewed-by: Dong, Chuanxiao <chuanxiao.dong@intel.com>
+Reviewed-by: Tinelli, Vincent <vincent.tinelli@intel.com>
+Tested-by: Lumbierres, PhilippeX <philippex.lumbierres@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+---
+ ext4_utils/make_ext4fs.c      |    9 +++----
+ ext4_utils/make_ext4fs.h      |    9 +++++++-
+ ext4_utils/make_ext4fs_main.c |   14 ++++++------
+ ext4_utils/wipe.c             |   45 +++++++++++++++++++++++++++++++---------
+ ext4_utils/wipe.h             |    7 +++++-
+ 5 files changed, 60 insertions(+), 24 deletions(-)
+
+diff --git a/ext4_utils/make_ext4fs.c b/ext4_utils/make_ext4fs.c
+index b3de84b..0fe4599 100644
+--- a/ext4_utils/make_ext4fs.c
++++ b/ext4_utils/make_ext4fs.c
+@@ -400,7 +400,7 @@ int make_ext4fs_sparse_fd(int fd, long long len,
+ }
+ 
+ int make_ext4fs(const char *filename, long long len,
+-				const char *mountpoint, struct selabel_handle *sehnd)
++                                const char *mountpoint, struct selabel_handle *sehnd, int wipe_mode)
+ {
+ 	int fd;
+ 	int status;
+@@ -414,7 +414,7 @@ int make_ext4fs(const char *filename, long long len,
+ 		return EXIT_FAILURE;
+ 	}
+ 
+-	status = make_ext4fs_internal(fd, NULL, mountpoint, NULL, 0, 0, 0, 1, sehnd, 0, -1);
++	status = make_ext4fs_internal(fd, NULL, mountpoint, NULL, 0, 0, 0, wipe_mode, sehnd, 0, -1);
+ 	close(fd);
+ 
+ 	return status;
+@@ -482,7 +482,7 @@ static char *canonicalize_rel_slashes(const char *str)
+ 
+ int make_ext4fs_internal(int fd, const char *_directory,
+ 						 const char *_mountpoint, fs_config_func_t fs_config_func, int gzip,
+-						 int sparse, int crc, int wipe,
++						 int sparse, int crc, int wipe_mode,
+ 						 struct selabel_handle *sehnd, int verbose, time_t fixed_time)
+ {
+ 	u32 root_inode_num;
+@@ -627,8 +627,7 @@ int make_ext4fs_internal(int fd, const char *_directory,
+ 			aux_info.sb->s_blocks_count_lo - aux_info.sb->s_free_blocks_count_lo,
+ 			aux_info.sb->s_blocks_count_lo);
+ 
+-	if (wipe)
+-		wipe_block_device(fd, info.len);
++	wipe_block_device(fd, info.len, wipe_mode);
+ 
+ 	write_ext4_image(fd, gzip, sparse, crc);
+ 
+diff --git a/ext4_utils/make_ext4fs.h b/ext4_utils/make_ext4fs.h
+index 3784a9e..af2dcf0 100644
+--- a/ext4_utils/make_ext4fs.h
++++ b/ext4_utils/make_ext4fs.h
+@@ -21,10 +21,17 @@
+ extern "C" {
+ #endif
+ 
++#ifndef WIPE_DISABLED
++#define WIPE_DISABLED   0
++#define WIPE_FALLBACK   1
++#define WIPE_UNSECURE   2
++#define WIPE_SECURE     4
++#endif
++
+ struct selabel_handle;
+ 
+ int make_ext4fs(const char *filename, long long len,
+-                const char *mountpoint, struct selabel_handle *sehnd);
++                const char *mountpoint, struct selabel_handle *sehnd, int wipe_mode);
+ int make_ext4fs_sparse_fd(int fd, long long len,
+                 const char *mountpoint, struct selabel_handle *sehnd);
+ 
+diff --git a/ext4_utils/make_ext4fs_main.c b/ext4_utils/make_ext4fs_main.c
+index 9163506..ac546ed 100644
+--- a/ext4_utils/make_ext4fs_main.c
++++ b/ext4_utils/make_ext4fs_main.c
+@@ -53,7 +53,7 @@ static void usage(char *path)
+ 	fprintf(stderr, "    [ -g <blocks per group> ] [ -i <inodes> ] [ -I <inode size> ]\n");
+ 	fprintf(stderr, "    [ -L <label> ] [ -f ] [ -a <android mountpoint> ]\n");
+ 	fprintf(stderr, "    [ -S file_contexts ] [ -T timestamp ]\n");
+-	fprintf(stderr, "    [ -z | -s ] [ -w ] [ -c ] [ -J ] [ -v ]\n");
++	fprintf(stderr, "    [ -z | -s ] [ -w <wipe_mode>] [ -c ] [ -J ] [ -v ]\n");
+ 	fprintf(stderr, "    <filename> [<directory>]\n");
+ }
+ 
+@@ -67,7 +67,7 @@ int main(int argc, char **argv)
+ 	int gzip = 0;
+ 	int sparse = 0;
+ 	int crc = 0;
+-	int wipe = 0;
++	int wipe_mode = WIPE_DISABLED;
+ 	int fd;
+ 	int exitcode;
+ 	int verbose = 0;
+@@ -77,7 +77,7 @@ int main(int argc, char **argv)
+ 	struct selinux_opt seopts[] = { { SELABEL_OPT_PATH, "" } };
+ #endif
+ 
+-	while ((opt = getopt(argc, argv, "l:j:b:g:i:I:L:a:S:T:fwzJsctv")) != -1) {
++	while ((opt = getopt(argc, argv, "l:j:b:g:i:I:L:a:S:T:fw:zJsctv")) != -1) {
+ 		switch (opt) {
+ 		case 'l':
+ 			info.len = parse_num(optarg);
+@@ -114,7 +114,7 @@ int main(int argc, char **argv)
+ #endif
+ 			break;
+ 		case 'w':
+-			wipe = 1;
++			wipe_mode = parse_num(optarg);
+ 			break;
+ 		case 'z':
+ 			gzip = 1;
+@@ -165,13 +165,13 @@ int main(int argc, char **argv)
+ 	}
+ #endif
+ 
+-	if (wipe && sparse) {
++	if (wipe_mode && sparse) {
+ 		fprintf(stderr, "Cannot specifiy both wipe and sparse\n");
+ 		usage(argv[0]);
+ 		exit(EXIT_FAILURE);
+ 	}
+ 
+-	if (wipe && gzip) {
++	if (wipe_mode && gzip) {
+ 		fprintf(stderr, "Cannot specifiy both wipe and gzip\n");
+ 		usage(argv[0]);
+ 		exit(EXIT_FAILURE);
+@@ -205,7 +205,7 @@ int main(int argc, char **argv)
+ 	}
+ 
+ 	exitcode = make_ext4fs_internal(fd, directory, mountpoint, fs_config_func, gzip,
+-			sparse, crc, wipe, sehnd, verbose, fixed_time);
++			sparse, crc, wipe_mode, sehnd, verbose, fixed_time);
+ 	close(fd);
+ 	if (exitcode && strcmp(filename, "-"))
+ 		unlink(filename);
+diff --git a/ext4_utils/wipe.c b/ext4_utils/wipe.c
+index 3bd33e5..65354fa 100644
+--- a/ext4_utils/wipe.c
++++ b/ext4_utils/wipe.c
+@@ -30,31 +30,56 @@
+ #define BLKSECDISCARD _IO(0x12,125)
+ #endif
+ 
+-int wipe_block_device(int fd, s64 len)
++int wipe_block_device(int fd, s64 len, int wipe_mode)
+ {
+ 	u64 range[2];
+ 	int ret;
+ 
++
++	if (wipe_mode == WIPE_DISABLED) {
++		warn("Wipe is disabled\n");
++		return 0;
++	}
++
+ 	range[0] = 0;
+ 	range[1] = len;
+-	ret = ioctl(fd, BLKSECDISCARD, &range);
+-	if (ret < 0) {
+-		range[0] = 0;
+-		range[1] = len;
++
++	if (wipe_mode == WIPE_FALLBACK) {
++		ret = ioctl(fd, BLKSECDISCARD, &range);
++		if (ret < 0) {
++			range[0] = 0;
++			range[1] = len;
++			ret = ioctl(fd, BLKDISCARD, &range);
++			if (ret < 0) {
++				warn("Discard failed on fallback mode\n");
++				return 1;
++			} else {
++				warn("Wipe via secure discard failed, used discard instead\n");
++				return 0;
++			}
++		}
++	}
++
++	if (wipe_mode == WIPE_SECURE) {
++		ret = ioctl(fd, BLKSECDISCARD, &range);
++		if (ret < 0) {
++			warn("Secure Discard failed\n");
++			return 1;
++		}
++	}
++
++	if (wipe_mode == WIPE_UNSECURE) {
+ 		ret = ioctl(fd, BLKDISCARD, &range);
+ 		if (ret < 0) {
+-			warn("Discard failed\n");
++			warn("Unsecure Discard failed\n");
+ 			return 1;
+-		} else {
+-			warn("Wipe via secure discard failed, used discard instead\n");
+-			return 0;
+ 		}
+ 	}
+ 
+ 	return 0;
+ }
+ #else
+-int wipe_block_device(int fd, s64 len)
++int wipe_block_device(int fd, s64 len, int wipe_mode)
+ {
+ 	error("wipe not supported on non-linux platforms");
+ 	return 1;
+diff --git a/ext4_utils/wipe.h b/ext4_utils/wipe.h
+index ecde9c1..3cca335 100644
+--- a/ext4_utils/wipe.h
++++ b/ext4_utils/wipe.h
+@@ -19,6 +19,11 @@
+ 
+ #include "ext4_utils.h"
+ 
+-int wipe_block_device(int fd, s64 len);
++#define WIPE_DISABLED   0
++#define WIPE_FALLBACK   1
++#define WIPE_UNSECURE   2
++#define WIPE_SECURE     4
++
++int wipe_block_device(int fd, s64 len, int wipe_mode);
+ 
+ #endif
+-- 
+1.7.4.1
+
