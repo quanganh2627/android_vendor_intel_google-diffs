@@ -2,7 +2,7 @@
 
 # This script is source by build/envsetup.sh
 
-if [ -z "$KK_FUSION_PLATFORM_ZIP" ]; then
+if [ -z "$PDK_FUSION_PLATFORM_ZIP" ]; then
     
     # Set the platform.zip file.
     export PDK_FUSION_PLATFORM_ZIP=$(pwd)/vendor/pdk/mini_x86/mini_x86-userdebug/platform/platform.zip
