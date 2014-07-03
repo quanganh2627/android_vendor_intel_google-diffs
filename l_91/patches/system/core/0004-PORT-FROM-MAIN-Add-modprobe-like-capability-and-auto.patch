@@ -1,0 +1,1604 @@
+From 5a1818be54b8bdf8eb777522c55c58c3357e4a12 Mon Sep 17 00:00:00 2001
+From: Yong Yao <yong.yao@intel.com>
+Date: Mon, 23 Jun 2014 20:33:24 +0800
+Subject: [PORT FROM MAIN]Add modprobe-like capability and automatic uevent loading
+
+BZ: 87126
+
+Adds modprobe support based on uevent.This patch is ported
+from OTC android tree.
+
+354df89 Support module alias in insmod_by_dep
+4f13810 Refine return values of module loading API
+78ac9bb Improve module black lists in Android IA
+c795f24 Copy parser for black list and alias to libcutils
+f6387be Add aklog tool for kernel log
+d133f1a add modprobe-like capability and automatic ueventd loading
+
+Change-Id: I60fa83bd94cecff902aa0f5839a83eb95b280841
+Orig-Change-Id: Ia9443d96696ececddebee3a593e6492e0f2aa6c5
+Signed-off-by: Sathyanarayanan Kuppuswamy <sathyanarayanan.kuppuswamy@intel.com>
+Signed-off-by: Jeremie GARCIA <jeremie.garcia@intel.com>
+Signed-off-by: Yong Yao <yong.yao@intel.com>
+---
+ include/cutils/module_parsers.h |   45 +++
+ include/cutils/probe_module.h   |  106 +++++++
+ init/Android.mk                 |   11 +
+ init/builtins.c                 |   47 +++
+ init/devices.c                  |   90 ++++++-
+ init/devices.h                  |    2 +
+ init/init.c                     |    6 +-
+ init/init_parser.c              |    2 +
+ init/keywords.h                 |    4 +
+ init/ueventd.c                  |   26 ++
+ libcutils/Android.mk            |    2 +
+ libcutils/module_parsers.c      |  398 ++++++++++++++++++++++++++
+ libcutils/probe_module.c        |  584 +++++++++++++++++++++++++++++++++++++++
+ 13 files changed, 1311 insertions(+), 12 deletions(-)
+ create mode 100644 include/cutils/module_parsers.h
+ create mode 100644 include/cutils/probe_module.h
+ create mode 100644 libcutils/module_parsers.c
+ create mode 100644 libcutils/probe_module.c
+
+diff --git a/include/cutils/module_parsers.h b/include/cutils/module_parsers.h
+new file mode 100644
+index 0000000..694fbde
+--- /dev/null
++++ b/include/cutils/module_parsers.h
+@@ -0,0 +1,45 @@
++/*
++ * Copyright (C) 2012 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/* parsers for module loading */
++
++#include <cutils/list.h>
++
++struct module_alias_node {
++    char *name;
++    char *pattern;
++    struct listnode list;
++};
++
++struct module_blacklist_node {
++    char *name;
++    struct listnode list;
++};
++
++int is_module_blacklisted(const char *name, struct listnode *black_list);
++int parse_alias_to_list(const char *file_name, struct listnode *head);
++int parse_blacklist_to_list(const char *file_name, struct listnode *head);
++void free_alias_list(struct listnode *head);
++void free_black_list(struct listnode *head);
++/* return a module's name from its alias.
++ * id           : alias string passed by caller
++ * name         : allocated string of module name, caller is responsible to free it.
++ * alias_list   : list head of an alias map. The map is a list of struct module_alias_node.
++ * return       : 0 when module name is found and name holds the valid content.
++ *              : -1 when it failed to allocate name string's memory, or the module name
++ *                cannot be found in alias list. Content of name is NULL.
++ */
++int get_module_name_from_alias(const char *id, char **name, struct listnode *alias_list);
+diff --git a/include/cutils/probe_module.h b/include/cutils/probe_module.h
+new file mode 100644
+index 0000000..a739a3d
+--- /dev/null
++++ b/include/cutils/probe_module.h
+@@ -0,0 +1,106 @@
++/*
++ * Copyright (C) 2012 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef _LIBS_CUTILS_PROBEMODULE_H
++#define _LIBS_CUTILS_PROBEMODULE_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define MOD_NO_ERR                  (0)         /* The operation is successful. */
++#define MOD_UNKNOWN                 (1 << 0)    /* unknown errors */
++#define MOD_IN_BLACK                (1 << 1)    /* A module is in base black list. */
++#define MOD_IN_CALLER_BLACK         (1 << 2)    /* A module is in caller's black list. */
++#define MOD_BAD_DEP                 (1 << 3)    /* Invalid module dependency file or it's parsing failed. */
++#define MOD_BAD_ALIAS               (1 << 4)    /* Invalid module alias file or it's parsing failed. */
++#define MOD_DEP_NOT_FOUND           (1 << 5)    /* Cannot find module's dependency chain */
++#define MOD_INVALID_CALLER_BLACK    (1 << 6)    /* Caller provides invalid black list or it's parsing failed. */
++#define MOD_INVALID_NAME            (1 << 7)    /* The module's name or alias is invalid */
++
++
++/* insmod_by_dep() - load a kernel module (target) with its dependency
++ * The module's dependency must be described in the provided dependency file.
++ * other modules in the dependency chain will be loaded prior to the target.
++ *
++ * module_name: Name of the target module. e.g. name "MyModule" is for
++ *              module file MyModule.ko.
++ *
++ * args       : A string of target module's parameters. NOTE: we only
++ *              support parameters of the target module.
++ *
++ * dep_name   : Name of dependency file. If it is NULL, we will look
++ *              up /system/lib/modules/modules.dep by default.
++ *
++ * strip      : Non-zero values remove paths of modules in dependency.
++ *              before loading them. The final path of a module will be
++ *              base/MyModule.ko. This is for devices which put every
++ *              modules into a single directory.
++ *
++ *              Passing 0 to strip keeps module paths in dependency file.
++ *              e.g. "kernel/drivers/.../MyModule.ko" in dep file will
++ *              be loaded as base/kernel/drivers/.../MyModule.ko .
++ *
++ * base       : Base dir, a prefix to be added to module's path prior to
++ *              loading. The last character prior to base string's terminator
++ *              must be a '/'. If it is NULL, we will take
++ *              /system/lib/modules/modules.dep by default.
++ *
++ * blacklist  : A file of modules you don't want to loaded. It is optional.
++ *              If a valid file is provided, modules in it will be parsed
++ *              and used along with the base module black list in insmod.c to
++ *              scan the dependency chain BEFORE any actual module loading.
++ *              The black list will always be applied in insmod_by_dep().
++ *              The typical format of a module in the black list file is shown
++ *              at below. Note, specify module's name instead of alias.
++ *
++ *              blacklist your_module_name
++ *
++ * return     : 0 (MOD_NO_ERR) for success;
++ *              >0 refer to defined error macros in this file.
++ *              <0 errors returned from lower levels.
++ * Note:
++ * When loading modules, function will not fail for any modules which are
++ * already in kernel. The module parameters passed to function will not be
++ * effective in this case if target module is already loaded into kernel.
++ */
++extern int insmod_by_dep(
++        const char *module_name,
++        const char *args,
++        const char *dep_name,
++        int strip,
++        const char *base,
++        const char *blacklist);
++
++/* rmmod_by_dep() - remove a module (target) from kernel with its dependency
++ * The module's dependency must be described in the provided dependency file.
++ * This function will try to remove other modules in the dependency chain too
++ *
++ * module_name: Name of the target module. e.g. name "MyModule" is for
++ *              module file MyModule.ko.
++ *
++ * dep_name   : Name of dependency file. If it is NULL, we will look
++ *              up /system/lib/modules/modules.dep by default.
++ *
++ * return     : 0 for success; non-zero for any errors.
++ */
++extern int rmmod_by_dep(const char *module_name, const char *dep_name);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /*_LIBS_CUTILS_PROBEMODULE_H*/
+diff --git a/init/Android.mk b/init/Android.mk
+index 489dc93..c963766 100644
+--- a/init/Android.mk
++++ b/init/Android.mk
+@@ -69,3 +69,14 @@ ALL_DEFAULT_INSTALLED_MODULES += $(SYMLINKS)
+ # local module name
+ ALL_MODULES.$(LOCAL_MODULE).INSTALLED := \
+     $(ALL_MODULES.$(LOCAL_MODULE).INSTALLED) $(SYMLINKS)
++
++# make a link of modprobe to init
++SYMLINK_MODPROBE := $(TARGET_ROOT_OUT)/sbin/modprobe
++$(SYMLINK_MODPROBE): MODPROBE_BINARY := $(LOCAL_MODULE)
++$(SYMLINK_MODPROBE): $(LOCAL_INSTALLED_MODULE) $(LOCAL_PATH)/Android.mk
++	@echo "Symlink: $@ -> ../$(MODPROBE_BINARY)"
++	@mkdir -p $(dir $@)
++	@rm -rf $@
++	$(hide) ln -sf ../$(MODPROBE_BINARY) $@
++
++ALL_DEFAULT_INSTALLED_MODULES += $(SYMLINK_MODPROBE)
+diff --git a/init/builtins.c b/init/builtins.c
+index 24abb00..c7f2a7f 100644
+--- a/init/builtins.c
++++ b/init/builtins.c
+@@ -34,6 +34,9 @@
+ #include <cutils/partition_utils.h>
+ #include <cutils/android_reboot.h>
+ #include <fs_mgr.h>
++#include <fnmatch.h>
++#include <dirent.h>
++#include <cutils/probe_module.h>
+ 
+ #include <selinux/selinux.h>
+ #include <selinux/label.h>
+@@ -306,6 +309,40 @@ int do_insmod(int nargs, char **args)
+     return do_insmod_inner(nargs, args, size);
+ }
+ 
++static int do_probemod_inner(int nargs, char **args, int opt_len)
++{
++    char options[opt_len + 1];
++    int i;
++    int ret;
++
++    options[0] = '\0';
++    if (nargs > 2) {
++        strcpy(options, args[2]);
++        for (i = 3; i < nargs; ++i) {
++            strcat(options, " ");
++            strcat(options, args[i]);
++        }
++    }
++
++    ret = insmod_by_dep(args[1], options, NULL, 1, NULL, NULL);
++    if (ret)
++        ERROR("Couldn't probe module '%s'\n", args[1]);
++    return ret;
++}
++
++int do_probemod(int nargs, char **args)
++{
++    int i;
++    int size = 0;
++
++    if (nargs > 2) {
++        for (i = 2; i < nargs; ++i)
++            size += strlen(args[i]) + 1;
++    }
++
++    return do_probemod_inner(nargs, args, size);
++}
++
+ int do_mkdir(int nargs, char **args)
+ {
+     mode_t mode = 0755;
+@@ -582,6 +619,16 @@ int do_setkey(int nargs, char **args)
+     return setkey(&kbe);
+ }
+ 
++int do_builtin_coldboot(int nargs, char **args)
++{
++    if (nargs != 2 || !args[1] || *args[1] == '\0')
++        return -1;
++
++    coldboot(args[1]);
++
++    return 0;
++}
++
+ int do_setprop(int nargs, char **args)
+ {
+     const char *name = args[1];
+diff --git a/init/devices.c b/init/devices.c
+index b896410..c79349c 100644
+--- a/init/devices.c
++++ b/init/devices.c
+@@ -41,12 +41,15 @@
+ #include <sys/wait.h>
+ 
+ #include <cutils/list.h>
++#include <cutils/probe_module.h>
+ #include <cutils/uevent.h>
++#include <cutils/module_parsers.h>
+ 
+ #include "devices.h"
+ #include "ueventd_parser.h"
+ #include "util.h"
+ #include "log.h"
++#include "parser.h"
+ 
+ #define UNUSED __attribute__((__unused__))
+ 
+@@ -66,6 +69,7 @@ struct uevent {
+     const char *firmware;
+     const char *partition_name;
+     const char *device_name;
++    const char *modalias;
+     int partition_num;
+     int major;
+     int minor;
+@@ -96,6 +100,7 @@ struct platform_node {
+ static list_declare(sys_perms);
+ static list_declare(dev_perms);
+ static list_declare(platform_names);
++static list_declare(deferred_module_loading_list);
+ 
+ int add_dev_perms(const char *name, const char *attr,
+                   mode_t perm, unsigned int uid, unsigned int gid,
+@@ -141,11 +146,8 @@ void fixup_sys_perms(const char *upath)
+          */
+     list_for_each(node, &sys_perms) {
+         dp = &(node_to_item(node, struct perm_node, plist))->dp;
+-        if (dp->prefix) {
+-            if (strncmp(upath, dp->name + 4, strlen(dp->name + 4)))
+-                continue;
+-        } else if (dp->wildcard) {
+-            if (fnmatch(dp->name + 4, upath, FNM_PATHNAME) != 0)
++        if (dp->wildcard) {
++            if (fnmatch(dp->name + 4, upath, 0) != 0)
+                 continue;
+         } else {
+             if (strcmp(upath, dp->name + 4))
+@@ -184,11 +186,8 @@ static mode_t get_device_perm(const char *path, unsigned *uid, unsigned *gid)
+         perm_node = node_to_item(node, struct perm_node, plist);
+         dp = &perm_node->dp;
+ 
+-        if (dp->prefix) {
+-            if (strncmp(path, dp->name, strlen(dp->name)))
+-                continue;
+-        } else if (dp->wildcard) {
+-            if (fnmatch(dp->name, path, FNM_PATHNAME) != 0)
++        if (dp->wildcard) {
++            if (fnmatch(dp->name, path, 0) != 0)
+                 continue;
+         } else {
+             if (strcmp(path, dp->name))
+@@ -369,6 +368,7 @@ static void parse_event(const char *msg, struct uevent *uevent)
+     uevent->partition_name = NULL;
+     uevent->partition_num = -1;
+     uevent->device_name = NULL;
++    uevent->modalias = NULL;
+ 
+         /* currently ignoring SEQNUM */
+     while(*msg) {
+@@ -399,6 +399,9 @@ static void parse_event(const char *msg, struct uevent *uevent)
+         } else if(!strncmp(msg, "DEVNAME=", 8)) {
+             msg += 8;
+             uevent->device_name = msg;
++        } else if (!strncmp(msg, "MODALIAS=", 9)) {
++            msg += 9;
++            uevent->modalias = msg;
+         }
+ 
+         /* advance to after the next \0 */
+@@ -746,8 +749,73 @@ static void handle_generic_device_event(struct uevent *uevent)
+              uevent->major, uevent->minor, links);
+ }
+ 
++static void handle_deferred_module_loading()
++{
++    struct listnode *node = NULL;
++    struct listnode *next = NULL;
++    struct module_alias_node *alias = NULL;
++    int ret = -1;
++
++    list_for_each_safe(node, next, &deferred_module_loading_list) {
++        alias = node_to_item(node, struct module_alias_node, list);
++
++        if (alias && alias->pattern) {
++            INFO("deferred loading of module for %s\n", alias->pattern);
++            ret = insmod_by_dep(alias->pattern, "", NULL, 1, NULL,
++                    MODULES_BLKLST);
++            /* if it looks like file system where these files are is not
++             * ready, keep the module in defer list for retry. */
++            if (!(ret & (MOD_BAD_DEP | MOD_INVALID_CALLER_BLACK | MOD_BAD_ALIAS))) {
++                free(alias->pattern);
++                list_remove(node);
++                free(alias);
++            }
++        }
++    }
++}
++
++int module_probe(const char *modalias)
++{
++    return insmod_by_dep(modalias, "", NULL, 1, NULL, NULL);    /* not to reuse ueventd's black list. */
++}
++
++static void handle_module_loading(const char *modalias)
++{
++    char *tmp;
++    struct module_alias_node *node;
++    int ret;
++
++
++    handle_deferred_module_loading();
++
++    if (!modalias) return;
++
++    ret = insmod_by_dep(modalias, "", NULL, 1, NULL, MODULES_BLKLST);
++
++    if (ret & (MOD_BAD_DEP | MOD_INVALID_CALLER_BLACK | MOD_BAD_ALIAS)) {
++        node = calloc(1, sizeof(*node));
++        if (node) {
++            node->pattern = strdup(modalias);
++            if (!node->pattern) {
++                free(node);
++            } else {
++                list_add_tail(&deferred_module_loading_list, &node->list);
++                INFO("add to queue for deferred module loading: %s",
++                        node->pattern);
++            }
++        } else {
++            ERROR("failed to allocate memory to store device id for deferred module loading.\n");
++        }
++    }
++}
++
++
+ static void handle_device_event(struct uevent *uevent)
+ {
++    if (!strcmp(uevent->action,"add")) {
++        handle_module_loading(uevent->modalias);
++    }
++
+     if (!strcmp(uevent->action,"add") || !strcmp(uevent->action, "change") || !strcmp(uevent->action, "online"))
+         fixup_sys_perms(uevent->path);
+ 
+@@ -987,7 +1055,7 @@ static void do_coldboot(DIR *d)
+     }
+ }
+ 
+-static void coldboot(const char *path)
++void coldboot(const char *path)
+ {
+     DIR *d = opendir(path);
+     if(d) {
+diff --git a/init/devices.h b/init/devices.h
+index 5d0fe88..18ec71c 100644
+--- a/init/devices.h
++++ b/init/devices.h
+@@ -21,9 +21,11 @@
+ 
+ extern void handle_device_fd();
+ extern void device_init(void);
++extern int module_probe(const char *alias);
+ extern int add_dev_perms(const char *name, const char *attr,
+                          mode_t perm, unsigned int uid,
+                          unsigned int gid, unsigned short prefix,
+                          unsigned short wildcard);
+ int get_device_fd();
++void coldboot(const char *path);
+ #endif	/* _INIT_DEVICES_H */
+diff --git a/init/init.c b/init/init.c
+index e4ac1cf..4c4f386 100644
+--- a/init/init.c
++++ b/init/init.c
+@@ -1001,7 +1001,11 @@ int main(int argc, char **argv)
+     int keychord_fd_init = 0;
+     bool is_charger = false;
+ 
+-    if (!strcmp(basename(argv[0]), "ueventd"))
++    /* If we are called as 'modprobe' command, we run as a
++     * standalone executable and reuse ueventd's logic to do the job.
++     */
++    if (!strcmp(basename(argv[0]), "ueventd")
++            || !strcmp(basename(argv[0]), "modprobe"))
+         return ueventd_main(argc, argv);
+ 
+     if (!strcmp(basename(argv[0]), "watchdogd"))
+diff --git a/init/init_parser.c b/init/init_parser.c
+index f412de7..b2d65a1 100644
+--- a/init/init_parser.c
++++ b/init/init_parser.c
+@@ -91,6 +91,7 @@ static int lookup_keyword(const char *s)
+         if (!strcmp(s, "onsole")) return K_console;
+         if (!strcmp(s, "hown")) return K_chown;
+         if (!strcmp(s, "hmod")) return K_chmod;
++        if (!strcmp(s, "oldboot")) return K_coldboot;
+         if (!strcmp(s, "ritical")) return K_critical;
+         break;
+     case 'd':
+@@ -134,6 +135,7 @@ static int lookup_keyword(const char *s)
+         break;
+     case 'p':
+         if (!strcmp(s, "owerctl")) return K_powerctl;
++        else if (!strcmp(s, "robemod")) return K_probemod;
+     case 'r':
+         if (!strcmp(s, "estart")) return K_restart;
+         if (!strcmp(s, "estorecon")) return K_restorecon;
+diff --git a/init/keywords.h b/init/keywords.h
+index 2d97e5b..d15def6 100644
+--- a/init/keywords.h
++++ b/init/keywords.h
+@@ -1,5 +1,6 @@
+ 
+ #ifndef KEYWORD
++int do_builtin_coldboot(int nargs, char **args);
+ int do_chroot(int nargs, char **args);
+ int do_chdir(int nargs, char **args);
+ int do_class_start(int nargs, char **args);
+@@ -16,6 +17,7 @@ int do_mkdir(int nargs, char **args);
+ int do_mount_all(int nargs, char **args);
+ int do_mount(int nargs, char **args);
+ int do_powerctl(int nargs, char **args);
++int do_probemod(int nargs, char **args);
+ int do_restart(int nargs, char **args);
+ int do_restorecon(int nargs, char **args);
+ int do_restorecon_recursive(int nargs, char **args);
+@@ -73,6 +75,7 @@ enum {
+     KEYWORD(oneshot,     OPTION,  0, 0)
+     KEYWORD(onrestart,   OPTION,  0, 0)
+     KEYWORD(powerctl,    COMMAND, 1, do_powerctl)
++    KEYWORD(probemod,    COMMAND, 1, do_probemod)
+     KEYWORD(restart,     COMMAND, 1, do_restart)
+     KEYWORD(restorecon,  COMMAND, 1, do_restorecon)
+     KEYWORD(restorecon_recursive,  COMMAND, 1, do_restorecon_recursive)
+@@ -104,6 +107,7 @@ enum {
+     KEYWORD(load_persist_props,    COMMAND, 0, do_load_persist_props)
+     KEYWORD(load_all_props,        COMMAND, 0, do_load_all_props)
+     KEYWORD(ioprio,      OPTION,  0, 0)
++    KEYWORD(coldboot,    COMMAND, 1, do_builtin_coldboot)
+ #ifdef __MAKE_KEYWORD_ENUM__
+     KEYWORD_COUNT,
+ };
+diff --git a/init/ueventd.c b/init/ueventd.c
+index 833e4fd..e1547bb 100644
+--- a/init/ueventd.c
++++ b/init/ueventd.c
+@@ -22,6 +22,8 @@
+ #include <ctype.h>
+ #include <signal.h>
+ #include <selinux/selinux.h>
++#include <libgen.h>
++#include <errno.h>
+ 
+ #include <private/android_filesystem_config.h>
+ 
+@@ -54,6 +56,30 @@ int ueventd_main(int argc, char **argv)
+     int nr;
+     char tmp[32];
+ 
++    /* kernel will launch a program in user space to load
++     * modules, by default it is modprobe.
++     * Kernel doesn't send module parameters, so we don't
++     * need to support them.
++     * No deferred loading in this case.
++     */
++    if (!strcmp(basename(argv[0]), "modprobe")) {
++        if (argc >= 4
++                && argv[3] != NULL
++                && *argv[3] != '\0') {
++            uid_t uid;
++
++            /* We only accept requests from root user (kernel) */
++            uid = getuid();
++            if (uid)
++                return -EPERM;
++
++            return module_probe(argv[3]);
++        } else {
++            /* modprobe is called without enough arguments */
++            return -EINVAL;
++        }
++    }
++
+     /*
+      * init sets the umask to 077 for forked processes. We need to
+      * create files with exact permissions, without modification by
+diff --git a/libcutils/Android.mk b/libcutils/Android.mk
+index 933a77b..39d5695 100644
+--- a/libcutils/Android.mk
++++ b/libcutils/Android.mk
+@@ -38,7 +38,9 @@ commonSources := \
+ 	threads.c \
+ 	sched_policy.c \
+ 	iosched_policy.c \
++	probe_module.c \
+ 	str_parms.c \
++	module_parsers.c \
+ 
+ # some files must not be compiled when building against Mingw
+ # they correspond to features not used by our host development tools
+diff --git a/libcutils/module_parsers.c b/libcutils/module_parsers.c
+new file mode 100644
+index 0000000..4a744b9
+--- /dev/null
++++ b/libcutils/module_parsers.c
+@@ -0,0 +1,398 @@
++/*
++ * Copyright (C) 2012 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/* parsers for module alias and blacklists */
++
++#define _GNU_SOURCE 1
++
++#include <stdio.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <string.h>
++#include <cutils/list.h>
++#include <stdlib.h>
++#include <fnmatch.h>
++
++#define LOG_TAG "ModuleParsers"
++#include <cutils/log.h>
++
++#include <cutils/misc.h>
++#include <cutils/module_parsers.h>
++
++
++#define READ_MODULES_ALIAS  1
++#define READ_MODULES_BLKLST 2
++
++/* These macros, parse_state and next_token are copied
++ * from parser in init with modifications.
++ */
++#define T_EOF 0
++#define T_TEXT 1
++#define T_NEWLINE 2
++
++struct parse_state
++{
++    char *ptr;
++    char *text;
++    int line;
++    int nexttoken;
++    void *context;
++    void (*parse_line)(struct parse_state *state, int nargs, char **args, struct listnode *head);
++    const char *filename;
++    void *priv;
++};
++
++static int next_token(struct parse_state *state)
++{
++    char *x = state->ptr;
++    char *s;
++
++    if (state->nexttoken) {
++        int t = state->nexttoken;
++        state->nexttoken = 0;
++        return t;
++    }
++
++    for (;;) {
++        switch (*x) {
++        case 0:
++            state->ptr = x;
++            return T_EOF;
++        case '\n':
++            x++;
++            state->ptr = x;
++            return T_NEWLINE;
++        case ' ':
++        case '\t':
++        case '\r':
++            x++;
++            continue;
++        case '#':
++            while (*x && (*x != '\n')) x++;
++            if (*x == '\n') {
++                state->ptr = x+1;
++                return T_NEWLINE;
++            } else {
++                state->ptr = x;
++                return T_EOF;
++            }
++        default:
++            goto text;
++        }
++    }
++
++textdone:
++    state->ptr = x;
++    *s = 0;
++    return T_TEXT;
++text:
++    state->text = s = x;
++textresume:
++    for (;;) {
++        switch (*x) {
++        case 0:
++            goto textdone;
++        case ' ':
++        case '\t':
++        case '\r':
++            x++;
++            goto textdone;
++        case '\n':
++            state->nexttoken = T_NEWLINE;
++            x++;
++            goto textdone;
++        case '"':
++            x++;
++            for (;;) {
++                switch (*x) {
++                case 0:
++                        /* unterminated quoted thing */
++                    state->ptr = x;
++                    return T_EOF;
++                case '"':
++                    x++;
++                    goto textresume;
++                default:
++                    *s++ = *x++;
++                }
++            }
++            break;
++        case '\\':
++            x++;
++            switch (*x) {
++            case 0:
++                goto textdone;
++            case 'n':
++                *s++ = '\n';
++                break;
++            case 'r':
++                *s++ = '\r';
++                break;
++            case 't':
++                *s++ = '\t';
++                break;
++            case '\\':
++                *s++ = '\\';
++                break;
++            case '\r':
++                    /* \ <cr> <lf> -> line continuation */
++                if (x[1] != '\n') {
++                    x++;
++                    continue;
++                }
++            case '\n':
++                    /* \ <lf> -> line continuation */
++                state->line++;
++                x++;
++                    /* eat any extra whitespace */
++                while((*x == ' ') || (*x == '\t')) x++;
++                continue;
++            default:
++                    /* unknown escape -- just copy */
++                *s++ = *x++;
++            }
++            continue;
++        default:
++            *s++ = *x++;
++        }
++    }
++    return T_EOF;
++}
++
++void free_alias_list(struct listnode *head)
++{
++    struct listnode *node = NULL;
++    struct listnode *next = NULL;
++    struct module_alias_node *alias = NULL;
++
++    list_for_each_safe(node, next, head)
++    {
++        alias = node_to_item(node, struct module_alias_node, list);
++        if (alias) {
++            free(alias->pattern);
++            free(alias->name);
++            list_remove(node);
++            free(alias);
++        }
++    }
++}
++
++void free_black_list(struct listnode *head)
++{
++
++    struct listnode *node = NULL;
++    struct listnode *next = NULL;
++    struct module_blacklist_node *black = NULL;
++
++    list_for_each_safe(node, next, head)
++    {
++        black = node_to_item(node, struct module_blacklist_node, list);
++        if (black) {
++            free(black->name);
++            list_remove(node);
++            free(black);
++        }
++    }
++}
++
++int get_module_name_from_alias(const char *id, char **name, struct listnode *alias_list)
++{
++    struct listnode *alias_node;
++    struct module_alias_node *alias;
++    int ret = -1;
++
++    if (!id)
++        return ret;
++
++    list_for_each(alias_node, alias_list)
++    {
++        alias = node_to_item(alias_node, struct module_alias_node, list);
++        if (alias && alias->name && alias->pattern) {
++            if (fnmatch(alias->pattern, id, 0) == 0) {
++                if (asprintf(name, "%s", alias->name) < 0)
++                    *name = NULL;
++                else
++                    ret = 0;
++
++                break;
++            }
++        }
++    }
++
++    return ret;
++}
++
++int is_module_blacklisted(const char *name, struct listnode *black_list_head)
++{
++    struct listnode *blklst_node;
++    struct module_blacklist_node *blacklist;
++    int ret = 0;
++
++    if (!name)
++        return ret;
++
++    /* See if module is blacklisted, skip if it is */
++    list_for_each(blklst_node, black_list_head) {
++        blacklist = node_to_item(blklst_node,
++                                 struct module_blacklist_node,
++                                 list);
++        if (!strcmp(name, blacklist->name)) {
++            ALOGI("modules %s is blacklisted\n", name);
++            ret = 1;
++
++            break;
++        }
++    }
++
++    return ret;
++}
++
++static void parse_line_module_blacklist(struct parse_state *state, int nargs, char **args, struct listnode *head)
++{
++    struct module_blacklist_node *node;
++
++    /* empty line or not enough arguments */
++    if (!args ||
++        (nargs != 2) ||
++            !args[0] || !args[1])
++        return;
++
++    /* this line does not begin with "blacklist" */
++    if (strncmp(args[0], "blacklist", 9))
++        return;
++
++    node = calloc(1, sizeof(*node));
++    if (!node)
++        return;
++
++    node->name = strdup(args[1]);
++    if (!node->name) {
++        free(node);
++        return;
++    }
++
++    list_add_tail(head, &node->list);
++}
++
++static void parse_line_module_alias(struct parse_state *state, int nargs, char **args, struct listnode *head)
++{
++    struct module_alias_node *node;
++
++    /* empty line or not enough arguments */
++    if (!args ||
++        (nargs != 3) ||
++            !args[0] || !args[1] || !args[2])
++        return;
++
++    node = calloc(1, sizeof(*node));
++    if (!node)
++        return;
++
++    node->name = strdup(args[2]);
++    if (!node->name) {
++        free(node);
++        return;
++    }
++
++    node->pattern = strdup(args[1]);
++    if (!node->pattern) {
++        free(node->name);
++        free(node);
++        return;
++    }
++
++    list_add_tail(head, &node->list);
++
++}
++
++int module_parser(const char *file_name, int mode, struct listnode *head)
++{
++    struct parse_state state;
++    char *args[3];
++    int nargs;
++    char *data = NULL;
++    char *fn;
++    int ret = -1;
++    int args_to_read = 0;
++
++    if (mode == READ_MODULES_ALIAS) {
++        /* read modules.alias */
++        if (asprintf(&fn, "%s", file_name) <= 0)
++            goto out;
++
++    } else if (mode == READ_MODULES_BLKLST) {
++        /* read modules.blacklist */
++        if (asprintf(&fn, "%s", file_name) <= 0)
++            goto out;
++    } else /* unknown mode */
++        return ret;
++
++    /* read the whole file */
++    data = load_file(fn, 0);
++    if (!data)
++        goto out;
++
++    /* invoke tokenizer */
++    nargs = 0;
++    state.filename = fn;
++    state.line = 1;
++    state.ptr = data;
++    state.nexttoken = 0;
++    if (mode == READ_MODULES_ALIAS) {
++        state.parse_line = parse_line_module_alias;
++        args_to_read = 3;
++    } else if (mode == READ_MODULES_BLKLST) {
++        state.parse_line = parse_line_module_blacklist;
++        args_to_read = 2;
++    }
++    for (;;) {
++        int token = next_token(&state);
++        switch (token) {
++        case T_EOF:
++            state.parse_line(&state, 0, 0, head);
++            ret = 0;
++            goto out;
++        case T_NEWLINE:
++            if (nargs) {
++                state.parse_line(&state, nargs, args, head);
++                nargs = 0;
++            }
++            break;
++        case T_TEXT:
++            if (nargs < args_to_read) {
++                args[nargs++] = state.text;
++            }
++            break;
++        }
++    }
++    ret = 0;
++
++out:
++
++    free(data);
++    return ret;
++}
++
++int parse_alias_to_list(const char *file_name, struct listnode *head)
++{
++    return module_parser(file_name, READ_MODULES_ALIAS, head);
++}
++
++int parse_blacklist_to_list(const char *file_name, struct listnode *head)
++{
++    return module_parser(file_name, READ_MODULES_BLKLST, head);
++}
+diff --git a/libcutils/probe_module.c b/libcutils/probe_module.c
+new file mode 100644
+index 0000000..b577072
+--- /dev/null
++++ b/libcutils/probe_module.c
+@@ -0,0 +1,584 @@
++/*
++ * Copyright (C) 2012 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#define _GNU_SOURCE
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <cutils/misc.h>
++#include <cutils/list.h>
++#include <cutils/module_parsers.h>
++#include <cutils/probe_module.h>
++
++#define LOG_TAG "ProbeModule"
++#include <cutils/log.h>
++
++
++#define LDM_DEFAULT_DEP_FILE "/lib/modules/modules.dep"
++#define LDM_DEFAULT_MOD_PATH "/lib/modules/"
++#define LDM_INIT_DEP_NUM 10
++
++extern int init_module(void *, unsigned long, const char *);
++extern int delete_module(const char *, unsigned int);
++
++static void dump_dep(char **dep)
++{
++    int d;
++
++    for (d = 0; dep[d]; d++)
++        ALOGD("DUMP DEP: %s\n", dep[d]);
++}
++
++static char * strip_path(const char * const str)
++{
++    char *ptr;
++    int i;
++
++    /* initialize pos to terminator */
++    for (i = strlen(str); i > 0; i--)
++        if (str[i - 1] == '/')
++            break;
++
++    return (char *)&str[i];
++}
++
++static void hyphen_to_underscore(char *str)
++{
++    while (str && *str != '\0') {
++        if (*str == '-')
++            *str = '_';
++        str++;
++    }
++}
++
++/* Compare module names, but don't differentiate '_' and '-'.
++ * return: 0 when s1 is matched to s2 or size is zero.
++ *         non-zero in any other cases.
++ */
++static int match_name(const char *s1, const char *s2, const size_t size)
++{
++    size_t i;
++
++    if (!size)
++        return 0;
++
++    for (i = 0; i < size; i++, s1++, s2++) {
++
++        if ((*s1 == '_' || *s1 == '-') && (*s2 == '_' || *s2 == '-'))
++            continue;
++
++        if (*s1 != *s2)
++            return -1;
++
++        if (*s1 == '\0')
++            return 0;
++    }
++
++    return 0;
++}
++
++/* check if a line in dep file is target module's dependency.
++ * return 1 when it is, otherwise 0 in any other cases.
++ */
++static int is_target_module(char *line, const char *target)
++{
++    char *token;
++    char *name;
++    size_t name_len;
++    const char *suffix = ".ko";
++    const char *delimiter = ":";
++    int ret = 0;
++
++    /* search token */
++    token = strstr(line, delimiter);
++
++    if (!token) {
++        ALOGE("invalid line: no token\n");
++        return 0;
++    }
++
++    /* only take stuff before the token */
++    *token = '\0';
++
++    /* use "module.ko" in comparision */
++    name_len = strlen(suffix) + strlen(target) + 1;
++
++    name = malloc(sizeof(char) * name_len);
++
++    if (!name) {
++        ALOGE("cannot alloc ram for comparision\n");
++        return 0;
++    }
++
++    snprintf(name, name_len, "%s%s", target, suffix);
++
++    ret = !match_name(strip_path(line), name, name_len);
++
++    /* restore [single] token, keep line unchanged until we parse it later */
++    *token = *delimiter;
++
++    free(name);
++
++    return ret;
++
++}
++
++/* turn a single string into an array of dependency.
++ *
++ * return: dependency array's address if it succeeded. Caller
++ *         is responsible to free the array's memory.
++ *         NULL when any error happens.
++ */
++static char** setup_dep(char *line)
++{
++    char *tmp;
++    char *brk;
++    int dep_num = LDM_INIT_DEP_NUM;
++    char **new;
++    int i;
++    char **dep = NULL;
++
++    dep = malloc(sizeof(char *) * dep_num);
++
++    if (!dep) {
++        ALOGE("cannot alloc dep array\n");
++        return dep;
++    }
++
++    for (i = 0, tmp = strtok_r(line, ": ", &brk);
++            tmp;
++            tmp = strtok_r(NULL, ": ", &brk), i++) {
++
++        /* check if we need enlarge dep array */
++        if (!(i < dep_num - 1)) {
++
++            dep_num += LDM_INIT_DEP_NUM;
++
++            new = realloc(dep, dep_num);
++
++            if (!new) {
++                ALOGE("failed to enlarge dep buffer\n");
++                free(dep);
++                return NULL;
++            }
++            else
++                dep = new;
++        }
++
++        dep[i] = tmp;
++
++    }
++    /* terminate array with a null pointer */
++    dep[i] = NULL;
++
++    return dep;
++}
++
++static int insmod(const char *path_name, const char *args)
++{
++    void *data;
++    unsigned int len;
++    int ret;
++
++    data = load_file(path_name, &len);
++
++    if (!data) {
++        ALOGE("%s: Failed to load module file [%s]\n", __FUNCTION__, path_name);
++        return -1;
++    }
++
++    ret = init_module(data, len, args);
++
++    if (ret != 0 && errno != EEXIST) {
++        ALOGE("%s: Failed to insmod [%s] with args [%s] error: %s ret: %d\n",
++                __FUNCTION__, path_name, args, strerror(errno), ret);
++        ret = -1;
++    }
++    else
++        ret = 0;    /* if module is already in kernel, return success. */
++
++    free(data);
++
++    return ret;
++}
++
++/* install all modules in the dependency chain
++ * deps    : A array of module file names, must be terminated by a NULL pointer
++ * args    : The module parameters for target module.
++ * strip   : Non-zero to strip out path info in the file name;
++ *           0 to keep path info when loading modules.
++ * base    : a prefix to module path, it will NOT be affected by strip flag.
++ * return  : 0 for success or nothing to do; non-zero when any error occurs.
++ */
++static int insmod_s(char *dep[], const char *args, int strip, const char *base)
++{
++    char *name;
++    char *path_name;
++    int cnt;
++    size_t len;
++    int ret = 0;
++    const char * base_dir = LDM_DEFAULT_MOD_PATH;
++
++    if (base && strlen(base))
++        base_dir = base;
++
++    /* load modules in reversed order */
++    for (cnt = 0; dep[cnt]; cnt++)
++        ;
++
++    while (cnt--) {
++
++        name = strip ? strip_path(dep[cnt]) : dep[cnt];
++
++        len = strlen(base_dir) + strlen(name) + 1;
++
++        path_name = malloc(sizeof(char) * len);
++
++        if (!path_name) {
++            ALOGE("alloc module [%s] path failed\n", path_name);
++            return -1;
++        }
++
++        snprintf(path_name, len, "%s%s", base_dir, name);
++
++        if (cnt)
++            ret = insmod(path_name, "");
++        else
++            ret = insmod(path_name, args);
++
++        free(path_name);
++
++        if (ret)
++            break;
++    }
++
++    return ret;
++}
++
++static int rmmod(const char *mod_name, unsigned int flags)
++{
++    return delete_module(mod_name, flags);
++}
++
++/* remove all modules in a dependency chain
++ * NOTE: We assume module name in kernel is same as the file name without .ko
++ */
++static int rmmod_s(char *dep[], unsigned int flags)
++{
++    int i;
++    int ret = 0;
++    char * mod_name;
++
++    for (i = 0; dep[i]; i++) {
++        size_t len;
++        mod_name = strip_path(dep[i]);
++        len = strlen(mod_name);
++
++        if (len > strlen(".ko")
++                && mod_name[len - 1] == 'o'
++                        && mod_name[len - 2] == 'k'
++                                && mod_name[len - 3] == '.') {
++
++            mod_name[len - 3] = '\0';
++
++            hyphen_to_underscore(mod_name);
++
++            ret = rmmod(mod_name, flags);
++
++            if (ret) {
++                ALOGE("%s: Failed to remove module [%s] error (%s)\n",
++                        __FUNCTION__, mod_name, strerror(errno));
++                break;
++
++            }
++        }
++    }
++
++    return ret;
++}
++
++/* look_up_dep() find and setup target module's dependency in modules.dep
++ *
++ * dep_file:    a pointer to module's dep file loaded in memory, its content
++ *              will be CHANGED during parsing.
++ *
++ * return:      a pointer to an array which holds the dependency strings and
++ *              terminated by a NULL pointer. Caller is responsible to free the
++ *              array's memory.
++ *
++ *              non-zero in any other cases. Content of dep array is invalid.
++ */
++static char ** look_up_dep(const char *module_name, void *dep_file)
++{
++
++    char *line;
++    char *saved_pos;
++    char *start;
++    int ret = -1;
++    char **dep = NULL;
++
++    if (!dep_file || !module_name || *module_name == '\0')
++        return NULL;
++
++    start = (char *)dep_file;
++
++    /* We expect modules.dep file has a new line char before EOF. */
++    while ((line = strtok_r(start, "\n", &saved_pos)) != NULL) {
++
++        start = NULL;
++
++        if (is_target_module(line, module_name)) {
++
++            dep = setup_dep(line);
++            /* job done */
++            break;
++        }
++    }
++
++    return dep;
++}
++
++/* load_dep_file() load a dep file (usually it is modules.dep)
++ * into memory. Caller is responsible to free the memory.
++ *
++ * file_name:   dep file's name, if it is NULL or an empty string,
++ *              This function will try to load a dep file in the
++ *              default path defined in LDM_DEFAULT_DEP_FILE
++ *
++ * return:      a pointer to the allocated mem which holds all
++ *              content of the depfile. a zero pointer will be
++ *              returned for any errors.
++ * */
++static void *load_dep_file(const char *file_name)
++{
++    const char *dep_file_name = LDM_DEFAULT_DEP_FILE;
++    unsigned int len;
++
++    if (file_name && *file_name != '\0')
++        dep_file_name = file_name;
++
++    return load_file(dep_file_name, &len);
++}
++
++/* is_dep_in_blacklist() checks if any module in dependency
++ * is in a blacklilst
++ * dep:         dependency array
++ * blacklist :  head of a black list.
++ * return:      1 if any module in dep is in black list.
++ *              -1 when any error happens
++ *              0 none of modules in dep is in black list.
++ * */
++static int is_dep_in_blacklist(char *dep[], struct listnode *blacklist)
++{
++    int i;
++    char *tmp;
++    int ret = 0;
++    size_t len;
++
++    for (i = 0; dep[i]; i++) {
++        tmp = dep[i];
++        len = strlen(tmp);
++
++        if (!(len > strlen(".ko")
++                && tmp[len - 1] == 'o'
++                        && tmp[len - 2] == 'k'
++                                && tmp[len - 3] == '.')) {
++            ret = -1;
++
++            break;
++        }
++
++        if (asprintf(&tmp, "%s", dep[i]) <= 0) {
++            ret = -1;
++
++            break;
++        }
++
++        tmp[len - 3] = '\0';
++        if (is_module_blacklisted(strip_path(tmp), blacklist)) {
++            ALOGE("found module [%s] is in black list\n", tmp);
++            free(tmp);
++            ret = 1;
++
++            break;
++        }
++        free(tmp);
++    }
++
++    return ret;
++}
++static void dump_black_list(struct listnode *black_list_head)
++{
++    struct listnode *blklst_node;
++    struct module_blacklist_node *blacklist;
++
++    list_for_each(blklst_node, black_list_head) {
++        blacklist = node_to_item(blklst_node,
++                                 struct module_blacklist_node,
++                                 list);
++
++            ALOGE("DUMP BLACK: [%s]\n", blacklist->name);
++    }
++}
++/* insmod_by_dep() interface to outside,
++ * refer to its description in probe_module.h
++ */
++int insmod_by_dep(const char *module_name,
++        const char *args,
++        const char *dep_name,
++        int strip,
++        const char *base,
++        const char *blacklist)
++{
++    void *dep_file = NULL;
++    char **dep = NULL;
++    char *mod_name = NULL;
++    int ret = MOD_UNKNOWN;
++    list_declare(base_blacklist);
++    list_declare(extra_blacklist);
++    list_declare(alias_list);
++
++    if (!module_name || *module_name == '\0') {
++        ALOGE("need valid module name\n");
++
++        return MOD_INVALID_NAME;
++    }
++
++    ret = parse_alias_to_list("/lib/modules/modules.alias", &alias_list);
++
++    if (ret) {
++        ALOGE("%s: parse alias error %d\n", __FUNCTION__, ret);
++        ret = MOD_BAD_ALIAS;
++
++        goto free_file;
++    }
++
++    /* We allow no base blacklist. */
++    /* TODO: tell different cases between no caller black list and parsing failures. */
++    ret = parse_blacklist_to_list("/system/etc/modules.blacklist", &base_blacklist);
++
++    if (ret)
++        ALOGI("%s: parse base black list error %d\n", __FUNCTION__, ret);
++
++    if (blacklist && *blacklist != '\0') {
++        ret = parse_blacklist_to_list(blacklist, &extra_blacklist);
++        if (ret) {
++            ALOGI("%s: parse extra black list error %d\n", __FUNCTION__, ret);
++
++            /* A black list from caller is optional, but when caller does
++             * give us a file and something's wrong with it, we will stop going further*/
++            ret = MOD_INVALID_CALLER_BLACK;
++
++            goto free_file;
++        }
++    }
++    dep_file = load_dep_file(dep_name);
++
++    if (!dep_file) {
++        ALOGE("cannot load dep file : %s\n", dep_name);
++        ret = MOD_BAD_DEP;
++
++        goto free_file;
++    }
++
++    /* check if module name is an alias. */
++    if (!get_module_name_from_alias(module_name, &mod_name, &alias_list))
++        module_name = mod_name;
++
++    dep = look_up_dep(module_name, dep_file);
++
++    if (!dep) {
++        ALOGE("%s: cannot find module's dependency info: [%s]\n", __FUNCTION__, module_name);
++        ret = MOD_DEP_NOT_FOUND;
++
++        goto free_file;
++    }
++
++    if (is_dep_in_blacklist(dep, &extra_blacklist)) {
++        ALOGE("%s: a module is in caller's black list, stop further loading\n", __FUNCTION__);
++        ret = MOD_IN_CALLER_BLACK;
++
++        goto free_file;
++    }
++
++    if (is_dep_in_blacklist(dep, &base_blacklist)) {
++        ALOGE("%s: a module is in system black list, stop further loading\n", __FUNCTION__);
++        ret = MOD_IN_BLACK;
++
++        goto free_file;
++    }
++
++    ret = insmod_s(dep, args, strip, base);
++
++free_file:
++    free(mod_name);
++    free(dep);
++    free(dep_file);
++    free_alias_list(&alias_list);
++    free_black_list(&base_blacklist);
++    free_black_list(&extra_blacklist);
++
++    return ret;
++}
++
++/* rmmod_by_dep() interface to outside,
++ * refer to its description in probe_module.h
++ */
++int rmmod_by_dep(const char *module_name,
++        const char *dep_name)
++{
++    void *dep_file;
++    char **dep = NULL;
++    int ret = MOD_UNKNOWN;
++
++    if (!module_name || *module_name == '\0') {
++        ALOGE("need valid module name\n");
++        ret = MOD_INVALID_NAME;
++
++        return ret;
++    }
++
++    dep_file = load_dep_file(dep_name);
++
++    if (!dep_file) {
++        ALOGE("cannot load dep file : %s\n", dep_name);
++        ret = MOD_BAD_DEP;
++
++        return ret;
++    }
++
++    dep = look_up_dep(module_name, dep_file);
++
++    if (!dep) {
++        ALOGE("%s: cannot remove module: [%s]\n", __FUNCTION__, module_name);
++        ret = MOD_DEP_NOT_FOUND;
++
++        goto free_file;
++    }
++
++    ret = rmmod_s(dep, O_NONBLOCK);
++
++    free(dep);
++
++free_file:
++    free(dep_file);
++
++    return ret;
++}
++
++/* end of file */
+-- 
+1.7.4.1
+

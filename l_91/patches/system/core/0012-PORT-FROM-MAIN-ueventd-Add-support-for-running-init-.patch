@@ -1,0 +1,244 @@
+From f7feb72c93e3500c2331c77458035704f88a3184 Mon Sep 17 00:00:00 2001
+From: Quentin Casasnovas <quentinx.casasnovas@intel.com>
+Date: Thu, 11 Jul 2013 11:28:48 +0200
+Subject: [PORT FROM MAIN]ueventd: Add support for running init builtins on receiving uevent
+
+BZ: 125765
+
+Add support for running init builtins from within ueventd when it receives
+modalias from the kernel. Added syntax:
+
+uevent:<modalias> <init_builtin> [builtin args]
+
+where <modalias> is a modalias string like in modules.alias (it supports
+globbing). Example for bcm:
+
+uevent:sdio:c*v02D0d* setprop wlan.driver.vendor bcm
+
+Which means: if there is an SDIO device, whatever its class (c*), whatever the
+device id (d*), if the vendor ID is 02D0, then run 'setprop wlan.driver.vendor
+bcm'
+
+Category: device enablement
+Domain: CWS.WIFI-Common
+Origin: internal
+Upstream-Candidate: yes
+
+Change-Id: Ic0d716b83c32ca37e10b826c12901583158a0c9f
+Orig-Change-Id: I9eb6a57ea1a933730e0fde8b9c516539f5dc4138
+Signed-off-by: Quentin Casasnovas <quentinx.casasnovas@intel.com>
+Reviewed-on: http://android.intel.com:8080/118420
+Reviewed-by: Champciaux, Nicolas <nicolas.champciaux@intel.com>
+Tested-by: Champciaux, Nicolas <nicolas.champciaux@intel.com>
+Reviewed-by: cactus <cactus@intel.com>
+Tested-by: cactus <cactus@intel.com>
+Signed-off-by: Jeremie GARCIA <jeremie.garcia@intel.com>
+---
+ init/devices.c        |   22 +++++++++++++++++-
+ init/devices.h        |    1 +
+ init/init_parser.c    |   60 +++++++++++++++++++++++++++++++++++++++++++++++++
+ init/init_parser.h    |    9 +++++++
+ init/ueventd.c        |   13 ++++++++++
+ init/ueventd_parser.c |    4 ++-
+ init/ueventd_parser.h |    2 +
+ 7 files changed, 109 insertions(+), 2 deletions(-)
+
+diff --git a/init/devices.c b/init/devices.c
+index 109af5d..9c51c06 100644
+--- a/init/devices.c
++++ b/init/devices.c
+@@ -50,6 +50,7 @@
+ #include "util.h"
+ #include "log.h"
+ #include "parser.h"
++#include "init_parser.h"
+ 
+ #define UNUSED __attribute__((__unused__))
+ 
+@@ -109,6 +110,8 @@ struct platform_node {
+ };
+ 
+ static list_declare(lmodalias);
++list_declare(ltriggers);
++
+ static list_declare(lmod_args);
+ static list_declare(sys_perms);
+ static list_declare(dev_perms);
+@@ -881,7 +884,10 @@ static void handle_module_loading(const char *modalias)
+ static void handle_device_event(struct uevent *uevent)
+ {
+     if (!strcmp(uevent->action,"add")) {
+-        handle_module_loading(uevent->modalias);
++        if (uevent->modalias) {
++                handle_module_loading(uevent->modalias);
++                handle_modalias_triggers(uevent->modalias);
++        }
+     }
+ 
+     if (!strcmp(uevent->action,"add") || !strcmp(uevent->action, "change") || !strcmp(uevent->action, "online"))
+@@ -1170,3 +1176,17 @@ int get_device_fd()
+ {
+     return device_fd;
+ }
++
++void handle_modalias_triggers(const char* modalias)
++{
++    struct listnode* node_ptr;
++    struct alias_trigger_node* node;
++    int i;
++
++    list_for_each(node_ptr, &ltriggers) {
++        node = node_to_item(node_ptr, struct alias_trigger_node, plist);
++        if (!fnmatch(node->pattern, modalias, 0)) {
++            node->func(node->nargs, node->args);
++        }
++    }
++}
+diff --git a/init/devices.h b/init/devices.h
+index c48a92e..41aa615 100644
+--- a/init/devices.h
++++ b/init/devices.h
+@@ -20,6 +20,7 @@
+ #include <sys/stat.h>
+ 
+ extern void handle_device_fd();
++extern void handle_modalias_triggers(const char* modalias);
+ extern void device_init(void);
+ extern int module_probe(const char *alias);
+ extern int add_dev_perms(const char *name, const char *attr,
+diff --git a/init/init_parser.c b/init/init_parser.c
+index 665e8d3..3b9889d 100644
+--- a/init/init_parser.c
++++ b/init/init_parser.c
+@@ -881,3 +881,63 @@ static void parse_line_action(struct parse_state* state, int nargs, char **args)
+     memcpy(cmd->args, args, sizeof(char*) * nargs);
+     list_add_tail(&act->commands, &cmd->clist);
+ }
++
++extern struct listnode ltriggers;
++
++int add_uevent_trigger(int nargs, char** args)
++{
++    struct alias_trigger_node* node = NULL;
++    int i;
++    int kw;
++
++    if (nargs <= 1)
++        return -1;
++
++    kw = lookup_keyword(args[1]);
++    if (!kw_is(kw, COMMAND)) {
++        ERROR("ueventd: invalid command '%s' to be executed on %s\n",
++              args[1], args[0]);
++        return -EINVAL;
++    }
++
++    if (nargs - 1 < kw_nargs(kw)) {
++        ERROR("ueventd: invalid number of arguments '%s' to be executed on %s\n",
++              args[1], args[0]);
++        return -EINVAL;
++    }
++
++    if (!(node = calloc(1, sizeof(*node))))
++        return -ENOMEM;
++
++    node->nargs = nargs - 1;
++
++    if (!(node->args = calloc(nargs, sizeof(*node))))
++        goto nomem_node;
++
++    if (!(node->pattern = strdup(args[0] + 7))) /* arg[0] = "uevent:MODALIAS" */
++        goto nomem_args;
++
++    if (!(node->func = kw_uev_func(kw)))
++        goto nomem_pattern;
++
++    for (i = 0; i < (nargs - 1); ++i) {
++        if (!(node->args[i] = strdup(args[i + 1])))
++            goto nomem_func;
++    }
++    node->args[i] = NULL;
++
++    list_add_tail(&ltriggers, &node->plist);
++
++    return 0;
++
++ nomem_func:
++    for (i = i - 1; i >= 0; --i)
++        free(node->args[i]);
++ nomem_pattern:
++    free(node->pattern);
++ nomem_args:
++    free(node->args);
++ nomem_node:
++    free(node);
++    return -ENOMEM;
++}
+diff --git a/init/init_parser.h b/init/init_parser.h
+index b078cad..fceeaca 100644
+--- a/init/init_parser.h
++++ b/init/init_parser.h
+@@ -33,4 +33,13 @@ void queue_builtin_action(int (*func)(int nargs, char **args), char *name);
+ int init_parse_config_file(const char *fn);
+ int expand_props(char *dst, const char *src, int len);
+ 
++struct alias_trigger_node {
++    char* pattern;
++    char** args;
++    int nargs;
++    int (*func)(int nargs, char **args);
++    struct listnode plist;
++};
++
++
+ #endif
+diff --git a/init/ueventd.c b/init/ueventd.c
+index 75b9b99..ac8ac36 100644
+--- a/init/ueventd.c
++++ b/init/ueventd.c
+@@ -237,3 +237,16 @@ void set_module_args(int nargs, char **args)
+ 
+     add_mod_args(nargs, mod_name, args);
+ }
++
++void set_uevent_trigger(int nargs, char** args)
++{
++    char* modalias;
++
++    if (nargs <= 1)
++        return;
++
++    if (args[0][0] == '#')
++        return;
++
++    add_uevent_trigger(nargs, args);
++}
+diff --git a/init/ueventd_parser.c b/init/ueventd_parser.c
+index 5ac0ea9..7783bdf 100644
+--- a/init/ueventd_parser.c
++++ b/init/ueventd_parser.c
+@@ -246,6 +246,8 @@ static void parse_line_device(struct parse_state *state __attribute__((unused)),
+ {
+     if (args && args[0] && !strncmp("mod:", args[0], 4))
+         set_module_args(nargs, args);
+-    else
++    else if (args && args[0] && !strncmp("uevent:", args[0], 7))
++        set_uevent_trigger(nargs, args);
++    else if (args)
+         set_device_permission(nargs, args);
+ }
+diff --git a/init/ueventd_parser.h b/init/ueventd_parser.h
+index b095c10..55ce528 100644
+--- a/init/ueventd_parser.h
++++ b/init/ueventd_parser.h
+@@ -25,5 +25,7 @@ int ueventd_parse_config_file(const char *fn);
+ void set_device_permission(int nargs, char **args);
+ struct ueventd_subsystem *ueventd_subsystem_find_by_name(const char *name);
+ void set_module_args(int nargs, char **args);
++void set_uevent_trigger(int nargs, char **args);
++int add_uevent_trigger(int nargs, char** args);
+ 
+ #endif
+-- 
+1.7.4.1
+
