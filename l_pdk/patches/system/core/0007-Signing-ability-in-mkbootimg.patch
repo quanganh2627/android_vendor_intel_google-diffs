@@ -1,0 +1,533 @@
+From 8c3a751bddf459c708fd7f546a28c2737321b9fe Mon Sep 17 00:00:00 2001
+From: Andrew Boie <andrew.p.boie@intel.com>
+Date: Fri, 12 Apr 2013 13:31:15 -0700
+Subject: [PATCH 7/8] Signing ability in mkbootimg
+
+BZ: 150574
+
+Add two new arguments to sign boot image
+--signsize: size of signature
+--signexec: command to sign boot image. It is expected to take
+unsigned payload from STDIN when mkbootimage invokes it and output
+signature ONLY to STDOUT.
+
+The signature block is appended page-aligned to the boot image
+right after the 2nd-stage loader. The size of the signature block
+is stored in one of the previously unused fields and is 0 if
+the boot image is not signed, maintaining backward compatibility.
+
+As an example, one can use openssl for this purpose:
+
+BOARD_MKBOOTIMG_ARGS := --signsize 256 \
+        --signexec "openssl dgst -sha256 -sign $(TARGET_BOOT_IMAGE_KEY)"
+
+https://android-review.googlesource.com/#/c/64440/
+
+Author: Andrew Boie <andrew.p.boie@intel.com>
+Author: Jianxun Zhang <jianxun.zhang@intel.com>
+Issue: AXIA-1715 ADEV-197
+
+Change-Id: I8bbf126c2a106d37f33ab59cc581bc1ef611dedb
+Category: aosp improvement
+Domain: AOSP-Framework-CoreService
+Origin: internal
+Upstream-Candidate: no
+Signed-off-by: Jianxun Zhang <jianxun.zhang@intel.com>
+Signed-off-by: Andrew Boie <andrew.p.boie@intel.com>
+Signed-off-by: Vincent Tinelli <vincent.tinelli@intel.com>
+Signed-off-by: geoffroy.weisenhorn <weisenhorn.geoffroy.@intel.com>
+---
+ mkbootimg/bootimg.h   |    8 +-
+ mkbootimg/mkbootimg.c |  338 +++++++++++++++++++++++++++++++++++++++++++------
+ 2 files changed, 307 insertions(+), 39 deletions(-)
+
+diff --git a/mkbootimg/bootimg.h b/mkbootimg/bootimg.h
+index 9171d85..1883e17 100644
+--- a/mkbootimg/bootimg.h
++++ b/mkbootimg/bootimg.h
+@@ -41,7 +41,8 @@ struct boot_img_hdr
+ 
+     unsigned tags_addr;    /* physical addr for kernel tags */
+     unsigned page_size;    /* flash page size we assume */
+-    unsigned unused[2];    /* future expansion: should be 0 */
++    unsigned sig_size;     /* bootimage signature size or 0 */
++    unsigned unused;       /* future expansion: should be 0 */
+ 
+     unsigned char name[BOOT_NAME_SIZE]; /* asciiz product name */
+ 
+@@ -64,10 +65,13 @@ struct boot_img_hdr
+ ** +-----------------+
+ ** | second stage    | o pages
+ ** +-----------------+
++** | signature       | p pages
++** +-----------------+
+ **
+ ** n = (kernel_size + page_size - 1) / page_size
+ ** m = (ramdisk_size + page_size - 1) / page_size
+ ** o = (second_size + page_size - 1) / page_size
++** p = (sig_size + page_size - 1) / page_size
+ **
+ ** 0. all entities are page_size aligned in flash
+ ** 1. kernel and ramdisk are required (size != 0)
+@@ -79,6 +83,8 @@ struct boot_img_hdr
+ ** 5. r0 = 0, r1 = MACHINE_TYPE, r2 = tags_addr
+ ** 6. if second_size != 0: jump to second_addr
+ **    else: jump to kernel_addr
++** 7. signature is optional; size should be 0 if not
++**    present. signature type specified by bootloader
+ */
+ 
+ #if 0
+diff --git a/mkbootimg/mkbootimg.c b/mkbootimg/mkbootimg.c
+index fc92b4d..7b4ac0e 100644
+--- a/mkbootimg/mkbootimg.c
++++ b/mkbootimg/mkbootimg.c
+@@ -21,7 +21,9 @@
+ #include <unistd.h>
+ #include <fcntl.h>
+ #include <errno.h>
+-
++#include <sys/types.h>
++#include <sys/wait.h>
++#include <limits.h>
+ #include "mincrypt/sha.h"
+ #include "bootimg.h"
+ 
+@@ -60,6 +62,8 @@ int usage(void)
+     fprintf(stderr,"usage: mkbootimg\n"
+             "       --kernel <filename>\n"
+             "       --ramdisk <filename>\n"
++            "       [ --signsize <size in bytes of digital signature> ]\n"
++            "       [ --signexec <image signing tool with args> ]\n"
+             "       [ --second <2ndbootloader-filename> ]\n"
+             "       [ --cmdline <kernel-commandline> ]\n"
+             "       [ --board <boardname> ]\n"
+@@ -71,27 +75,249 @@ int usage(void)
+ }
+ 
+ 
++static size_t pagealign(size_t sz, unsigned pagesize)
++{
++    return ((sz + (pagesize - 1)) / pagesize) * pagesize;
++}
++
++/* caller must check return value to determine if output is validly set
++ * return: 0 successful conversion, output holds a valid value
++ *         1 conversion failed, output holds an invalid value
++ */
++static int string_to_long(long int *output, const char *input, int base)
++{
++    char *endptr = NULL;
++    long int val;
++
++    errno = 0;
++
++    val = strtol(input, &endptr, base);
++
++    /* don't care which kind of error*/
++    if(errno) {
++        perror("strtol");
++        return 1;
++    }
++
++    if(endptr == input) {
++        fprintf(stderr, "no digits\n");
++        return 1;
++    }
++
++    *output = val;
++
++    return 0;
++}
++
++/* return:
++ * 1  - child exits successfully
++ * -1 - child exits without success or errors happen
++ * 0  - child has not exited, as for non-block
++ */
++static int wait_child_exit(pid_t pid, int block)
++{
++    int status = 0;
++    int ret = -1;
++    pid_t w;
++
++    do {
++        w = waitpid(pid, &status, block ? 0 : WNOHANG);
++
++        if(w == -1) {
++            fprintf(stderr, "Wait child %d failed\n", pid);
++            ret = -1;
++            goto wait_done;
++        } else if(!w) { /* non-block check and no change on child's state */
++            ret = 0;
++            goto wait_done;
++        } else if(WIFEXITED(status)) { /* child exits */
++            if(WEXITSTATUS(status) != EXIT_SUCCESS)
++                ret = -1;
++            else
++                ret = 1;
++        }
++    } while (!WIFEXITED(status) && !WIFSIGNALED(status));
++
++wait_done:
++    return ret;
++}
++
++static int read_write_data(void *outdata, size_t outsz,
++        void *indata, size_t insz, int outfd, int infd)
++{
++    pid_t pid;
++    FILE *fp;
++    unsigned char *pos;
++    size_t remaining;
++    size_t ret;
++    int status;
++    int w;
++    int result = 0; /* for parent */
++
++    pid = fork();
++    switch (pid) {
++    case -1:
++        perror("fork");
++        exit(EXIT_FAILURE);
++    case 0: /* child, writes outgoing data */
++        close(infd);
++
++        fp = fdopen(outfd, "w");
++        if(!fp) {
++            perror("fdopen");
++            exit(EXIT_FAILURE);
++        }
++        remaining = outsz;
++        pos = outdata;
++
++        while (remaining) {
++            ret = fwrite(pos, 1, remaining, fp);
++            if(ferror(fp)) {
++                perror("fwrite");
++                fclose(fp);
++                exit(EXIT_FAILURE);
++            }
++            remaining -= ret;
++            pos += ret;
++        }
++        fclose(fp);
++        exit(EXIT_SUCCESS);
++    default: /* parent, read incoming data */
++        close(outfd);
++
++        fp = fdopen(infd, "r");
++        if(!fp) {
++            perror("fdopen");
++            result = 1;
++            goto rw_done;
++        }
++        remaining = insz;
++        pos = indata;
++
++        while (remaining) {
++            if(wait_child_exit(pid, 0)) {
++                fprintf(stderr, "child %d exits too early\n", pid);
++                result = 1;
++                goto rw_done;
++            }
++            ret = fread(pos, 1, remaining, fp);
++            if(ferror(fp)) {
++                perror("fread");
++                result = 1;
++                goto rw_done;
++            }
++            remaining -= ret;
++            pos += ret;
++
++        }
++
++        if(wait_child_exit(pid, 1) != 1) {
++            fprintf(stderr, "wait child %d after reading\n",pid);
++            result = 1;
++            goto rw_done;
++        }
++
++rw_done:
++        fclose(fp);
++        return result;
++    }
++}
+ 
+ static unsigned char padding[16384] = { 0, };
+ 
+-int write_padding(int fd, unsigned pagesize, unsigned itemsize)
++static int sign_blob(void **sigdata_ptr, void *data, size_t datasize,
++            const char *signexec, size_t signsize)
+ {
+-    unsigned pagemask = pagesize - 1;
+-    ssize_t count;
++    pid_t pid;
++    int to_pipe[2];
++    int from_pipe[2];
++    int ret = 0; /* for parent */
+ 
+-    if((itemsize & pagemask) == 0) {
+-        return 0;
++    if(pipe(to_pipe) || pipe(from_pipe)) {
++        perror("pipe");
++        return 1;
+     }
+ 
+-    count = pagesize - (itemsize & pagemask);
++    pid = fork();
+ 
+-    if(write(fd, padding, count) != count) {
+-        return -1;
+-    } else {
+-        return 0;
++    switch (pid) {
++    case -1:
++        perror("fork");
++        return 1;
++    case 0: /* child */
++        close(to_pipe[1]);
++        close(from_pipe[0]);
++        /* Redirect appropriate pipe ends to the child process'
++         * stdin and stdout */
++        if(dup2(to_pipe[0], STDIN_FILENO) < 0 ||
++                    dup2(from_pipe[1], STDOUT_FILENO) < 0) {
++            perror("dup2");
++            exit(EXIT_FAILURE);
++        }
++        close(to_pipe[0]);
++        close(from_pipe[1]);
++        execlp("sh", "sh", "-c", signexec, NULL);
++
++        /* should not reach here unless something wrong happens */
++        perror("execlp");
++        exit(EXIT_FAILURE);
++    default: /* parent */
++        close(to_pipe[0]);
++        close(from_pipe[1]);
++
++        ret = read_write_data(data, datasize, *sigdata_ptr, signsize,
++                to_pipe[1], from_pipe[0]);
++
++        if(wait_child_exit(pid, 1) != 1)
++            fprintf(stderr, "wait child %d to exit\n", pid);
+     }
++
++    return ret;
+ }
+ 
++
++
++static int create_image(unsigned char **image, ssize_t *imgsize,
++        struct boot_img_hdr *hdr, void *kernel_data,
++        void *ramdisk_data, void *second_data)
++{
++    unsigned char *bootimg, *pos;
++    size_t total_size;
++    size_t ps;
++
++    ps = hdr->page_size;
++
++    total_size = pagealign(sizeof(hdr), ps) + pagealign(hdr->kernel_size, ps) +
++            pagealign(hdr->ramdisk_size, ps) +
++            pagealign(hdr->second_size, ps);
++    bootimg = malloc(total_size);
++    if(!bootimg) {
++        perror("malloc");
++        return 1;
++    }
++    memset(bootimg, 0, total_size);
++
++    pos = bootimg;
++    memcpy(pos, hdr, sizeof(*hdr));
++
++    pos += ps;
++    memcpy(pos, kernel_data, hdr->kernel_size);
++
++    pos += pagealign(hdr->kernel_size, ps);
++    memcpy(pos, ramdisk_data, hdr->ramdisk_size);
++
++    if(second_data) {
++        pos += pagealign(hdr->ramdisk_size, ps);
++        memcpy(pos, second_data, hdr->second_size);
++    }
++
++    *image = bootimg;
++    *imgsize = total_size;
++
++    return 0;
++}
++
++
+ int main(int argc, char **argv)
+ {
+     boot_img_hdr hdr;
+@@ -105,8 +331,10 @@ int main(int argc, char **argv)
+     char *cmdline = "";
+     char *bootimg = 0;
+     char *board = "";
++    char *signexec = 0;
+     unsigned pagesize = 2048;
+-    int fd;
++    long int signsize = 0;
++    int fd = -1;
+     SHA_CTX ctx;
+     const uint8_t* sha;
+     unsigned base           = 0x10000000;
+@@ -115,6 +343,11 @@ int main(int argc, char **argv)
+     unsigned second_offset  = 0x00f00000;
+     unsigned tags_offset    = 0x00000100;
+     size_t cmdlen;
++    unsigned char *outimg;
++    unsigned char *sigdata = NULL;
++    ssize_t outsize;
++    ssize_t sig_size_aligned = 0;
++    int ret = 1;
+ 
+     argc--;
+     argv++;
+@@ -156,14 +389,23 @@ int main(int argc, char **argv)
+             if ((pagesize != 2048) && (pagesize != 4096)
+                 && (pagesize != 8192) && (pagesize != 16384)) {
+                 fprintf(stderr,"error: unsupported page size %d\n", pagesize);
+-                return -1;
++                return ret;
++            }
++        } else if(!strcmp(arg,"--signexec")) {
++            signexec = val;
++        } else if(!strcmp(arg,"--signsize")) {
++            if(string_to_long(&signsize, val, 0) || signsize <= 0) {
++                fprintf(stderr, "error: unsupported signature size\n");
++                return ret;
+             }
++
+         } else {
++            fprintf(stderr,"error: unsupported arg:  %s\n", arg);
+             return usage();
+         }
+     }
+-    hdr.page_size = pagesize;
+ 
++    hdr.page_size = pagesize;
+     hdr.kernel_addr =  base + kernel_offset;
+     hdr.ramdisk_addr = base + ramdisk_offset;
+     hdr.second_addr =  base + second_offset;
+@@ -189,14 +431,32 @@ int main(int argc, char **argv)
+         return usage();
+     }
+ 
++    if(!!signexec != !!signsize) {
++        fprintf(stderr,"error: --signexec and --signsize must be used together\n");
++        return usage();
++    } else if(signexec) {
++        sig_size_aligned = pagealign(signsize, hdr.page_size);
++
++        sigdata = malloc(sig_size_aligned);
++
++        if(!sigdata) {
++            perror("malloc sigdata");
++            goto fail;
++        }
++        memset(sigdata, 0, sig_size_aligned);
++    }
++
++    hdr.sig_size = signsize;
++
+     strcpy((char *) hdr.name, board);
+ 
++
+     memcpy(hdr.magic, BOOT_MAGIC, BOOT_MAGIC_SIZE);
+ 
+     cmdlen = strlen(cmdline);
+     if(cmdlen > (BOOT_ARGS_SIZE + BOOT_EXTRA_ARGS_SIZE - 2)) {
+         fprintf(stderr,"error: kernel commandline too large\n");
+-        return 1;
++        goto fail;
+     }
+     /* Even if we need to use the supplemental field, ensure we
+      * are still NULL-terminated */
+@@ -210,7 +470,7 @@ int main(int argc, char **argv)
+     kernel_data = load_file(kernel_fn, &hdr.kernel_size);
+     if(kernel_data == 0) {
+         fprintf(stderr,"error: could not load kernel '%s'\n", kernel_fn);
+-        return 1;
++        goto fail;
+     }
+ 
+     if(!strcmp(ramdisk_fn,"NONE")) {
+@@ -220,7 +480,7 @@ int main(int argc, char **argv)
+         ramdisk_data = load_file(ramdisk_fn, &hdr.ramdisk_size);
+         if(ramdisk_data == 0) {
+             fprintf(stderr,"error: could not load ramdisk '%s'\n", ramdisk_fn);
+-            return 1;
++            goto fail;
+         }
+     }
+ 
+@@ -228,7 +488,7 @@ int main(int argc, char **argv)
+         second_data = load_file(second_fn, &hdr.second_size);
+         if(second_data == 0) {
+             fprintf(stderr,"error: could not load secondstage '%s'\n", second_fn);
+-            return 1;
++            goto fail;
+         }
+     }
+ 
+@@ -246,32 +506,34 @@ int main(int argc, char **argv)
+     memcpy(hdr.id, sha,
+            SHA_DIGEST_SIZE > sizeof(hdr.id) ? sizeof(hdr.id) : SHA_DIGEST_SIZE);
+ 
++    if(create_image(&outimg, &outsize, &hdr, kernel_data, ramdisk_data,
++                second_data))
++        goto fail;
++    if(signexec) {
++        if(sign_blob((void **)&sigdata, outimg, outsize, signexec, signsize)) {
++            fprintf(stderr,"error: couldn't sign boot image\n");
++            goto fail;
++        }
++    }
+     fd = open(bootimg, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+     if(fd < 0) {
+         fprintf(stderr,"error: could not create '%s'\n", bootimg);
+-        return 1;
++        goto fail;
+     }
+-
+-    if(write(fd, &hdr, sizeof(hdr)) != sizeof(hdr)) goto fail;
+-    if(write_padding(fd, pagesize, sizeof(hdr))) goto fail;
+-
+-    if(write(fd, kernel_data, hdr.kernel_size) != (ssize_t) hdr.kernel_size) goto fail;
+-    if(write_padding(fd, pagesize, hdr.kernel_size)) goto fail;
+-
+-    if(write(fd, ramdisk_data, hdr.ramdisk_size) != (ssize_t) hdr.ramdisk_size) goto fail;
+-    if(write_padding(fd, pagesize, hdr.ramdisk_size)) goto fail;
+-
+-    if(second_data) {
+-        if(write(fd, second_data, hdr.second_size) != (ssize_t) hdr.second_size) goto fail;
+-        if(write_padding(fd, pagesize, hdr.second_size)) goto fail;
++    if(write(fd, outimg, outsize) != outsize)
++        goto fail;
++    if(signexec) {
++        if(write(fd, sigdata, sig_size_aligned) != sig_size_aligned)
++            goto fail;
+     }
+ 
+-    return 0;
++    ret = 0;
+ 
+ fail:
+-    unlink(bootimg);
+-    close(fd);
+-    fprintf(stderr,"error: failed writing '%s': %s\n", bootimg,
+-            strerror(errno));
+-    return 1;
++    free(sigdata);
++    if(!(fd < 0))
++        close(fd);
++    if(ret)
++        unlink(bootimg);
++    return ret;
+ }
+-- 
+1.7.10.4
+

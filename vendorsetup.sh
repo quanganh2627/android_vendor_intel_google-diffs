@@ -4,8 +4,10 @@
 
 if [ -z "$PDK_FUSION_PLATFORM_ZIP" ]; then
     
-    # Set the platform.zip file.
-    export PDK_FUSION_PLATFORM_ZIP=$(pwd)/vendor/pdk/mini_x86/mini_x86-userdebug/platform/platform.zip
+    # Set the platform.zip file for PDK but not for full sources
+    if [ ! -d frameworks/base/core/java ]; then
+        export PDK_FUSION_PLATFORM_ZIP=$(pwd)/vendor/pdk/mini_x86/mini_x86-userdebug/platform/platform.zip
+    fi
     
     # Patch the tree
     bash $(pwd)/vendor/intel/google_diffs/scripts/apply_patch.sh l_pdk
