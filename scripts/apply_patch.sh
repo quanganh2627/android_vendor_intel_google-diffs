@@ -22,6 +22,9 @@ fi
 
 DIFFS_DIR=${ROOT_DIR}/vendor/intel/google_diffs
 
+# Enable the temporary Makefile to abort the build in case of failure
+(\cp ${DIFFS_DIR}/Show-stopper.mk ${DIFFS_DIR}/Android.mk)
+
 if [ $# -eq 1 ]
 then
     PATCH_DIR=${DIFFS_DIR}/${1}/patches
@@ -92,3 +95,7 @@ do
     done
     cd ${PATCH_DIR}
 done
+
+# All went well, disable the show-stopper Makefile
+(\rm -f ${DIFFS_DIR}/Android.mk)
+
