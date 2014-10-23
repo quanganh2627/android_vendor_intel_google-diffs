@@ -86,6 +86,7 @@ do
             then
                 echo "Failed at ${proj}"
                 echo "Abort..."
+                git am --abort
                 exit
             fi
         else
